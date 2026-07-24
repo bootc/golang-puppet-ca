@@ -77,7 +77,7 @@ kubernetes_export:
 ### Target fields
 
 | Field | Applies to | Default | Notes |
-| ----- | ---------- | ------- | ----- |
+| --- | --- | --- | --- |
 | `kind` | both | — | `Secret` or `ConfigMap` (required; matched case-insensitively) |
 | `metadata.name` | both | — | Object name (required) |
 | `metadata.namespace` | both | pod's namespace | Resolved from the ServiceAccount mount when empty |

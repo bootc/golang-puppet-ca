@@ -1,65 +1,64 @@
 # Container images
 
-The [`Container images`](../.github/workflows/container-images.yml) workflow
-builds the two runtime images and publishes multi-arch manifests to the GitHub
-Container Registry (GHCR).
+Prebuilt, multi-arch container images are published to the GitHub Container
+Registry (GHCR) for every release and every push to `main`. Two variants are
+built, differing only in base image:
 
-| Variant       | Dockerfile                              | Base image              | Tag suffix |
-| ------------- | --------------------------------------- | ----------------------- | ---------- |
-| CentOS Stream | [`Dockerfile`](../Dockerfile)           | `quay.io/centos/centos` | *(none)*   |
-| Alpine        | [`Dockerfile.alpine`](../Dockerfile.alpine) | `alpine`            | `-alpine`  |
+| Variant | Base image | Tag suffix |
+| --- | --- | --- |
+| CentOS Stream | `quay.io/centos/centos` | *(none)* |
+| Alpine | `alpine` | `-alpine` |
 
 Both variants are built for `linux/amd64` and `linux/arm64` and published as a
-single multi-arch manifest per variant. The image name follows the repository:
-`ghcr.io/<owner>/openvox-ca`.
+single multi-arch manifest per variant, so `docker`/`podman` pulls the right
+architecture automatically. The images are published as
+`ghcr.io/voxpupuli/openvox-ca`.
+
+## Pulling
 
 ```console
-$ docker pull ghcr.io/<owner>/openvox-ca:latest          # CentOS Stream
-$ docker pull ghcr.io/<owner>/openvox-ca:latest-alpine   # Alpine
+$ docker pull ghcr.io/voxpupuli/openvox-ca:latest          # CentOS Stream
+$ docker pull ghcr.io/voxpupuli/openvox-ca:latest-alpine   # Alpine
 ```
 
-## When images are built
+## Available tags
 
-| Trigger | What happens |
+| Tag | Points at |
 | --- | --- |
-| **Push to `main`** | Builds both variants on both architectures and pushes the rolling `edge` (and `main`) tags, plus their `-alpine` counterparts. `edge` always points at the latest default-branch build. |
-| **Release tag** (`git push` of a `v*` tag) | Builds both variants on both architectures and pushes the semver tags (`1.2.3`, `1.2`, `1`), `latest`, and their `-alpine` counterparts. |
-| **Manual** (Actions → *Container images* → *Run workflow*) | Builds everything. Pushes only if you tick the **push** input; otherwise it builds and smoke-tests without publishing. |
-| **Pull request** | Always builds both variants on both architectures as a validation check. Same-repo PRs also push a throwaway `pr-<n>` tag; fork PRs build only and discard the result (their token cannot write packages). |
+| `latest` / `latest-alpine` | The most recent release |
+| `1.2.3`, `1.2`, `1` (+ `-alpine`) | A specific release and its semver aliases |
+| `edge` / `edge-alpine` | The latest build from the default branch (`main`) |
+| `main` / `main-alpine` | Same as `edge`; the head of `main` |
 
-Architecture builds run on native GitHub-hosted runners — `ubuntu-latest`
-(amd64) and `ubuntu-24.04-arm` (arm64) — and the per-architecture digests are
-merged into the final manifest. No QEMU emulation is involved, so arm64 builds
-run at native speed.
+Pin to a specific semver tag (e.g. `1.2.3`) for reproducible deployments;
+`edge` tracks unreleased changes and can break at any time.
 
-## One-time repository setup (for the repository owner)
+## Running
 
-These steps must be performed once by someone with admin access to the upstream
-repository. Until then, release/manual builds will fail at the push step and PR
-validation builds will still work (they don't push).
+The image's entrypoint is `openvox-ca`; any arguments you pass are appended to
+it, exactly like running the binary. Mount a volume for the CA directory so the
+CA survives container restarts, and publish port 8140:
 
-1. **Allow Actions to publish packages.**
-   Settings → Actions → General → *Workflow permissions*. The workflow already
-   requests `packages: write`, but if an organization policy overrides this,
-   select **Read and write permissions** (or explicitly allow the
-   `GITHUB_TOKEN` to write packages for this repository).
+```console
+$ docker run -d --name openvox-ca \
+    -p 8140:8140 \
+    -v openvox-ca-data:/data \
+    ghcr.io/voxpupuli/openvox-ca:latest \
+    --cadir=/data --hostname=puppet.example.com
+```
 
-2. **Publish a release to create the package, then set its visibility.**
-   The GHCR package is created on the first successful push and is **private**
-   by default. To make the images publicly pullable: your profile/org →
-   *Packages* → `openvox-ca` → *Package settings* → *Change visibility* →
-   **Public**. The package is automatically linked to this repository via the
-   `org.opencontainers.image.source` label.
+On first run this bootstraps a new CA under `/data` and serves plain HTTP on
+port 8140. For a production deployment — TLS, mTLS, an alternative storage
+backend, autosigning — pass the relevant flags (or mount a config file and set
+`--config`). See [configuring the server](configuration.md) for the full
+reference, and the [HTTP API reference](api.md) for the endpoints agents use.
 
-3. **arm64 runners.**
-   The `ubuntu-24.04-arm` runner used for arm64 is free for **public**
-   repositories. For a private repository you must provision arm64 runners
-   (GitHub-hosted larger runners or self-hosted) or the arm64 build jobs will
-   queue indefinitely.
+> **Autosigning is off by default.** Only set `--autosign-config=true` in
+> dev/test environments: it lets any CSR submitter obtain a signed certificate
+> without operator review.
 
-4. **Fork pull-request approval (the build "gate").**
-   GitHub holds workflow runs on PRs from first-time contributors until a
-   maintainer approves them (Settings → Actions → General → *Fork pull request
-   workflows from outside collaborators*). Fork PRs still build once approved,
-   but their `GITHUB_TOKEN` is read-only, so the build result is discarded
-   rather than pushed.
+## Publishing
+
+How these images are built and published (the GitHub Actions workflow, the tag
+matrix, and the one-time repository setup a maintainer performs) is documented
+in [publishing container images](development/publishing-images.md).

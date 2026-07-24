@@ -1,17 +1,17 @@
 # OpenBao Transit-engine CA key
 
 By default `openvox-ca` holds the CA private key itself: as a local PEM file
-(optionally encrypted at rest, see the [main README](../README.md#ca-key-encryption-at-rest)),
-or — in the isolated-signer deployment — inside a separate `openvox-ca
-[signer]` child process reachable only over an authenticated Unix socketpair.
+(optionally encrypted at rest, see [CA key security](ca-key-security.md#ca-key-encryption-at-rest)),
+or — in the isolated-signer deployment — inside a separate, isolated `openvox-ca
+[signer]` child process.
 
 Setting `--ca-key-provider openbao` changes where the key itself lives: it
 never exists inside any `openvox-ca` process at all. Instead it lives in an
 [OpenBao](https://openbao.org/) **Transit secrets engine**, and `openvox-ca`
-only ever sends OpenBao a digest to sign, getting a signature back. This is
-the same `crypto.Signer` seam the isolated-signer feature already uses (and
-the seam the README's PKCS#11/HSM plans target); OpenBao is simply the first
-concrete backend for it.
+only ever sends OpenBao a digest to sign, getting a signature back. It plugs
+into the same key-custody seam the isolated signer uses and the
+[PKCS#11/HSM plans](ca-key-security.md#planned-pkcs11--hsm-support) target;
+OpenBao is simply the first concrete backend for it.
 
 Every other storage backend — filesystem, etcd, redis/valkey, sqlite,
 postgres, mysql — keeps working exactly as documented in
@@ -162,7 +162,7 @@ Every OpenBao-specific setting lives under a top-level `openbao:` YAML key
 prefix instead, since there's no flat-file nesting for those).
 
 | Config key | Environment variable | CLI flag | Description |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `ca_key_provider` | `PUPPET_CA_CA_KEY_PROVIDER` | `--ca-key-provider` | `file` (default) or `openbao` |
 | `openbao.addr` | `PUPPET_CA_OPENBAO_ADDR` | `--openbao-addr` | OpenBao server address as a full URI, including scheme and port, e.g. `https://openbao.example.com:8200`. `http://` is also accepted for a plain-HTTP listener in development only — never against a non-loopback or production OpenBao, because the client token and all signing traffic then cross the network in cleartext |
 | `openbao.transit_mount` | `PUPPET_CA_OPENBAO_TRANSIT_MOUNT` | `--openbao-transit-mount` | Transit engine mount path (default `transit`) |
@@ -175,7 +175,7 @@ prefix instead, since there's no flat-file nesting for those).
 ### AppRole auth (VM / systemd deployments)
 
 | Config key | Environment variable | CLI flag | Description |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `openbao.approle_mount` | `PUPPET_CA_OPENBAO_APPROLE_MOUNT` | `--openbao-approle-mount` | AppRole mount path (default `approle`) |
 | `openbao.approle_role_id` | `PUPPET_CA_OPENBAO_APPROLE_ROLE_ID` | `--openbao-approle-role-id` | AppRole `role_id` |
 | `openbao.approle_role_id_file` | `PUPPET_CA_OPENBAO_APPROLE_ROLE_ID_FILE` | `--openbao-approle-role-id-file` | Path to a file containing `role_id`, read fresh on every login |
@@ -194,7 +194,7 @@ openbao:
 ### Static token file (VM / systemd deployments)
 
 | Config key | Environment variable | CLI flag | Description |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `openbao.token_file` | `PUPPET_CA_OPENBAO_TOKEN_FILE` | `--openbao-token-file` | Path to a file containing a pre-issued OpenBao token |
 
 This file holds a bearer credential that can sign arbitrary certificates as
@@ -213,7 +213,7 @@ revoked.
 ### Kubernetes auth (native, no sidecar)
 
 | Config key | Environment variable | CLI flag | Description |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `openbao.kubernetes_mount` | `PUPPET_CA_OPENBAO_KUBERNETES_MOUNT` | `--openbao-kubernetes-mount` | Kubernetes auth mount path (default `kubernetes`) |
 | `openbao.kubernetes_role` | `PUPPET_CA_OPENBAO_KUBERNETES_ROLE` | `--openbao-kubernetes-role` | OpenBao Kubernetes auth role name |
 | `openbao.kubernetes_jwt_file` | `PUPPET_CA_OPENBAO_KUBERNETES_JWT_FILE` | `--openbao-kubernetes-jwt-file` | Path to the projected ServiceAccount token (default: the standard in-cluster path) |
@@ -324,9 +324,8 @@ this in two places:
   is already running, the next issuance signs with the new key, that
   signature no longer verifies against the trusted CA certificate, and the
   request fails with an error instead of returning a certificate that would
-  silently fail verification later. This is an in-process check with no extra
-  OpenBao round trip — the signing request that already goes to OpenBao is
-  the only one.
+  silently fail verification later. The check adds no extra OpenBao round trip
+  — it reuses the signature from the signing request itself.
 
 This works the same way whether or not key isolation (the isolated
 `openvox-ca [signer]` process) is in use — the check happens wherever the
@@ -339,17 +338,16 @@ running CA.
 
 ## Process isolation
 
-The isolated-signer deployment (the default; see the main README's
-[OpenBao Transit-engine key custody](../README.md#openbao-transit-engine-key-custody)
+The isolated-signer deployment (the default; see the
+[OpenBao Transit-engine key custody](ca-key-security.md#openbao-transit-engine-key-custody)
 discussion) keeps working unchanged in OpenBao
 mode: the OpenBao client and its token live inside the isolated
 `openvox-ca [signer]` child process, exactly where a local private key lives
 today. An OpenBao token scoped to `sign`+`read` on one Transit key is still a
 credential capable of signing arbitrary certificates on the CA's behalf, so
 it gets the same process isolation a local key would. The frontend process
-is unaffected either way — it always talks to the signer over the same
-authenticated RPC socketpair, whether the signer is holding a local key or an
-OpenBao client.
+is unaffected either way — it talks to the signer the same way whether the
+signer holds a local key or an OpenBao client.
 
 `--single-process` disables that isolation (as it does for local keys):
 the one process authenticates to OpenBao and holds the resulting token
