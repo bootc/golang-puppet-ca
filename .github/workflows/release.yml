@@ -5,8 +5,11 @@ on:
     tags:
       - 'v*'
 
+# The verify and build jobs only read; contents: write is granted to the
+# release job alone, so a compromise in the build path cannot push refs or
+# publish releases.
 permissions:
-  contents: write  # required to create releases and upload assets
+  contents: read
   checks: read  # verify-release-tag reads the tagged commit's check runs
 
 jobs:
@@ -74,6 +77,8 @@ jobs:
     name: Publish release
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write  # create the release and upload assets
     steps:
       - name: Download artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -87,6 +92,18 @@ jobs:
         run: |
           cd dist
           ls -l
+          # Refuse to publish an incomplete release: every variant in the
+          # build matrix must have produced exactly one tarball, and nothing
+          # unexpected may sneak in. Keep this list in sync with the matrix
+          # above and distVariants() in magefile.go.
+          for variant in linux_amd64 linux_arm64 linux_amd64_fips linux_arm64_fips; do
+            ls -- openvox-ca_*_"$variant".tar.gz > /dev/null
+          done
+          tarballs="$(ls -- *.tar.gz | wc -l)"
+          if [ "$tarballs" -ne 4 ]; then
+            echo "::error::Expected 4 release tarballs, found $tarballs"
+            exit 1
+          fi
           sha256sum -- *.tar.gz > checksums.txt
           cat checksums.txt
       - name: Publish GitHub release

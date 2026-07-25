@@ -31,12 +31,12 @@ on:
         type: boolean
         default: false
 
-# GITHUB_TOKEN needs packages:write to push to GHCR. On pull requests from
-# forks GitHub automatically downgrades this to read-only; the build job
-# detects that and skips pushing.
+# GITHUB_TOKEN needs packages:write to push to GHCR; it is granted per-job to
+# the build and merge jobs that actually push. On pull requests from forks
+# GitHub automatically downgrades it to read-only; the build job detects that
+# and skips pushing.
 permissions:
   contents: read
-  packages: write
   checks: read  # verify-release-tag reads the tagged commit's check runs
 
 # Cancel superseded PR runs, but never cancel a release/tag build mid-flight.
@@ -102,6 +102,9 @@ jobs:
     name: Build ${{ matrix.variant }} (${{ matrix.arch }})
     needs: [setup, verify-tag]
     runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write  # push per-arch images by digest
     strategy:
       fail-fast: false
       matrix:
@@ -191,6 +194,8 @@ jobs:
     needs: [setup, build]
     if: needs.setup.outputs.push == 'true'
     runs-on: ubuntu-latest
+    permissions:
+      packages: write  # push the multi-arch manifests and tags
     strategy:
       fail-fast: false
       matrix:
