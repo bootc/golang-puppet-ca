@@ -83,10 +83,11 @@ func runLauncher(drain time.Duration) error {
 	defer frontendSock.Close()
 
 	// Generate a PSK for authenticating the socketpair endpoints.
-	// Both children receive this via an inherited pipe (fd 4) and verify it
-	// in a challenge-response handshake before the first RPC call, preventing
-	// a rogue process from injecting a fake signer if the fd is somehow
-	// leaked.
+	// Both children receive this via an inherited pipe (fd 4) and run a
+	// mutual challenge-response handshake before the first RPC call: each
+	// endpoint proves knowledge of the PSK to the other, so a rogue process
+	// that somehow obtained a leaked fd could impersonate neither the
+	// frontend nor the signer.
 	//
 	// SECURITY: the PSK travels over a pipe rather than an environment
 	// variable because a child's exec-time environment stays visible in
