@@ -31,6 +31,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -173,15 +174,58 @@ func (Build) FIPS() error {
 		"./cmd/openvox-ca-ctl")
 }
 
+// releaseVersion extracts the Version constant from internal/version, the
+// single source of truth for the release version. Parsed from source rather
+// than imported so that editing the constant never requires rebuilding the
+// mage binary to be picked up.
+func releaseVersion() (string, error) {
+	src, err := os.ReadFile(filepath.Join("internal", "version", "version.go"))
+	if err != nil {
+		return "", err
+	}
+	m := regexp.MustCompile(`(?m)^const Version = "([^"]+)"$`).FindSubmatch(src)
+	if m == nil {
+		return "", fmt.Errorf("could not find the Version constant in internal/version/version.go")
+	}
+	return string(m[1]), nil
+}
+
+// fipsCrossCC returns the C compiler needed to link the boringcrypto syso for
+// a FIPS build targeting goarch. Cross-linking from a different architecture
+// needs the matching GNU cross toolchain (on Debian/Ubuntu: the
+// gcc-aarch64-linux-gnu / gcc-x86-64-linux-gnu packages). Returns "" when the
+// default compiler is fine (native Linux build) or when CC is already set in
+// the environment (respected as an override).
+func fipsCrossCC(goarch string) string {
+	if os.Getenv("CC") != "" {
+		return ""
+	}
+	if runtime.GOOS == "linux" && runtime.GOARCH == goarch {
+		return ""
+	}
+	switch goarch {
+	case "amd64":
+		return "x86_64-linux-gnu-gcc"
+	case "arm64":
+		return "aarch64-linux-gnu-gcc"
+	}
+	return ""
+}
+
 // Dist cross-compiles release artifacts for all supported platforms and writes
 // them to dist/. Each artifact is a .tar.gz containing openvox-ca and
 // openvox-ca-ctl. A SHA-256 checksums.txt is also written to dist/.
 //
-// Artifacts produced:
+// Artifacts produced (VERSION is the internal/version constant):
 //
-//	openvox-ca_linux_amd64.tar.gz       (standard; CGO_ENABLED=0)
-//	openvox-ca_linux_arm64.tar.gz       (standard; CGO_ENABLED=0)
-//	openvox-ca_linux_amd64_fips.tar.gz  (FIPS; GOEXPERIMENT=boringcrypto)
+//	openvox-ca_VERSION_linux_amd64.tar.gz       (standard; CGO_ENABLED=0)
+//	openvox-ca_VERSION_linux_arm64.tar.gz       (standard; CGO_ENABLED=0)
+//	openvox-ca_VERSION_linux_amd64_fips.tar.gz  (FIPS; GOEXPERIMENT=boringcrypto)
+//	openvox-ca_VERSION_linux_arm64_fips.tar.gz  (FIPS; GOEXPERIMENT=boringcrypto)
+//
+// The FIPS variants are cgo builds, so they need a Linux host with a C
+// toolchain for each target architecture (see fipsCrossCC); the pure-Go
+// variants cross-compile from anywhere.
 func (Build) Dist() error {
 	distDir := "dist"
 	if err := os.RemoveAll(distDir); err != nil {
@@ -191,22 +235,38 @@ func (Build) Dist() error {
 		return err
 	}
 
+	ver, err := releaseVersion()
+	if err != nil {
+		return err
+	}
+
 	type variant struct {
 		name string
 		env  map[string]string
 	}
+	fipsEnv := func(goarch string) map[string]string {
+		env := map[string]string{"CGO_ENABLED": "1", "GOOS": "linux", "GOARCH": goarch, "GOEXPERIMENT": "boringcrypto"}
+		if cc := fipsCrossCC(goarch); cc != "" {
+			env["CC"] = cc
+		}
+		return env
+	}
 	variants := []variant{
 		{
-			name: "openvox-ca_linux_amd64",
+			name: fmt.Sprintf("openvox-ca_%s_linux_amd64", ver),
 			env:  map[string]string{"CGO_ENABLED": "0", "GOOS": "linux", "GOARCH": "amd64"},
 		},
 		{
-			name: "openvox-ca_linux_arm64",
+			name: fmt.Sprintf("openvox-ca_%s_linux_arm64", ver),
 			env:  map[string]string{"CGO_ENABLED": "0", "GOOS": "linux", "GOARCH": "arm64"},
 		},
 		{
-			name: "openvox-ca_linux_amd64_fips",
-			env:  map[string]string{"CGO_ENABLED": "1", "GOOS": "linux", "GOARCH": "amd64", "GOEXPERIMENT": "boringcrypto"},
+			name: fmt.Sprintf("openvox-ca_%s_linux_amd64_fips", ver),
+			env:  fipsEnv("amd64"),
+		},
+		{
+			name: fmt.Sprintf("openvox-ca_%s_linux_arm64_fips", ver),
+			env:  fipsEnv("arm64"),
 		},
 	}
 
