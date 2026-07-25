@@ -96,7 +96,7 @@ func (c *CA) rebuildCertIndex(ctx context.Context) {
 	// apparent hang between "Loaded existing CA" and the listener coming up.
 	var missing int
 	for _, rec := range records {
-		if rec.Fingerprint == "" {
+		if rec.Fingerprint == "" && rec.State != storage.CertStateUnknown {
 			missing++
 		}
 	}
@@ -121,6 +121,14 @@ func (c *CA) rebuildCertIndex(ctx context.Context) {
 				"projections_backfilled", projected, "states_corrected", restated,
 				"error", err)
 			return
+		}
+		if rec.State == storage.CertStateUnknown {
+			// The backend cannot address this record's serial one-to-one
+			// (duplicated legacy serial on etcd): index writes for it are
+			// refused, so backfill and reconciliation can never converge.
+			// Readers derive its state from the CRL instead; skip it rather
+			// than re-attempt and warn on every start.
+			continue
 		}
 		if rec.Fingerprint == "" && c.backfillCertProjection(ctx, rec) {
 			projected++
