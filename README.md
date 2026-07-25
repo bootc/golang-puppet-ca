@@ -80,21 +80,25 @@ Full build instructions (including the FIPS build) are in
 
 ## Quick start
 
-### Plain HTTP, auto-bootstrap CA
+### Local demo: plain HTTP on loopback, auto-bootstrap CA
 
 ```bash
-./bin/openvox-ca --cadir /etc/puppetlabs/puppet/ssl --hostname puppet.example.com
+./bin/openvox-ca --cadir /etc/puppetlabs/puppet/ssl/ca --host 127.0.0.1 --hostname puppet.example.com
 ```
 
-On first run the server bootstraps a new CA under `--cadir` and begins serving on port 8140.
+On first run the server bootstraps a new CA under `--cadir` and begins serving
+plain HTTP on port 8140. The server refuses plain HTTP on a non-loopback
+address unless `--no-tls-required` is set — only do that behind a trusted
+TLS-terminating proxy or in test environments. For anything reachable from the
+network, serve HTTPS as below.
 
 ### HTTPS with mTLS
 
 ```bash
 ./bin/openvox-ca \
-  --cadir /etc/puppetlabs/puppet/ssl \
+  --cadir /etc/puppetlabs/puppet/ssl/ca \
   --tls-cert /etc/puppetlabs/puppet/ssl/ca/ca_crt.pem \
-  --tls-key  /etc/puppetlabs/puppet/ssl/ca/ca_key.pem \
+  --tls-key  /etc/puppetlabs/puppet/ssl/ca/private/ca_key.pem \
   --puppet-server puppet.example.com
 ```
 
