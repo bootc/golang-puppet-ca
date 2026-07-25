@@ -186,6 +186,76 @@ var _ = Describe("Certificate statuses via the certificate index", func() {
 		Expect(requested[0].Name).To(Equal("idx-pending"))
 	})
 
+	It("falls back to the stored PEM for a projection-less record, keeping the record's state", func() {
+		submitAndSign("idx-legacy", generateCSRWithSANs("idx-legacy", []string{"idx-legacy"}))
+
+		// Append a projection-less inventory row for the same subject, as a
+		// legacy blob import (or the crash window between blob and inventory
+		// writes) would leave behind. Being the subject's latest issuance it
+		// is the row the index serves, its serial does not match the stored
+		// PEM, and no repair pass runs between here and the request.
+		Expect(store.AppendInventory(ctx,
+			"0FFF 2024-01-01T00:00:00UTC 2029-01-01T00:00:00UTC /idx-legacy")).To(Succeed())
+
+		statuses := getStatuses("")
+		Expect(statuses).To(HaveLen(1))
+		got := statuses[0]
+
+		// Every display field must come from the authoritative PEM, not the
+		// bogus row: same derivation as the non-indexed path.
+		certPEM, err := store.GetCert(ctx, "idx-legacy")
+		Expect(err).NotTo(HaveOccurred())
+		block, _ := pem.Decode(certPEM)
+		Expect(block).NotTo(BeNil())
+		cert, err := x509.ParseCertificate(block.Bytes)
+		Expect(err).NotTo(HaveOccurred())
+
+		Expect(got.Name).To(Equal("idx-legacy"))
+		Expect(got.State).To(Equal("signed"))
+		Expect(got.Fingerprint).To(Equal(ca.SHA256ColonFingerprint(block.Bytes)))
+		Expect(got.SerialNumber).NotTo(BeNil())
+		Expect(*got.SerialNumber).To(Equal(cert.SerialNumber.Text(10)),
+			"the serial must be the PEM's, not the projection-less row's")
+		Expect(got.DNSAltNames).To(Equal([]string{"idx-legacy"}))
+	})
+
+	It("suppresses a pending re-submission for an already-certified subject", func() {
+		submitAndSign("idx-dual", generateCSRWithSANs("idx-dual", []string{"idx-dual"}))
+
+		// SaveRequest refuses a CSR while a live certificate exists, so plant
+		// the pending CSR directly in storage — the state a clean-then-crash
+		// or an out-of-band write can produce, and exactly what the handler's
+		// seen-map dedup exists for.
+		csrPEM, err := testutil.GenerateCSR("idx-dual")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(store.SaveCSR(ctx, "idx-dual", csrPEM)).To(Succeed())
+
+		// A genuinely pending subject as the positive control.
+		csrPEM, err = testutil.GenerateCSR("idx-pending")
+		Expect(err).NotTo(HaveOccurred())
+		rr := httptest.NewRecorder()
+		mux.ServeHTTP(rr, httptest.NewRequest("PUT", "/certificate_request/idx-pending", bytes.NewReader(csrPEM)))
+		Expect(rr.Code).To(Equal(http.StatusOK))
+
+		// Unfiltered: the certificate wins; idx-dual appears exactly once.
+		all := getStatuses("")
+		states := map[string]string{}
+		for _, s := range all {
+			states[s.Name] = s.State
+		}
+		Expect(all).To(HaveLen(2))
+		Expect(states).To(Equal(map[string]string{
+			"idx-dual":    "signed",
+			"idx-pending": "requested",
+		}))
+
+		// Under the requested filter the certified subject must stay
+		// suppressed even though no certificate rows are emitted.
+		requested := getStatuses("?state=requested")
+		Expect(requested).To(HaveLen(1))
+		Expect(requested[0].Name).To(Equal("idx-pending"))
+	})
+
 	It("serialises an empty index as [] and projects a promoted CN SAN", func() {
 		rr := httptest.NewRecorder()
 		mux.ServeHTTP(rr, httptest.NewRequest("GET", "/certificate_statuses/any", nil))

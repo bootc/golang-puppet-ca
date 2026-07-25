@@ -236,6 +236,30 @@ var _ = Describe("SQLiteCertIndex", func() {
 		Expect(recs[0].AuthExtensions).To(BeNil(), "no auth extensions were projected")
 	})
 
+	It("degrades a corrupt projection to a missing one instead of failing the record", func() {
+		// record() promises undecodable projection JSON reads as "projection
+		// missing" (empty Fingerprint) so listings keep working and readers
+		// fall back to the authoritative PEM.
+		row := sqlInventoryRow{
+			Serial: "0001", Subject: "node1",
+			NotBefore: "2024-01-01T00:00:00UTC", NotAfter: "2029-01-01T00:00:00UTC",
+			State:       CertStateSigned,
+			Fingerprint: "aa:bb:cc",
+			DNSAltNames: "{not-json",
+		}
+		rec := row.record()
+		Expect(rec.CertProjection).To(Equal(CertProjection{}), "bad dns_alt_names discards the projection")
+		Expect(rec.State).To(Equal(CertStateSigned), "state is not part of the projection and survives")
+
+		// Bad auth_extensions JSON discards the whole projection, including
+		// the DNS names that decoded successfully — the record is either
+		// fully projected or not projected at all.
+		row.DNSAltNames = `["node1"]`
+		row.AuthExts = "{not-json"
+		rec = row.record()
+		Expect(rec.CertProjection).To(Equal(CertProjection{}))
+	})
+
 	It("degrades gracefully on backends without the capability", func() {
 		ctx := context.Background()
 		svc := New(GinkgoT().TempDir())
