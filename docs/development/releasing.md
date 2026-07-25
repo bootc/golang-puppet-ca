@@ -84,9 +84,10 @@ other, and neither waits for CI.
    (`CGO_ENABLED=0`) cross-compile from anywhere, but the FIPS variants are
    `cgo` builds and need a Linux C toolchain per target architecture (the
    cross ones on Debian/Ubuntu: `gcc-aarch64-linux-gnu` /
-   `gcc-x86-64-linux-gnu`) — on macOS the FIPS build fails in `runtime/cgo`
-   with assembler errors, after the pure-Go tarballs have already been
-   written, leaving `dist/` incomplete. That is expected, not a regression.
+   `gcc-x86-64-linux-gnu`) — on macOS the FIPS builds fail up front with
+   `cgo: C compiler "x86_64-linux-gnu-gcc" not found` (and the aarch64
+   equivalent), after the pure-Go tarballs have already been written, leaving
+   `dist/` incomplete. That is expected, not a regression.
 
    From macOS, either check the pure-Go variants only:
 
