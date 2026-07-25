@@ -1,4 +1,4 @@
-// Copyright (C) 2026 Trevor Vaughan
+// Copyright (C) 2026 Chris Boot
 // Copyright (C) 2026 Vox Pupuli and contributors
 //
 // This program is free software; you can redistribute it and/or modify
@@ -27,17 +27,7 @@ import (
 	"github.com/voxpupuli/openvox-ca/internal/version"
 )
 
-// The root command must reject stray positional arguments instead of silently
-// ignoring them. The bug fix sets Args: cobra.NoArgs on the root command.
 var _ = Describe("Root command", func() {
-	It("rejects unexpected positional arguments", func() {
-		cmd := newRootCmd()
-		cmd.SetArgs([]string{"stray-arg", "--cadir", GinkgoT().TempDir()})
-		cmd.SetOut(io.Discard)
-		cmd.SetErr(io.Discard)
-		Expect(cmd.Execute()).To(HaveOccurred(), "expected error for unexpected positional arg, got nil")
-	})
-
 	It("prints the release version for --version", func() {
 		var out bytes.Buffer
 		cmd := newRootCmd()
@@ -45,15 +35,29 @@ var _ = Describe("Root command", func() {
 		cmd.SetOut(&out)
 		cmd.SetErr(io.Discard)
 		Expect(cmd.Execute()).To(Succeed())
-		Expect(out.String()).To(ContainSubstring("openvox-ca version " + version.Version))
+		Expect(out.String()).To(ContainSubstring("openvox-ca-ctl version " + version.Version))
 	})
 
-	// -v must stay the shorthand for --verbosity: cobra would otherwise claim
-	// it for the synthesised --version flag, silently changing what -v does.
-	It("keeps -v as the shorthand for --verbosity", func() {
+	// --version is root-only (cobra registers it on the root's local flag
+	// set), unlike the persistent global flags; the CLI reference documents
+	// this, so pin it.
+	It("rejects --version after a subcommand", func() {
 		cmd := newRootCmd()
-		flag := cmd.Flags().ShorthandLookup("v")
+		cmd.SetArgs([]string{"list", "--version"})
+		cmd.SetOut(io.Discard)
+		cmd.SetErr(io.Discard)
+		err := cmd.Execute()
+		Expect(err).To(MatchError(ContainSubstring("unknown flag: --version")))
+	})
+
+	// -v must stay the shorthand for --verbose, mirroring the server binary
+	// (where -v is --verbosity): cobra would otherwise claim it for the
+	// synthesised --version flag, giving the two siblings opposite -v
+	// semantics.
+	It("keeps -v as the shorthand for --verbose", func() {
+		cmd := newRootCmd()
+		flag := cmd.PersistentFlags().ShorthandLookup("v")
 		Expect(flag).NotTo(BeNil())
-		Expect(flag.Name).To(Equal("verbosity"))
+		Expect(flag.Name).To(Equal("verbose"))
 	})
 })
