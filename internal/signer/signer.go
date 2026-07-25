@@ -43,8 +43,9 @@ import (
 // endpoint to child processes via exec.Cmd.ExtraFiles.
 const InheritedFD = 3
 
-// pskEnvVar is the environment variable containing the hex-encoded PSK.
-const pskEnvVar = "PUPPET_CA_SIGNER_PSK"
+// PSKFD is the file descriptor number used to pass the read end of the
+// PSK pipe to child processes via exec.Cmd.ExtraFiles.
+const PSKFD = 4
 
 // pskLen is the expected PSK length in bytes.
 const pskLen = 32
@@ -80,9 +81,10 @@ func (s *Service) Sign(req *SignRequest, resp *SignResponse) error {
 // Serve runs the signer RPC server on the inherited socketpair fd.
 // It blocks until the connection is closed or a SIGTERM/SIGINT is received.
 //
-// If PUPPET_CA_SIGNER_PSK is set, the signer performs a challenge-response
-// handshake before serving RPC calls: it sends a 32-byte random nonce,
-// then expects the client to respond with HMAC-SHA256(PSK, nonce).
+// Before serving RPC calls the signer performs a mandatory challenge-response
+// handshake using the PSK read from the inherited pipe (fd 4): it sends a
+// 32-byte random nonce, then expects the client to respond with
+// HMAC-SHA256(PSK, nonce).
 func Serve(key crypto.Signer) error {
 	// Recover the socketpair endpoint passed via ExtraFiles (fd 3).
 	conn, err := connFromFD(InheritedFD)
@@ -92,14 +94,14 @@ func Serve(key crypto.Signer) error {
 	defer conn.Close()
 
 	// PSK authentication handshake.
-	if psk, err := loadPSK(); err != nil {
+	psk, err := loadPSK()
+	if err != nil {
 		return fmt.Errorf("loading PSK: %w", err)
-	} else if psk != nil {
-		if err := serverHandshake(conn, psk); err != nil {
-			return fmt.Errorf("PSK handshake failed: %w", err)
-		}
-		slog.Info("PSK handshake succeeded")
 	}
+	if err := serverHandshake(conn, psk); err != nil {
+		return fmt.Errorf("PSK handshake failed: %w", err)
+	}
+	slog.Info("PSK handshake succeeded")
 
 	svc := &Service{key: key}
 	server := rpc.NewServer()
@@ -184,16 +186,16 @@ func DialConn() (net.Conn, error) {
 	}
 
 	// PSK authentication handshake.
-	if psk, err := loadPSK(); err != nil {
+	psk, err := loadPSK()
+	if err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("loading PSK: %w", err)
-	} else if psk != nil {
-		if err := clientHandshake(conn, psk); err != nil {
-			conn.Close()
-			return nil, fmt.Errorf("PSK handshake failed: %w", err)
-		}
-		slog.Info("PSK handshake succeeded")
 	}
+	if err := clientHandshake(conn, psk); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("PSK handshake failed: %w", err)
+	}
+	slog.Info("PSK handshake succeeded")
 
 	return conn, nil
 }
@@ -239,21 +241,41 @@ func (r *RemoteSigner) Close() error {
 
 // ---------- PSK handshake ----------
 
-// loadPSK reads the PSK from the environment variable. Returns nil if unset.
+// loadPSK reads the hex-encoded PSK from the pipe inherited on fd 4. The
+// launcher pre-loads the pipe and closes the write end before spawning, so
+// a single read drains it to EOF.
+//
+// SECURITY: the PSK deliberately travels over a pipe rather than an
+// environment variable. A process's exec-time environment stays visible in
+// /proc/<pid>/environ for its whole lifetime (os.Unsetenv only mutates the
+// process's own copy) and is captured verbatim by crash-dump and support
+// tooling such as systemd-coredump; a pipe is consumed once and leaves no
+// such residue.
 func loadPSK() ([]byte, error) {
-	hexPSK := os.Getenv(pskEnvVar)
-	if hexPSK == "" {
-		return nil, nil
-	}
-	psk, err := hex.DecodeString(hexPSK)
+	f := os.NewFile(uintptr(PSKFD), "signer-psk-pipe")
+	defer f.Close()
+	psk, err := parsePSK(f)
 	if err != nil {
-		return nil, fmt.Errorf("decoding %s: %w", pskEnvVar, err)
+		return nil, fmt.Errorf("reading PSK from inherited fd %d (process not spawned by the launcher?): %w", PSKFD, err)
+	}
+	return psk, nil
+}
+
+// parsePSK reads a hex-encoded PSK from r and decodes and validates it.
+func parsePSK(r io.Reader) ([]byte, error) {
+	// Read one byte beyond the expected hex length so trailing garbage is
+	// detected as a length error rather than silently truncated.
+	hexPSK, err := io.ReadAll(io.LimitReader(r, 2*pskLen+1))
+	if err != nil {
+		return nil, err
+	}
+	psk, err := hex.DecodeString(string(hexPSK))
+	if err != nil {
+		return nil, fmt.Errorf("decoding PSK: %w", err)
 	}
 	if len(psk) != pskLen {
-		return nil, fmt.Errorf("%s must be %d bytes, got %d", pskEnvVar, pskLen, len(psk))
+		return nil, fmt.Errorf("PSK must be %d bytes, got %d", pskLen, len(psk))
 	}
-	// Clear from environment after reading to reduce exposure.
-	os.Unsetenv(pskEnvVar)
 	return psk, nil
 }
 

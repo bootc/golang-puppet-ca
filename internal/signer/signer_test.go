@@ -28,6 +28,7 @@ import (
 	"net"
 	"net/rpc"
 	"os"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -35,22 +36,6 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
-
-// setPSKEnv sets the PSK environment variable for the duration of the current
-// spec, restoring its prior value (set or unset) via DeferCleanup. It replaces
-// the upstream tests' use of t.Setenv, which is unavailable inside Ginkgo
-// nodes.
-func setPSKEnv(value string) {
-	prev, had := os.LookupEnv(pskEnvVar)
-	Expect(os.Setenv(pskEnvVar, value)).To(Succeed())
-	DeferCleanup(func() {
-		if had {
-			Expect(os.Setenv(pskEnvVar, prev)).To(Succeed())
-		} else {
-			Expect(os.Unsetenv(pskEnvVar)).To(Succeed())
-		}
-	})
-}
 
 var _ = Describe("RemoteSigner over RPC", func() {
 	// verifies that a signing request can be sent over an RPC connection and
@@ -219,10 +204,10 @@ var _ = Describe("PSK handshake", func() {
 			srv.ServeConn(serverConn)
 		}()
 
-		// Client side: handshake then create RemoteSigner.
-		setPSKEnv(pskHex)
-		loadedPSK, err := loadPSK()
-		Expect(err).NotTo(HaveOccurred(), "loadPSK")
+		// Client side: parse the PSK as the frontend would, handshake, then
+		// create a RemoteSigner.
+		loadedPSK, err := parsePSK(strings.NewReader(pskHex))
+		Expect(err).NotTo(HaveOccurred(), "parsePSK")
 		Expect(clientHandshake(clientConn, loadedPSK)).To(Succeed(), "client handshake")
 
 		rs := &RemoteSigner{
@@ -238,42 +223,51 @@ var _ = Describe("PSK handshake", func() {
 	})
 })
 
-var _ = Describe("loadPSK", func() {
-	// verifies loadPSK returns nil when env var is unset.
-	It("returns nil when the env var is empty", func() {
-		setPSKEnv("")
-		psk, err := loadPSK()
-		Expect(err).NotTo(HaveOccurred(), "unexpected error")
-		Expect(psk).To(BeNil(), "expected nil PSK when env var is empty")
+var _ = Describe("parsePSK", func() {
+	// verifies parsePSK drains a pre-loaded pipe to EOF, matching how the
+	// launcher delivers the PSK to a child on fd 4.
+	It("reads a PSK from a pre-loaded pipe", func() {
+		psk := make([]byte, 32)
+		rand.Read(psk)
+
+		r, w, err := os.Pipe()
+		Expect(err).NotTo(HaveOccurred(), "creating pipe")
+		DeferCleanup(func() { _ = r.Close() })
+		_, err = w.WriteString(hex.EncodeToString(psk))
+		Expect(err).NotTo(HaveOccurred(), "writing PSK to pipe")
+		Expect(w.Close()).To(Succeed(), "closing pipe write end")
+
+		parsed, err := parsePSK(r)
+		Expect(err).NotTo(HaveOccurred(), "parsePSK")
+		Expect(parsed).To(Equal(psk), "parsed PSK should round-trip")
 	})
 
-	// verifies loadPSK rejects non-hex values.
+	// verifies parsePSK rejects an empty stream: the handshake is mandatory,
+	// so a missing PSK must be an error rather than a silent downgrade.
+	It("rejects an empty stream", func() {
+		_, err := parsePSK(strings.NewReader(""))
+		Expect(err).To(HaveOccurred(), "expected error for empty PSK stream")
+	})
+
+	// verifies parsePSK rejects non-hex values.
 	It("rejects non-hex values", func() {
-		setPSKEnv("not-hex-data")
-		_, err := loadPSK()
+		_, err := parsePSK(strings.NewReader("not-hex-data"))
 		Expect(err).To(HaveOccurred(), "expected error for invalid hex PSK")
 	})
 
-	// verifies loadPSK rejects PSKs of wrong length.
+	// verifies parsePSK rejects PSKs of wrong length.
 	It("rejects PSKs of wrong length", func() {
-		setPSKEnv(hex.EncodeToString([]byte("short")))
-		_, err := loadPSK()
+		_, err := parsePSK(strings.NewReader(hex.EncodeToString([]byte("short"))))
 		Expect(err).To(HaveOccurred(), "expected error for wrong-length PSK")
 	})
 
-	// verifies loadPSK removes the env var after reading.
-	It("clears the env var after reading", func() {
+	// verifies parsePSK rejects trailing garbage after a valid PSK rather
+	// than silently truncating it.
+	It("rejects trailing garbage", func() {
 		psk := make([]byte, 32)
 		rand.Read(psk)
-		// Note: loadPSK calls os.Unsetenv, so setPSKEnv's restore must not
-		// reintroduce the value; it saves the prior (unset) state and restores
-		// that, matching the upstream test's os.Setenv + t.Cleanup(os.Unsetenv).
-		setPSKEnv(hex.EncodeToString(psk))
-
-		_, err := loadPSK()
-		Expect(err).NotTo(HaveOccurred(), "unexpected error")
-		// After loadPSK, the env var should be cleared.
-		Expect(os.Getenv(pskEnvVar)).To(Equal(""), "env var should be cleared after loadPSK")
+		_, err := parsePSK(strings.NewReader(hex.EncodeToString(psk) + "\n"))
+		Expect(err).To(HaveOccurred(), "expected error for trailing bytes after PSK")
 	})
 })
 
