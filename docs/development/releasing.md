@@ -38,8 +38,9 @@ version is `v0.*`, because a `0.x` major carries no compatibility promise.
 
 ## The machinery
 
-Two workflows fire independently off the same tag push. Neither waits for the
-other, and neither waits for CI.
+Two workflows fire independently off the same tag push; neither waits for the
+other. Neither re-runs the CI suite — instead each starts with the shared
+verify gate described below, which checks that CI already passed.
 
 | Workflow | File | What it does on a `v*` tag |
 | --- | --- | --- |
