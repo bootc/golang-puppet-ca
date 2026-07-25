@@ -1,7 +1,9 @@
 # Publishing container images
 
 > This is a maintainer/CI reference. If you only want to **run** the published
-> images, see [container images](../container-images.md).
+> images, see [container images](../container-images.md). For the release
+> process that triggers the versioned image builds, see
+> [cutting a release](releasing.md).
 
 The [`Container images`](../../.github/workflows/container-images.yml) workflow
 builds the two runtime images and publishes multi-arch manifests to the GitHub

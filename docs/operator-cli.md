@@ -11,6 +11,7 @@
 --client-cert  ""                       Client certificate PEM for mTLS
 --client-key   ""                       Client private key PEM for mTLS
 --verbose                               Enable debug logging
+--version                               Print the version and exit (includes commit metadata when built from a git checkout)
 ```
 
 Global flags may be placed before or after the subcommand name.
