@@ -97,14 +97,31 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   # -- Release artefact build --------------------------------------------------
-  # Builds all dist tarballs exactly as the Release workflow does (including
-  # the cgo/boringcrypto FIPS variants and the aarch64 cross-link) and
-  # discards the output. Without this leg, that build path would first run
-  # when a release tag is pushed, turning any breakage into a
-  # delete-tag/fix/retag cycle.
+  # Builds each dist tarball exactly as the Release workflow does — one
+  # variant per job, on a runner native to the target architecture (so the
+  # cgo/boringcrypto FIPS variants need no cross toolchain and every built
+  # binary can be executed for verification) — and discards the output.
+  # Without these legs, that build path would first run when a release tag is
+  # pushed, turning any breakage into a delete-tag/fix/retag cycle.
   dist:
-    name: Release artefact build
-    runs-on: ubuntu-latest
+    name: Release artefact build (${{ matrix.variant }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: linux_amd64
+            runner: ubuntu-latest
+            fips: false
+          - variant: linux_arm64
+            runner: ubuntu-24.04-arm
+            fips: false
+          - variant: linux_amd64_fips
+            runner: ubuntu-latest
+            fips: true
+          - variant: linux_arm64_fips
+            runner: ubuntu-24.04-arm
+            fips: true
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
@@ -112,76 +129,68 @@ jobs:
           go-version-file: go.mod
           # setup-go's cache is keyed only on go.sum, and that key is claimed
           # by whichever job saves it first — none of whose build caches
-          # contain this job's four cross-compile configurations. Use a
-          # dist-specific cache below instead, shared with release.yml.
+          # match this variant's build configuration. Use a per-variant cache
+          # below instead, shared with release.yml.
           cache: false
-      - name: Go caches (dist)
+      - name: Go caches (${{ matrix.variant }})
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
           # Unique key per commit so every run saves its updated cache;
-          # restore-keys fall back to the most recent dist cache. Caches
-          # saved on main are visible to all refs, including release tags.
-          key: dist-gocache-${{ hashFiles('go.mod', 'go.sum') }}-${{ github.sha }}
+          # restore-keys fall back to the most recent cache for this variant.
+          # Caches saved on main are visible to all refs, including release
+          # tags.
+          key: dist-gocache-${{ matrix.variant }}-${{ hashFiles('go.mod', 'go.sum') }}-${{ github.sha }}
           restore-keys: |
-            dist-gocache-${{ hashFiles('go.mod', 'go.sum') }}-
-            dist-gocache-
+            dist-gocache-${{ matrix.variant }}-${{ hashFiles('go.mod', 'go.sum') }}-
+            dist-gocache-${{ matrix.variant }}-
       - name: Install Mage
         run: go install github.com/magefile/mage@v1.17.2
-      - name: Install aarch64 cross toolchain
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross
-      - name: Build release artifacts
-        run: mage build:dist
-      - name: Verify artifacts
-        # Assert the expected artefact set rather than just exit-zero: a
-        # variant silently dropped from the magefile, or naming drift against
-        # the internal/version constant, should fail here. The sed parse
-        # matches the one in release.yml's tag gate.
+      - name: Build release artifact
+        run: mage build:distVariant ${{ matrix.variant }}
+      - name: Verify artifact
+        # Assert the expected artefact rather than just exit-zero: naming
+        # drift against the internal/version constant should fail here. The
+        # sed parse matches the one in release.yml's tag gate. The runner is
+        # native to the variant's architecture, so the binaries are executed
+        # directly.
         #
         # shell: bash upgrades the default shell to `bash -eo pipefail`, so a
         # binary that prints the expected --version line but exits non-zero
         # still fails the piped greps below.
         shell: bash
+        env:
+          VARIANT: ${{ matrix.variant }}
+          FIPS: ${{ matrix.fips }}
         run: |
           ver="$(sed -n 's/^const Version = "\(.*\)"$/\1/p' internal/version/version.go)"
           if [ -z "$ver" ]; then
             echo "::error::Could not parse the Version constant from internal/version/version.go"
             exit 1
           fi
-          ls -l dist/
-          for variant in linux_amd64 linux_arm64 linux_amd64_fips linux_arm64_fips; do
-            tarball="dist/openvox-ca_${ver}_${variant}.tar.gz"
-            if [ ! -f "$tarball" ]; then
-              echo "::error::Expected artefact $tarball is missing"
-              exit 1
-            fi
-          done
-          (cd dist && sha256sum -c checksums.txt)
-          tar xzf "dist/openvox-ca_${ver}_linux_amd64.tar.gz" -C "$RUNNER_TEMP"
+          tarball="dist/openvox-ca_${ver}_${VARIANT}.tar.gz"
+          if [ ! -f "$tarball" ]; then
+            echo "::error::Expected artefact $tarball is missing"
+            exit 1
+          fi
+          tar xzf "$tarball" -C "$RUNNER_TEMP"
           "$RUNNER_TEMP/openvox-ca" --version | grep -F "openvox-ca version $ver"
           "$RUNNER_TEMP/openvox-ca-ctl" --version | grep -F "openvox-ca-ctl version $ver"
           # The _fips artefacts must really be boringcrypto builds: fipsEnv in
           # the magefile is the only thing setting GOEXPERIMENT for dist, so a
           # regression there would otherwise ship standard-crypto binaries
-          # under a FIPS label. `go version -m` reads the embedded build info
-          # without executing, so the arm64 binaries are checkable here too.
-          # (grep without -q: reading all input avoids a SIGPIPE race under
-          # pipefail.)
-          for variant in linux_amd64_fips linux_arm64_fips; do
-            fipsdir="$RUNNER_TEMP/$variant"
-            mkdir -p "$fipsdir"
-            tar xzf "dist/openvox-ca_${ver}_${variant}.tar.gz" -C "$fipsdir"
+          # under a FIPS label. (grep without -q: reading all input avoids a
+          # SIGPIPE race under pipefail.)
+          if [ "$FIPS" = "true" ]; then
             for bin in openvox-ca openvox-ca-ctl; do
-              if ! go version -m "$fipsdir/$bin" | grep boringcrypto > /dev/null; then
-                echo "::error::$variant/$bin is not a boringcrypto build"
+              if ! go version -m "$RUNNER_TEMP/$bin" | grep boringcrypto > /dev/null; then
+                echo "::error::${VARIANT}/${bin} is not a boringcrypto build"
                 exit 1
               fi
             done
-          done
+          fi
 
   # -- Puppet stack integration tests ------------------------------------------
   # Runs the full OpenVox 8 stack: Go CA (TLS) → OpenVox Server (WEBrick) →
