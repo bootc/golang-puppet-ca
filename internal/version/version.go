@@ -16,10 +16,10 @@
 // 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 
 // Package version is the single source of truth for the openvox-ca release
-// version. The release process rewrites Version via `mage release:prepare`,
-// and the Release workflow refuses to publish a tag whose version does not
-// match it, so a release can only be cut once the release-preparation pull
-// request has merged.
+// version. Release artefact names embed the Version constant, both binaries
+// report it via --version, and the Release workflow refuses to publish a tag
+// whose version does not match it — so cutting release vX.Y.Z requires first
+// landing a change that sets Version to exactly "X.Y.Z".
 package version
 
 import (
@@ -28,9 +28,9 @@ import (
 )
 
 // Version is the semantic version of this source tree, without a "v" prefix.
-// Between releases it carries a "-dev" pre-release suffix; the release
-// preparation process sets it to the exact release version, and the release
-// tag must be exactly "v" + Version.
+// Between releases it carries a "-dev" pre-release suffix; set it to the
+// exact release version before tagging, because the release tag must be
+// exactly "v" + Version.
 const Version = "0.9.0-dev"
 
 // Full returns Version augmented with the VCS metadata the Go toolchain
@@ -56,15 +56,23 @@ func Full() string {
 			dirty = s.Value == "true"
 		}
 	}
+	return full(Version, revision, commitTime, dirty)
+}
+
+// full formats a version string from its parts: the bare version, then a
+// parenthesised suffix carrying whatever VCS metadata is present. An empty
+// revision means the binary was not built from a git checkout, in which case
+// the other VCS fields are meaningless and only the version is returned.
+func full(version, revision, commitTime string, dirty bool) string {
 	if revision == "" {
-		return Version
+		return version
 	}
 	if len(revision) > 12 {
 		revision = revision[:12]
 	}
 
 	var b strings.Builder
-	b.WriteString(Version)
+	b.WriteString(version)
 	b.WriteString(" (commit ")
 	b.WriteString(revision)
 	if commitTime != "" {

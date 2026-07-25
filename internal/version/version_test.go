@@ -18,8 +18,6 @@
 package version_test
 
 import (
-	"regexp"
-
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
@@ -27,27 +25,20 @@ import (
 )
 
 var _ = Describe("Version", func() {
-	// The release workflow tags releases as "v" + Version and derives
-	// artefact names from it, so the constant must always parse as a bare
-	// semantic version (optionally with a pre-release suffix such as -dev
-	// or -rc1) and never carry a "v" prefix of its own.
+	// Release artefact names embed this constant, and a release tag must be
+	// exactly "v" + Version, so it must always parse as a bare semantic
+	// version (optionally with a pre-release suffix such as -dev or -rc1)
+	// and never carry a "v" prefix of its own.
 	It("is a bare semantic version", func() {
 		Expect(version.Version).To(MatchRegexp(`^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$`))
 	})
 })
 
 var _ = Describe("Full", func() {
-	// Test binaries are never VCS-stamped, so Full() cannot be asserted
-	// against exact commit metadata here; what matters is that the release
-	// version always leads and any suffix is well-formed.
+	// Test binaries are never VCS-stamped, so this exercises only Full()'s
+	// no-metadata path; the suffix formatting is covered by the white-box
+	// table test in version_internal_test.go.
 	It("starts with the release version", func() {
 		Expect(version.Full()).To(HavePrefix(version.Version))
-	})
-
-	It("appends either nothing or a parenthesised commit suffix", func() {
-		full := version.Full()
-		if full != version.Version {
-			Expect(full).To(MatchRegexp(`^` + regexp.QuoteMeta(version.Version) + ` \(commit [0-9a-f]{1,12}(, [^,)]+)?(, dirty)?\)$`))
-		}
 	})
 })
