@@ -40,6 +40,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/voxpupuli/openvox-ca/internal/ca"
 	"github.com/voxpupuli/openvox-ca/internal/storage"
+	"github.com/voxpupuli/openvox-ca/internal/version"
 )
 
 // ---------- global state (set by persistent flags / config) ----------
@@ -565,8 +566,9 @@ func newImportCmd() *cobra.Command {
 
 func main() {
 	rootCmd := &cobra.Command{
-		Use:   "openvox-ca-ctl",
-		Short: "Operator management CLI for openvox-ca",
+		Use:     "openvox-ca-ctl",
+		Short:   "Operator management CLI for openvox-ca",
+		Version: version.Full(),
 		Long: `openvox-ca-ctl manages certificates on a running openvox-ca server.
 
 Global flags must be specified before the subcommand.`,
