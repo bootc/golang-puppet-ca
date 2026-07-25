@@ -9,9 +9,11 @@
 # restarts and image upgrades. On first run a new CA is bootstrapped under
 # /data and served over HTTPS on port 8140, using the CA's own certificate
 # as the TLS server certificate (the server refuses plain HTTP on
-# non-loopback addresses). To present a certificate that matches the
-# server's DNS name instead, issue one with `openvox-ca-ctl generate` and
-# point --tls-cert/--tls-key at it.
+# non-loopback addresses). For production, issue a dedicated TLS server
+# certificate with `openvox-ca-ctl generate` and point
+# --tls-cert/--tls-key at it: that keeps the CA's long-lived signing key
+# out of the network-facing listener and presents a certificate that
+# matches the server's DNS name.
 #
 # See docs/container-images.md for the available image tags, and
 # docs/configuration.md for the full configuration reference (mTLS,
