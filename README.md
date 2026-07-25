@@ -62,7 +62,8 @@ $ docker pull ghcr.io/voxpupuli/openvox-ca:latest
 ```
 
 See [container images](docs/container-images.md) for the available tags and a
-`docker run` example.
+`docker run` example, or use the [compose.yml](compose.yml) at the repository
+root for a Docker/Podman Compose deployment.
 
 ### Building from source
 

@@ -58,6 +58,14 @@ the relevant flags (or mount a config file and set `--config`). See
 [configuring the server](configuration.md) for the full reference, and the
 [HTTP API reference](api.md) for the endpoints agents use.
 
+### Compose
+
+The [`compose.yml`](../compose.yml) at the repository root is the equivalent
+Docker/Podman Compose deployment: edit `--hostname`, then `docker compose up
+-d` (or `podman-compose up -d`). The `test/compose*.yml` files, by contrast,
+are the integration-test topologies — they build throwaway images from the
+working tree and are not deployment examples.
+
 > **Autosigning is off by default.** Only set `--autosign-config=true` in
 > dev/test environments: it lets any CSR submitter obtain a signed certificate
 > without operator review.
