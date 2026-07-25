@@ -20,6 +20,12 @@ jobs:
           cache: true
       - name: Install Mage
         run: go install github.com/magefile/mage@v1.17.2
+      - name: Install aarch64 cross toolchain
+        # The FIPS variants are cgo builds (boringcrypto); linking the arm64
+        # one on this amd64 runner needs the GNU cross toolchain.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross
       - name: Build release artifacts
         run: mage build:dist
       - name: Publish GitHub release
