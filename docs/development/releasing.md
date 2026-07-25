@@ -20,17 +20,18 @@ mislabelled artefacts.
 
 | Artefact | Produced by | Where it lands |
 | --- | --- | --- |
-| `openvox-ca_X.Y.Z_linux_amd64.tar.gz` | `mage build:dist` | GitHub release assets |
-| `openvox-ca_X.Y.Z_linux_arm64.tar.gz` | `mage build:dist` | GitHub release assets |
-| `openvox-ca_X.Y.Z_linux_amd64_fips.tar.gz` | `mage build:dist` (`GOEXPERIMENT=boringcrypto`) | GitHub release assets |
-| `openvox-ca_X.Y.Z_linux_arm64_fips.tar.gz` | `mage build:dist` (`GOEXPERIMENT=boringcrypto`) | GitHub release assets |
-| `checksums.txt` (SHA-256) | `mage build:dist` | GitHub release assets |
+| `openvox-ca_X.Y.Z_linux_amd64.tar.gz` | `mage build:distVariant` (Release workflow) | GitHub release assets |
+| `openvox-ca_X.Y.Z_linux_arm64.tar.gz` | `mage build:distVariant` (Release workflow) | GitHub release assets |
+| `openvox-ca_X.Y.Z_linux_amd64_fips.tar.gz` | `mage build:distVariant` (`GOEXPERIMENT=boringcrypto`) | GitHub release assets |
+| `openvox-ca_X.Y.Z_linux_arm64_fips.tar.gz` | `mage build:distVariant` (`GOEXPERIMENT=boringcrypto`) | GitHub release assets |
+| `checksums.txt` (SHA-256) | Release workflow (`sha256sum` aggregate step) | GitHub release assets |
 | GitHub release + auto-generated notes | `gh release create --generate-notes` | Releases page |
 | `ghcr.io/voxpupuli/openvox-ca:{X.Y.Z,X.Y,latest}` | *Container images* workflow | GHCR |
 | `…:{X.Y.Z,X.Y,latest}-alpine` | *Container images* workflow | GHCR |
 
 Each tarball contains both binaries, `openvox-ca` and `openvox-ca-ctl`. Only
-Linux is built: there are no macOS or Windows release artefacts.
+Linux is built: there are no macOS or Windows release artefacts. To build the
+same set (plus `checksums.txt`) locally in one go, run `mage build:dist`.
 
 The major-only container tag (`:1`, `:2`) is deliberately suppressed while the
 version is `v0.*`, because a `0.x` major carries no compatibility promise.
@@ -350,3 +351,4 @@ can work around at release time. They are worth fixing before 1.0.
 | Gap | Impact |
 | --- | --- |
 | **No signing or attestation of release artefacts.** | `checksums.txt` establishes integrity against tampering in transit, but nothing establishes provenance. Image provenance attestations are also explicitly disabled, because they break the push-by-digest manifest merge. |
+| **Release builds restore Go caches saved by CI runs on `main`.** | A deliberate trade-off for fast tag builds: the published binaries link against `~/.cache/go-build` contents that are not checksum-verified (unlike the module cache, which `go.sum` covers), so code already running in `main`'s CI could in principle poison a cache that a later release build consumes. Signing/attestation (above) would be the durable fix. |
