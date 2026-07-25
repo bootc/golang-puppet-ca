@@ -55,9 +55,10 @@ import (
 
 // -- Namespaces ----------------------------------------------------------------
 
-type Build mg.Namespace // build:all  build:fips  build:dist
-type Test mg.Namespace  // test:unit  test:integcompose  test:integcomposefips  test:loadcompose  test:bench  test:puppet  test:puppetfips  test:migration  test:backendsRedis  test:backendsEtcd
-type Dev mg.Namespace   // dev:check  dev:tidy    dev:clean  dev:container
+type Build mg.Namespace   // build:all  build:fips  build:dist  build:distVariant
+type Test mg.Namespace    // test:unit  test:integcompose  test:integcomposefips  test:loadcompose  test:bench  test:puppet  test:puppetfips  test:migration  test:backendsRedis  test:backendsEtcd
+type Dev mg.Namespace     // dev:check  dev:tidy    dev:clean  dev:container
+type Release mg.Namespace // release:prepare
 
 // -- Helpers ------------------------------------------------------------------─
 
@@ -375,6 +376,117 @@ func (Build) DistVariant(name string) error {
 		known = append(known, v.name)
 	}
 	return fmt.Errorf("unknown dist variant %q (known: %s)", name, strings.Join(known, ", "))
+}
+
+// -- release:* -----------------------------------------------------------------
+
+// bareSemverRe matches the versions release:prepare accepts: bare semver with
+// an optional pre-release suffix (0.9.0, 0.9.0-rc1, 0.10.0-dev), never a "v"
+// prefix.
+var bareSemverRe = regexp.MustCompile(`^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$`)
+
+// repoSlug derives the "owner/repo" slug from a git remote URL, accepting the
+// SSH (git@github.com:owner/repo.git) and HTTPS forms.
+func repoSlug(remote string) (string, error) {
+	url, err := sh.Output("git", "remote", "get-url", remote)
+	if err != nil {
+		return "", fmt.Errorf("resolving remote %q: %w", remote, err)
+	}
+	m := regexp.MustCompile(`[:/]([^/:]+/[^/:]+?)(\.git)?$`).FindStringSubmatch(strings.TrimSpace(url))
+	if m == nil {
+		return "", fmt.Errorf("could not derive owner/repo from remote URL %q", strings.TrimSpace(url))
+	}
+	return m[1], nil
+}
+
+// Prepare opens the version-bump pull request that must land before a release
+// can be tagged: it creates a release/vVERSION branch off the remote's main,
+// sets the internal/version constant, pushes the branch, and opens the PR
+// with `gh` — including a preview of the auto-generated release notes for
+// release versions (skipped for -dev bumps, which are the post-release step
+// returning main to a development version).
+//
+// The remote defaults to origin; set OPENVOX_CA_RELEASE_REMOTE to prepare a
+// release elsewhere (e.g. a fork rehearsal). Requires a clean working tree
+// and an authenticated `gh`.
+func (Release) Prepare(ver string) error {
+	if !bareSemverRe.MatchString(ver) {
+		return fmt.Errorf("version %q is not bare semver (expected e.g. 0.9.0, 0.9.0-rc1, or 0.10.0-dev, without a v prefix)", ver)
+	}
+	remote := os.Getenv("OPENVOX_CA_RELEASE_REMOTE")
+	if remote == "" {
+		remote = "origin"
+	}
+	slug, err := repoSlug(remote)
+	if err != nil {
+		return err
+	}
+
+	if out, err := sh.Output("git", "status", "--porcelain"); err != nil {
+		return err
+	} else if strings.TrimSpace(out) != "" {
+		return fmt.Errorf("working tree is not clean; commit or stash first")
+	}
+
+	if err := sh.RunV("git", "fetch", remote); err != nil {
+		return err
+	}
+	branch := "release/v" + ver
+	if err := sh.RunV("git", "switch", "-c", branch, remote+"/main"); err != nil {
+		return fmt.Errorf("creating %s from %s/main (does the branch already exist?): %w", branch, remote, err)
+	}
+
+	verFile := filepath.Join("internal", "version", "version.go")
+	src, err := os.ReadFile(verFile)
+	if err != nil {
+		return err
+	}
+	re := regexp.MustCompile(`(?m)^const Version = "[^"]+"$`)
+	if !re.Match(src) {
+		return fmt.Errorf("could not find the Version constant in %s", verFile)
+	}
+	if err := os.WriteFile(verFile, re.ReplaceAll(src, fmt.Appendf(nil, "const Version = %q", ver)), 0644); err != nil {
+		return err
+	}
+
+	isDev := strings.HasSuffix(ver, "-dev")
+	title := "Release v" + ver
+	body := fmt.Sprintf(`Sets the release version to %s. Once this merges, cut the release by pushing the tag (see docs/development/releasing.md):
+
+    git fetch %s
+    git tag -a v%s %s/main -m "OpenVox CA %s"
+    git push %s v%s
+`, ver, remote, ver, remote, ver, remote, ver)
+	if isDev {
+		title = "Bump version to " + ver
+		body = fmt.Sprintf("Post-release bump so builds from main identify as %s rather than as the release.\n", ver)
+	}
+
+	if err := sh.RunV("git", "add", verFile); err != nil {
+		return err
+	}
+	if err := sh.RunV("git", "commit", "-m", title); err != nil {
+		return err
+	}
+	if err := sh.RunV("git", "push", "-u", remote, branch); err != nil {
+		return err
+	}
+
+	if !isDev {
+		// Preview what --generate-notes will produce so the release PR shows
+		// reviewers the notes before the tag exists. Read-only and
+		// best-effort: the release itself regenerates the real thing.
+		notes, err := sh.Output("gh", "api", "repos/"+slug+"/releases/generate-notes",
+			"-f", "tag_name=v"+ver, "-f", "target_commitish=main", "--jq", ".body")
+		if err != nil {
+			fmt.Println("WARNING: could not generate a release-notes preview:", err)
+		} else if notes != "" {
+			body += "\n<details><summary>Auto-generated release-notes preview</summary>\n\n" + notes + "\n\n</details>\n"
+		}
+	}
+
+	return sh.RunV("gh", "pr", "create", "--repo", slug, "--base", "main",
+		"--head", branch, "--title", title, "--body", body)
 }
 
 // -- test:* --------------------------------------------------------------------
