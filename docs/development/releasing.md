@@ -42,16 +42,16 @@ other, and neither waits for CI.
 
 | Workflow | File | What it does on a `v*` tag |
 | --- | --- | --- |
-| **Release** | [`release.yml`](../../.github/workflows/release.yml) | Verifies the tag equals `"v" +` the `internal/version` constant, runs `mage build:dist`, then `gh release create` with the four tarballs and `checksums.txt` |
+| **Release** | [`release.yml`](../../.github/workflows/release.yml) | Verifies the tag equals `"v" +` the `internal/version` constant, builds each variant on a runner native to its architecture (`mage build:distVariant`, no cross toolchain), then aggregates the tarballs, generates `checksums.txt`, and runs `gh release create` |
 | **Container images** | [`container-images.yml`](../../.github/workflows/container-images.yml) | Builds both image variants on native amd64 and arm64 runners and publishes multi-arch manifests. See [publishing container images](publishing-images.md) |
 
 > **CI does not run on tags.** [`ci.yml`](../../.github/workflows/ci.yml) is
 > wired to `push: branches: [main]` and pull requests only. Beyond the
 > version-match gate, tagging a broken commit will happily publish a broken
 > release. Always tag a commit that has already gone green on `main`, and
-> check it before you push the tag. (The artefact build itself is exercised
-> on every PR by CI's *Release artefact build* job, so at least that step is
-> unlikely to be the thing that breaks.)
+> check it before you push the tag. (The artefact builds themselves are
+> exercised on every PR by CI's per-variant *Release artefact build* jobs, so
+> at least that step is unlikely to be the thing that breaks.)
 
 ## Before you tag
 
@@ -96,7 +96,9 @@ other, and neither waits for CI.
    $ CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o /dev/null ./cmd/...
    ```
 
-   …and leave the FIPS build to CI, or run the full thing in a container:
+   …and leave the FIPS builds to CI (a single variant can also be built with
+   `mage build:distVariant linux_amd64`), or run the full thing in a
+   container:
 
    ```console
    $ docker run --rm -v "$PWD:/src" -w /src golang:1-bookworm \

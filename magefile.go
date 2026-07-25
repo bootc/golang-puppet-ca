@@ -213,6 +213,75 @@ func fipsCrossCC(goarch string) string {
 	return ""
 }
 
+// distVariantSpec describes one release artefact: its short name (the
+// artefact-name suffix, e.g. "linux_arm64_fips") and the build environment
+// that produces it.
+type distVariantSpec struct {
+	name string
+	env  map[string]string
+}
+
+// distVariants returns the full set of release artefact variants. The FIPS
+// variants are cgo builds, so they need a Linux host with a C toolchain for
+// the target architecture (see fipsCrossCC); the pure-Go variants
+// cross-compile from anywhere.
+func distVariants() []distVariantSpec {
+	fipsEnv := func(goarch string) map[string]string {
+		env := map[string]string{"CGO_ENABLED": "1", "GOOS": "linux", "GOARCH": goarch, "GOEXPERIMENT": "boringcrypto"}
+		if cc := fipsCrossCC(goarch); cc != "" {
+			env["CC"] = cc
+		}
+		return env
+	}
+	return []distVariantSpec{
+		{
+			name: "linux_amd64",
+			env:  map[string]string{"CGO_ENABLED": "0", "GOOS": "linux", "GOARCH": "amd64"},
+		},
+		{
+			name: "linux_arm64",
+			env:  map[string]string{"CGO_ENABLED": "0", "GOOS": "linux", "GOARCH": "arm64"},
+		},
+		{
+			name: "linux_amd64_fips",
+			env:  fipsEnv("amd64"),
+		},
+		{
+			name: "linux_arm64_fips",
+			env:  fipsEnv("arm64"),
+		},
+	}
+}
+
+// buildDistVariant builds one variant's tarball into distDir and returns its
+// SHA-256 checksum. The artefact is named openvox-ca_VER_NAME.tar.gz and
+// contains both binaries.
+func buildDistVariant(distDir, ver string, v distVariantSpec) (string, error) {
+	bins := []string{"openvox-ca", "openvox-ca-ctl"}
+	archive := filepath.Join(distDir, fmt.Sprintf("openvox-ca_%s_%s.tar.gz", ver, v.name))
+
+	tmpDir, err := os.MkdirTemp("", "openvox-ca-dist-*")
+	if err != nil {
+		return "", err
+	}
+	defer os.RemoveAll(tmpDir)
+
+	for _, cmd := range bins {
+		// -trimpath keeps builder paths out of the binaries so artefacts are
+		// reproducible across build machines.
+		if err := sh.RunWith(v.env, "go", "build", "-trimpath",
+			"-o", filepath.Join(tmpDir, cmd),
+			"./cmd/"+cmd); err != nil {
+			return "", fmt.Errorf("build %s for %s: %w", cmd, v.name, err)
+		}
+	}
+
+	if err := createTarGz(archive, tmpDir, bins); err != nil {
+		return "", fmt.Errorf("archive %s: %w", v.name, err)
+	}
+	return sha256File(archive)
+}
+
 // Dist cross-compiles release artifacts for all supported platforms and writes
 // them to dist/. Each artifact is a .tar.gz containing openvox-ca and
 // openvox-ca-ctl. A SHA-256 checksums.txt is also written to dist/.
@@ -224,9 +293,9 @@ func fipsCrossCC(goarch string) string {
 //	openvox-ca_VERSION_linux_amd64_fips.tar.gz  (FIPS; GOEXPERIMENT=boringcrypto)
 //	openvox-ca_VERSION_linux_arm64_fips.tar.gz  (FIPS; GOEXPERIMENT=boringcrypto)
 //
-// The FIPS variants are cgo builds, so they need a Linux host with a C
-// toolchain for each target architecture (see fipsCrossCC); the pure-Go
-// variants cross-compile from anywhere.
+// CI and the Release workflow build one variant per (native) runner via
+// build:distVariant instead; this target remains the way to build everything
+// locally.
 func (Build) Dist() error {
 	distDir := "dist"
 	if err := os.RemoveAll(distDir); err != nil {
@@ -241,77 +310,21 @@ func (Build) Dist() error {
 		return err
 	}
 
-	type variant struct {
-		name string
-		env  map[string]string
-	}
-	fipsEnv := func(goarch string) map[string]string {
-		env := map[string]string{"CGO_ENABLED": "1", "GOOS": "linux", "GOARCH": goarch, "GOEXPERIMENT": "boringcrypto"}
-		if cc := fipsCrossCC(goarch); cc != "" {
-			env["CC"] = cc
-		}
-		return env
-	}
-	variants := []variant{
-		{
-			name: fmt.Sprintf("openvox-ca_%s_linux_amd64", ver),
-			env:  map[string]string{"CGO_ENABLED": "0", "GOOS": "linux", "GOARCH": "amd64"},
-		},
-		{
-			name: fmt.Sprintf("openvox-ca_%s_linux_arm64", ver),
-			env:  map[string]string{"CGO_ENABLED": "0", "GOOS": "linux", "GOARCH": "arm64"},
-		},
-		{
-			name: fmt.Sprintf("openvox-ca_%s_linux_amd64_fips", ver),
-			env:  fipsEnv("amd64"),
-		},
-		{
-			name: fmt.Sprintf("openvox-ca_%s_linux_arm64_fips", ver),
-			env:  fipsEnv("arm64"),
-		},
-	}
-
-	bins := []string{"openvox-ca", "openvox-ca-ctl"}
-
-	buildVariant := func(v variant) (string, error) {
-		archive := filepath.Join(distDir, v.name+".tar.gz")
-
-		tmpDir, err := os.MkdirTemp("", "openvox-ca-dist-*")
-		if err != nil {
-			return "", err
-		}
-		defer os.RemoveAll(tmpDir)
-
-		for _, cmd := range bins {
-			// -trimpath keeps builder paths out of the binaries so
-			// artefacts are reproducible across build machines.
-			if err := sh.RunWith(v.env, "go", "build", "-trimpath",
-				"-o", filepath.Join(tmpDir, cmd),
-				"./cmd/"+cmd); err != nil {
-				return "", fmt.Errorf("build %s for %s: %w", cmd, v.name, err)
-			}
-		}
-
-		if err := createTarGz(archive, tmpDir, bins); err != nil {
-			return "", fmt.Errorf("archive %s: %w", v.name, err)
-		}
-		return sha256File(archive)
-	}
-
 	// The variants are independent, so build them concurrently; the Go build
 	// and module caches are safe under concurrent use. Checksums are collected
 	// per-index to keep checksums.txt in deterministic variant order, and
 	// every variant runs to completion so a failure report covers all broken
 	// variants, not just the first.
+	variants := distVariants()
 	var wg sync.WaitGroup
 	sums := make([]string, len(variants))
 	errs := make([]error, len(variants))
 	for i, v := range variants {
-		fmt.Printf("Building %s...\n", v.name)
+		fmt.Printf("Building openvox-ca_%s_%s...\n", ver, v.name)
 		wg.Add(1)
-		go func(i int, v variant) {
+		go func(i int, v distVariantSpec) {
 			defer wg.Done()
-			sums[i], errs[i] = buildVariant(v)
+			sums[i], errs[i] = buildDistVariant(distDir, ver, v)
 		}(i, v)
 	}
 	wg.Wait()
@@ -321,13 +334,47 @@ func (Build) Dist() error {
 
 	var checksums strings.Builder
 	for i, v := range variants {
-		fmt.Fprintf(&checksums, "%s  %s.tar.gz\n", sums[i], v.name)
+		fmt.Fprintf(&checksums, "%s  openvox-ca_%s_%s.tar.gz\n", sums[i], ver, v.name)
 	}
 	return os.WriteFile(
 		filepath.Join(distDir, "checksums.txt"),
 		[]byte(checksums.String()),
 		0644,
 	)
+}
+
+// DistVariant builds a single release artefact variant (by short name, e.g.
+// "linux_arm64_fips") into dist/ without touching other artefacts, and prints
+// its SHA-256 checksum. Used by CI and the Release workflow to build each
+// variant on a native runner for its architecture; checksums.txt aggregation
+// happens in the workflow, not here.
+func (Build) DistVariant(name string) error {
+	ver, err := releaseVersion()
+	if err != nil {
+		return err
+	}
+
+	for _, v := range distVariants() {
+		if v.name != name {
+			continue
+		}
+		if err := os.MkdirAll("dist", 0755); err != nil {
+			return err
+		}
+		fmt.Printf("Building openvox-ca_%s_%s...\n", ver, v.name)
+		sum, err := buildDistVariant("dist", ver, v)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("%s  openvox-ca_%s_%s.tar.gz\n", sum, ver, v.name)
+		return nil
+	}
+
+	var known []string
+	for _, v := range distVariants() {
+		known = append(known, v.name)
+	}
+	return fmt.Errorf("unknown dist variant %q (known: %s)", name, strings.Join(known, ", "))
 }
 
 // -- test:* --------------------------------------------------------------------
