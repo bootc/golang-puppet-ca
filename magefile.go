@@ -285,7 +285,9 @@ func (Build) Dist() error {
 			defer os.RemoveAll(tmpDir)
 
 			for _, cmd := range bins {
-				if err := sh.RunWith(v.env, "go", "build",
+				// -trimpath keeps builder paths out of the binaries so
+				// artefacts are reproducible across build machines.
+				if err := sh.RunWith(v.env, "go", "build", "-trimpath",
 					"-o", filepath.Join(tmpDir, cmd),
 					"./cmd/"+cmd); err != nil {
 					return "", fmt.Errorf("build %s for %s: %w", cmd, v.name, err)
