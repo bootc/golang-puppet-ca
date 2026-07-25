@@ -263,6 +263,13 @@ backend creates and upgrades its own tables automatically on startup, so
 multiple replicas can start against the same database safely. `cadir` is still
 required for per-subject keys and ancillary local state.
 
+SQL backends additionally maintain a certificate index: `GET
+/certificate_statuses` (`puppetserver ca list`) is answered from indexed
+columns instead of reading and parsing every stored certificate, which matters
+for large fleets. The index is a rebuildable projection of the stored
+certificates and the CRL — after migrating from another backend it is
+backfilled automatically on the next server start.
+
 ### SQLite backend
 
 Stores the entire CA in one SQLite database file — a convenient, dependency-free
