@@ -33,8 +33,14 @@ import (
 // and the signed CRL) by the CA's index repair pass at startup, so this
 // migration needs no data backfill of its own.
 //
-// The state and not_after indices serve the certificate_statuses state filter
-// and expiry-window queries respectively.
+// The state and not_after indices are provisioned ahead of their consumers,
+// deliberately: no shipped query filters on either column yet (the statuses
+// handler filters state in Go to keep its dedup set complete, and no
+// expiry-window query exists), but issue #137 fixes this schema before 1.0.0
+// precisely because changing it later means another migration on live
+// databases. Two low-cardinality index maintenances per issuance is the
+// price of not re-migrating when a state-filtered or expiry-window consumer
+// lands.
 func init() {
 	sqlMigrations.MustRegister(func(ctx context.Context, db *bun.DB) error {
 		// bun's dialects map time.Time to different column types; mirror the

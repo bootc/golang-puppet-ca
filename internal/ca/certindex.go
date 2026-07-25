@@ -95,10 +95,31 @@ func (c *CA) rebuildCertIndex(ctx context.Context) {
 		}
 	}
 
+	// The backfill reads and parses one stored PEM per projection-less record,
+	// so the first start after a blob→SQL migration legitimately takes a while
+	// on a large fleet. Announce the work up front and report progress, so the
+	// operator watching that first start sees a moving backfill rather than an
+	// apparent hang between "Loaded existing CA" and the listener coming up.
+	var missing int
+	for _, rec := range records {
+		if rec.Fingerprint == "" {
+			missing++
+		}
+	}
+	if missing > 0 {
+		slog.Info("Certificate index repair: backfilling projections from stored certificates",
+			"records", missing)
+	}
+
+	const progressEvery = 1000
 	var projected, restated int
 	for _, rec := range records {
 		if rec.Fingerprint == "" && c.backfillCertProjection(ctx, rec) {
 			projected++
+			if projected%progressEvery == 0 {
+				slog.Info("Certificate index repair: backfill progress",
+					"done", projected, "total", missing)
+			}
 		}
 
 		// Serials are stored verbatim as issued; normalise through big.Int for
