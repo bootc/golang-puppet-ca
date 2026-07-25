@@ -153,6 +153,10 @@ Notes:
   making a real release.
 - `<commit-sha>` is optional; without it you tag `HEAD`, which is only correct
   if your local `main` is exactly `origin/main`. Being explicit is safer.
+- If you have the repository's git hooks installed (`lefthook install`), the
+  pre-push hook runs the version-match check locally and refuses a
+  mismatching `v*` tag before it ever reaches the remote — the same check
+  the server-side gate would fail, minus the delete/fix/re-tag round trip.
 
 Then watch both workflows:
 
