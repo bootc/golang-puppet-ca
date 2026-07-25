@@ -65,7 +65,7 @@ With the default prefix `/puppet-ca`:
 | `ca_key` | `/puppet-ca/ca/key` |
 | `crl` | `/puppet-ca/ca/crl` |
 | `serial` | `/puppet-ca/serial` |
-| `inventory` | `/puppet-ca/inventory/data` |
+| `inventory` | `/puppet-ca/inventory/data` (presence marker only; see below) |
 | `inventory_hmac` | `/puppet-ca/inventory/hmac` |
 | `hmac_key` | `/puppet-ca/private/hmac_key` |
 | `csr/<subject>` | `/puppet-ca/requests/<subject>` |
@@ -75,11 +75,19 @@ Stored values carry an 8-byte big-endian `time.UnixNano` mtime prefix so
 `GET /puppet-ca/v1/certificate_revocation_list/ca` still answers
 `If-Modified-Since` without a second round-trip.
 
-Inventory appends use an etcd transaction guarded on the key's `ModRevision`
-with bounded retry, so concurrent appends across replicas don't lose lines.
-When two replicas race to bootstrap, etcd's compare-and-swap semantics prevent
-double-writes of `ca/cert` and `ca/key`; the loser observes the winner's cert
-and continues.
+The certificate inventory is not stored at `inventory/data` — that key is only
+a presence marker (and the location pre-decomposition versions kept the blob).
+The inventory itself is decomposed into one key per issued certificate under
+`inventory/entries/<seq>`, with `inventory/seq` acting as sequence allocator
+and mutation fence and `inventory/by-serial/<serial>` /
+`inventory/by-subject/<subject>` as index keys. Appends are transactions
+guarded on the fence's `ModRevision` with bounded retry, so concurrent
+appends across replicas lose nothing and duplicate serials are rejected
+cluster-wide. See
+[the inventory store](inventory-store.md#the-etcd-decomposition) for the full
+key family and the rules that keep it coherent. When two replicas race to
+bootstrap, etcd's compare-and-swap semantics prevent double-writes of
+`ca/cert` and `ca/key`; the loser observes the winner's cert and continues.
 
 ### Cross-node coordination
 
