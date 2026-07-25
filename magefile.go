@@ -26,6 +26,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -272,42 +273,59 @@ func (Build) Dist() error {
 
 	bins := []string{"openvox-ca", "openvox-ca-ctl"}
 
-	var checksums []string
-	for _, v := range variants {
-		fmt.Printf("Building %s...\n", v.name)
-
+	buildVariant := func(v variant) (string, error) {
 		archive := filepath.Join(distDir, v.name+".tar.gz")
-		sum, err := func() (string, error) {
-			tmpDir, err := os.MkdirTemp("", "openvox-ca-dist-*")
-			if err != nil {
-				return "", err
-			}
-			defer os.RemoveAll(tmpDir)
 
-			for _, cmd := range bins {
-				// -trimpath keeps builder paths out of the binaries so
-				// artefacts are reproducible across build machines.
-				if err := sh.RunWith(v.env, "go", "build", "-trimpath",
-					"-o", filepath.Join(tmpDir, cmd),
-					"./cmd/"+cmd); err != nil {
-					return "", fmt.Errorf("build %s for %s: %w", cmd, v.name, err)
-				}
-			}
-
-			if err := createTarGz(archive, tmpDir, bins); err != nil {
-				return "", fmt.Errorf("archive %s: %w", v.name, err)
-			}
-			return sha256File(archive)
-		}()
+		tmpDir, err := os.MkdirTemp("", "openvox-ca-dist-*")
 		if err != nil {
-			return err
+			return "", err
 		}
-		checksums = append(checksums, fmt.Sprintf("%s  %s\n", sum, filepath.Base(archive)))
+		defer os.RemoveAll(tmpDir)
+
+		for _, cmd := range bins {
+			// -trimpath keeps builder paths out of the binaries so
+			// artefacts are reproducible across build machines.
+			if err := sh.RunWith(v.env, "go", "build", "-trimpath",
+				"-o", filepath.Join(tmpDir, cmd),
+				"./cmd/"+cmd); err != nil {
+				return "", fmt.Errorf("build %s for %s: %w", cmd, v.name, err)
+			}
+		}
+
+		if err := createTarGz(archive, tmpDir, bins); err != nil {
+			return "", fmt.Errorf("archive %s: %w", v.name, err)
+		}
+		return sha256File(archive)
 	}
 
+	// The variants are independent, so build them concurrently; the Go build
+	// and module caches are safe under concurrent use. Checksums are collected
+	// per-index to keep checksums.txt in deterministic variant order, and
+	// every variant runs to completion so a failure report covers all broken
+	// variants, not just the first.
+	var wg sync.WaitGroup
+	sums := make([]string, len(variants))
+	errs := make([]error, len(variants))
+	for i, v := range variants {
+		fmt.Printf("Building %s...\n", v.name)
+		wg.Add(1)
+		go func(i int, v variant) {
+			defer wg.Done()
+			sums[i], errs[i] = buildVariant(v)
+		}(i, v)
+	}
+	wg.Wait()
+	if err := errors.Join(errs...); err != nil {
+		return err
+	}
+
+	var checksums strings.Builder
+	for i, v := range variants {
+		fmt.Fprintf(&checksums, "%s  %s.tar.gz\n", sums[i], v.name)
+	}
 	return os.WriteFile(
 		filepath.Join(distDir, "checksums.txt"),
-		[]byte(strings.Join(checksums, "")),
+		[]byte(checksums.String()),
 		0644,
 	)
 }
