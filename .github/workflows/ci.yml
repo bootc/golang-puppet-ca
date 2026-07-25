@@ -96,6 +96,32 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
+  # -- Release artefact build --------------------------------------------------
+  # Builds all dist tarballs exactly as the Release workflow does (including
+  # the cgo/boringcrypto FIPS variants and the aarch64 cross-link) and
+  # discards the output. Without this leg, that build path would first run
+  # when a release tag is pushed, turning any breakage into a
+  # delete-tag/fix/retag cycle.
+  dist:
+    name: Release artefact build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Install Mage
+        run: go install github.com/magefile/mage@v1.17.2
+      - name: Install aarch64 cross toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross
+      - name: Build release artifacts
+        run: mage build:dist
+      - name: List artifacts
+        run: ls -l dist/ && cat dist/checksums.txt
+
   # -- Puppet stack integration tests ------------------------------------------
   # Runs the full OpenVox 8 stack: Go CA (TLS) → OpenVox Server (WEBrick) →
   # OpenVoxDB.  Requires docker compose and network access to pull base images
@@ -301,6 +327,7 @@ jobs:
       - hadolint
       - markdownlint
       - unit
+      - dist
       - puppet
       - migration
       - backends-redis
