@@ -50,6 +50,22 @@ var _ = Describe("Root command", func() {
 		Expect(err).To(MatchError(ContainSubstring("unknown flag: --version")))
 	})
 
+	// Positive half of the documented "global flags may be placed before or
+	// after the subcommand name" contract (the negative half being that
+	// --version may not). --help returns before PersistentPreRunE, keeping
+	// the spec hermetic — no config loading or network.
+	It("accepts a persistent flag after the subcommand", func() {
+		DeferCleanup(func(orig bool) { globalVerbose = orig }, globalVerbose)
+		cmd := newRootCmd()
+		cmd.SetArgs([]string{"list", "-v", "--help"})
+		cmd.SetOut(io.Discard)
+		cmd.SetErr(io.Discard)
+		Expect(cmd.Execute()).To(Succeed())
+		flag := cmd.PersistentFlags().Lookup("verbose")
+		Expect(flag).NotTo(BeNil())
+		Expect(flag.Changed).To(BeTrue())
+	})
+
 	// -v must stay the shorthand for --verbose, mirroring the server binary
 	// (where -v is --verbosity): cobra would otherwise claim it for the
 	// synthesised --version flag, giving the two siblings opposite -v
