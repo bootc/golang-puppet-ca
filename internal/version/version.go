@@ -32,10 +32,11 @@ import (
 // exact release version before tagging, because the release tag must be
 // exactly "v" + Version.
 //
-// NOTE: the Release workflow (.github/workflows/release.yml), the CI dist
-// verify step (.github/workflows/ci.yml), and the magefile (releaseVersion)
-// all parse this exact line textually, so any reformatting must update all
-// four places together.
+// NOTE: the verify-release-tag action (.github/actions/verify-release-tag),
+// the CI dist verify steps (.github/workflows/ci.yml), and the magefile
+// (releaseVersion; release:prepare also rewrites this line) all depend on
+// this line's exact textual shape, so any reformatting must update all four
+// places together.
 const Version = "0.9.0-dev"
 
 // Full returns Version augmented with the VCS metadata the Go toolchain
