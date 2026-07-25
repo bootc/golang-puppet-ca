@@ -110,7 +110,24 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
-          cache: true
+          # setup-go's cache is keyed only on go.sum, and that key is claimed
+          # by whichever job saves it first — none of whose build caches
+          # contain this job's four cross-compile configurations. Use a
+          # dist-specific cache below instead, shared with release.yml.
+          cache: false
+      - name: Go caches (dist)
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          # Unique key per commit so every run saves its updated cache;
+          # restore-keys fall back to the most recent dist cache. Caches
+          # saved on main are visible to all refs, including release tags.
+          key: dist-gocache-${{ hashFiles('go.mod', 'go.sum') }}-${{ github.sha }}
+          restore-keys: |
+            dist-gocache-${{ hashFiles('go.mod', 'go.sum') }}-
+            dist-gocache-
       - name: Install Mage
         run: go install github.com/magefile/mage@v1.17.2
       - name: Install aarch64 cross toolchain
