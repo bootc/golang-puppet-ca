@@ -12,7 +12,7 @@ The build system is [Mage](https://magefile.dev) (`magefile.go`), not Make or
 Task. Invoke targets with `go run mage.go <Target>` or the `mage` binary:
 
 | Command | What it does |
-|---|---|
+| --- | --- |
 | `mage build:all` | Build `openvox-ca` and `openvox-ca-ctl` binaries |
 | `mage test:unit` | Run the unit suite (all packages, coverage to `coverage.out`) |
 | `mage dev:lint` | Run `golangci-lint` (gate; see `.golangci.yml`) |
@@ -141,8 +141,9 @@ a build-tagged suite wired to no target is dead code.
 
 ## Compatibility contracts (do not rename)
 
-openvox-ca is a drop-in for Puppet's CA. The following identifiers are
-deliberately preserved for backward compatibility and **must not** be rebranded:
+openvox-ca is a drop-in for the OpenVox/Puppet Server CA. The following
+identifiers are deliberately preserved for backward compatibility and **must
+not** be rebranded:
 
 - HTTP route prefix `/puppet-ca/v1`
 - Environment-variable prefix `PUPPET_CA_` (and `PUPPET_CA_CTL_` for the CLI)

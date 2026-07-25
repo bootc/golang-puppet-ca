@@ -1,14 +1,18 @@
-# Migrating from Puppet Server CA to openvox-ca
+# Migrating from OpenVox Server (or Puppet Server) to openvox-ca
 
-This guide walks through replacing Puppet Server's built-in CA with `openvox-ca`.
-The Go CA uses the same HTTP API and a compatible flat-file layout, so existing
-agents continue to work without reconfiguration, provided the CA hostname and
-port stay the same.
+This guide walks through replacing the certificate authority built into OpenVox
+Server (or Puppet Server) with `openvox-ca`. The Go CA uses the same HTTP API
+and a compatible flat-file layout, so existing agents continue to work without
+reconfiguration, provided the CA hostname and port stay the same.
+
+OpenVox Server is the Vox Pupuli fork of Puppet Server and keeps the same
+`/etc/puppetlabs` paths and `puppetserver` command, so the steps below apply to
+both; where a path or command is shown, it is identical on each.
 
 ## Prerequisites
 
 - `openvox-ca` and `openvox-ca-ctl` binaries built and installed
-- Access to the existing Puppet Server CA directory
+- Access to the existing OpenVox/Puppet Server CA directory
   (typically `/etc/puppetlabs/puppet/ssl` or `/etc/puppetlabs/puppetserver/ca`)
 - Maintenance window: agents cannot sign new certs during migration
 
@@ -18,7 +22,7 @@ port stay the same.
 1. Back up the existing CA directory
 2. Import the CA cert, key, and CRL into a new openvox-ca directory
 3. Copy signed certificates and inventory
-4. Disable the built-in CA in Puppet Server
+4. Disable the built-in CA in OpenVox Server
 5. Start openvox-ca
 6. Verify agent connectivity
 ```
@@ -35,12 +39,13 @@ echo "Backed up to $BACKUP_DIR"
 
 ## Step 2: Identify your CA files
 
-Puppet Server stores CA material in one of two locations depending on version:
+OpenVox Server (and Puppet Server) store CA material in one of two locations
+depending on version:
 
 | Version | CA directory |
-|---------|-------------|
-| Puppet Server 6+ (monolithic) | `/etc/puppetlabs/puppet/ssl/ca/` |
-| Puppet Server 6+ (external CA) | `/etc/puppetlabs/puppetserver/ca/` |
+| --- | --- |
+| OpenVox / Puppet Server 6+ (monolithic) | `/etc/puppetlabs/puppet/ssl/ca/` |
+| OpenVox / Puppet Server 6+ (external CA) | `/etc/puppetlabs/puppetserver/ca/` |
 | Older Puppet | `/var/lib/puppet/ssl/ca/` |
 
 Find your CA cert and key:
@@ -115,13 +120,13 @@ done
 echo "Inventory rebuilt with $(wc -l < "$NEW_CADIR/inventory.txt") entries"
 ```
 
-## Step 6: Disable the built-in Puppet CA
+## Step 6: Disable the built-in CA
 
-In Puppet Server's service configuration, replace the CA service with the
-disabled stub:
+In OpenVox Server's (or Puppet Server's) service configuration, replace the CA
+service with the disabled stub:
 
 ```bash
-# Puppet Server 7+ uses services.d/ca.cfg
+# OpenVox / Puppet Server 7+ uses services.d/ca.cfg
 CA_CFG=/etc/puppetlabs/puppetserver/services.d/ca.cfg
 [ -f "$CA_CFG" ] || CA_CFG=/etc/puppetlabs/puppetserver/bootstrap.cfg
 
@@ -200,8 +205,8 @@ puppet agent --test --noop
 
 ## Directory layout mapping
 
-| Puppet Server | openvox-ca | Notes |
-|--------------|-----------|-------|
+| OpenVox / Puppet Server | openvox-ca | Notes |
+| --- | --- | --- |
 | `ssl/ca/ca_crt.pem` | `<cadir>/ca_crt.pem` | Same filename |
 | `ssl/ca/ca_key.pem` | `<cadir>/private/ca_key.pem` | Moved into `private/` |
 | `ssl/ca/ca_crl.pem` | `<cadir>/ca_crl.pem` | Same filename |
@@ -215,7 +220,7 @@ puppet agent --test --noop
 ## CLI command mapping
 
 | Puppet / puppetserver ca | openvox-ca-ctl | Notes |
-|--------------------------|---------------|-------|
+| --- | --- | --- |
 | `puppet cert list` | `openvox-ca-ctl list` | Pending CSRs |
 | `puppet cert list --all` | `openvox-ca-ctl list --all` | All certs |
 | `puppet cert sign <name>` | `openvox-ca-ctl sign --certname <name>` | |
@@ -305,11 +310,11 @@ systemctl stop openvox-ca  # or kill the process
 # Restore the old CA directory
 cp -a "$BACKUP_DIR" "$PUPPET_SSL"
 
-# Re-enable the built-in CA in Puppet Server
+# Re-enable the built-in CA in OpenVox Server (or Puppet Server)
 sed -i \
   's|certificate-authority-disabled-service/certificate-authority-disabled-service|certificate-authority-service/certificate-authority-service|g' \
   /etc/puppetlabs/puppetserver/services.d/ca.cfg
 
-# Restart Puppet Server
+# Restart the server
 systemctl restart puppetserver
 ```

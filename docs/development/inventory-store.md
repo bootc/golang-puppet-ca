@@ -13,7 +13,7 @@ It is addressed by the logical key `inventory` and manipulated through a handful
 of `StorageService` methods (`AppendInventory`, `ReadInventory`,
 `TouchInventory`, `HasInventory`). Integrity is provided by an HMAC-SHA256 over
 the **entire blob**, stored under `inventory_hmac` and keyed by `hmac_key`
-(see [storage-backends.md](storage-backends.md)).
+(see [storage-backends.md](../storage-backends.md)).
 
 Despite being a blob, the inventory is only ever used three ways:
 

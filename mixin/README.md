@@ -1,7 +1,7 @@
-# Puppet CA monitoring mixin
+# OpenVox CA monitoring mixin
 
 A [monitoring mixin](https://monitoring.mixins.dev/) providing Prometheus
-alerting rules for the Puppet CA exporter. It alerts on:
+alerting rules for the openvox-ca exporter. It alerts on:
 
 - the exporter being down or unable to read CA state, and the CA not being ready;
 - the **CA certificate** nearing expiry (warning) or expiring imminently (critical);

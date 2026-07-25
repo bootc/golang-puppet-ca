@@ -15,7 +15,7 @@ and on Kubernetes export failures.
 The exporter is **disabled by default**. Enable it by setting a listen address:
 
 | Flag | Env | Config (YAML) |
-|------|-----|---------------|
+| --- | --- | --- |
 | `--metrics-listen 127.0.0.1:9140` | `PUPPET_CA_METRICS_LISTEN=127.0.0.1:9140` | `metrics_listen: 127.0.0.1:9140` |
 
 ```sh
@@ -53,21 +53,21 @@ the Unix epoch, the Prometheus convention for `*_timestamp_seconds` gauges.
 ### Standard Go / web-application metrics
 
 | Metric | Description |
-|--------|-------------|
+| --- | --- |
 | `go_*` | Go runtime metrics (goroutines, GC, memory) from the standard Go collector. |
 | `process_*` | Process metrics (CPU, resident memory, open FDs) where supported by the platform. |
 | `puppetca_http_requests_total{method,code}` | Total CA API requests, by HTTP method and response code. |
 | `puppetca_http_request_duration_seconds{method,code}` | CA API request latency histogram. |
 | `puppetca_http_requests_in_flight` | CA API requests currently being served. |
 
-> HTTP request metrics are intentionally **not** labelled by URL path: Puppet CA
-> paths embed per-node subjects (e.g. `/certificate_status/<hostname>`), which
-> would otherwise explode metric cardinality.
+> HTTP request metrics are intentionally **not** labelled by URL path: the CA's
+> API paths embed per-node subjects (e.g. `/certificate_status/<hostname>`),
+> which would otherwise explode metric cardinality.
 
 ### Exporter health
 
 | Metric | Description |
-|--------|-------------|
+| --- | --- |
 | `puppetca_ca_ready` | `1` when the CA has finished initialising, else `0`. |
 | `puppetca_collector_scrape_success` | `1` if the last CA-state gather succeeded, else `0` (e.g. storage unavailable). |
 | `puppetca_collector_scrape_duration_seconds` | Time taken to gather the CA, CRL and leaf metrics. |
@@ -75,7 +75,7 @@ the Unix epoch, the Prometheus convention for `*_timestamp_seconds` gauges.
 ### CA certificate
 
 | Metric | Labels | Description |
-|--------|--------|-------------|
+| --- | --- | --- |
 | `puppetca_ca_certificate_info` | `common_name`, `serial`, `issuer` | Constant `1`; carries CA identity in labels. |
 | `puppetca_ca_certificate_not_before_timestamp_seconds` | — | CA certificate issue time. |
 | `puppetca_ca_certificate_not_after_timestamp_seconds` | — | CA certificate expiry time. |
@@ -83,7 +83,7 @@ the Unix epoch, the Prometheus convention for `*_timestamp_seconds` gauges.
 ### CRL
 
 | Metric | Description |
-|--------|-------------|
+| --- | --- |
 | `puppetca_crl_number` | Monotonic CRL sequence number (`cRLNumber`). |
 | `puppetca_crl_this_update_timestamp_seconds` | CRL `ThisUpdate` time. |
 | `puppetca_crl_next_update_timestamp_seconds` | CRL `NextUpdate` (expiry) time. |
@@ -98,7 +98,7 @@ inventory line persists. The `state` label is one of `requested` (a pending CSR
 with no issued certificate), `signed`, or `revoked`.
 
 | Metric | Labels | Description |
-|--------|--------|-------------|
+| --- | --- | --- |
 | `puppetca_leaf_certificate_info` | `subject`, `serial`, `state` | Constant `1`. For `requested`, `serial` is empty. |
 | `puppetca_leaf_certificate_not_before_timestamp_seconds` | `subject`, `serial`, `state` | Issue time. Not emitted for `requested`. |
 | `puppetca_leaf_certificate_not_after_timestamp_seconds` | `subject`, `serial`, `state` | Expiry time. Not emitted for `requested`. |
@@ -117,7 +117,7 @@ are the way to alert on a target that persistently fails. One series per
 configured target (cardinality is bounded by the configuration).
 
 | Metric | Labels | Description |
-| ------ | ------ | ----------- |
+| --- | --- | --- |
 | `puppetca_k8s_export_applies_total` | `kind`, `namespace`, `name`, `result` | Apply attempts per target; `result` is `success` or `error`. |
 | `puppetca_k8s_export_last_success_timestamp_seconds` | `kind`, `namespace`, `name` | Time of the last successful apply for each target. |
 | `puppetca_k8s_export_last_error_timestamp_seconds` | `kind`, `namespace`, `name` | Time of the last failed apply for each target. |

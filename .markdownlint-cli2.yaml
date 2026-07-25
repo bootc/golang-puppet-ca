@@ -1,0 +1,44 @@
+# markdownlint-cli2 configuration for the free-standing documentation.
+# See https://github.com/DavidAnson/markdownlint for the rule reference.
+config:
+  default: true
+
+  # Prose and tables in this repo intentionally run long; wrapping them would
+  # hurt readability and make wide reference tables unmaintainable.
+  MD013: false
+
+  # The same sub-headings (Configuration, CLI flags, Environment variables,
+  # Operational notes, Tests, ...) legitimately recur under each storage
+  # backend section. Only flag duplicates that share the same parent heading.
+  MD024:
+    siblings_only: true
+
+  # We use small amounts of inline HTML (<details>, <sub>) where Markdown falls
+  # short.
+  MD033: false
+
+  # Some fenced blocks show plain text with no meaningful language (directory
+  # trees, the inventory.txt line format, console transcripts).
+  MD040: false
+
+  # `console` transcripts intentionally show a `$ ` prompt without command
+  # output; that convention is deliberate here, not a mistake.
+  MD014: false
+
+  # Allow hard tabs inside fenced code blocks: embedded Go examples are
+  # tab-indented, per gofmt. Tabs are still flagged in prose.
+  MD010:
+    code_blocks: false
+
+  # Keep every table in the compact pipe style, e.g. "| --- | --- |" with a
+  # single space of padding, rather than columns padded out to align.
+  MD060:
+    style: compact
+
+globs:
+  - "**/*.md"
+
+ignores:
+  - node_modules
+  - vendor
+  - ".git"

@@ -57,6 +57,19 @@ jobs:
         with:
           dockerfile: ${{ matrix.dockerfile }}
 
+  # -- Markdown lint (markdownlint-cli2) ---------------------------------------
+  # Lints every Markdown document against .markdownlint-cli2.yaml. Like
+  # hadolint, markdownlint-cli2 fails the build on violations (though it can fix
+  # most of them locally with `markdownlint-cli2 --fix`). Node is preinstalled
+  # on GitHub-hosted runners, so npx runs the pinned version with no setup step.
+  markdownlint:
+    name: Markdown lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Run markdownlint-cli2
+        run: npx --yes markdownlint-cli2@0.23.1
+
   # -- Unit tests --------------------------------------------------------------─
   unit:
     name: Unit tests
@@ -286,6 +299,7 @@ jobs:
     needs:
       - check
       - hadolint
+      - markdownlint
       - unit
       - puppet
       - migration
