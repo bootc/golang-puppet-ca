@@ -1,0 +1,42 @@
+name: Verify release tag
+description: >
+  Gate for v* tag builds, shared by the Release and Container images
+  workflows. Verifies that the tag equals "v" + the internal/version Version
+  constant (so a release can only be published once the version-bump change
+  has landed on the tagged commit), and that the tagged commit already has a
+  passing "CI success" check run (so a commit that never went green on main
+  cannot be released). Requires the repository to be checked out and the
+  calling workflow to grant checks: read.
+
+runs:
+  using: composite
+  steps:
+    - name: Verify tag matches internal/version
+      shell: bash
+      env:
+        TAG: ${{ github.ref_name }}
+      run: |
+        want="${TAG#v}"
+        have="$(sed -n 's/^const Version = "\(.*\)"$/\1/p' internal/version/version.go)"
+        if [ -z "$have" ]; then
+          echo "::error::Could not parse the Version constant from internal/version/version.go"
+          exit 1
+        fi
+        if [ "$have" != "$want" ]; then
+          echo "::error::Tag $TAG does not match internal/version (Version=\"$have\"). Land a version-bump change setting Version to \"$want\", then re-tag."
+          exit 1
+        fi
+        echo "Tag $TAG matches internal/version"
+
+    - name: Verify tagged commit passed CI
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        passed="$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/check-runs" --paginate \
+          --jq '[.check_runs[] | select(.name == "CI success" and .conclusion == "success")] | length')"
+        if [ "$passed" -lt 1 ]; then
+          echo "::error::Commit $GITHUB_SHA has no passing 'CI success' check run. Tag a commit that has gone green on main (and wait for CI to finish before tagging)."
+          exit 1
+        fi
+        echo "Commit $GITHUB_SHA has a passing 'CI success' check run"
