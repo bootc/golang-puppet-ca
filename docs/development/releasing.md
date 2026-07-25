@@ -43,23 +43,33 @@ other, and neither waits for CI.
 | Workflow | File | What it does on a `v*` tag |
 | --- | --- | --- |
 | **Release** | [`release.yml`](../../.github/workflows/release.yml) | Verifies the tag equals `"v" +` the `internal/version` constant, builds each variant on a runner native to its architecture (`mage build:distVariant`, no cross toolchain), then aggregates the tarballs, generates `checksums.txt`, and runs `gh release create` |
-| **Container images** | [`container-images.yml`](../../.github/workflows/container-images.yml) | Builds both image variants on native amd64 and arm64 runners and publishes multi-arch manifests. See [publishing container images](publishing-images.md) |
+| **Container images** | [`container-images.yml`](../../.github/workflows/container-images.yml) | After the same verify gate, builds both image variants on native amd64 and arm64 runners and publishes multi-arch manifests. See [publishing container images](publishing-images.md) |
 
-> **CI does not run on tags.** [`ci.yml`](../../.github/workflows/ci.yml) is
-> wired to `push: branches: [main]` and pull requests only. Beyond the
-> version-match gate, tagging a broken commit will happily publish a broken
-> release. Always tag a commit that has already gone green on `main`, and
-> check it before you push the tag. (The artefact builds themselves are
-> exercised on every PR by CI's per-variant *Release artefact build* jobs, so
-> at least that step is unlikely to be the thing that breaks.)
+> **CI's full suite does not re-run on tags.** Instead, both tag-triggered
+> workflows start with the shared
+> [`verify-release-tag`](../../.github/actions/verify-release-tag/action.yml)
+> gate: the tag must equal `"v" +` the `internal/version` constant, and the
+> tagged commit must already have a passing *CI success* check run — i.e. it
+> went green on `main`. Tagging an unprepared, unmerged, or red commit fails
+> the gate instead of publishing. (The artefact builds themselves are also
+> exercised on every PR by CI's per-variant *Release artefact build* jobs.)
 
 ## Before you tag
 
-1. **Land the version bump.** Open a PR setting the `Version` constant in
-   [`internal/version/version.go`](../../internal/version/version.go) to
-   exactly the release version without the `v` prefix (`0.9.0` for tag
-   `v0.9.0`), and merge it. The Release workflow refuses a tag whose version
-   does not match the constant at the tagged commit, so this must land first.
+1. **Land the version bump.** Run:
+
+   ```console
+   $ mage release:prepare 0.9.0
+   ```
+
+   It creates a `release/v0.9.0` branch off `origin/main`, sets the `Version`
+   constant in
+   [`internal/version/version.go`](../../internal/version/version.go), pushes
+   the branch, and opens the release PR with a preview of the auto-generated
+   release notes in its body. Merge that PR. The verify gate refuses a tag
+   whose version does not match the constant at the tagged commit, so this
+   must land first. (The manual equivalent: edit the constant to the release
+   version without the `v` prefix and open a PR yourself.)
 
 2. **Confirm the target commit is green on `main`.**
 
@@ -70,7 +80,9 @@ other, and neither waits for CI.
    ```
 
    The *CI success* job is the aggregate gate — that is the one that must be
-   green.
+   green, and it is also what the verify gate checks for on the tagged
+   commit, so an un-green commit cannot be released by accident. Wait for it
+   before tagging.
 
 3. **Check the tree builds the release artefacts.** This catches
    cross-compilation breakage before the workflow does:
@@ -152,6 +164,15 @@ $ gh run watch <run-id>
 The release build takes a few minutes; the container build is the slower of
 the two (four image builds plus two manifest merges).
 
+After the release is out, return `main` to a development version so builds
+from `main` stop identifying as the release:
+
+```console
+$ mage release:prepare 0.10.0-dev
+```
+
+This opens a small "Bump version to 0.10.0-dev" PR; merge it.
+
 ## Release notes
 
 `release.yml` calls `gh release create --generate-notes`, which asks GitHub to
@@ -193,33 +214,30 @@ $ gh api repos/voxpupuli/openvox-ca/releases/generate-notes \
 
 That call is read-only and creates nothing, so it is a safe dry run.
 
-### Reducing the noise permanently
+### What the generated notes include
 
-GitHub honours a `.github/release.yml` configuration file that categorises
-generated notes by pull-request label and excludes chosen labels or authors
-entirely — for example, dropping everything authored by `renovate[bot]` and
-`dependabot[bot]` into a single collapsed "Dependencies" category instead of
-listing each bump inline. This repository does not currently have one; adding
-it would make every subsequent release's notes usable without hand-editing.
+[`.github/release.yml`](../../.github/release.yml) configures the generated
+notes: everything authored by `renovate[bot]` and `dependabot[bot]` is
+excluded outright (dependency bumps dominate the merge history), and the
+remaining PRs are grouped by label — `breaking`, `enhancement`/`feature`,
+`bug`, `documentation` — with unlabelled PRs falling through to "Other
+changes". Labelling PRs as they merge is what keeps the notes usable without
+hand-editing.
 
 ## Pre-1.0 and pre-release tags
 
-Two behaviours to be aware of when tagging `v0.9.0`:
+A **semver pre-release tag** — any tag with a hyphen, e.g. `v0.9.0-rc1` — is
+handled specially by both workflows: the GitHub release is created with
+`--prerelease` (it will not appear as the latest stable release), and
+`docker/metadata-action` withholds the `latest` container tags. Use one for
+anything you do not want users upgrading to by default.
 
-- **`gh release create` does not pass `--prerelease`.** The GitHub release will
-  be marked as the latest stable release, and appear as such on the repository
-  front page. If you want it flagged as a pre-release, either add the flag to
-  the workflow or fix it afterwards with `gh release edit v0.9.0 --prerelease`.
-- **`v0.9.0` claims the `latest` container tags.** The image workflow uses
-  `latest=auto`, which means "apply `latest` to any semver tag that is not a
-  semver pre-release". `v0.9.0` is not a pre-release in semver terms, so
-  `ghcr.io/voxpupuli/openvox-ca:latest` and `:latest-alpine` will move to it.
-
-If you want a rehearsal that touches neither of those, tag a genuine semver
-pre-release instead — `v0.9.0-rc1`. `docker/metadata-action` recognises the
-`-rc1` suffix and withholds `latest`, and `gh release create --generate-notes`
-still produces full notes. The GitHub release still will not be marked
-pre-release, but the container tags stay clean.
+A plain `v0.9.0`, by contrast, is **not** a pre-release in semver terms
+despite the `0.` major: it publishes as the latest stable GitHub release and
+claims `ghcr.io/voxpupuli/openvox-ca:latest` and `:latest-alpine`. The only
+`v0.*` concession is the suppressed major-only container tag. If you want a
+`0.x` release marked as a GitHub pre-release anyway, fix it afterwards with
+`gh release edit v0.9.0 --prerelease`.
 
 ## Rehearsing on your own fork
 
@@ -255,22 +273,24 @@ your fork. Both are throwaway.
 
 ### The rehearsal
 
-The version-match gate applies on the fork too, so the rehearsal needs a
-throwaway commit setting the `Version` constant to the rehearsal version —
-which also makes the rehearsal exercise the real process end to end:
+The verify gate applies on the fork too, so the rehearsal runs the real
+process end to end — version-bump PR, merge, green CI, tag:
 
 ```console
-$ git checkout -b rehearsal origin/main
-$ $EDITOR internal/version/version.go    # set Version = "0.9.0-test1"
-$ git commit -m "Bump version to 0.9.0-test1" internal/version/version.go
-$ git push <fork-remote> rehearsal
-$ git tag -a v0.9.0-test1 -m "release rehearsal"
+$ git push <fork-remote> main            # fork main must match what you'll tag
+$ OPENVOX_CA_RELEASE_REMOTE=<fork-remote> mage release:prepare 0.9.0-test1
+# merge the PR it opens on the fork, wait for CI on the fork's main to go
+# green (the verify gate checks for a passing "CI success" run), then:
+$ git fetch <fork-remote>
+$ git tag -a v0.9.0-test1 <fork-remote>/main -m "release rehearsal"
 $ git push <fork-remote> v0.9.0-test1
 $ gh run list --repo <you>/<fork> --limit 5
 ```
 
 Use a tag name you will never want upstream (`v0.9.0-test1`, `v0.0.1-rehearsal`)
-so there is no chance of it being confused with the real thing later.
+so there is no chance of it being confused with the real thing later — the
+hyphen also makes it a semver pre-release, so the rehearsal release is marked
+as a pre-release and the fork's `latest` container tags stay untouched.
 
 Then verify the results end to end:
 
@@ -303,9 +323,9 @@ Worth checking specifically:
 
 ```console
 $ gh release delete v0.9.0-test1 --repo <you>/<fork> --yes
-$ git push <fork-remote> --delete v0.9.0-test1 rehearsal
+$ git push <fork-remote> --delete v0.9.0-test1 release/v0.9.0-test1
 $ git tag -d v0.9.0-test1
-$ git branch -D rehearsal
+$ git branch -D release/v0.9.0-test1
 ```
 
 The GHCR package versions have to be deleted separately, from the package's
@@ -325,7 +345,4 @@ can work around at release time. They are worth fixing before 1.0.
 
 | Gap | Impact |
 | --- | --- |
-| **CI does not run on tags.** | Nothing prevents tagging a commit that has not passed the test suite. |
-| **No `--prerelease` handling.** | Pre-1.0 and `-rc` tags are published as stable GitHub releases. |
-| **No `.github/release.yml`.** | Generated notes are a flat list dominated by dependency bumps. |
 | **No signing or attestation of release artefacts.** | `checksums.txt` establishes integrity against tampering in transit, but nothing establishes provenance. Image provenance attestations are also explicitly disabled, because they break the push-by-digest manifest merge. |
