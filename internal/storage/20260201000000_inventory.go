@@ -23,6 +23,21 @@ import (
 	"github.com/uptrace/bun"
 )
 
+// sqlInventoryRowV1 is the inventory table exactly as this migration created
+// it, frozen so later schema changes to the live sqlInventoryRow model cannot
+// leak into this migration's DDL. A fresh database must create this shape and
+// then replay the follow-up migrations (which ALTER it forward), identically
+// to a database that upgraded in place.
+type sqlInventoryRowV1 struct {
+	bun.BaseModel `bun:"table:puppet_ca_inventory,alias:inv"`
+
+	ID        int64  `bun:"id,pk,autoincrement"`
+	Serial    string `bun:"serial,notnull,type:varchar(128)"`
+	Subject   string `bun:"subject,notnull,type:varchar(512)"`
+	NotBefore string `bun:"not_before,notnull,type:varchar(64)"`
+	NotAfter  string `bun:"not_after,notnull,type:varchar(64)"`
+}
+
 // Migration 20260201000000 (inventory): create the structured inventory table
 // that backs the InventoryStore capability. Each issued certificate is one row,
 // ordered by the autoincrement id (issuance order); the subject index serves
@@ -33,7 +48,7 @@ import (
 func init() {
 	sqlMigrations.MustRegister(func(ctx context.Context, db *bun.DB) error {
 		if _, err := db.NewCreateTable().
-			Model((*sqlInventoryRow)(nil)).
+			Model((*sqlInventoryRowV1)(nil)).
 			IfNotExists().
 			Exec(ctx); err != nil {
 			return err
@@ -41,7 +56,7 @@ func init() {
 		// Index subject for LatestSerialForSubject. No IF NOT EXISTS: MySQL does
 		// not support it on CREATE INDEX, and bun applies each migration once.
 		if _, err := db.NewCreateIndex().
-			Model((*sqlInventoryRow)(nil)).
+			Model((*sqlInventoryRowV1)(nil)).
 			Index("idx_puppet_ca_inventory_subject").
 			Column("subject").
 			Exec(ctx); err != nil {
@@ -52,7 +67,7 @@ func init() {
 		// or a double insert, which AppendEntry should fail on rather than
 		// silently record two certs under one serial.
 		if _, err := db.NewCreateIndex().
-			Model((*sqlInventoryRow)(nil)).
+			Model((*sqlInventoryRowV1)(nil)).
 			Unique().
 			Index("idx_puppet_ca_inventory_serial").
 			Column("serial").
@@ -62,7 +77,7 @@ func init() {
 		return nil
 	}, func(ctx context.Context, db *bun.DB) error {
 		_, err := db.NewDropTable().
-			Model((*sqlInventoryRow)(nil)).
+			Model((*sqlInventoryRowV1)(nil)).
 			IfExists().
 			Exec(ctx)
 		return err

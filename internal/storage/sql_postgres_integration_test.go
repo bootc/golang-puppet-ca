@@ -243,3 +243,13 @@ var _ = Describe("Postgres EndToEndViaStorageService", func() {
 		Expect(csrs[0]).To(Equal("node1"), "ListCSRs = %v, want [node1]", csrs)
 	})
 })
+
+var _ = Describe("Postgres CertIndex", func() {
+	It("round-trips the certificate index end to end", func() {
+		certIndexRoundTrip(newPostgresBackend())
+	})
+
+	It("survives a migration rollback and re-apply", func() {
+		certIndexMigrationRollback(newPostgresBackend())
+	})
+})
