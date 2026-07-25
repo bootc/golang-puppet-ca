@@ -14,6 +14,26 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Verify tag matches internal/version
+        # The tag must be exactly "v" + the Version constant, so a release
+        # can only be published once the version-bump change has landed on
+        # the tagged commit. A mismatch (e.g. tagging v0.9.0 while main still
+        # says 0.9.0-dev) would bake the wrong version into the artefact
+        # names and the binaries' --version output.
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          want="${TAG#v}"
+          have="$(sed -n 's/^const Version = "\(.*\)"$/\1/p' internal/version/version.go)"
+          if [ -z "$have" ]; then
+            echo "::error::Could not parse the Version constant from internal/version/version.go"
+            exit 1
+          fi
+          if [ "$have" != "$want" ]; then
+            echo "::error::Tag $TAG does not match internal/version (Version=\"$have\"). Land a version-bump change setting Version to \"$want\", then re-tag."
+            exit 1
+          fi
+          echo "Tag $TAG matches internal/version"
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
