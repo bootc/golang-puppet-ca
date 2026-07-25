@@ -229,6 +229,14 @@ type CertIndex interface {
 	// CertStateRevoked; "" returns all records. Records whose projection has
 	// never been populated are returned with an empty Fingerprint so the
 	// caller can fall back to the stored PEM for display fields.
+	//
+	// Note today's in-tree callers always pass "": the statuses handler must
+	// see every certified subject to keep its CSR-dedup set complete (it
+	// filters per record in Go), and the index repair pass reconciles all
+	// records. The filter is nevertheless part of the capability contract —
+	// it is the indexed query shape issue #137 fixes the schema for, it is
+	// dialect-tested, and direct consumers (CLI/report tooling) can use it
+	// without a schema change.
 	Statuses(ctx context.Context, stateFilter string) ([]CertRecord, error)
 
 	// SetRevoked marks every index row bearing serial as revoked at the given

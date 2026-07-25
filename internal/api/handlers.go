@@ -829,6 +829,8 @@ func (s *Server) handleGetStatuses(w http.ResponseWriter, r *http.Request) {
 				// state so the response matches the filter just applied.
 				certPEM, err := s.CA.Storage.GetCert(r.Context(), rec.Subject)
 				if err != nil {
+					slog.Warn("statuses: reading stored certificate failed, omitting subject",
+						"subject", rec.Subject, "error", err)
 					continue
 				}
 				resp = certStatusFromCert(rec.Subject, certPEM, rec.State, s.timeFormat())
@@ -846,6 +848,8 @@ func (s *Server) handleGetStatuses(w http.ResponseWriter, r *http.Request) {
 			seen[subject] = true
 			certPEM, err := s.CA.Storage.GetCert(r.Context(), subject)
 			if err != nil {
+				slog.Warn("statuses: reading stored certificate failed, omitting subject",
+					"subject", subject, "error", err)
 				continue
 			}
 			state := "signed"
