@@ -147,22 +147,37 @@ var _ = Describe("launcher fd contract", func() {
 	})
 
 	// verifies the mandatory-handshake failure mode across the exec
-	// boundary: a child spawned without the fd 4 pipe must fail closed
-	// rather than proceed unauthenticated.
-	It("fails closed when the PSK pipe fd is missing", func() {
+	// boundary: a child whose fd 4 is not the launcher's PSK pipe must fail
+	// closed rather than proceed unauthenticated.
+	//
+	// fd 4 is pinned to /dev/null rather than simply left out of ExtraFiles.
+	// Omitting it does not guarantee the child sees fd 4 closed: exec only
+	// rewrites fds 0-2 and the ExtraFiles range, so any descriptor this test
+	// binary inherited without FD_CLOEXEC from its own parent stays open at
+	// its original number in the child. Under a wrapper that leaks one at
+	// fd 4 (lefthook's pre-push hook does, as do some CI runners) the child
+	// would inherit a foreign pipe, satisfy loadPSK's S_IFIFO check, and then
+	// block or fail with an unrelated read error instead of the fd-contract
+	// message asserted here. A character device is never a FIFO, so this
+	// drives the guard deterministically wherever the suite runs.
+	It("fails closed when fd 4 is not the launcher's PSK pipe", func() {
 		signerSock, frontendSock, err := signer.Socketpair()
 		Expect(err).NotTo(HaveOccurred(), "creating socketpair")
 		DeferCleanup(func() { _ = signerSock.Close() })
+
+		notAPipe, err := os.Open(os.DevNull)
+		Expect(err).NotTo(HaveOccurred(), "opening %s", os.DevNull)
+		DeferCleanup(func() { _ = notAPipe.Close() })
 
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		DeferCleanup(cancel)
 
 		var out bytes.Buffer
-		cmd := pskChildCmd(ctx, "frontend", []*os.File{frontendSock}, &out)
+		cmd := pskChildCmd(ctx, "frontend", []*os.File{frontendSock, notAPipe}, &out)
 		err = cmd.Run()
 		frontendSock.Close()
 
-		Expect(err).To(HaveOccurred(), "child without fd 4 should exit non-zero; output: %s", out.String())
+		Expect(err).To(HaveOccurred(), "child without a PSK pipe on fd 4 should exit non-zero; output: %s", out.String())
 		Expect(out.String()).To(ContainSubstring("not spawned by the launcher"),
 			"child should report the missing PSK pipe")
 	})
