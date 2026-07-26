@@ -37,7 +37,7 @@ import (
 // (.lefthook/pre-push/verify-tags.sh), and the magefile (releaseVersion;
 // release:prepare also rewrites this line) all depend on this line's exact
 // textual shape, so any reformatting must update all five places together.
-const Version = "0.9.0-dev"
+const Version = "0.9.0-test1"
 
 // Full returns Version augmented with the VCS metadata the Go toolchain
 // embeds in binaries built from a git checkout: the commit hash, the commit
