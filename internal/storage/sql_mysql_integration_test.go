@@ -260,3 +260,13 @@ var _ = Describe("MySQL EndToEndViaStorageService", func() {
 		Expect(csrs[0]).To(Equal("node1"), "ListCSRs = %v, want [node1]", csrs)
 	})
 })
+
+var _ = Describe("MySQL CertIndex", func() {
+	It("round-trips the certificate index end to end", func() {
+		certIndexRoundTrip(newMySQLBackend())
+	})
+
+	It("survives a migration rollback and re-apply", func() {
+		certIndexMigrationRollback(newMySQLBackend())
+	})
+})
