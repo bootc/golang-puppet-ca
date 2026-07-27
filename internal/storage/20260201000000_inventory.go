@@ -23,6 +23,12 @@ import (
 	"github.com/uptrace/bun"
 )
 
+// inventoryTableV1 is the name this migration gave the inventory table. Later
+// migrations that ALTER the same table address it through this constant, so
+// they keep targeting the table as created here even if a future migration
+// renames it.
+const inventoryTableV1 = "puppet_ca_inventory"
+
 // sqlInventoryRowV1 is the inventory table exactly as this migration created
 // it, frozen so later schema changes to the live sqlInventoryRow model cannot
 // leak into this migration's DDL. A fresh database must create this shape and
@@ -47,39 +53,32 @@ type sqlInventoryRowV1 struct {
 // migrate it via the storage migrate command, which parses it into rows.
 func init() {
 	sqlMigrations.MustRegister(func(ctx context.Context, db *bun.DB) error {
-		if _, err := db.NewCreateTable().
-			Model((*sqlInventoryRowV1)(nil)).
-			IfNotExists().
-			Exec(ctx); err != nil {
-			return err
-		}
-		// Index subject for LatestSerialForSubject. No IF NOT EXISTS: MySQL does
-		// not support it on CREATE INDEX, and bun applies each migration once.
-		if _, err := db.NewCreateIndex().
-			Model((*sqlInventoryRowV1)(nil)).
-			Index("idx_puppet_ca_inventory_subject").
-			Column("subject").
-			Exec(ctx); err != nil {
-			return err
-		}
-		// Serials are unique per issuance (random 128-bit, fresh on every
-		// (re-)issuance), so enforce it: a duplicate signals a serial collision
-		// or a double insert, which AppendEntry should fail on rather than
-		// silently record two certs under one serial.
-		if _, err := db.NewCreateIndex().
-			Model((*sqlInventoryRowV1)(nil)).
-			Unique().
-			Index("idx_puppet_ca_inventory_serial").
-			Column("serial").
-			Exec(ctx); err != nil {
-			return err
-		}
-		return nil
+		return migrationDDL(ctx, db, func(ctx context.Context, idb bun.IDB) error {
+			if _, err := idb.NewCreateTable().
+				Model((*sqlInventoryRowV1)(nil)).
+				IfNotExists().
+				Exec(ctx); err != nil {
+				return err
+			}
+			// Index subject for LatestSerialForSubject.
+			if err := createIndexIfMissing(ctx, idb, inventoryTableV1,
+				"idx_puppet_ca_inventory_subject", false, "subject"); err != nil {
+				return err
+			}
+			// Serials are unique per issuance (random 128-bit, fresh on every
+			// (re-)issuance), so enforce it: a duplicate signals a serial collision
+			// or a double insert, which AppendEntry should fail on rather than
+			// silently record two certs under one serial.
+			return createIndexIfMissing(ctx, idb, inventoryTableV1,
+				"idx_puppet_ca_inventory_serial", true, "serial")
+		})
 	}, func(ctx context.Context, db *bun.DB) error {
-		_, err := db.NewDropTable().
-			Model((*sqlInventoryRowV1)(nil)).
-			IfExists().
-			Exec(ctx)
-		return err
+		return migrationDDL(ctx, db, func(ctx context.Context, idb bun.IDB) error {
+			_, err := idb.NewDropTable().
+				Model((*sqlInventoryRowV1)(nil)).
+				IfExists().
+				Exec(ctx)
+			return err
+		})
 	})
 }

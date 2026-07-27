@@ -253,3 +253,9 @@ var _ = Describe("Postgres CertIndex", func() {
 		certIndexMigrationRollback(newPostgresBackend())
 	})
 })
+
+var _ = Describe("Postgres schema migrations", func() {
+	It("survives two backends migrating the same database at once", func() {
+		sqlMigrationsConcurrentRunners(newPostgresBackend)
+	})
+})

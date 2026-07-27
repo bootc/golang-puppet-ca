@@ -43,69 +43,54 @@ import (
 // lands.
 func init() {
 	sqlMigrations.MustRegister(func(ctx context.Context, db *bun.DB) error {
-		// bun's dialects map time.Time to different column types; mirror the
-		// type CreateTable-from-model would have produced so an upgraded table
-		// is indistinguishable from a freshly created one.
-		timeType := "TIMESTAMP"
-		switch db.Dialect().Name() {
-		case dialect.PG:
-			timeType = "TIMESTAMPTZ"
-		case dialect.MySQL:
-			timeType = "DATETIME"
-		}
-
-		columns := []string{
-			"fingerprint_sha256 VARCHAR(95)",
-			"dns_alt_names TEXT",
-			"auth_extensions TEXT",
-			"state VARCHAR(16) NOT NULL DEFAULT 'signed'",
-			"revoked_at " + timeType,
-		}
-		for _, col := range columns {
-			if _, err := db.NewAddColumn().
-				Model((*sqlInventoryRow)(nil)).
-				ColumnExpr(col).
-				Exec(ctx); err != nil {
-				return err
+		return migrationDDL(ctx, db, func(ctx context.Context, idb bun.IDB) error {
+			// bun's dialects map time.Time to different column types; mirror the
+			// type CreateTable-from-model would have produced so an upgraded table
+			// is indistinguishable from a freshly created one.
+			timeType := "TIMESTAMP"
+			switch idb.Dialect().Name() {
+			case dialect.PG:
+				timeType = "TIMESTAMPTZ"
+			case dialect.MySQL:
+				timeType = "DATETIME"
 			}
-		}
 
-		if _, err := db.NewCreateIndex().
-			Model((*sqlInventoryRow)(nil)).
-			Index("idx_puppet_ca_inventory_state").
-			Column("state").
-			Exec(ctx); err != nil {
-			return err
-		}
-		if _, err := db.NewCreateIndex().
-			Model((*sqlInventoryRow)(nil)).
-			Index("idx_puppet_ca_inventory_not_after").
-			Column("not_after").
-			Exec(ctx); err != nil {
-			return err
-		}
-		return nil
+			columns := []struct{ name, definition string }{
+				{"fingerprint_sha256", "VARCHAR(95)"},
+				{"dns_alt_names", "TEXT"},
+				{"auth_extensions", "TEXT"},
+				{"state", "VARCHAR(16) NOT NULL DEFAULT 'signed'"},
+				{"revoked_at", timeType},
+			}
+			for _, col := range columns {
+				if err := addColumnIfMissing(ctx, idb, inventoryTableV1, col.name, col.definition); err != nil {
+					return err
+				}
+			}
+
+			for _, idx := range []struct{ name, column string }{
+				{"idx_puppet_ca_inventory_state", "state"},
+				{"idx_puppet_ca_inventory_not_after", "not_after"},
+			} {
+				if err := createIndexIfMissing(ctx, idb, inventoryTableV1, idx.name, false, idx.column); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
 	}, func(ctx context.Context, db *bun.DB) error {
-		// bun's DropIndexQuery emits bare "DROP INDEX <name>", which MySQL
-		// rejects (it requires "... ON <table>"), so build the statement per
-		// dialect.
-		for _, idx := range []string{"idx_puppet_ca_inventory_not_after", "idx_puppet_ca_inventory_state"} {
-			stmt := "DROP INDEX " + idx
-			if db.Dialect().Name() == dialect.MySQL {
-				stmt += " ON puppet_ca_inventory"
+		return migrationDDL(ctx, db, func(ctx context.Context, idb bun.IDB) error {
+			for _, idx := range []string{"idx_puppet_ca_inventory_not_after", "idx_puppet_ca_inventory_state"} {
+				if err := dropIndexIfPresent(ctx, idb, inventoryTableV1, idx); err != nil {
+					return err
+				}
 			}
-			if _, err := db.ExecContext(ctx, stmt); err != nil {
-				return err
+			for _, col := range []string{"revoked_at", "state", "auth_extensions", "dns_alt_names", "fingerprint_sha256"} {
+				if err := dropColumnIfPresent(ctx, idb, inventoryTableV1, col); err != nil {
+					return err
+				}
 			}
-		}
-		for _, col := range []string{"revoked_at", "state", "auth_extensions", "dns_alt_names", "fingerprint_sha256"} {
-			if _, err := db.NewDropColumn().
-				Model((*sqlInventoryRow)(nil)).
-				ColumnExpr(col).
-				Exec(ctx); err != nil {
-				return err
-			}
-		}
-		return nil
+			return nil
+		})
 	})
 }

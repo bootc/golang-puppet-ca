@@ -98,6 +98,14 @@ func inventoryRowFromRecord(rec CertRecord) (*sqlInventoryRow, error) {
 	return row, nil
 }
 
+// inventoryEntryColumns are the columns needed to build an InventoryEntry (plus
+// the id that orders and identifies rows). Queries that only render inventory
+// entries name these explicitly instead of selecting the whole model: the
+// integrity check reads the inventory before anything else at startup, so a
+// select naming columns it does not need turns any unrelated schema drift into
+// a fatal — and thoroughly misleading — "inventory integrity check failed".
+var inventoryEntryColumns = []string{"id", "serial", "subject", "not_before", "not_after"}
+
 func (r sqlInventoryRow) entry() InventoryEntry {
 	return InventoryEntry{
 		Serial:    r.Serial,
@@ -225,7 +233,10 @@ func (b *SQLBackend) Entries(ctx context.Context) ([]InventoryEntry, error) {
 	defer cancel()
 
 	var rows []sqlInventoryRow
-	if err := b.db.NewSelect().Model(&rows).Order("id ASC").Scan(ctx); err != nil {
+	if err := b.db.NewSelect().Model(&rows).
+		Column(inventoryEntryColumns...).
+		Order("id ASC").
+		Scan(ctx); err != nil {
 		return nil, err
 	}
 	entries := make([]InventoryEntry, len(rows))
@@ -299,7 +310,10 @@ func (b *SQLBackend) pruneEntriesOnce(ctx context.Context, keep func(InventoryEn
 		}
 
 		var rows []sqlInventoryRow
-		if err := tx.NewSelect().Model(&rows).Order("id ASC").Scan(ctx); err != nil {
+		if err := tx.NewSelect().Model(&rows).
+			Column(inventoryEntryColumns...).
+			Order("id ASC").
+			Scan(ctx); err != nil {
 			return err
 		}
 
@@ -478,7 +492,10 @@ func (b *SQLBackend) getInventory(ctx context.Context) ([]byte, error) {
 	}
 
 	var rows []sqlInventoryRow
-	if err := b.db.NewSelect().Model(&rows).Order("id ASC").Scan(ctx); err != nil {
+	if err := b.db.NewSelect().Model(&rows).
+		Column(inventoryEntryColumns...).
+		Order("id ASC").
+		Scan(ctx); err != nil {
 		return nil, err
 	}
 	var buf bytes.Buffer

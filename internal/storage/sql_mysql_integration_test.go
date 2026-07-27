@@ -270,3 +270,9 @@ var _ = Describe("MySQL CertIndex", func() {
 		certIndexMigrationRollback(newMySQLBackend())
 	})
 })
+
+var _ = Describe("MySQL schema migrations", func() {
+	It("survives two backends migrating the same database at once", func() {
+		sqlMigrationsConcurrentRunners(newMySQLBackend)
+	})
+})
