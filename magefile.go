@@ -61,6 +61,7 @@ type Build mg.Namespace   // build:all  build:fips  build:dist  build:distVarian
 type Test mg.Namespace    // test:unit  test:magefile  test:integcompose  test:integcomposefips  test:loadcompose  test:bench  test:puppet  test:puppetfips  test:migration  test:backendsRedis  test:backendsEtcd
 type Dev mg.Namespace     // dev:check  dev:tidy    dev:clean  dev:container
 type Release mg.Namespace // release:prepare
+type Chart mg.Namespace   // chart:version  chart:lint  chart:validate  chart:package
 
 // -- Helpers ------------------------------------------------------------------─
 
@@ -537,7 +538,8 @@ func repoSlugFromURL(url string) (string, error) {
 
 // Prepare opens the version-bump pull request that must land before a release
 // can be tagged: it creates a release/vVERSION branch off the remote's main,
-// sets the internal/version constant, pushes the branch, and opens the PR
+// sets the internal/version constant and the Helm chart's version and
+// appVersion to match, pushes the branch, and opens the PR
 // with `gh` — including a preview of the auto-generated release notes for
 // release versions (skipped for -dev bumps, which are the post-release step
 // returning main to a development version).
@@ -585,6 +587,25 @@ func (Release) Prepare(ver string) error {
 		return err
 	}
 
+	// The Helm chart releases in lockstep, so its version and appVersion move
+	// with the constant. chart:version (and the tag gates) refuse a mismatch.
+	chartFile := filepath.Join(chartDir, "Chart.yaml")
+	chartSrc, err := os.ReadFile(chartFile)
+	if err != nil {
+		return err
+	}
+	if !chartVersionRe.Match(chartSrc) {
+		return fmt.Errorf("could not find the version field in %s", chartFile)
+	}
+	if !chartAppVersionRe.Match(chartSrc) {
+		return fmt.Errorf("could not find the appVersion field in %s", chartFile)
+	}
+	chartSrc = chartVersionRe.ReplaceAll(chartSrc, fmt.Appendf(nil, "version: %s", ver))
+	chartSrc = chartAppVersionRe.ReplaceAll(chartSrc, fmt.Appendf(nil, "appVersion: %q", ver))
+	if err := os.WriteFile(chartFile, chartSrc, 0644); err != nil {
+		return err
+	}
+
 	isDev := strings.HasSuffix(ver, "-dev")
 	title := "Release v" + ver
 	body := fmt.Sprintf(`Sets the release version to %s. Once this merges, cut the release by pushing the tag (see docs/development/releasing.md):
@@ -598,7 +619,7 @@ func (Release) Prepare(ver string) error {
 		body = fmt.Sprintf("Post-release bump so builds from main identify as %s rather than as the release.\n", ver)
 	}
 
-	if err := sh.RunV("git", "add", verFile); err != nil {
+	if err := sh.RunV("git", "add", verFile, chartFile); err != nil {
 		return err
 	}
 	if err := sh.RunV("git", "commit", "-m", title); err != nil {
@@ -623,6 +644,210 @@ func (Release) Prepare(ver string) error {
 
 	return sh.RunV("gh", "pr", "create", "--repo", slug, "--base", "main",
 		"--head", branch, "--title", title, "--body", body)
+}
+
+// -- chart:* -------------------------------------------------------------------
+
+// chartDir is the Helm chart's source directory. The chart ships in lockstep
+// with the binaries: both its version and its appVersion track the
+// internal/version constant, and chart:version is the gate that says so.
+const chartDir = "charts/openvox-ca"
+
+// kubeconformVersion is the Kubernetes API version the rendered manifests are
+// validated against. Bumping it is how the chart picks up newly-GA fields.
+const kubeconformVersion = "1.31.0"
+
+// crdSchemaLocation points kubeconform at community-maintained JSON schemas
+// for the CRDs the chart can emit (ServiceMonitor, HTTPRoute, TLSRoute), which
+// are absent from the core Kubernetes schema set.
+const crdSchemaLocation = "https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json"
+
+var (
+	chartVersionRe    = regexp.MustCompile(`(?m)^version: (.+)$`)
+	chartAppVersionRe = regexp.MustCompile(`(?m)^appVersion: "(.+)"$`)
+)
+
+// chartVersions parses the version and appVersion fields out of Chart.yaml.
+// Parsed textually, like releaseVersion, so that the check does not depend on
+// a YAML library or on the chart being renderable.
+func chartVersions() (version, appVersion string, err error) {
+	path := filepath.Join(chartDir, "Chart.yaml")
+	src, err := os.ReadFile(path)
+	if err != nil {
+		return "", "", err
+	}
+	v := chartVersionRe.FindSubmatch(src)
+	if v == nil {
+		return "", "", fmt.Errorf("could not find the version field in %s", path)
+	}
+	a := chartAppVersionRe.FindSubmatch(src)
+	if a == nil {
+		return "", "", fmt.Errorf("could not find the appVersion field in %s", path)
+	}
+	return strings.TrimSpace(string(v[1])), strings.TrimSpace(string(a[1])), nil
+}
+
+// chartValuesFiles returns the fixture values files under the chart's ci/
+// directory. Each is a distinct rendering of the chart that chart:lint and
+// chart:validate exercise in full. Finding none is an error rather than a
+// no-op: an empty fixture set would silently turn both targets into
+// rubber stamps.
+func chartValuesFiles() ([]string, error) {
+	files, err := filepath.Glob(filepath.Join(chartDir, "ci", "*.yaml"))
+	if err != nil {
+		return nil, err
+	}
+	if len(files) == 0 {
+		return nil, fmt.Errorf("no fixture values files found under %s", filepath.Join(chartDir, "ci"))
+	}
+	return files, nil
+}
+
+// requireChartTool resolves a tool the chart targets need, turning a missing
+// binary into an actionable error rather than an exec failure deep in a
+// pipeline.
+func requireChartTool(name, install string) error {
+	if _, err := exec.LookPath(name); err != nil {
+		return fmt.Errorf("%s not found on PATH; install it with:\n    %s", name, install)
+	}
+	return nil
+}
+
+// Version verifies that the chart's version and appVersion both equal the
+// internal/version constant, so the chart published for a release always
+// carries that release's number and defaults to that release's image.
+//
+// The same check runs in CI, in the shared verify-release-tag gate, and in the
+// pre-push hook.
+func (Chart) Version() error {
+	want, err := releaseVersion()
+	if err != nil {
+		return err
+	}
+	version, appVersion, err := chartVersions()
+	if err != nil {
+		return err
+	}
+	if version != want || appVersion != want {
+		return fmt.Errorf("%s/Chart.yaml is out of step with internal/version (%s): version=%s appVersion=%s\n"+
+			"Run 'mage release:prepare %s', or set both fields to %s by hand",
+			chartDir, want, version, appVersion, want, want)
+	}
+	fmt.Printf("Chart version and appVersion match internal/version (%s)\n", want)
+	return nil
+}
+
+// Lint runs `helm lint` over the chart with its default values and then once
+// per fixture, so a fixture that trips the values schema or a template guard
+// fails here rather than at install time.
+func (Chart) Lint() error {
+	if err := requireChartTool("helm", "https://helm.sh/docs/intro/install/"); err != nil {
+		return err
+	}
+	values, err := chartValuesFiles()
+	if err != nil {
+		return err
+	}
+
+	fmt.Println("Linting the chart with default values...")
+	if err := sh.RunV("helm", "lint", "--strict", chartDir); err != nil {
+		return err
+	}
+	for _, f := range values {
+		fmt.Printf("Linting the chart with %s...\n", f)
+		if err := sh.RunV("helm", "lint", "--strict", chartDir, "-f", f); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Validate renders the chart with every fixture and checks the resulting
+// manifests against the published Kubernetes and CRD JSON schemas. This is
+// what catches a template emitting a field that does not exist, or emitting it
+// at the wrong nesting level — neither of which `helm lint` sees, because to
+// Helm the output is just YAML.
+//
+// Rendered manifests are kept in .test-output/chart/ for inspection.
+func (Chart) Validate() error {
+	mg.Deps(Chart.Lint)
+
+	if err := requireChartTool("kubeconform",
+		"go install github.com/yannh/kubeconform/cmd/kubeconform@v0.7.0"); err != nil {
+		return err
+	}
+	values, err := chartValuesFiles()
+	if err != nil {
+		return err
+	}
+
+	outDir := filepath.Join(".test-output", "chart")
+	if err := os.MkdirAll(outDir, 0755); err != nil {
+		return err
+	}
+
+	// The default fixture is the chart's own values.yaml, rendered with no
+	// overrides; it is the configuration most installs start from.
+	renders := append([]string{""}, values...)
+	for _, f := range renders {
+		name := "default"
+		args := []string{"template", "openvox-ca", chartDir}
+		if f != "" {
+			name = strings.TrimSuffix(filepath.Base(f), ".yaml")
+			args = append(args, "-f", f)
+		}
+
+		fmt.Printf("Rendering the chart with %s values...\n", name)
+		manifest, err := sh.Output("helm", args...)
+		if err != nil {
+			return err
+		}
+		path := filepath.Join(outDir, name+".yaml")
+		if err := os.WriteFile(path, []byte(manifest+"\n"), 0644); err != nil {
+			return err
+		}
+
+		fmt.Printf("Validating %s against Kubernetes %s schemas...\n", path, kubeconformVersion)
+		if err := sh.RunV("kubeconform",
+			"-strict",
+			"-summary",
+			"-kubernetes-version", kubeconformVersion,
+			"-schema-location", "default",
+			"-schema-location", crdSchemaLocation,
+			path,
+		); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Package writes the packaged chart tarball to dist/, named for the
+// internal/version constant. The publish workflow packages the chart the same
+// way before pushing it to the OCI registry, so this is the local dry run.
+func (Chart) Package() error {
+	mg.Deps(Chart.Version)
+
+	if err := requireChartTool("helm", "https://helm.sh/docs/intro/install/"); err != nil {
+		return err
+	}
+	if err := os.MkdirAll("dist", 0755); err != nil {
+		return err
+	}
+	if err := sh.RunV("helm", "package", chartDir, "--destination", "dist"); err != nil {
+		return err
+	}
+
+	ver, err := releaseVersion()
+	if err != nil {
+		return err
+	}
+	tarball := filepath.Join("dist", fmt.Sprintf("openvox-ca-%s.tgz", ver))
+	if _, err := os.Stat(tarball); err != nil {
+		return fmt.Errorf("expected chart package %s was not produced: %w", tarball, err)
+	}
+	fmt.Println("Wrote", tarball)
+	return nil
 }
 
 // -- test:* --------------------------------------------------------------------
