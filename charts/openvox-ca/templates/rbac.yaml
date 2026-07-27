@@ -1,0 +1,81 @@
+{{- if and .Values.kubernetesExport.enabled .Values.kubernetesExport.rbac.create }}
+{{- $fullName := include "openvox-ca.fullname" . }}
+{{- $namespace := include "openvox-ca.namespace" . }}
+{{- $labels := include "openvox-ca.labels" . }}
+{{- $serviceAccount := include "openvox-ca.serviceAccountName" . }}
+{{- $cluster := eq .Values.kubernetesExport.rbac.scope "ClusterRole" }}
+{{/*
+The exporter only ever creates or server-side-applies its targets — it never
+reads them back — so create and patch are the whole permission set.
+*/}}
+{{- if $cluster }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ $fullName }}-export
+  labels:
+    {{- $labels | nindent 4 }}
+  {{- with .Values.commonAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+rules:
+  - apiGroups: [""]
+    resources: ["secrets", "configmaps"]
+    verbs: ["create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ $fullName }}-export
+  labels:
+    {{- $labels | nindent 4 }}
+  {{- with .Values.commonAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ $fullName }}-export
+subjects:
+  - kind: ServiceAccount
+    name: {{ $serviceAccount }}
+    namespace: {{ $namespace }}
+{{- else }}
+{{/*
+One Role/RoleBinding pair per namespace exported into: the release namespace,
+plus whatever rbac.namespaces lists.
+*/}}
+{{- range $ns := prepend .Values.kubernetesExport.rbac.namespaces $namespace | uniq }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $fullName }}-export
+  namespace: {{ $ns }}
+  labels:
+    {{- $labels | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["secrets", "configmaps"]
+    verbs: ["create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $fullName }}-export
+  namespace: {{ $ns }}
+  labels:
+    {{- $labels | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $fullName }}-export
+subjects:
+  - kind: ServiceAccount
+    name: {{ $serviceAccount }}
+    namespace: {{ $namespace }}
+{{- end }}
+{{- end }}
+{{- end }}

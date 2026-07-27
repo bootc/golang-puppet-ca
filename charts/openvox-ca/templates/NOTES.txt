@@ -1,0 +1,61 @@
+{{- $fullName := include "openvox-ca.fullname" . -}}
+{{- $namespace := include "openvox-ca.namespace" . -}}
+{{- $backend := dig "storage_backend" "filesystem" .Values.config -}}
+{{- $tlsConfigured := or .Values.tls.existingSecret (dig "tls_cert" "" .Values.config) -}}
+openvox-ca {{ .Chart.AppVersion }} has been deployed as {{ $fullName }} in namespace {{ $namespace }}.
+
+Image:           {{ include "openvox-ca.image" . }}
+Storage backend: {{ $backend }}
+Service:         {{ $fullName }}.{{ $namespace }}.svc:{{ .Values.service.port }}
+
+Watch it come up:
+
+  kubectl --namespace {{ $namespace }} rollout status deployment/{{ $fullName }}
+
+Fetch the CA certificate once it is ready:
+
+  kubectl --namespace {{ $namespace }} port-forward svc/{{ $fullName }} 8140:{{ .Values.service.port }}
+  curl -k https://localhost:8140/puppet-ca/v1/certificate/ca
+
+{{ if not $tlsConfigured }}
+WARNING: no server TLS certificate is configured, so openvox-ca will serve
+plain HTTP. Puppet agents require HTTPS, and every client-certificate
+authenticated endpoint is unavailable without it. Set tls.existingSecret to a
+kubernetes.io/tls Secret (cert-manager issues one readily), or point
+config.tls_cert / config.tls_key at your own mounted files.
+{{ end }}
+{{- if and (has $backend (list "filesystem" "sqlite")) (not .Values.persistence.enabled) }}
+WARNING: the {{ $backend }} backend keeps the entire CA — including its private
+key — in {{ .Values.persistence.mountPath }}, but persistence is disabled, so
+that directory is an emptyDir. The CA will be regenerated from scratch on every
+restart and previously issued certificates will stop verifying. Set
+persistence.enabled: true, or switch to an external storage backend.
+{{ end }}
+{{- if and (has $backend (list "filesystem" "sqlite")) (gt (int .Values.replicaCount) 1) }}
+WARNING: replicaCount is {{ .Values.replicaCount }}, but the {{ $backend }}
+backend is not safe to share between replicas. Use postgres, mysql, etcd, or
+redis to run more than one replica — see docs/storage-backends.md.
+{{ end }}
+{{- if eq (dig "autosign_config" "" .Values.config | toString) "true" }}
+WARNING: autosigning is set to "true", so every CSR that reaches the CA is
+signed without review. Anyone who can reach the API can obtain a valid
+certificate for any name. Use this in development only.
+{{ end }}
+{{- if and .Values.autosign.mode (eq (.Values.autosign.mode | toString) "true") }}
+WARNING: autosign.mode is "true", so every CSR that reaches the CA is signed
+without review. Anyone who can reach the API can obtain a valid certificate for
+any name. Use this in development only.
+{{ end }}
+{{- if and .Values.metrics.enabled (not .Values.networkPolicy.enabled) }}
+NOTE: the Prometheus exporter is enabled on port {{ .Values.metrics.port }}. Its
+leaf-certificate series carry node hostnames as label values, and no
+NetworkPolicy is in place to restrict who can scrape it. Consider
+networkPolicy.enabled: true.
+{{ end }}
+{{- if not .Values.puppetServers }}
+NOTE: no puppetServers are listed, so no CN is granted admin API access over
+mTLS. Your OpenVox/Puppet Server compilers need to be listed here (or via
+config.puppet_server) before they can sign, revoke, or list certificates.
+{{ end }}
+Full configuration reference: https://github.com/voxpupuli/openvox-ca/blob/main/docs/configuration.md
+Chart documentation:          https://github.com/voxpupuli/openvox-ca/blob/main/docs/helm-chart.md
