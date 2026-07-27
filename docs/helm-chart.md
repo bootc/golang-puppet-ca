@@ -142,12 +142,20 @@ The alternatives, in the same message:
 | Setting | When |
 | --- | --- |
 | `config.tls_cert` / `config.tls_key` | A certificate you mount yourself, via `extraVolumes` |
+| `env` / `extraEnv` — `PUPPET_CA_TLS_CERT` and `PUPPET_CA_TLS_KEY` | The paths come from a Secret at runtime. Environment variables outrank the config file, and the chart counts them |
 | `config.no_tls_required: true` | Only behind a proxy that terminates TLS and re-originates it to the pod. Client certificates do not survive that, so mTLS-authenticated endpoints become unreachable |
-| `listen.host` | A loopback address, for a sidecar-only deployment |
+| `listen.host: 127.0.0.1` or `localhost` | A sidecar-only deployment. Those two spellings and nothing else: the server tests `net.ParseIP(host).IsLoopback()`, which rejects the bracketed `[::1]`, and it builds its listen address as `host + ":" + port`, which turns a bare `::1` into the unparseable `::1:8140` |
 
 With `no_tls_required` the chart also switches the health probes to HTTP, since
 the kubelet has to speak whatever the server speaks. Set `httpGet.scheme` on a
 probe explicitly to override that.
+
+**The check only runs when the chart can see the whole configuration.**
+`existingConfigMap`, `args` and `envFrom` each put settings somewhere the chart
+does not read — someone else's ConfigMap, a replaced argv, a Secret — so it
+stops asserting rather than refusing an install it cannot judge. In those modes
+the probes assume HTTPS, and it is on you to set `httpGet.scheme` if the server
+is actually serving cleartext.
 
 Two consequences follow from the CA terminating its own TLS:
 

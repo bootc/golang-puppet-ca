@@ -66,8 +66,20 @@ config: {}
 
 # Use a ConfigMap you manage yourself instead of one rendered from `config`.
 # It must contain a config.yaml key; the chart mounts it at configMount and
-# skips rendering its own ConfigMap (puppetServers and extraConfigFiles are
-# then your responsibility too).
+# skips rendering its own ConfigMap.
+#
+# This turns off everything downstream of that rendering, because the chart no
+# longer knows what the server is configured with:
+#   * `config`, `verbosity`, `listen`, `puppetServers`, `autosign`,
+#     `extraConfigFiles` and `kubernetesExport.targets` stop being written
+#     anywhere — set the equivalents in your own ConfigMap.
+#   * The tls/ca/caKeyPassphrase Secrets are still *mounted*, but nothing points
+#     the server at them; write the paths into your config.yaml yourself.
+#   * `configChecksumAnnotation` goes inert, so pods do not roll on a change.
+#   * The TLS precondition is not checked, and the probes assume HTTPS. Set
+#     `httpGet.scheme` explicitly if your config.yaml sets no_tls_required.
+#   * Export RBAC cannot narrow `patch` to your target names, so it grants it
+#     in full.
 existingConfigMap: ""
 
 # Where the config ConfigMap is mounted. openvox-ca auto-detects
@@ -88,11 +100,15 @@ listen:
   host: 0.0.0.0
   port: 8140
 
-# Log verbosity passed as --verbosity: 0=Info, 1=Debug, 2=Trace.
+# Log verbosity: 0=Info, 1=Debug, 2=Trace. Written into config.yaml rather
+# than passed as --verbosity, so that config.verbosity can override it — a flag
+# would outrank the config file unconditionally.
 verbosity: 0
 
 # CNs granted admin API access over mTLS. Rendered into the config ConfigMap
-# as a puppet-server file and wired up via puppet_server_file.
+# as a puppet-server file and wired up via puppet_server_file. One entry per
+# line, so an entry containing a newline is refused rather than silently
+# mangling the allow list.
 puppetServers: []
 # - openvoxserver.example.com
 # - compile-1.example.com
@@ -250,7 +266,8 @@ strategy:
 revisionHistoryLimit: 10
 
 # Override the container entrypoint and arguments outright. When args is set
-# the chart stops constructing --config/--verbosity for you.
+# the chart stops constructing --config for you, and stops checking the TLS
+# precondition — it can no longer tell what the server will be told.
 command: []
 args: []
 
@@ -283,7 +300,8 @@ resources:
   limits:
     memory: 64Mi
 
-# Roll the pods when the rendered config changes.
+# Roll the pods when the rendered config changes. Inert when existingConfigMap
+# is set: the chart cannot checksum a ConfigMap it did not render.
 configChecksumAnnotation: true
 
 podAnnotations: {}
@@ -376,6 +394,10 @@ extraVolumeMounts: []
 
 serviceAccount:
   create: true
+  # Required when kubernetesExport.rbac.create is on and create is false: the
+  # chart refuses to bind the export Role to the namespace's default
+  # ServiceAccount, which would grant create/patch on Secrets to every pod in
+  # the namespace.
   name: ""
   annotations: {}
   labels: {}
@@ -437,7 +459,9 @@ ingress:
   #   ingress.kubernetes.io/ssl-passthrough: "true"
   labels: {}
 
-  # Service port the rules point at: "https" or "metrics".
+  # Service port the rules point at: "https" or "metrics". "metrics" requires
+  # metrics.enabled — the Service has no metrics port otherwise, and the chart
+  # refuses the combination rather than routing nowhere.
   backendPort: https
 
   hosts:
@@ -522,6 +546,7 @@ podDisruptionBudget:
   enabled: false
   minAvailable: 1
   maxUnavailable: ""
+  # Kubernetes 1.27+.
   unhealthyPodEvictionPolicy: ""
 
 autoscaling:

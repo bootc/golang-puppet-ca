@@ -20,11 +20,12 @@ name: Helm chart
 #     appVersion is a -dev version, which the chart resolves to the rolling
 #     "edge-alpine" image, so the pair stay consistent.
 #
-#     Only -dev versions publish from main. Merging the release-prep PR (which
-#     sets the version to a bare X.Y.Z) puts a release-numbered chart on main
-#     *before* the tag is pushed; publishing it there would bypass the verify
-#     gate entirely and ship a chart whose appVersion names an image the tag
-#     build has not created yet. Such a push is skipped and says so.
+#     Only -dev versions publish from main. Merging a release-prep PR — for
+#     0.9.0, but equally for 0.9.0-rc1 or a rehearsal's 0.9.0-test1 — puts a
+#     to-be-tagged version on main *before* the tag is pushed; publishing it
+#     there would bypass the verify gate entirely and ship a chart whose
+#     appVersion names an image the tag build has not created yet. Such a push
+#     is skipped and says so.
 #   * Release tags (v*)          -> publish the released chart, after the same
 #     verify gate the Release and Container images workflows use.
 #   * Manual (workflow_dispatch) -> package always; push only if asked.
@@ -112,18 +113,25 @@ jobs:
             *)                 push=false ;;
           esac
 
-          # A release-numbered chart publishes from its tag, where the verify
-          # gate runs and where the matching image is built — never from main,
-          # which a merged release-prep PR would otherwise trigger. Tag builds
-          # are exempt: that is the intended path for a bare version.
+          # Only the rolling development version publishes from main. Every
+          # other version — 0.9.0, but equally 0.9.0-rc1 or a rehearsal's
+          # 0.9.0-test1 — is a version somebody intends to tag, and publishes
+          # from that tag, where the verify gate runs and where the matching
+          # image gets built. Merging any release-prep PR is a push to main, so
+          # without this the chart would ship from there with both skipped.
+          #
+          # The test is "-dev", not "has a hyphen": -dev is exactly what the
+          # chart's image helper maps to the rolling "edge" tag, so it is
+          # exactly the set whose appVersion resolves to an image main has
+          # actually published.
           case "$REF" in
             refs/tags/v*) ;;
             *)
               case "$version" in
-                *-*) ;;   # a pre-release (0.9.0-dev, 0.9.0-rc1): rolling, fine
+                *-dev) ;;   # the rolling development chart
                 *)
                   if [ "$push" = "true" ]; then
-                    echo "::notice::Chart version $version is a release version; it publishes from its v$version tag, not from $REF. Skipping the push."
+                    echo "::notice::Chart version $version is not a development version; it publishes from its v$version tag, not from $REF. Skipping the push."
                     push=false
                   fi
                   ;;
@@ -194,13 +202,18 @@ jobs:
           ref="$(echo "$IMAGE" | tr '[:upper:]' '[:lower:]'):${VERSION}-alpine"
           echo "Waiting for $ref"
           for attempt in $(seq 1 60); do
-            if docker buildx imagetools inspect "$ref" > /dev/null 2>&1; then
+            # Keep the last attempt's output: a 401, a missing binary and a
+            # genuinely absent image are three different problems, and after
+            # half an hour of silence they are indistinguishable without it.
+            if err="$(docker buildx imagetools inspect "$ref" 2>&1 >/dev/null)"; then
               echo "Found $ref after $attempt attempt(s)"
               exit 0
             fi
             sleep 30
           done
-          echo "::error::$ref did not appear within 30 minutes. Check the Container images workflow for this tag; publishing the chart now would ship one that installs a nonexistent image."
+          echo "Last error from 'docker buildx imagetools inspect $ref':"
+          echo "$err"
+          echo "::error::$ref did not appear within 30 minutes (see the error above for why the lookup failed). If the image is genuinely missing, check the Container images workflow for this tag — publishing the chart now would ship one that installs a nonexistent image."
           exit 1
 
       - name: Push the chart

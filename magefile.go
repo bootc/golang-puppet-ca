@@ -662,8 +662,14 @@ const kubeconformVersion = "1.31.0"
 // is validated against it as well, so the floor is a checked promise rather
 // than a claim. Fixtures that opt into newer fields
 // (unhealthyPodEvictionPolicy is 1.27+, trafficDistribution 1.31+) are only
-// checked at kubeconformVersion; the values documenting those fields say so.
+// checked at kubeconformVersion; both values carry that note, as does the
+// chart README's requirements section.
 const kubeconformFloorVersion = "1.26.0"
+
+// chartFloorFixture is the fixture that stands in for the chart's defaults and
+// is therefore the one held to the floor. Named here rather than inline so
+// that renaming it fails loudly instead of quietly skipping the check.
+const chartFloorFixture = "minimal-values"
 
 // crdSchemaLocation points kubeconform at community-maintained JSON schemas
 // for the CRDs the chart can emit (ServiceMonitor, HTTPRoute, TLSRoute), which
@@ -820,6 +826,7 @@ func (Chart) Validate() error {
 		return err
 	}
 
+	floorChecked := false
 	for _, f := range values {
 		name := chartFixtureName(f)
 
@@ -837,8 +844,9 @@ func (Chart) Validate() error {
 		// the kubeVersion floor Chart.yaml advertises. The others opt into
 		// fields newer than that on purpose.
 		targets := []string{kubeconformVersion}
-		if name == "minimal-values" {
+		if name == chartFloorFixture {
 			targets = append(targets, kubeconformFloorVersion)
+			floorChecked = true
 		}
 		for _, kubeVersion := range targets {
 			fmt.Printf("Validating %s against Kubernetes %s schemas...\n", path, kubeVersion)
@@ -854,15 +862,41 @@ func (Chart) Validate() error {
 			}
 		}
 	}
+	if !floorChecked {
+		return fmt.Errorf("no %s.yaml fixture found, so nothing was validated against the "+
+			"kubeVersion floor (%s) that %s/Chart.yaml advertises; renaming that fixture "+
+			"silently drops the check",
+			chartFloorFixture, kubeconformFloorVersion, chartDir)
+	}
 	return nil
+}
+
+// chartConfigChecksum renders the chart and returns the checksum/config value
+// it produced, so a case can assert that a *different* input yields a
+// different checksum rather than that the annotation merely exists.
+func chartConfigChecksum(sets ...string) string {
+	out, err := helmTemplate(sets)
+	if err != nil {
+		return "<render failed>"
+	}
+	m := regexp.MustCompile(`checksum/config: ([0-9a-f]{64})`).FindStringSubmatch(out)
+	if m == nil {
+		return "<no checksum rendered>"
+	}
+	return m[1]
 }
 
 // chartRenderCase is one assertion over a rendering of the chart: render with
 // these --set overrides, then require each `wants` string to appear in the
 // output and each `notWants` string to be absent.
 type chartRenderCase struct {
-	name     string
-	sets     []string
+	name string
+	sets []string
+	// notes renders the post-install notes as well as the manifests. `helm
+	// template` never evaluates NOTES.txt, and `helm install --dry-run`
+	// reaches for a cluster on Helm 3, so this renders the openvox-ca.notes
+	// template through a probe manifest instead — offline, on both majors.
+	notes    bool
 	wants    []string
 	notWants []string
 }
@@ -870,9 +904,49 @@ type chartRenderCase struct {
 // chartRejectCase is one assertion that the chart refuses a configuration:
 // render with these overrides and require the failure to mention `wantErr`.
 type chartRejectCase struct {
-	name    string
-	sets    []string
-	wantErr string
+	name string
+	sets []string
+	// valuesYAML supplies values a --set cannot express; helm's --set parser
+	// swallows backslash escapes, so a value containing a real newline has to
+	// come from a file.
+	valuesYAML string
+	wantErr    string
+}
+
+// renderWithAppVersion renders a throwaway copy of the chart whose appVersion
+// has been rewritten, so the -dev-to-edge rule can be asserted on both of its
+// branches whichever side of a release this tree happens to be on. Helm offers
+// no way to override .Chart.AppVersion from the command line, and asserting
+// only the current version's branch is what left a release-time landmine here
+// the first time round.
+func renderWithAppVersion(appVersion string, sets []string) (string, error) {
+	tmp, err := os.MkdirTemp("", "openvox-ca-chart")
+	if err != nil {
+		return "", err
+	}
+	defer os.RemoveAll(tmp)
+
+	dst := filepath.Join(tmp, "openvox-ca")
+	if err := sh.Run("cp", "-R", chartDir, dst); err != nil {
+		return "", err
+	}
+	chartFile := filepath.Join(dst, "Chart.yaml")
+	src, err := os.ReadFile(chartFile)
+	if err != nil {
+		return "", err
+	}
+	patched := chartAppVersionRe.ReplaceAll(src, fmt.Appendf(nil, "appVersion: %q", appVersion))
+	if err := os.WriteFile(chartFile, patched, 0644); err != nil {
+		return "", err
+	}
+
+	args := []string{"template", "openvox-ca", dst}
+	for _, s := range sets {
+		args = append(args, "--set", s)
+	}
+	var out bytes.Buffer
+	_, err = sh.Exec(nil, &out, &out, "helm", args...)
+	return out.String(), err
 }
 
 // helmTemplate renders the chart with --set overrides, returning stdout and
@@ -880,9 +954,58 @@ type chartRejectCase struct {
 // but a `fail` from a precondition — the thing the reject cases assert on —
 // only ever appears on stderr.
 func helmTemplate(sets []string) (string, error) {
-	args := []string{"template", "openvox-ca", chartDir}
+	return helmRender(false, sets, "")
+}
+
+// notesProbeTemplate renders the openvox-ca.notes template into a manifest, so
+// that `helm template` — which ignores NOTES.txt — surfaces it.
+const notesProbeTemplate = `apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: notes-probe
+data:
+  notes: |
+{{ include "openvox-ca.notes" . | indent 4 }}
+`
+
+// helmRender renders the chart, optionally including the post-install notes,
+// and optionally with an extra values file.
+func helmRender(notes bool, sets []string, valuesYAML string) (string, error) {
+	dir := chartDir
+	if notes {
+		tmp, err := os.MkdirTemp("", "openvox-ca-notes")
+		if err != nil {
+			return "", err
+		}
+		defer os.RemoveAll(tmp)
+		dir = filepath.Join(tmp, "openvox-ca")
+		if err := sh.Run("cp", "-R", chartDir, dir); err != nil {
+			return "", err
+		}
+		probe := filepath.Join(dir, "templates", "zz-notes-probe.yaml")
+		if err := os.WriteFile(probe, []byte(notesProbeTemplate), 0644); err != nil {
+			return "", err
+		}
+	}
+
+	args := []string{"template", "openvox-ca", dir}
 	for _, s := range sets {
 		args = append(args, "--set", s)
+	}
+	if valuesYAML != "" {
+		f, err := os.CreateTemp("", "openvox-ca-values-*.yaml")
+		if err != nil {
+			return "", err
+		}
+		defer os.Remove(f.Name())
+		if _, err := f.WriteString(valuesYAML); err != nil {
+			f.Close()
+			return "", err
+		}
+		if err := f.Close(); err != nil {
+			return "", err
+		}
+		args = append(args, "-f", f.Name())
 	}
 	var out bytes.Buffer
 	_, err := sh.Exec(nil, &out, &out, "helm", args...)
@@ -904,11 +1027,25 @@ func (Chart) Test() error {
 	// refuses outright, which is itself asserted in the reject cases below.
 	tls := "tls.existingSecret=openvox-ca-tls"
 
+	// Derive the expected default tag from the chart's own appVersion rather
+	// than hard-coding today's. A literal here would assert the constant
+	// instead of the rule, and would fail on the very commit release:prepare
+	// produces — taking CI red and blocking the tag it was preparing.
+	_, appVersion, err := chartVersions()
+	if err != nil {
+		return err
+	}
+	defaultTag := appVersion
+	if strings.HasSuffix(appVersion, "-dev") {
+		defaultTag = "edge"
+	}
+	defaultTag += "-alpine"
+
 	renders := []chartRenderCase{
 		{
 			name:  "an unset tag resolves to the Alpine variant of the appVersion",
 			sets:  []string{tls, "image.tag=", "image.digest="},
-			wants: []string{"image: ghcr.io/voxpupuli/openvox-ca:edge-alpine"},
+			wants: []string{"image: ghcr.io/voxpupuli/openvox-ca:" + defaultTag},
 		},
 		{
 			name: "an explicit tag is used verbatim, selecting the CentOS variant",
@@ -971,9 +1108,13 @@ func (Chart) Test() error {
 			wants: []string{"automountServiceAccountToken: true"},
 		},
 		{
-			name:  "a config change rolls the pods",
-			sets:  []string{tls},
-			wants: []string{"checksum/config:"},
+			name: "a config change rolls the pods",
+			// Asserting the annotation exists would pass on a constant, which
+			// would roll nothing. Assert instead that a different config does
+			// not produce the checksum this one does.
+			sets:     []string{tls},
+			wants:    []string{"checksum/config: "},
+			notWants: []string{chartConfigChecksum(tls, "config.crl_validity_days=7")},
 		},
 		{
 			name:     "an externally managed ConfigMap cannot be checksummed",
@@ -998,6 +1139,62 @@ func (Chart) Test() error {
 			name:  "a deny-all network policy renders an empty list, not a null",
 			sets:  []string{tls, "networkPolicy.enabled=true", "networkPolicy.apiAccess=none"},
 			wants: []string{"ingress: []"},
+		},
+		{
+			name:  "export patch is held to the configured target names",
+			sets:  []string{tls, "kubernetesExport.enabled=true", "kubernetesExport.targets[0].kind=Secret", "kubernetesExport.targets[0].metadata.name=trust-bundle", "kubernetesExport.targets[0].cert=true"},
+			wants: []string{"resourceNames:\n      - trust-bundle"},
+		},
+		{
+			name: "export with no targets grants no patch at all",
+			// An empty resourceNames list is not a restriction — RBAC reads an
+			// absent list as every resource — so the rule has to be omitted.
+			sets:     []string{tls, "kubernetesExport.enabled=true"},
+			wants:    []string{`verbs: ["create"]`},
+			notWants: []string{`verbs: ["patch"]`},
+		},
+		{
+			name: "export config the chart cannot read grants patch unrestricted",
+			sets: []string{"existingConfigMap=mine", "kubernetesExport.enabled=true"},
+			// Unrestricted, because the chart cannot know the target names —
+			// but emitted as its own rule rather than an empty resourceNames
+			// list, which RBAC would read as "every resource" anyway.
+			wants:    []string{`verbs: ["patch"]`},
+			notWants: []string{"resourceNames:\n"},
+		},
+		{
+			name: "a falsy config value still overrides what the chart computed",
+			// mergeOverwrite consults isEmptyValue on the destination only, so
+			// false does win — asserted rather than assumed.
+			sets:     []string{tls, "caKeyPassphrase.existingSecret=pw", "config.encrypt_ca_key=false"},
+			wants:    []string{"encrypt_ca_key: false"},
+			notWants: []string{"encrypt_ca_key: true"},
+		},
+		{
+			name:     "retain: false drops the resource policy without leaving an empty annotations key",
+			sets:     []string{tls, "persistence.enabled=true", "persistence.retain=false"},
+			wants:    []string{"kind: PersistentVolumeClaim"},
+			notWants: []string{"helm.sh/resource-policy", "annotations:\nspec:"},
+		},
+		{
+			name:  "NOTES warns when nothing is granted admin access",
+			notes: true,
+			sets:  []string{tls},
+			wants: []string{"no puppetServers are listed"},
+		},
+		{
+			name:  "NOTES warns about a shared filesystem CA under autoscaling",
+			notes: true,
+			// The replica warning has to read the autoscaling floor, not just
+			// replicaCount.
+			sets:  []string{tls, "autoscaling.enabled=true", "autoscaling.minReplicas=3"},
+			wants: []string{"autoscaling starts at 3 replicas", "not safe to share between replicas"},
+		},
+		{
+			name:     "NOTES does not warn about autosign when patterns override the mode",
+			notes:    true,
+			sets:     []string{tls, "autosign.mode=true", "autosign.patterns[0]=*.example.com"},
+			notWants: []string{"signed without review"},
 		},
 		{
 			name:  "topology constraints default to this release's own pods",
@@ -1028,6 +1225,23 @@ func (Chart) Test() error {
 			wantErr: "no metrics port",
 		},
 		{
+			name:    "an HTTPRoute routed to a metrics port that was never created",
+			sets:    []string{tls, "gateway.httpRoute.enabled=true", "gateway.httpRoute.backendPort=metrics"},
+			wantErr: "no metrics port",
+		},
+		{
+			name:       "an allow-list entry carrying a newline, which would inject a ConfigMap key",
+			sets:       []string{tls},
+			valuesYAML: "puppetServers:\n  - \"ca.example.com\\ninjected: value\"\n",
+			wantErr:    "single non-empty line",
+		},
+		{
+			name:       "an autosign pattern carrying a newline",
+			sets:       []string{tls},
+			valuesYAML: "autosign:\n  patterns:\n    - \"*.a.example.com\\n*.b.example.com\"\n",
+			wantErr:    "single non-empty line",
+		},
+		{
 			name:    "export RBAC bound to the namespace's default ServiceAccount",
 			sets:    []string{tls, "kubernetesExport.enabled=true", "serviceAccount.create=false"},
 			wantErr: "default ServiceAccount",
@@ -1040,8 +1254,32 @@ func (Chart) Test() error {
 	}
 
 	failures := 0
+
+	// The -dev-to-edge rule, on both of its branches. Rendered from a copy of
+	// the chart with a substituted appVersion, so this asserts the rule rather
+	// than whichever side of a release this tree currently sits on.
+	for _, tc := range []struct{ appVersion, wantTag string }{
+		{"9.9.9-dev", "edge-alpine"},
+		{"9.9.9", "9.9.9-alpine"},
+		{"9.9.9-rc1", "9.9.9-rc1-alpine"},
+	} {
+		name := fmt.Sprintf("appVersion %s resolves to %s", tc.appVersion, tc.wantTag)
+		out, err := renderWithAppVersion(tc.appVersion, []string{tls})
+		want := "image: ghcr.io/voxpupuli/openvox-ca:" + tc.wantTag
+		switch {
+		case err != nil:
+			fmt.Printf("FAIL  %s\n      render failed: %v\n", name, err)
+			failures++
+		case !strings.Contains(out, want):
+			fmt.Printf("FAIL  %s\n      expected to find: %q\n", name, want)
+			failures++
+		default:
+			fmt.Printf("ok    %s\n", name)
+		}
+	}
+
 	for _, tc := range renders {
-		out, err := helmTemplate(tc.sets)
+		out, err := helmRender(tc.notes, tc.sets, "")
 		if err != nil {
 			fmt.Printf("FAIL  %s\n      render failed: %v\n", tc.name, err)
 			failures++
@@ -1068,7 +1306,7 @@ func (Chart) Test() error {
 	}
 
 	for _, tc := range rejects {
-		out, err := helmTemplate(tc.sets)
+		out, err := helmRender(false, tc.sets, tc.valuesYAML)
 		switch {
 		case err == nil:
 			fmt.Printf("FAIL  rejects %s\n      rendered successfully instead of failing\n", tc.name)
@@ -1084,7 +1322,7 @@ func (Chart) Test() error {
 	if failures > 0 {
 		return fmt.Errorf("%d chart assertion(s) failed", failures)
 	}
-	fmt.Printf("\nAll %d chart assertions passed\n", len(renders)+len(rejects))
+	fmt.Printf("\nAll %d chart assertions passed\n", len(renders)+len(rejects)+3)
 	return nil
 }
 

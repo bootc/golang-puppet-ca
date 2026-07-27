@@ -41,15 +41,17 @@ version is `v0.*`, because a `0.x` major carries no compatibility promise.
 
 ## The machinery
 
-Three workflows fire independently off the same tag push; none waits for the
-others. None re-runs the CI suite — instead each starts with the shared
-verify gate described below, which checks that CI already passed.
+Three workflows fire off the same tag push. None re-runs the CI suite — each
+starts with the shared verify gate described below, which checks that CI
+already passed. Release and Container images then run independently; the Helm
+chart build waits for the alpine image before publishing, so that a published
+chart can never name an image that does not exist.
 
 | Workflow | File | What it does on a `v*` tag |
 | --- | --- | --- |
 | **Release** | [`release.yml`](../../.github/workflows/release.yml) | Verifies the tag equals `"v" +` the `internal/version` constant, builds each variant on a runner native to its architecture (`mage build:distVariant`, no cross toolchain), verifies each built artefact (binaries execute, FIPS variants carry boringcrypto build info), then aggregates the tarballs, generates `checksums.txt`, and runs `gh release create` |
 | **Container images** | [`container-images.yml`](../../.github/workflows/container-images.yml) | After the same verify gate, builds both image variants on native amd64 and arm64 runners and publishes multi-arch manifests. See [publishing container images](publishing-images.md) |
-| **Helm chart** | [`helm-chart.yml`](../../.github/workflows/helm-chart.yml) | After the same verify gate, packages `charts/openvox-ca` and pushes it to `ghcr.io/voxpupuli/openvox-ca-charts` as an OCI artefact, then pulls it back to prove the reference resolves |
+| **Helm chart** | [`helm-chart.yml`](../../.github/workflows/helm-chart.yml) | After the same verify gate, packages `charts/openvox-ca`, waits for the tag's alpine image to appear, pushes the chart to `ghcr.io/voxpupuli/openvox-ca-charts` as an OCI artefact, then pulls it back to prove the reference resolves |
 
 > **CI's full suite does not re-run on tags.** Instead, all three
 > tag-triggered workflows start with the shared
@@ -78,7 +80,12 @@ verify gate described below, which checks that CI already passed.
    match, pushes the branch, and opens the release PR with a preview of the
    auto-generated release notes in its body. Merge that PR. The verify gate
    refuses a tag whose version does not match the constant — or the chart — at
-   the tagged commit, so this must land first. (The manual equivalent: edit all
+   the tagged commit, so this must land first.
+
+   Merging it also triggers the *Helm chart* workflow, which will deliberately
+   publish nothing and say so: only `-dev` versions publish from `main`, since
+   any other version is one somebody means to tag, and the chart for it belongs
+   to that tag's gated build. (The manual equivalent: edit all
    three to the release version without the `v` prefix and open a PR yourself;
    `mage chart:version` checks they agree.)
 

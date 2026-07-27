@@ -9,11 +9,16 @@ The chart is released in lockstep with openvox-ca itself: its `version` and
 openvox-ca `0.9.0`. It is published as an OCI artefact only — there is no HTTP
 chart repository to add.
 
+A server TLS certificate is **required**: openvox-ca refuses to serve plain
+HTTP on a non-loopback address, so the chart refuses to render an install that
+has none rather than handing you a crash-looping pod.
+
 ```console
 $ helm install openvox-ca \
     oci://ghcr.io/voxpupuli/openvox-ca-charts/openvox-ca \
     --version 0.9.0 \
-    --namespace puppet --create-namespace
+    --namespace puppet --create-namespace \
+    --set tls.existingSecret=openvox-ca-server-tls
 ```
 
 A narrative guide — TLS termination, storage backends, ingress and Gateway API,
@@ -40,6 +45,15 @@ mirror it key by key. Instead:
   must come from a Secret at runtime, such as a database DSN.
 
 A single `helm template` will show you exactly what the merge produced.
+
+## Requirements
+
+Kubernetes **1.26 or newer** (the `kubeVersion` floor in `Chart.yaml`, checked
+against the 1.26 schemas in CI). Two optional values need more:
+`podDisruptionBudget.unhealthyPodEvictionPolicy` needs 1.27, and
+`service.trafficDistribution` needs 1.31.
+
+Helm 3.21 or 4.2; both are exercised in CI.
 
 ## Values
 
@@ -75,7 +89,7 @@ A single `helm template` will show you exactly what the merge produced.
 | `listen.host` | `0.0.0.0` | API listen address; use `[::]` for a dual-stack Service |
 | `listen.port` | `8140` | API listen port |
 | `verbosity` | `0` | `0`=Info, `1`=Debug, `2`=Trace. Written into `config.yaml`, so `config.verbosity` overrides it |
-| `puppetServers` | `[]` | CNs granted admin API access over mTLS; rendered into a file and wired to `puppet_server_file` |
+| `puppetServers` | `[]` | CNs granted admin API access over mTLS; rendered into a file and wired to `puppet_server_file`. One entry per line — an entry containing a newline is refused |
 | `autosign.mode` | `""` | `"false"`, `"true"`, or a path inside the container |
 | `autosign.patterns` | `[]` | Glob allowlist rendered into the config ConfigMap; sets `autosign_config` |
 
@@ -169,7 +183,7 @@ A single `helm template` will show you exactly what the merge produced.
 | `extraVolumes` | `[]` | Templated |
 | `extraVolumeMounts` | `[]` | Passed through as written |
 | `serviceAccount.create` | `true` | |
-| `serviceAccount.name` | `""` | |
+| `serviceAccount.name` | `""` | Required when `create` is false and `kubernetesExport.rbac.create` is on — the chart refuses to bind the export Role to the namespace's `default` account |
 | `serviceAccount.annotations` / `.labels` | `{}` | |
 
 ### Service
@@ -202,7 +216,7 @@ certificate, so the controller **must** pass TLS through untouched.
 | `ingress.enabled` | `false` | |
 | `ingress.className` | `""` | |
 | `ingress.annotations` / `.labels` | `{}` | Where the controller's ssl-passthrough annotation goes |
-| `ingress.backendPort` | `https` | `https` or `metrics` |
+| `ingress.backendPort` | `https` | `https` or `metrics`; `metrics` requires `metrics.enabled` |
 | `ingress.hosts` | one example host | `[{host, paths: [{path, pathType}]}]`; `host` is templated |
 | `ingress.tls` | `[]` | Templated |
 
@@ -256,7 +270,7 @@ request. They are excluded from the packaged chart.
 
 ```console
 $ mage chart:version    # Chart.yaml tracks internal/version
-$ mage chart:lint       # helm lint, default values and every fixture
+$ mage chart:lint       # helm lint, once per fixture
 $ mage chart:validate   # render everything, check against Kubernetes schemas
 $ mage chart:test       # assert what it renders, and that the guards refuse
 $ mage chart:package    # write dist/openvox-ca-<version>.tgz

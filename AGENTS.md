@@ -213,10 +213,12 @@ not** be rebranded:
 ## Helm chart
 
 The chart in `charts/openvox-ca/` releases in lockstep with the binaries: its
-`version` and `appVersion` are both the `internal/version` constant. Three
-places enforce that (`mage chart:version`, the shared `verify-release-tag`
-action, and the pre-push hook) and `mage release:prepare` rewrites all of them
-together — so never hand-edit one of the version lines on its own.
+`version` and `appVersion` are both the `internal/version` constant. Four
+places parse those two lines (`mage chart:version`, the shared
+`verify-release-tag` action, the pre-push hook, and the publish workflow, which
+keys its main-vs-tag decision on the version) and `mage release:prepare`
+rewrites them together — so never hand-edit one of the version lines on its
+own, and never assume a chart version is `-dev` just because it has a hyphen.
 
 The chart deliberately does **not** enumerate the server's settings as values.
 `config` is written verbatim to `/etc/puppet-ca/config.yaml`, and the

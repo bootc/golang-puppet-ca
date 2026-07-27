@@ -217,21 +217,51 @@ token only when something actually needs it.
 {{- end -}}
 
 {{/*
-Whether the server will serve HTTPS: it does so exactly when both a certificate
-and a key are configured, whether by the tls block or by config directly.
+Whether the chart can see the server's whole configuration.
 
-With existingConfigMap the chart cannot see the config at all, so it assumes
-TLS is configured — the normal case, and the assumption that fails safe: the
-alternative is warning and refusing to install on a configuration that is
-perfectly correct. Operators terminating TLS elsewhere set the probe scheme
-themselves.
+It cannot when the config file is somebody else's (existingConfigMap), when
+argv has been replaced outright (args), or when settings arrive from a
+ConfigMap or Secret the chart never reads (envFrom) — each of those layers
+outranks or replaces what the chart renders. Where the answer is "no", the
+chart says so rather than asserting: it neither refuses an install it cannot
+judge nor claims to know which scheme the probes should use.
+*/}}
+{{- define "openvox-ca.configFullyKnown" -}}
+{{- if or .Values.existingConfigMap .Values.args .Values.envFrom -}}
+false
+{{- else -}}
+true
+{{- end -}}
+{{- end -}}
+
+{{/*
+Whether the server will serve HTTPS.
+
+It does so exactly when a certificate and a key are both configured — on any
+layer. The config file is the one the chart renders; environment variables
+outrank it, so PUPPET_CA_TLS_CERT/KEY set through env or extraEnv count too,
+and are how someone feeds the certificate paths in from a Secret.
+
+When the configuration is not fully known this answers "true": HTTPS is the
+normal case, and it is the answer that neither blocks a correct install nor
+makes the probes fail on one.
 */}}
 {{- define "openvox-ca.tlsConfigured" -}}
-{{- if .Values.existingConfigMap -}}
+{{- if ne (include "openvox-ca.configFullyKnown" .) "true" -}}
 true
 {{- else -}}
 {{- $config := include "openvox-ca.config" . | fromYaml -}}
-{{- if and (dig "tls_cert" "" $config) (dig "tls_key" "" $config) -}}
+{{- $cert := dig "tls_cert" "" $config -}}
+{{- $key := dig "tls_key" "" $config -}}
+{{- range $name, $value := .Values.env -}}
+{{- if eq $name "PUPPET_CA_TLS_CERT" }}{{ $cert = $value }}{{ end -}}
+{{- if eq $name "PUPPET_CA_TLS_KEY" }}{{ $key = $value }}{{ end -}}
+{{- end -}}
+{{- range .Values.extraEnv -}}
+{{- if eq .name "PUPPET_CA_TLS_CERT" }}{{ $cert = "set" }}{{ end -}}
+{{- if eq .name "PUPPET_CA_TLS_KEY" }}{{ $key = "set" }}{{ end -}}
+{{- end -}}
+{{- if and $cert $key -}}
 true
 {{- else -}}
 false
@@ -270,14 +300,27 @@ CrashLoopBackOff or a Service that silently routes nowhere.
 
 {{/*
   The server refuses to serve plain HTTP on a non-loopback address, because an
-  on-path host could then inject forged certificates. Reproduce its three-way
-  condition here so the operator is told at install time, with the same three
-  remedies, instead of watching the pod crash-loop.
+  on-path host could then inject forged certificates. Reproduce its condition
+  so the operator is told at install time, with the same remedies, instead of
+  watching the pod crash-loop.
+
+  Only checked when the chart can see the whole configuration: a guard that
+  fires on a configuration it cannot read is worse than no guard at all.
+
+  The loopback forms are exactly the ones that work end to end. The server
+  tests net.ParseIP(host).IsLoopback() or host == "localhost"
+  (cmd/openvox-ca/main.go), which rejects the bracketed "[::1]"; and it builds
+  its listen address as host + ":" + port, which turns a bare "::1" into the
+  unparseable "::1:8140". That leaves 127.0.0.0/8 and localhost. Note that
+  "[::]" — the chart's documented dual-stack spelling — is not loopback and
+  correctly does not qualify.
 */}}
+{{- if eq (include "openvox-ca.configFullyKnown" .) "true" -}}
 {{- $host := dig "host" "" $config | toString -}}
-{{- $loopback := or (hasPrefix "127." $host) (eq $host "::1") (eq $host "[::1]") (eq $host "localhost") -}}
+{{- $loopback := or (hasPrefix "127." $host) (eq $host "localhost") -}}
 {{- if and (ne (include "openvox-ca.tlsConfigured" .) "true") (not (dig "no_tls_required" false $config)) (not $loopback) -}}
-{{- fail (printf "openvox-ca will refuse to start: no server TLS certificate is configured and the listen address (%s) is not loopback, which the server rejects as vulnerable to certificate injection.\n\nSet one of:\n  tls.existingSecret       a kubernetes.io/tls Secret holding the server certificate (recommended; Puppet agents require HTTPS)\n  config.tls_cert/tls_key  paths to a certificate you mount yourself\n  config.no_tls_required   true, only behind a trusted TLS proxy that re-originates TLS\n  listen.host              a loopback address, for a sidecar-only deployment" $host) -}}
+{{- fail (printf "openvox-ca will refuse to start: no server TLS certificate is configured and the listen address (%s) is not loopback, which the server rejects as vulnerable to certificate injection.\n\nSet one of:\n  tls.existingSecret       a kubernetes.io/tls Secret holding the server certificate (recommended; Puppet agents require HTTPS)\n  config.tls_cert/tls_key  paths to a certificate you mount yourself\n  env/extraEnv             PUPPET_CA_TLS_CERT and PUPPET_CA_TLS_KEY, to feed those paths in from a Secret\n  config.no_tls_required   true, only behind a trusted TLS proxy that re-originates TLS\n  listen.host              127.0.0.1 or localhost, for a sidecar-only deployment" $host) -}}
+{{- end -}}
 {{- end -}}
 
 {{/*
@@ -326,11 +369,19 @@ CrashLoopBackOff or a Service that silently routes nowhere.
 
 {{/*
 The names the exporter will apply to, gathered from the merged config so that
-targets supplied through config.kubernetes_export count too. Empty when the
-config is not the chart's to read, which is the signal not to restrict.
+targets supplied through config.kubernetes_export count too.
+
+Returns the literal string "unknown" — distinct from an empty list — when the
+export config is not the chart's to read, because the two mean opposite things
+to the caller: "no targets, so grant nothing" versus "unknown targets, so grant
+everything". A marker rather than a JSON null because Helm's fromJson rejects
+anything that is not an object, so the caller has to test before decoding
+anyway.
 */}}
 {{- define "openvox-ca.exportTargetNames" -}}
-{{- if not .Values.existingConfigMap -}}
+{{- if .Values.existingConfigMap -}}
+unknown
+{{- else -}}
 {{- $config := include "openvox-ca.config" . | fromYaml -}}
 {{- $names := list -}}
 {{- range (dig "kubernetes_export" "targets" list $config) -}}
@@ -339,7 +390,91 @@ config is not the chart's to read, which is the signal not to restrict.
 {{- end -}}
 {{- end -}}
 {{- $names | uniq | sortAlpha | toJson -}}
-{{- else -}}
-[]
 {{- end -}}
+{{- end -}}
+
+{{/*
+The post-install notes.
+
+Held in a named template rather than inline in NOTES.txt so that they can be
+rendered — and therefore asserted — offline. `helm template` does not evaluate
+NOTES.txt at all, and `helm install --dry-run` reaches for a cluster on Helm 3,
+so a probe template that includes this is the only portable way to test the
+warnings. They were the operator-facing half of a defect once already.
+*/}}
+{{- define "openvox-ca.notes" -}}
+{{- $fullName := include "openvox-ca.fullname" . -}}
+{{- $namespace := include "openvox-ca.namespace" . -}}
+{{- $config := include "openvox-ca.config" . | fromYaml -}}
+{{- $backend := dig "storage_backend" "filesystem" $config -}}
+{{- $tls := eq (include "openvox-ca.tlsConfigured" .) "true" -}}
+{{- $replicas := ternary (int .Values.autoscaling.minReplicas) (int .Values.replicaCount) .Values.autoscaling.enabled -}}
+{{- $autosign := dig "autosign_config" "" $config | toString -}}
+openvox-ca {{ .Chart.AppVersion }} has been deployed as {{ $fullName }} in namespace {{ $namespace }}.
+
+Image:           {{ include "openvox-ca.image" . }}
+Storage backend: {{ $backend }}
+Service:         {{ $fullName }}.{{ $namespace }}.svc:{{ .Values.service.port }}
+
+Watch it come up:
+
+  kubectl --namespace {{ $namespace }} rollout status deployment/{{ $fullName }}
+
+Fetch the CA certificate once it is ready:
+
+  kubectl --namespace {{ $namespace }} port-forward svc/{{ $fullName }} 8140:{{ .Values.service.port }}
+  curl {{ if $tls }}-k https{{ else }}http{{ end }}://localhost:8140/puppet-ca/v1/certificate/ca
+
+{{- if not $tls }}
+
+WARNING: no server TLS certificate is configured, so openvox-ca is serving
+plain HTTP. Puppet agents require HTTPS, and every endpoint authenticated by
+client certificate — signing, revoking, listing — is unavailable. This is only
+safe behind a proxy that terminates TLS and re-originates it to the pod. Set
+tls.existingSecret to a kubernetes.io/tls Secret to serve TLS directly.
+{{- end }}
+{{- if and (has $backend (list "filesystem" "sqlite")) (not .Values.persistence.enabled) }}
+
+WARNING: the {{ $backend }} backend keeps the entire CA — including its private
+key — in {{ .Values.persistence.mountPath }}, but persistence is disabled, so
+that directory is an emptyDir. The CA will be regenerated from scratch on every
+restart and previously issued certificates will stop verifying. Set
+persistence.enabled: true, or switch to an external storage backend.
+{{- end }}
+{{- if and (has $backend (list "filesystem" "sqlite")) (gt $replicas 1) }}
+
+WARNING: {{ if .Values.autoscaling.enabled }}autoscaling starts at {{ $replicas }} replicas{{ else }}replicaCount is {{ $replicas }}{{ end }}, but the
+{{ $backend }} backend is not safe to share between replicas. Use postgres,
+mysql, etcd, or redis to run more than one — see
+https://github.com/voxpupuli/openvox-ca/blob/main/docs/storage-backends.md
+{{- end }}
+{{- if eq $autosign "true" }}
+
+WARNING: autosigning is set to "true", so every CSR that reaches the CA is
+signed without review. Anyone who can reach the API can obtain a valid
+certificate for any name. Use this in development only.
+{{- end }}
+{{- if and .Values.metrics.enabled (not .Values.networkPolicy.enabled) }}
+
+NOTE: the Prometheus exporter is enabled on port {{ .Values.metrics.port }}. Its
+leaf-certificate series carry node hostnames as label values, and no
+NetworkPolicy is in place to restrict who can scrape it. Consider
+networkPolicy.enabled: true.
+{{- end }}
+{{- if and .Values.networkPolicy.enabled .Values.networkPolicy.egress.enabled (eq (include "openvox-ca.needsAPIAccess" .) "true") }}
+
+NOTE: this pod talks to the Kubernetes API ({{ if .Values.kubernetesExport.enabled }}Kubernetes export{{ else }}OpenBao Kubernetes auth{{ end }}), but
+egress is restricted and the chart cannot know your API server's address. Add a
+rule for it to networkPolicy.egress.rules, or the feature will fail while
+readiness still reports healthy.
+{{- end }}
+{{- if not (or .Values.puppetServers (dig "puppet_server" "" $config) (dig "puppet_server_file" "" $config)) }}
+
+NOTE: no puppetServers are listed, so no CN is granted admin API access over
+mTLS. Your OpenVox/Puppet Server compilers need to be listed here (or via
+config.puppet_server) before they can sign, revoke, or list certificates.
+{{- end }}
+
+Full configuration reference: https://github.com/voxpupuli/openvox-ca/blob/main/docs/configuration.md
+Chart documentation:          https://github.com/voxpupuli/openvox-ca/blob/main/docs/helm-chart.md
 {{- end -}}
