@@ -155,6 +155,11 @@ jobs:
         run: mage chart:version
       - name: Lint and validate the rendered manifests
         run: mage chart:validate
+      # Schema validity is not correctness: these assert what the templates
+      # actually resolve to, and that each precondition really refuses what it
+      # claims to.
+      - name: Assert the chart renders the right values
+        run: mage chart:test
       # Exercise the packaging step the publish workflow performs, so a chart
       # that renders but cannot be packaged fails here rather than on a tag.
       - name: Package the chart

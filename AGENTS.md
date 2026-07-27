@@ -27,6 +27,7 @@ Task. Invoke targets with `go run mage.go <Target>` or the `mage` binary:
 | `mage test:backendsRedisGo` | Redis backend Go integration suite (build tag `redis_integration`) |
 | `mage test:backendsOpenBao` | OpenBao Transit signer integration suite (build tag `openbao_integration`, `test/compose-backends-openbao.yml`) |
 | `mage chart:validate` | Lint the Helm chart and check every rendered fixture against the Kubernetes schemas (needs `helm` and `kubeconform`) |
+| `mage chart:test` | Assert what the chart renders, and that each precondition refuses what it claims to |
 | `mage chart:version` | Assert `charts/openvox-ca/Chart.yaml` still tracks `internal/version` |
 
 `golangci-lint` is pinned in CI (`.github/workflows/ci.yml`). Build it with the
@@ -225,7 +226,17 @@ Kubernetes wiring *and* set the config keys pointing at it, deep-merged with
 needs no chart change; adding a value that duplicates one is a regression.
 
 Every fixture under `charts/openvox-ca/ci/` is linted and schema-checked in CI.
-A new template branch needs a fixture that exercises it, or it is untested.
+A new template branch needs a fixture that exercises it, or it is untested —
+and schema validity is not correctness, so anything a reader has to *trust*
+(tag resolution, merge precedence, which kind a value selects) needs a case in
+`chart:test` as well.
+
+Preconditions live in one place, the `openvox-ca.validate` helper, and are
+checked from `deployment.yaml`. When a value combination would render something
+a cluster silently mishandles — a route to a port that does not exist, a
+binding to the `default` ServiceAccount — `fail` at install time with the
+remedy in the message, rather than rendering it. Each one needs a matching
+reject case in `chart:test`.
 
 ## Commits
 

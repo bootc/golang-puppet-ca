@@ -5,8 +5,13 @@ type: application
 
 # NOTE: version and appVersion are both the internal/version Version constant,
 # and are rewritten by `mage release:prepare` alongside internal/version.go.
-# The verify-release-tag action, the CI chart job, and the pre-push hook all
-# refuse a mismatch, so do not edit either line by hand.
+# Four places parse these two lines' exact textual shape (appVersion's quotes
+# included) and refuse a mismatch, so do not edit either by hand and do not
+# reformat them without updating all four together:
+#   .github/actions/verify-release-tag/action.yml   the shared tag gate
+#   .github/workflows/helm-chart.yml                the publish version
+#   .lefthook/pre-push/verify-tags.sh               the local tag gate
+#   magefile.go                                     chartVersions, release:prepare
 version: 0.9.0-dev
 appVersion: "0.9.0-dev"
 

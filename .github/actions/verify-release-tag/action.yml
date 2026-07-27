@@ -45,6 +45,10 @@ runs:
         chart=charts/openvox-ca/Chart.yaml
         version="$(sed -n 's/^version: \(.*\)$/\1/p' "$chart")"
         app_version="$(sed -n 's/^appVersion: "\(.*\)"$/\1/p' "$chart")"
+        if [ -z "$version" ] || [ -z "$app_version" ]; then
+          echo "::error::Could not parse version and appVersion from $chart (appVersion must be double-quoted). Parsed: version=\"$version\" appVersion=\"$app_version\""
+          exit 1
+        fi
         if [ "$version" != "$want" ] || [ "$app_version" != "$want" ]; then
           echo "::error::$chart does not match tag $TAG (version=\"$version\" appVersion=\"$app_version\"). Land a version-bump change (mage release:prepare $want), then re-tag."
           exit 1

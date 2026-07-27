@@ -20,9 +20,23 @@ metadata:
     {{- toYaml . | nindent 4 }}
   {{- end }}
 rules:
+{{- $names := include "openvox-ca.exportTargetNames" $ | fromJsonArray }}
+  # create cannot be restricted by resourceNames — the object has no name yet
+  # at admission time — but patch can, so overwriting an existing Secret is
+  # limited to the objects actually configured as export targets. The names are
+  # taken from the merged config, so targets set through config.kubernetes_export
+  # are covered too; an externally managed ConfigMap leaves the list empty,
+  # since the chart cannot see what it asks for.
   - apiGroups: [""]
     resources: ["secrets", "configmaps"]
-    verbs: ["create", "patch"]
+    verbs: ["create"]
+  - apiGroups: [""]
+    resources: ["secrets", "configmaps"]
+    verbs: ["patch"]
+    {{- with $names }}
+    resourceNames:
+      {{- toYaml . | nindent 6 }}
+    {{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -56,10 +70,28 @@ metadata:
   namespace: {{ $ns }}
   labels:
     {{- $labels | nindent 4 }}
+  {{- with $.Values.commonAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
 rules:
+{{- $names := include "openvox-ca.exportTargetNames" $ | fromJsonArray }}
+  # create cannot be restricted by resourceNames — the object has no name yet
+  # at admission time — but patch can, so overwriting an existing Secret is
+  # limited to the objects actually configured as export targets. The names are
+  # taken from the merged config, so targets set through config.kubernetes_export
+  # are covered too; an externally managed ConfigMap leaves the list empty,
+  # since the chart cannot see what it asks for.
   - apiGroups: [""]
     resources: ["secrets", "configmaps"]
-    verbs: ["create", "patch"]
+    verbs: ["create"]
+  - apiGroups: [""]
+    resources: ["secrets", "configmaps"]
+    verbs: ["patch"]
+    {{- with $names }}
+    resourceNames:
+      {{- toYaml . | nindent 6 }}
+    {{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -68,6 +100,10 @@ metadata:
   namespace: {{ $ns }}
   labels:
     {{- $labels | nindent 4 }}
+  {{- with $.Values.commonAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role

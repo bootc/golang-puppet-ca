@@ -18,13 +18,13 @@ $ helm install openvox-ca \
 
 A narrative guide — TLS termination, storage backends, ingress and Gateway API,
 monitoring, Kubernetes export — is in
-[docs/helm-chart.md](../../docs/helm-chart.md). This file is the values
+[docs/helm-chart.md](https://github.com/voxpupuli/openvox-ca/blob/main/docs/helm-chart.md). This file is the values
 reference.
 
 ## How configuration works
 
 openvox-ca has a large configuration surface (see
-[docs/configuration.md](../../docs/configuration.md)), and the chart does not
+[docs/configuration.md](https://github.com/voxpupuli/openvox-ca/blob/main/docs/configuration.md)), and the chart does not
 mirror it key by key. Instead:
 
 - **`config`** is written verbatim to `/etc/puppet-ca/config.yaml`, which the
@@ -68,13 +68,13 @@ A single `helm template` will show you exactly what the merge produced.
 
 | Key | Default | Description |
 | --- | --- | --- |
-| `config` | `{}` | Written verbatim to `config.yaml`; the full [configuration reference](../../docs/configuration.md) applies |
-| `existingConfigMap` | `""` | Use a ConfigMap you manage instead of rendering one |
+| `config` | `{}` | Written verbatim to `config.yaml`; the full [configuration reference](https://github.com/voxpupuli/openvox-ca/blob/main/docs/configuration.md) applies |
+| `existingConfigMap` | `""` | Use a ConfigMap you manage instead of rendering one. The chart cannot checksum what it did not render, so `configChecksumAnnotation` has no effect and editing that ConfigMap will **not** restart the pods — the server has no reload path, so roll them yourself |
 | `configMount` | `/etc/puppet-ca` | Where the config ConfigMap is mounted |
 | `extraConfigFiles` | `{}` | Extra `filename: contents` entries placed alongside `config.yaml` |
 | `listen.host` | `0.0.0.0` | API listen address; use `[::]` for a dual-stack Service |
 | `listen.port` | `8140` | API listen port |
-| `verbosity` | `0` | `0`=Info, `1`=Debug, `2`=Trace |
+| `verbosity` | `0` | `0`=Info, `1`=Debug, `2`=Trace. Written into `config.yaml`, so `config.verbosity` overrides it |
 | `puppetServers` | `[]` | CNs granted admin API access over mTLS; rendered into a file and wired to `puppet_server_file` |
 | `autosign.mode` | `""` | `"false"`, `"true"`, or a path inside the container |
 | `autosign.patterns` | `[]` | Glob allowlist rendered into the config ConfigMap; sets `autosign_config` |
@@ -151,12 +151,12 @@ A single `helm template` will show you exactly what the merge produced.
 | `extraEnv` | `[]` | Environment variables in list form, for `valueFrom` |
 | `envFrom` | `[]` | `configMapRef`/`secretRef` sources, verbatim |
 | `resources` | 10m CPU / 48–64Mi | |
-| `configChecksumAnnotation` | `true` | Roll the pods when the rendered config changes |
+| `configChecksumAnnotation` | `true` | Roll the pods when the rendered config changes. Inert when `existingConfigMap` is set |
 | `podAnnotations` / `podLabels` | `{}` | |
 | `deploymentAnnotations` | `{}` | Annotations on the Deployment rather than the pods |
 | `podSecurityContext` | non-root uid/gid 1000, `fsGroup` 1000, `RuntimeDefault` | |
 | `securityContext` | no privilege escalation, read-only rootfs, all capabilities dropped | |
-| `livenessProbe` / `readinessProbe` / `startupProbe` | HTTPS probes on `/healthz/*` | Set `enabled: false` to drop one; other keys are the probe spec |
+| `livenessProbe` / `readinessProbe` / `startupProbe` | probes on `/healthz/*` | Set `enabled: false` to drop one; other keys are the probe spec. `httpGet.scheme` defaults to HTTPS or HTTP to match whether the server has a certificate |
 | `lifecycle` | `{}` | |
 | `terminationGracePeriodSeconds` | `30` | Must exceed `shutdown_timeout_sec` by ≥ 3s |
 | `nodeSelector` / `tolerations` / `affinity` | `{}` / `[]` / `{}` | |
@@ -166,7 +166,8 @@ A single `helm template` will show you exactly what the merge produced.
 | `enableServiceLinks` | `false` | |
 | `automountServiceAccountToken` | `null` | `null` mounts the token only when the pod needs the API (Kubernetes export, OpenBao Kubernetes auth) |
 | `initContainers` / `extraContainers` | `[]` | Templated, so they can reference `.Values` |
-| `extraVolumes` / `extraVolumeMounts` | `[]` | Templated |
+| `extraVolumes` | `[]` | Templated |
+| `extraVolumeMounts` | `[]` | Passed through as written |
 | `serviceAccount.create` | `true` | |
 | `serviceAccount.name` | `""` | |
 | `serviceAccount.annotations` / `.labels` | `{}` | |
@@ -234,8 +235,8 @@ certificate, so the controller **must** pass TLS through untouched.
 | --- | --- | --- |
 | `podDisruptionBudget.enabled` | `false` | |
 | `podDisruptionBudget.minAvailable` | `1` | Ignored when `maxUnavailable` is set |
-| `podDisruptionBudget.maxUnavailable` | `""` | |
-| `podDisruptionBudget.unhealthyPodEvictionPolicy` | `""` | |
+| `podDisruptionBudget.maxUnavailable` | `""` | `0` is honoured (block every voluntary eviction), not treated as unset |
+| `podDisruptionBudget.unhealthyPodEvictionPolicy` | `""` | Kubernetes 1.27+ |
 | `autoscaling.enabled` | `false` | Requires an external storage backend |
 | `autoscaling.minReplicas` / `.maxReplicas` | `2` / `6` | |
 | `autoscaling.targetCPUUtilizationPercentage` | `80` | |
@@ -250,13 +251,14 @@ certificate, so the controller **must** pass TLS through untouched.
 
 ## Development
 
-The fixtures in [`ci/`](ci/) are rendered and schema-checked on every pull
+The fixtures in `ci/` are rendered and schema-checked on every pull
 request. They are excluded from the packaged chart.
 
 ```console
 $ mage chart:version    # Chart.yaml tracks internal/version
 $ mage chart:lint       # helm lint, default values and every fixture
 $ mage chart:validate   # render everything, check against Kubernetes schemas
+$ mage chart:test       # assert what it renders, and that the guards refuse
 $ mage chart:package    # write dist/openvox-ca-<version>.tgz
 ```
 

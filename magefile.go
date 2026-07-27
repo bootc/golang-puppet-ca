@@ -657,10 +657,29 @@ const chartDir = "charts/openvox-ca"
 // validated against. Bumping it is how the chart picks up newly-GA fields.
 const kubeconformVersion = "1.31.0"
 
+// kubeconformFloorVersion is the chart's declared kubeVersion floor
+// (charts/openvox-ca/Chart.yaml). The minimal fixture — the chart's defaults —
+// is validated against it as well, so the floor is a checked promise rather
+// than a claim. Fixtures that opt into newer fields
+// (unhealthyPodEvictionPolicy is 1.27+, trafficDistribution 1.31+) are only
+// checked at kubeconformVersion; the values documenting those fields say so.
+const kubeconformFloorVersion = "1.26.0"
+
 // crdSchemaLocation points kubeconform at community-maintained JSON schemas
 // for the CRDs the chart can emit (ServiceMonitor, HTTPRoute, TLSRoute), which
 // are absent from the core Kubernetes schema set.
-const crdSchemaLocation = "https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json"
+//
+// Pinned to a commit rather than a branch: this feeds a required check, and
+// tracking someone else's main means an upstream reorganisation can turn CI
+// red with no change of ours. It is a commit and not a tag because the
+// catalogue's newest tag (v0.0.12) predates its Gateway API schemas, so a
+// tagged pin cannot validate the routes the chart emits. Refresh it by hand
+// when a CRD the chart uses gains a new version; Renovate has no datasource
+// for a raw.githubusercontent path.
+const crdSchemaCommit = "dcaa31aa03082906c0325a7a0ee7d5191e9cbe24"
+
+const crdSchemaLocation = "https://raw.githubusercontent.com/datreeio/CRDs-catalog/" +
+	crdSchemaCommit + "/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json"
 
 var (
 	chartVersionRe    = regexp.MustCompile(`(?m)^version: (.+)$`)
@@ -692,14 +711,22 @@ func chartVersions() (version, appVersion string, err error) {
 // chart:validate exercise in full. Finding none is an error rather than a
 // no-op: an empty fixture set would silently turn both targets into
 // rubber stamps.
+//
+// Both YAML extensions are collected: globbing only *.yaml would skip a *.yml
+// fixture in silence, which is that same rubber stamp one file at a time.
 func chartValuesFiles() ([]string, error) {
-	files, err := filepath.Glob(filepath.Join(chartDir, "ci", "*.yaml"))
-	if err != nil {
-		return nil, err
+	var files []string
+	for _, ext := range []string{"*.yaml", "*.yml"} {
+		matched, err := filepath.Glob(filepath.Join(chartDir, "ci", ext))
+		if err != nil {
+			return nil, err
+		}
+		files = append(files, matched...)
 	}
 	if len(files) == 0 {
 		return nil, fmt.Errorf("no fixture values files found under %s", filepath.Join(chartDir, "ci"))
 	}
+	slices.Sort(files)
 	return files, nil
 }
 
@@ -737,9 +764,20 @@ func (Chart) Version() error {
 	return nil
 }
 
-// Lint runs `helm lint` over the chart with its default values and then once
-// per fixture, so a fixture that trips the values schema or a template guard
-// fails here rather than at install time.
+// chartFixtureName is the label a fixture's rendering is filed under.
+func chartFixtureName(path string) string {
+	base := filepath.Base(path)
+	return strings.TrimSuffix(strings.TrimSuffix(base, ".yaml"), ".yml")
+}
+
+// Lint runs `helm lint` over the chart once per fixture, so a fixture that
+// trips the values schema or a precondition fails here rather than at install
+// time.
+//
+// There is deliberately no bare-defaults run: the chart's preconditions reject
+// an install with no TLS configuration, because the server would refuse to
+// start. ci/minimal-values.yaml is the defaults plus that one required
+// setting, and stands in for it.
 func (Chart) Lint() error {
 	if err := requireChartTool("helm", "https://helm.sh/docs/intro/install/"); err != nil {
 		return err
@@ -749,10 +787,6 @@ func (Chart) Lint() error {
 		return err
 	}
 
-	fmt.Println("Linting the chart with default values...")
-	if err := sh.RunV("helm", "lint", "--strict", chartDir); err != nil {
-		return err
-	}
 	for _, f := range values {
 		fmt.Printf("Linting the chart with %s...\n", f)
 		if err := sh.RunV("helm", "lint", "--strict", chartDir, "-f", f); err != nil {
@@ -786,19 +820,11 @@ func (Chart) Validate() error {
 		return err
 	}
 
-	// The default fixture is the chart's own values.yaml, rendered with no
-	// overrides; it is the configuration most installs start from.
-	renders := append([]string{""}, values...)
-	for _, f := range renders {
-		name := "default"
-		args := []string{"template", "openvox-ca", chartDir}
-		if f != "" {
-			name = strings.TrimSuffix(filepath.Base(f), ".yaml")
-			args = append(args, "-f", f)
-		}
+	for _, f := range values {
+		name := chartFixtureName(f)
 
 		fmt.Printf("Rendering the chart with %s values...\n", name)
-		manifest, err := sh.Output("helm", args...)
+		manifest, err := sh.Output("helm", "template", "openvox-ca", chartDir, "-f", f)
 		if err != nil {
 			return err
 		}
@@ -807,18 +833,258 @@ func (Chart) Validate() error {
 			return err
 		}
 
-		fmt.Printf("Validating %s against Kubernetes %s schemas...\n", path, kubeconformVersion)
-		if err := sh.RunV("kubeconform",
-			"-strict",
-			"-summary",
-			"-kubernetes-version", kubeconformVersion,
-			"-schema-location", "default",
-			"-schema-location", crdSchemaLocation,
-			path,
-		); err != nil {
-			return err
+		// The minimal fixture is the chart's defaults, so it must also hold at
+		// the kubeVersion floor Chart.yaml advertises. The others opt into
+		// fields newer than that on purpose.
+		targets := []string{kubeconformVersion}
+		if name == "minimal-values" {
+			targets = append(targets, kubeconformFloorVersion)
+		}
+		for _, kubeVersion := range targets {
+			fmt.Printf("Validating %s against Kubernetes %s schemas...\n", path, kubeVersion)
+			if err := sh.RunV("kubeconform",
+				"-strict",
+				"-summary",
+				"-kubernetes-version", kubeVersion,
+				"-schema-location", "default",
+				"-schema-location", crdSchemaLocation,
+				path,
+			); err != nil {
+				return err
+			}
 		}
 	}
+	return nil
+}
+
+// chartRenderCase is one assertion over a rendering of the chart: render with
+// these --set overrides, then require each `wants` string to appear in the
+// output and each `notWants` string to be absent.
+type chartRenderCase struct {
+	name     string
+	sets     []string
+	wants    []string
+	notWants []string
+}
+
+// chartRejectCase is one assertion that the chart refuses a configuration:
+// render with these overrides and require the failure to mention `wantErr`.
+type chartRejectCase struct {
+	name    string
+	sets    []string
+	wantErr string
+}
+
+// helmTemplate renders the chart with --set overrides, returning stdout and
+// stderr combined. Both are needed: the rendered manifests arrive on stdout,
+// but a `fail` from a precondition — the thing the reject cases assert on —
+// only ever appears on stderr.
+func helmTemplate(sets []string) (string, error) {
+	args := []string{"template", "openvox-ca", chartDir}
+	for _, s := range sets {
+		args = append(args, "--set", s)
+	}
+	var out bytes.Buffer
+	_, err := sh.Exec(nil, &out, &out, "helm", args...)
+	return out.String(), err
+}
+
+// Test asserts what the chart actually renders, which neither `helm lint` nor
+// kubeconform can: both are satisfied by valid YAML carrying the wrong values.
+// These cases cover the logic a reader has to trust — image-tag resolution,
+// config merge precedence, probe scheme selection, which kind rbac.scope
+// picks — and the preconditions, which are only worth having if they really
+// fire.
+func (Chart) Test() error {
+	if err := requireChartTool("helm", "https://helm.sh/docs/intro/install/"); err != nil {
+		return err
+	}
+
+	// Every case starts from a renderable baseline: without TLS the chart
+	// refuses outright, which is itself asserted in the reject cases below.
+	tls := "tls.existingSecret=openvox-ca-tls"
+
+	renders := []chartRenderCase{
+		{
+			name:  "an unset tag resolves to the Alpine variant of the appVersion",
+			sets:  []string{tls, "image.tag=", "image.digest="},
+			wants: []string{"image: ghcr.io/voxpupuli/openvox-ca:edge-alpine"},
+		},
+		{
+			name: "an explicit tag is used verbatim, selecting the CentOS variant",
+			sets: []string{tls, "image.tag=0.9.0"},
+			// The whole point of the rule: no suffix is appended.
+			wants:    []string{"image: ghcr.io/voxpupuli/openvox-ca:0.9.0"},
+			notWants: []string{"0.9.0-alpine"},
+		},
+		{
+			name:     "a digest wins over a tag",
+			sets:     []string{tls, "image.tag=0.9.0", "image.digest=sha256:" + strings.Repeat("a", 64)},
+			wants:    []string{"image: ghcr.io/voxpupuli/openvox-ca@sha256:" + strings.Repeat("a", 64)},
+			notWants: []string{":0.9.0"},
+		},
+		{
+			name:  "config overrides what the tls block computes",
+			sets:  []string{tls, "config.tls_cert=/custom/cert.pem", "config.tls_key=/custom/key.pem"},
+			wants: []string{"tls_cert: /custom/cert.pem", "tls_key: /custom/key.pem"},
+			// The secret is still mounted; only the paths move.
+			notWants: []string{"tls_cert: /run/secrets/openvox-ca-tls/tls.crt"},
+		},
+		{
+			name:     "config.verbosity beats the verbosity value, and no flag outranks either",
+			sets:     []string{tls, "verbosity=1", "config.verbosity=2"},
+			wants:    []string{"verbosity: 2"},
+			notWants: []string{"--verbosity"},
+		},
+		{
+			name:  "probes follow the server: HTTPS when a certificate is configured",
+			sets:  []string{tls},
+			wants: []string{"scheme: HTTPS"},
+		},
+		{
+			name:     "probes follow the server: HTTP behind a terminating proxy",
+			sets:     []string{"config.no_tls_required=true"},
+			wants:    []string{"scheme: HTTP\n"},
+			notWants: []string{"scheme: HTTPS"},
+		},
+		{
+			name:     "rbac.scope selects the namespaced kinds by default",
+			sets:     []string{tls, "kubernetesExport.enabled=true", "kubernetesExport.targets[0].kind=Secret", "kubernetesExport.targets[0].metadata.name=t", "kubernetesExport.targets[0].cert=true"},
+			wants:    []string{"kind: Role\n", "kind: RoleBinding\n", "automountServiceAccountToken: true"},
+			notWants: []string{"kind: ClusterRole"},
+		},
+		{
+			name:     "rbac.scope: ClusterRole selects the cluster-scoped kinds",
+			sets:     []string{tls, "kubernetesExport.enabled=true", "kubernetesExport.rbac.scope=ClusterRole", "kubernetesExport.targets[0].kind=Secret", "kubernetesExport.targets[0].metadata.name=t", "kubernetesExport.targets[0].cert=true"},
+			wants:    []string{"kind: ClusterRole\n", "kind: ClusterRoleBinding\n"},
+			notWants: []string{"kind: Role\n", "kind: RoleBinding\n"},
+		},
+		{
+			name:     "the ServiceAccount token stays unmounted when nothing needs the API",
+			sets:     []string{tls},
+			wants:    []string{"automountServiceAccountToken: false"},
+			notWants: []string{"automountServiceAccountToken: true"},
+		},
+		{
+			name:  "OpenBao Kubernetes auth mounts the token too",
+			sets:  []string{tls, "config.ca_key_provider=openbao", "config.openbao.auth_method=kubernetes"},
+			wants: []string{"automountServiceAccountToken: true"},
+		},
+		{
+			name:  "a config change rolls the pods",
+			sets:  []string{tls},
+			wants: []string{"checksum/config:"},
+		},
+		{
+			name:     "an externally managed ConfigMap cannot be checksummed",
+			sets:     []string{tls, "existingConfigMap=mine"},
+			wants:    []string{"name: mine"},
+			notWants: []string{"checksum/config:"},
+		},
+		{
+			name:  "maxUnavailable: 0 survives the falsy-zero trap",
+			sets:  []string{tls, "podDisruptionBudget.enabled=true", "podDisruptionBudget.maxUnavailable=0"},
+			wants: []string{"maxUnavailable: 0"},
+			// minAvailable is the fallback that a plain `if` would have taken.
+			notWants: []string{"minAvailable:"},
+		},
+		{
+			name:     "clearing both emptyDir fields still yields a valid volume source",
+			sets:     []string{tls, "persistence.enabled=false", "emptyDir.medium=", "emptyDir.sizeLimit="},
+			wants:    []string{"emptyDir: {}"},
+			notWants: []string{"emptyDir:\n        - name"},
+		},
+		{
+			name:  "a deny-all network policy renders an empty list, not a null",
+			sets:  []string{tls, "networkPolicy.enabled=true", "networkPolicy.apiAccess=none"},
+			wants: []string{"ingress: []"},
+		},
+		{
+			name:  "topology constraints default to this release's own pods",
+			sets:  []string{tls},
+			wants: []string{"app.kubernetes.io/name: openvox-ca\n          maxSkew: 1"},
+		},
+	}
+
+	rejects := []chartRejectCase{
+		{
+			name:    "no TLS on a non-loopback address, which the server refuses to serve",
+			sets:    []string{},
+			wantErr: "refuse to start",
+		},
+		{
+			name:    "a ServiceMonitor for an exporter that is switched off",
+			sets:    []string{tls, "metrics.serviceMonitor.enabled=true"},
+			wantErr: "nothing to scrape",
+		},
+		{
+			name:    "an ingress routed to a metrics port that was never created",
+			sets:    []string{tls, "ingress.enabled=true", "ingress.backendPort=metrics"},
+			wantErr: "no metrics port",
+		},
+		{
+			name:    "a TLSRoute routed to a metrics port that was never created",
+			sets:    []string{tls, "gateway.tlsRoute.enabled=true", "gateway.tlsRoute.backendPort=metrics"},
+			wantErr: "no metrics port",
+		},
+		{
+			name:    "export RBAC bound to the namespace's default ServiceAccount",
+			sets:    []string{tls, "kubernetesExport.enabled=true", "serviceAccount.create=false"},
+			wantErr: "default ServiceAccount",
+		},
+		{
+			name:    "a mistyped value the schema should catch",
+			sets:    []string{tls, "metric.enabled=true"},
+			wantErr: "additional properties",
+		},
+	}
+
+	failures := 0
+	for _, tc := range renders {
+		out, err := helmTemplate(tc.sets)
+		if err != nil {
+			fmt.Printf("FAIL  %s\n      render failed: %v\n", tc.name, err)
+			failures++
+			continue
+		}
+		ok := true
+		for _, want := range tc.wants {
+			if !strings.Contains(out, want) {
+				fmt.Printf("FAIL  %s\n      expected to find: %q\n", tc.name, want)
+				ok = false
+			}
+		}
+		for _, notWant := range tc.notWants {
+			if strings.Contains(out, notWant) {
+				fmt.Printf("FAIL  %s\n      expected NOT to find: %q\n", tc.name, notWant)
+				ok = false
+			}
+		}
+		if ok {
+			fmt.Printf("ok    %s\n", tc.name)
+		} else {
+			failures++
+		}
+	}
+
+	for _, tc := range rejects {
+		out, err := helmTemplate(tc.sets)
+		switch {
+		case err == nil:
+			fmt.Printf("FAIL  rejects %s\n      rendered successfully instead of failing\n", tc.name)
+			failures++
+		case !strings.Contains(err.Error()+out, tc.wantErr):
+			fmt.Printf("FAIL  rejects %s\n      failed, but not with %q: %v\n", tc.name, tc.wantErr, err)
+			failures++
+		default:
+			fmt.Printf("ok    rejects %s\n", tc.name)
+		}
+	}
+
+	if failures > 0 {
+		return fmt.Errorf("%d chart assertion(s) failed", failures)
+	}
+	fmt.Printf("\nAll %d chart assertions passed\n", len(renders)+len(rejects))
 	return nil
 }
 

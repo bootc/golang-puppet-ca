@@ -59,6 +59,10 @@ openvox-ca has a large configuration surface, and the chart deliberately does
   half of a feature (mount the Secret, open the port, create the RBAC) *and*
   set the config keys pointing at whatever they mounted.
 - **`config` always wins.** The two are deep-merged with your `config` on top.
+  This is why `verbosity` is written into the config file rather than passed as
+  `--verbosity`: a flag would outrank the file unconditionally, leaving
+  `config.verbosity` silently ineffective. The only argument the chart passes is
+  `--config`.
 
 So this:
 
@@ -118,17 +122,32 @@ The digest wins over the tag, and the reference becomes
 ## TLS: the chart's most important setting
 
 Puppet agents speak HTTPS, and openvox-ca authenticates administrative
-operations by **client certificate**. Without a server certificate it falls
-back to plain HTTP and every mTLS-authenticated endpoint becomes unreachable.
-The chart's `NOTES.txt` warns about this on install.
+operations by **client certificate**. Serving plain HTTP on a non-loopback
+address would let an on-path host inject forged certificates, so the server
+does not offer it as a fallback: it **refuses to start**.
 
-Point `tls.existingSecret` at a `kubernetes.io/tls` Secret. cert-manager
-produces one readily:
+The chart therefore refuses to render an install that would hit that, rather
+than handing you a pod that crash-loops. `helm install` with no TLS
+configuration fails immediately, naming the ways out. The usual one is to point
+`tls.existingSecret` at a `kubernetes.io/tls` Secret — cert-manager produces one
+readily:
 
 ```yaml
 tls:
   existingSecret: openvox-ca-server-tls
 ```
+
+The alternatives, in the same message:
+
+| Setting | When |
+| --- | --- |
+| `config.tls_cert` / `config.tls_key` | A certificate you mount yourself, via `extraVolumes` |
+| `config.no_tls_required: true` | Only behind a proxy that terminates TLS and re-originates it to the pod. Client certificates do not survive that, so mTLS-authenticated endpoints become unreachable |
+| `listen.host` | A loopback address, for a sidecar-only deployment |
+
+With `no_tls_required` the chart also switches the health probes to HTTP, since
+the kubelet has to speak whatever the server speaks. Set `httpGet.scheme` on a
+probe explicitly to override that.
 
 Two consequences follow from the CA terminating its own TLS:
 
@@ -515,6 +534,11 @@ Two things worth knowing:
   restarts them even though the Deployment's pod template is otherwise
   unchanged. Set `configChecksumAnnotation: false` if you would rather manage
   restarts yourself (with Reloader, say).
+- **`existingConfigMap` turns that off**, necessarily: the chart cannot
+  checksum a ConfigMap it did not render. openvox-ca has no reload path, so
+  editing your own ConfigMap leaves the running pods on the old config until
+  you restart them — `kubectl rollout restart`, or an annotation-based reloader
+  watching that ConfigMap.
 
 ## Uninstalling
 

@@ -310,21 +310,24 @@ securityContext:
   seccompProfile:
     type: RuntimeDefault
 
-# Probes. Each block is merged over the chart's defaults, so you can override
-# just the timings; set `enabled: false` to drop a probe entirely.
+# Probes. Everything except `enabled` is the probe spec, passed through as
+# written; set `enabled: false` to drop a probe entirely.
+#
+# `httpGet.scheme` is deliberately absent: the kubelet has to speak whatever the
+# server speaks, so the chart fills it in as HTTPS when a server certificate is
+# configured and HTTP when one is not (behind a TLS-terminating proxy with
+# config.no_tls_required). Set it explicitly to override that.
 livenessProbe:
   enabled: true
   httpGet:
     path: /healthz/live
     port: https
-    scheme: HTTPS
 
 readinessProbe:
   enabled: true
   httpGet:
     path: /healthz/ready
     port: https
-    scheme: HTTPS
 
 startupProbe:
   enabled: true
@@ -333,7 +336,6 @@ startupProbe:
   httpGet:
     path: /healthz/startup
     port: https
-    scheme: HTTPS
 
 lifecycle: {}
 

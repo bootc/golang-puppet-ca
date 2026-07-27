@@ -22,6 +22,10 @@ guide is the human-friendly entry point; where the two overlap, AGENTS.md wins.
   slim container image may not have one. The product build is unaffected — it
   is still `CGO_ENABLED=0`.
 - Docker or Podman with the Compose plugin, for the integration and stack tests
+- Only if you are changing the Helm chart under [`charts/`](charts/):
+  [Helm](https://helm.sh/docs/intro/install/) and
+  [kubeconform](https://github.com/yannh/kubeconform)
+  (`go install github.com/yannh/kubeconform/cmd/kubeconform@v0.7.0`)
 
 ## Building
 
@@ -89,5 +93,9 @@ See [`AGENTS.md`](AGENTS.md) for the details. The essentials:
   committing.
 - Make sure `mage dev:check`, `mage test:unit`, `mage test:magefile`, and
   `markdownlint-cli2` pass.
+- Changed the Helm chart? `mage chart:validate` and `mage chart:test` are
+  required checks too. A new template branch needs a fixture under
+  `charts/openvox-ca/ci/`, and anything a reader has to trust needs a case in
+  `chart:test`.
 - Internal design notes live under [docs/development/](docs/development/); update
   them when you change the behaviour they describe.

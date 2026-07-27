@@ -10,6 +10,11 @@ persistence:
     - ReadWriteOnce
   annotations:
     example.com/backup: daily
+  labels:
+    example.com/tier: pki
+  selector:
+    matchLabels:
+      example.com/volume: openvox-ca
 
 tls:
   existingSecret: openvox-ca-server-tls

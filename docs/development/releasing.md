@@ -176,8 +176,10 @@ $ gh run list --limit 5
 $ gh run watch <run-id>
 ```
 
-The release build takes a few minutes; the container build is the slower of
-the two (four image builds plus two manifest merges).
+The release build takes a few minutes; the container build is the slowest of
+the three (four image builds plus two manifest merges). The chart build waits
+for the alpine image before publishing, so it finishes shortly after the
+container build does.
 
 After the release is out, return `main` to a development version so builds
 from `main` stop identifying as the release:
@@ -365,6 +367,13 @@ The GHCR package versions have to be deleted separately, from the package's
 
 ```console
 $ gh api --method DELETE /user/packages/container/<fork-name>/versions/<version-id>
+```
+
+The chart lives in a package of its own, `<fork-name>-charts/openvox-ca`, which
+has to be cleaned up separately:
+
+```console
+$ gh api --method DELETE /user/packages/container/<fork-name>-charts%2Fopenvox-ca/versions/<version-id>
 ```
 
 Deleting the rehearsal tags is not strictly necessary, but leaving them behind

@@ -19,6 +19,13 @@ spec:
     {{- if .Values.networkPolicy.egress.enabled }}
     - Egress
     {{- end }}
+  {{- /*
+    An empty `ingress:` key is a null value, not an empty list; spell the
+    deny-all case out so `apiAccess: none` with no other rules stays valid.
+  */}}
+  {{- if and (eq .Values.networkPolicy.apiAccess "none") (not .Values.networkPolicy.extraIngress) (not (and .Values.metrics.enabled .Values.networkPolicy.metricsNamespaces)) }}
+  ingress: []
+  {{- else }}
   ingress:
     {{- if eq .Values.networkPolicy.apiAccess "any" }}
     {{- /*
@@ -56,6 +63,7 @@ spec:
     {{- with .Values.networkPolicy.extraIngress }}
     {{- tpl (toYaml .) $ | nindent 4 }}
     {{- end }}
+  {{- end }}
   {{- if .Values.networkPolicy.egress.enabled }}
   egress:
     # DNS is always needed: the CA resolves its storage backend, OpenBao, and

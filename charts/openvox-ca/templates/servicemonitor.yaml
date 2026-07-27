@@ -1,7 +1,5 @@
 {{- if .Values.metrics.serviceMonitor.enabled }}
-{{- if not .Values.metrics.enabled }}
-{{- fail "metrics.serviceMonitor.enabled requires metrics.enabled: the exporter is off, so there is nothing to scrape" }}
-{{- end }}
+{{- /* The metrics.enabled precondition is checked in openvox-ca.validate. */}}
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:

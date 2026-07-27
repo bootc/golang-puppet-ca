@@ -1,3 +1,4 @@
+{{- include "openvox-ca.validate" . }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -33,9 +34,10 @@ spec:
         {{- with .Values.podLabels }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
-      {{- if or .Values.configChecksumAnnotation .Values.podAnnotations .Values.commonAnnotations }}
+      {{- $checksum := and .Values.configChecksumAnnotation (not .Values.existingConfigMap) }}
+      {{- if or $checksum .Values.podAnnotations .Values.commonAnnotations }}
       annotations:
-        {{- if and .Values.configChecksumAnnotation (not .Values.existingConfigMap) }}
+        {{- if $checksum }}
         checksum/config: {{ include "openvox-ca.configMapData" . | sha256sum }}
         {{- end }}
         {{- with .Values.commonAnnotations }}
@@ -130,7 +132,6 @@ spec:
               --cadir) is always replaced.
             */}}
             - --config={{ include "openvox-ca.configFilePath" . }}
-            - --verbosity={{ .Values.verbosity }}
             {{- with .Values.extraArgs }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
@@ -160,15 +161,15 @@ spec:
             {{- end }}
           {{- if .Values.livenessProbe.enabled }}
           livenessProbe:
-            {{- omit .Values.livenessProbe "enabled" | toYaml | nindent 12 }}
+            {{- include "openvox-ca.probe" (dict "probe" .Values.livenessProbe "root" $) | nindent 12 }}
           {{- end }}
           {{- if .Values.readinessProbe.enabled }}
           readinessProbe:
-            {{- omit .Values.readinessProbe "enabled" | toYaml | nindent 12 }}
+            {{- include "openvox-ca.probe" (dict "probe" .Values.readinessProbe "root" $) | nindent 12 }}
           {{- end }}
           {{- if .Values.startupProbe.enabled }}
           startupProbe:
-            {{- omit .Values.startupProbe "enabled" | toYaml | nindent 12 }}
+            {{- include "openvox-ca.probe" (dict "probe" .Values.startupProbe "root" $) | nindent 12 }}
           {{- end }}
           {{- with .Values.lifecycle }}
           lifecycle:
@@ -214,7 +215,7 @@ spec:
           {{- if .Values.persistence.enabled }}
           persistentVolumeClaim:
             claimName: {{ include "openvox-ca.pvcName" . }}
-          {{- else }}
+          {{- else if or .Values.emptyDir.medium .Values.emptyDir.sizeLimit }}
           emptyDir:
             {{- with .Values.emptyDir.medium }}
             medium: {{ . }}
@@ -222,6 +223,9 @@ spec:
             {{- with .Values.emptyDir.sizeLimit }}
             sizeLimit: {{ . }}
             {{- end }}
+          {{- else }}
+          {{- /* Both cleared: node-backed disk with no size limit. */}}
+          emptyDir: {}
           {{- end }}
         - name: config
           configMap:
