@@ -133,6 +133,44 @@ var _ = Describe("SQL schema migrations", func() {
 		})
 	})
 
+	// The floor is the only thing between a small sql_max_open_conns and a
+	// startup deadlock: the distributed locks are session-scoped, so each one
+	// held occupies a connection while the work under it needs another. A
+	// deadlock is the worst failure to find in production, and no other spec
+	// would notice the clamp disappearing — the concurrency specs run with the
+	// default pool. Both networked dialects open lazily, so these construct a
+	// backend against an unreachable DSN and never connect.
+	Describe("the connection pool floor", func() {
+		DescribeTable("raises a pool too small for the locks to hold",
+			func(d SQLDialect, dsn string) {
+				b, err := NewSQLBackend(SQLConfig{Dialect: d, DSN: dsn, MaxOpenConns: 1})
+				Expect(err).NotTo(HaveOccurred())
+				DeferCleanup(func() { _ = b.Close() })
+				Expect(b.db.Stats().MaxOpenConnections).To(Equal(sqlMinOpenConns))
+			},
+			Entry("postgres", SQLPostgres, "postgres://u:p@127.0.0.1:1/db?sslmode=disable"),
+			Entry("mysql", SQLMySQL, "u:p@tcp(127.0.0.1:1)/db"),
+		)
+
+		It("leaves a pool above the floor as configured", func() {
+			b, err := NewSQLBackend(SQLConfig{
+				Dialect:      SQLPostgres,
+				DSN:          "postgres://u:p@127.0.0.1:1/db?sslmode=disable",
+				MaxOpenConns: 25,
+			})
+			Expect(err).NotTo(HaveOccurred())
+			DeferCleanup(func() { _ = b.Close() })
+			Expect(b.db.Stats().MaxOpenConnections).To(Equal(25))
+		})
+
+		It("does not apply to SQLite, which is pinned to one connection", func() {
+			// SQLite reports ErrDistributedLockingUnsupported, so no connection
+			// is ever tied up by a lock and the single-writer pin still holds.
+			b := newSQLiteBackend()
+			Expect(b.db.Stats().MaxOpenConnections).To(Equal(1))
+		})
+	})
+
 	Describe("the inventory integrity read", func() {
 		// The startup integrity check reads the inventory before anything else
 		// touches the table. It must not depend on columns it has no use for, or

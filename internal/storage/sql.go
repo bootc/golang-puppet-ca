@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"io/fs"
+	"log/slog"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -182,6 +183,10 @@ func NewSQLBackend(cfg SQLConfig) (*SQLBackend, error) {
 		sqldb.SetMaxOpenConns(1)
 	} else {
 		if cfg.MaxOpenConns > 0 {
+			if cfg.MaxOpenConns < sqlMinOpenConns {
+				slog.Warn("Raising SQL connection limit to the minimum the distributed locks require",
+					"requested", cfg.MaxOpenConns, "effective", sqlMinOpenConns)
+			}
 			sqldb.SetMaxOpenConns(max(cfg.MaxOpenConns, sqlMinOpenConns))
 		}
 		if cfg.MaxIdleConns > 0 {
@@ -313,7 +318,15 @@ func (b *SQLBackend) EnsureReady(ctx context.Context) error {
 	unlock, lockErr := b.AcquireLock(ctx, lockNameSQLMigrate)
 	switch {
 	case lockErr == nil:
-		defer func() { _ = unlock.Unlock() }()
+		defer func() {
+			// Same treatment StorageService.WithLock gives a failed release: a
+			// lost unlock is not worth failing a successful migration over, but
+			// it must not be silent — a session-scoped lock left held is what
+			// the next start would block on.
+			if err := unlock.Unlock(); err != nil {
+				slog.Warn("Failed to release migration lock", "name", lockNameSQLMigrate, "error", err)
+			}
+		}()
 	case errors.Is(lockErr, ErrDistributedLockingUnsupported):
 		// SQLite has no distributed lock. Two processes sharing one file can
 		// still race here; the migrations are transactional and idempotent, so

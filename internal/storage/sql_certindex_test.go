@@ -114,8 +114,26 @@ func certIndexMigrationRollback(b *SQLBackend) {
 			break
 		}
 	}
+
+	// Assert the rollback actually removed something before re-applying. Every
+	// down step is guarded by dropColumnIfPresent/dropIndexIfPresent, so a
+	// catalogue query mis-scoped for this dialect would make the rollback a
+	// silent no-op, the re-apply a no-op too, and the round-trip below would
+	// still pass against a schema nothing ever touched.
+	for _, col := range certIndexColumns {
+		exists, err := columnExists(ctx, b.db, inventoryTableV1, col)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(exists).To(BeFalse(), "column %s should have been dropped by the rollback", col)
+	}
+	for _, idx := range certIndexIndices {
+		exists, err := indexExists(ctx, b.db, inventoryTableV1, idx)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(exists).To(BeFalse(), "index %s should have been dropped by the rollback", idx)
+	}
+
 	_, err := migrator.Migrate(ctx)
 	Expect(err).NotTo(HaveOccurred(), "Migrate (re-apply)")
+	expectCertIndexSchema(ctx, b)
 	certIndexRoundTrip(b)
 }
 
