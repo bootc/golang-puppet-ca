@@ -353,6 +353,16 @@ CrashLoopBackOff or a Service that silently routes nowhere.
 {{- end -}}
 
 {{/*
+  An autoscaler with no metric configured does not autoscale: it pins the
+  replica count at minReplicas and reports healthy while doing it.
+*/}}
+{{- if .Values.autoscaling.enabled -}}
+{{- if not (or .Values.autoscaling.targetCPUUtilizationPercentage .Values.autoscaling.targetMemoryUtilizationPercentage .Values.autoscaling.metrics) -}}
+{{- fail "autoscaling.enabled is set but no metric is configured, so the HorizontalPodAutoscaler would hold the replica count at minReplicas rather than scale. Set autoscaling.targetCPUUtilizationPercentage, targetMemoryUtilizationPercentage, or metrics." -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
   puppetServers and autosign.patterns are written one per line into the config
   ConfigMap. An entry containing a newline would end that block scalar early
   and inject a key of its own — and these two lists are the mTLS admin

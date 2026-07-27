@@ -1242,6 +1242,11 @@ func (Chart) Test() error {
 			wantErr:    "single non-empty line",
 		},
 		{
+			name:    "an autoscaler with no metric to act on",
+			sets:    []string{tls, "autoscaling.enabled=true", "autoscaling.targetCPUUtilizationPercentage="},
+			wantErr: "no metric is configured",
+		},
+		{
 			name:    "export RBAC bound to the namespace's default ServiceAccount",
 			sets:    []string{tls, "kubernetesExport.enabled=true", "serviceAccount.create=false"},
 			wantErr: "default ServiceAccount",

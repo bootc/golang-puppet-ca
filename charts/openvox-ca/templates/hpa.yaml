@@ -18,6 +18,11 @@ spec:
   minReplicas: {{ .Values.autoscaling.minReplicas }}
   maxReplicas: {{ .Values.autoscaling.maxReplicas }}
   metrics:
+    {{- /*
+      Guarded in openvox-ca.validate: with all three sources empty this key
+      would render as a null, and an HPA with no metric to act on holds the
+      replica count at minReplicas while looking like it autoscales.
+    */}}
     {{- with .Values.autoscaling.targetCPUUtilizationPercentage }}
     - type: Resource
       resource:
