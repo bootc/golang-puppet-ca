@@ -15,7 +15,7 @@ name: openvox-ca-backends-redis-go
 
 services:
   redis:
-    image: docker.io/redis:8.8.0-alpine@sha256:9d317178eceac8454a2284a9e6df2466b93c745529947f0cd42a0fa9609d7005
+    image: docker.io/redis:8.8.1-alpine@sha256:8096655e437712b07503796fb64d81359256cfcff0ab29d95a7da72863786efb
     ports:
       # Host 56379 -> container 6379, matching PUPPET_CA_TEST_REDIS_ADDR used by
       # the mage target. Distinct from any other compose stack's mappings.

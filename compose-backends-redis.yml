@@ -37,7 +37,7 @@ services:
 
   # -- Redis (CA storage backend) -----------------------------------------─
   redis:
-    image: docker.io/redis:8.8.0-alpine@sha256:9d317178eceac8454a2284a9e6df2466b93c745529947f0cd42a0fa9609d7005
+    image: docker.io/redis:8.8.1-alpine@sha256:8096655e437712b07503796fb64d81359256cfcff0ab29d95a7da72863786efb
     hostname: redis
     # Redis 7 default config is fine: standalone, no auth, in-memory only.
     # The integration test does not require persistence -- if the redis
