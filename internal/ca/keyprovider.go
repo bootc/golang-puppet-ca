@@ -153,7 +153,7 @@ func (c *CA) LoadOrCreateCAKey(ctx context.Context, create bool) (crypto.Signer,
 	// `csr --create-key` runs against a shared backend — and the loser would
 	// overwrite a key the winner has already sent to a parent for signing. Take
 	// the lock bootstrap uses and re-check inside it.
-	lockCtx, cancel := context.WithTimeout(ctx, lockTimeout)
+	lockCtx, cancel := context.WithTimeout(ctx, LockTimeout)
 	defer cancel()
 	var created crypto.Signer
 	if err := c.Storage.WithLock(lockCtx, lockNameBootstrap, func() error {

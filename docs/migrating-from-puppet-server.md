@@ -71,10 +71,13 @@ openvox-ca-ctl import \
   --cadir       "$NEW_CADIR" \
   --cert-bundle "$CA_CERT" \
   --private-key "$CA_KEY" \
-  --crl-chain   "$CA_CRL"
+  --crl-chain   "$CA_CRL"   # only X509 CRL blocks; anything else is refused
 
 echo "CA imported into $NEW_CADIR"
 ```
+
+This creates the directory structure, writes the CA cert/key/CRL, and
+initialises `inventory.txt` and `serial` (the serial file is written for compatibility but is not used at runtime; openvox-ca generates random serial numbers).
 
 `--cert-bundle` must be a **complete chain, ordered nearest first**: the CA's own
 certificate, each issuer after it, ending with a self-signed root. A self-signed
@@ -87,10 +90,13 @@ its own intermediate certificate. Assemble the full chain before importing:
 ```bash
 # ca_crt.pem first, then each issuer, then the root
 cat "$PUPPET_SSL/ca/ca_crt.pem" intermediate.pem root.pem > ca_chain.pem
+CA_CERT=ca_chain.pem   # re-run the import above with this
 ```
 
 Certificates only: a bundle containing the private key is rejected, because this
-file is stored world-readable and served to every agent.
+file is stored world-readable and served to every agent. Every certificate in
+the chain must also be within its validity window — an expired root is refused
+at import rather than surfacing as verification failures across the fleet.
 
 `--crl-chain` accepts a multi-CRL bundle in any order. Every `X509 CRL` block must
 parse, or the whole import is refused; PEM blocks of other types are ignored and

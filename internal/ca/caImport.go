@@ -73,20 +73,36 @@ var ErrCACertExists = errors.New("a CA certificate already exists")
 // Guidance about read-only mounts is only ever right for this one.
 var ErrCACertWrite = errors.New("writing the CA certificate")
 
+// retryHint is how a caller finishes an import that failed after the CA
+// certificate had already been written. It differs per entry point, and getting
+// it wrong is worst precisely here: the operator reads it while storage is
+// knowingly inconsistent, so a remedy their command rejects costs them a round
+// trip at the least convenient moment.
+type retryHint string
+
+const (
+	// retryWithForce suits ImportCACertificate, whose command has --force and
+	// whose existing-certificate check would otherwise refuse the re-run.
+	retryWithForce retryHint = "re-run this command with --force to finish the import"
+	// retryPlain suits ImportCA: openvox-ca-ctl import has no --force flag, and
+	// performs no existing-certificate check, so a plain re-run finishes the job.
+	retryPlain retryHint = "re-run this command to finish the import"
+)
+
 // incompleteImportError annotates a failure that happened after the CA
 // certificate was already written.
 //
 // Storage is then holding the new certificate beside a CRL — and possibly a
-// public key — belonging to the one it replaced, and nothing detects that
+// public key — belonging to whatever was there before, and nothing detects that
 // afterwards: loadCA compares the key to the certificate, and loadCRLCache
 // parses the CRL without checking who issued it. So a replica restarted in this
 // state comes up cleanly and serves a CRL no agent can verify against the CA
 // certificate it just fetched. The operator has to know to act, which means the
 // error has to say so.
-func incompleteImportError(err error) error {
-	return fmt.Errorf("%w. The CA certificate has already been replaced, so storage is "+
-		"now inconsistent: re-run this command with --force to finish the import, or run "+
-		"'openvox-ca-ctl reissue-crl' to re-sign the CRL under the new certificate", err)
+func incompleteImportError(err error, retry retryHint) error {
+	return fmt.Errorf("%w. The CA certificate has already been written, so storage is "+
+		"now inconsistent: %s, or run 'openvox-ca-ctl reissue-crl' to re-sign the CRL "+
+		"under the new certificate", err, retry)
 }
 
 // ImportCACertificate installs a CA certificate chain signed by an external
@@ -116,7 +132,7 @@ func ImportCACertificate(ctx context.Context, store *storage.StorageService, cer
 		return false, err
 	}
 
-	lockCtx, cancel := context.WithTimeout(ctx, lockTimeout)
+	lockCtx, cancel := context.WithTimeout(ctx, LockTimeout)
 	defer cancel()
 	err = store.WithLock(lockCtx, lockNameBootstrap, func() error {
 		hasCert, err := store.HasCACert(ctx)
@@ -141,7 +157,7 @@ func ImportCACertificate(ctx context.Context, store *storage.StorageService, cer
 				return err
 			}
 		}
-		return ImportCAMaterial(ctx, store, certBundlePEM, nil, crlPEM, signer, crlValidity)
+		return importCAMaterial(ctx, store, certBundlePEM, nil, crlPEM, signer, crlValidity, retryWithForce)
 	})
 	if err != nil {
 		return false, err
@@ -163,6 +179,10 @@ func ImportCACertificate(ctx context.Context, store *storage.StorageService, cer
 // crlPEM may be nil, in which case a fresh empty CRL is generated and signed
 // with signer, valid for crlValidity.
 func ImportCAMaterial(ctx context.Context, store *storage.StorageService, certBundlePEM, keyPEM, crlPEM []byte, signer crypto.Signer, crlValidity time.Duration) error {
+	return importCAMaterial(ctx, store, certBundlePEM, keyPEM, crlPEM, signer, crlValidity, retryPlain)
+}
+
+func importCAMaterial(ctx context.Context, store *storage.StorageService, certBundlePEM, keyPEM, crlPEM []byte, signer crypto.Signer, crlValidity time.Duration, retry retryHint) error {
 	// --- Parse and validate the certificate bundle ---
 	certs, err := ParseCABundle(certBundlePEM)
 	if err != nil {
@@ -228,7 +248,7 @@ func ImportCAMaterial(ctx context.Context, store *storage.StorageService, certBu
 	}
 	pubKeyPEM := pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: pubKeyBytes})
 	if err := store.SaveCAPubKey(ctx, pubKeyPEM); err != nil {
-		return incompleteImportError(fmt.Errorf("failed to write CA public key: %w", err))
+		return incompleteImportError(fmt.Errorf("failed to write CA public key: %w", err), retry)
 	}
 
 	// --- Decide and write the CRL, both under the lock ---
@@ -281,17 +301,17 @@ func ImportCAMaterial(ctx context.Context, store *storage.StorageService, certBu
 	// --- Initialise serial if absent ---
 	hasSerial, err := store.HasSerial(ctx)
 	if err != nil {
-		return fmt.Errorf("checking serial: %w", err)
+		return incompleteImportError(fmt.Errorf("checking serial: %w", err), retry)
 	}
 	if !hasSerial {
 		if err := store.WriteSerial(ctx, "0001"); err != nil {
-			return fmt.Errorf("failed to write serial: %w", err)
+			return incompleteImportError(fmt.Errorf("failed to write serial: %w", err), retry)
 		}
 	}
 
 	// --- Initialise inventory if absent ---
 	if err := store.TouchInventory(ctx); err != nil {
-		return fmt.Errorf("failed to create inventory: %w", err)
+		return incompleteImportError(fmt.Errorf("failed to create inventory: %w", err), retry)
 	}
 
 	return nil
