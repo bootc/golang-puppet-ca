@@ -856,6 +856,11 @@ func newRootCmd() *cobra.Command {
 	f.StringVar(&caKeyFile, "ca-key-file", "", "Keep the CA private key at this local path regardless of storage backend")
 	registerOpenBaoFlags(f, &obFlags)
 
+	// Offline subcommands. Cobra dispatches a known subcommand before applying
+	// the root command's Args validator, so bare "openvox-ca" still means "run
+	// the server" and cobra.NoArgs above still rejects stray arguments.
+	cmd.AddCommand(newCSRCmd())
+
 	return cmd
 }
 
