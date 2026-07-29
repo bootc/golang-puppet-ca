@@ -185,7 +185,7 @@ func (c *CA) seedSupportingState(ctx context.Context) error {
 		} else if !errors.Is(err, fs.ErrNotExist) {
 			return fmt.Errorf("re-checking CRL: %w", err)
 		}
-		crl, err := newEmptyCRL(c.CACert, c.CAKey, c.crlValidity())
+		crl, err := newEmptyCRL(c.CACert, c.CAKey, c.CRLValidityDuration())
 		if err != nil {
 			return fmt.Errorf("creating initial CRL: %w", err)
 		}
@@ -441,7 +441,7 @@ func (c *CA) bootstrapCA(ctx context.Context) error {
 	}
 
 	// Generate empty CRL.
-	crl, err := newEmptyCRL(c.CACert, c.CAKey, c.crlValidity())
+	crl, err := newEmptyCRL(c.CACert, c.CAKey, c.CRLValidityDuration())
 	if err != nil {
 		return err
 	}

@@ -860,6 +860,7 @@ func newRootCmd() *cobra.Command {
 	// the root command's Args validator, so bare "openvox-ca" still means "run
 	// the server" and cobra.NoArgs above still rejects stray arguments.
 	cmd.AddCommand(newCSRCmd())
+	cmd.AddCommand(newImportCACertCmd())
 
 	return cmd
 }

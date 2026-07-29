@@ -18,9 +18,18 @@
 package ca
 
 import (
+	"context"
+	"crypto"
+	"crypto/rand"
 	"crypto/x509"
 	"encoding/pem"
+	"errors"
 	"fmt"
+	"io/fs"
+	"math/big"
+	"time"
+
+	"github.com/voxpupuli/openvox-ca/internal/storage"
 )
 
 // ParseCABundle decodes every CERTIFICATE block in bundlePEM, in file order.
@@ -98,4 +107,50 @@ func ValidateCABundleOrder(certs []*x509.Certificate) error {
 	}
 
 	return nil
+}
+
+// ResignStoredCRL re-signs the CRL currently in storage under cert and signer,
+// preserving every revocation entry and bumping the CRL number.
+//
+// Replacing a CA certificate invalidates the stored CRL: it was signed by the
+// key being replaced and names the subject being replaced, so after the import
+// nothing can verify it and readStoredCRL's issuer check would reject it. The
+// revocations it records are still meaningful, though — they name serials this
+// CA issued — so they are carried across rather than discarded.
+//
+// Returns nil when storage holds no CRL yet, leaving the caller to generate a
+// fresh empty one.
+func ResignStoredCRL(ctx context.Context, store *storage.StorageService, cert *x509.Certificate, signer crypto.Signer, validity time.Duration) ([]byte, error) {
+	existing, err := store.GetCRL(ctx)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("reading the existing CRL: %w", err)
+	}
+	block, _ := pem.Decode(existing)
+	if block == nil {
+		return nil, fmt.Errorf("the stored CRL is not PEM-encoded")
+	}
+	old, err := x509.ParseRevocationList(block.Bytes)
+	if err != nil {
+		return nil, fmt.Errorf("parsing the existing CRL: %w", err)
+	}
+
+	next := big.NewInt(1)
+	if old.Number != nil {
+		next.Add(old.Number, big.NewInt(1))
+	}
+	now := time.Now().UTC()
+	template := &x509.RevocationList{
+		Number:                    next,
+		RevokedCertificateEntries: old.RevokedCertificateEntries,
+		ThisUpdate:                now,
+		NextUpdate:                now.Add(validity),
+	}
+	der, err := x509.CreateRevocationList(rand.Reader, template, cert, signer)
+	if err != nil {
+		return nil, fmt.Errorf("re-signing the CRL under the imported certificate: %w", err)
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "X509 CRL", Bytes: der}), nil
 }

@@ -234,6 +234,96 @@ pod only needs its own ServiceAccount bound to an OpenBao Kubernetes auth
 role; `openvox-ca` logs in and maintains its own token for as long as the
 process runs.
 
+## Running under an external root CA
+
+By default openvox-ca generates a self-signed root and issues everything from
+it. It can instead be an *intermediate* CA, with its certificate signed by an
+external root — an OpenBao PKI mount, an offline root, or any other CA — while
+its private key stays in Transit and is never exportable.
+
+Two subcommands on the `openvox-ca` binary do this. They read the server's own
+configuration, so they reach the Transit key and the configured storage backend
+exactly as the running server does.
+
+### 1. Create the key and request a certificate
+
+```console
+$ openvox-ca csr --hostname puppet.example.com --create-key --out ca-request.pem
+Certificate signing request written to ca-request.pem
+```
+
+`--create-key` creates `transit/keys/<ca_key_name>` when it does not exist. Omit
+it if you provisioned the key out of band, which is the recommended path — see
+[Provisioning the Transit key](#provisioning-the-transit-key).
+
+The request carries the same subject openvox-ca would otherwise self-sign, built
+from `hostname` and any `ca_subject_*` settings. If a CA certificate already
+exists the subject is reused verbatim instead, so re-keying reproduces the
+established name.
+
+### 2. Sign it with the parent
+
+Whatever your root is. With an OpenBao PKI mount:
+
+```console
+$ bao write -format=json pki-root/root/sign-intermediate \
+    csr=@ca-request.pem \
+    format=pem_bundle \
+    ttl=43800h | jq -r '.data.certificate' > signed.pem
+$ bao read -format=json pki-root/cert/ca | jq -r '.data.certificate' > root.pem
+$ cat signed.pem root.pem > signed-chain.pem
+```
+
+The bundle must be **nearest first**: openvox-ca's certificate, then each issuer,
+ending with the self-signed root. A partial chain is rejected — without the root
+nothing can verify the root's CRL, which is what agents need for full-chain
+revocation checking.
+
+### 3. Install the chain
+
+```console
+$ openvox-ca import-ca-cert --cert-bundle signed-chain.pem
+Imported CA certificate "Puppet CA: puppet.example.com" (2 certificates in chain)
+```
+
+The private key is never read. Instead the command proves the certificate binds
+the key Transit holds, refusing the import otherwise — a certificate this CA
+could not sign under would leave every issuance failing.
+
+### The server will not start between steps 1 and 3
+
+This is by design and is worth expecting. After `csr --create-key` the Transit
+key exists but storage has no CA certificate, which is exactly the
+disaster-recovery state `Init` refuses to bootstrap over: bootstrapping there
+would rotate the live key and invalidate every certificate already issued. The
+Deployment will crash-loop with
+
+```
+CA key provider already holds a key but the CA certificate is missing from storage
+```
+
+until `import-ca-cert` completes. Run the two steps together, or scale the
+Deployment to zero while you do.
+
+### Replacing the CA certificate later
+
+Re-keying or re-issuing under a new parent needs an ordered procedure, because
+`--force` re-signs the stored CRL and every replica caches the CA certificate
+for its process lifetime:
+
+1. `openvox-ca csr --out ca-request.pem`, and have the parent sign it.
+2. `openvox-ca import-ca-cert --cert-bundle signed-chain.pem --force`.
+3. Restart every replica. The CA certificate is read once at startup, so an
+   unrestarted replica will keep using the old one.
+
+When `ca_cert_file` mounts the certificate read-only — a Kubernetes Secret, for
+example — storage cannot be written directly. Use `--out` to validate the bundle
+and write it to a file, load that into the Secret, restart, then run
+`openvox-ca-ctl reissue-crl` to bring the CRL under the new certificate.
+`--out` and `--force` are mutually exclusive for that reason: `--out` writes no
+CRL, and moving the CRL to a certificate that is not yet installed would leave
+the CA serving a CRL that does not match itself.
+
 ## Token lifecycle
 
 `openvox-ca` proactively renews its OpenBao token before it expires, and

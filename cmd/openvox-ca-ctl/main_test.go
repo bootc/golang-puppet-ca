@@ -233,3 +233,23 @@ var _ = Describe("Global flag precedence", func() {
 			"ServerURL = %q; want the built-in default", globalServerURL)
 	})
 })
+
+var _ = Describe("import subcommand key requirement", func() {
+	It("points at openvox-ca import-ca-cert when no key file can exist", func() {
+		// A provider-held key has no PEM blob to pass. Failing with cobra's
+		// generic "required flag not set" would leave an operator looking for a
+		// file that will never exist, so the error names the command that can
+		// actually do the job.
+		//
+		// Driven through the root, which is where an operator meets it. That
+		// also pins --private-key having been un-required: a MarkFlagRequired
+		// would fail here before the handler that carries this advice runs.
+		cmd := newRootCmd()
+		var out, errOut bytes.Buffer
+		cmd.SetOut(&out)
+		cmd.SetErr(&errOut)
+		cmd.SetArgs([]string{"import", "--cadir", GinkgoT().TempDir(), "--cert-bundle", "/dev/null"})
+		err := cmd.Execute()
+		Expect(err).To(MatchError(ContainSubstring("openvox-ca import-ca-cert")))
+	})
+})
