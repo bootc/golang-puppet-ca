@@ -24,7 +24,6 @@ import (
 	"crypto"
 	"crypto/rand"
 	"crypto/x509"
-	"crypto/x509/pkix"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -355,25 +354,10 @@ func (c *CA) bootstrapCA(ctx context.Context) error {
 		return fmt.Errorf("failed to compute SubjectKeyIdentifier: %w", err)
 	}
 
-	// Build subject DN.
-	subject := pkix.Name{
-		CommonName: "Puppet CA: " + hostname,
-	}
-	if c.CASubject.Org != "" {
-		subject.Organization = []string{c.CASubject.Org}
-	}
-	if c.CASubject.OrgUnit != "" {
-		subject.OrganizationalUnit = []string{c.CASubject.OrgUnit}
-	}
-	if c.CASubject.Country != "" {
-		subject.Country = []string{c.CASubject.Country}
-	}
-	if c.CASubject.Locality != "" {
-		subject.Locality = []string{c.CASubject.Locality}
-	}
-	if c.CASubject.Province != "" {
-		subject.Province = []string{c.CASubject.Province}
-	}
+	// Build subject DN. Shared with the CSR path (see CASubjectName) so a
+	// self-signed bootstrap and a request sent to an external parent can never
+	// disagree about this CA's own name.
+	subject := CASubjectName(hostname, c.CASubject)
 
 	now := time.Now().UTC()
 

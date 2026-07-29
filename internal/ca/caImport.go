@@ -45,43 +45,68 @@ import (
 // with a generated CRL unconditionally, which destroyed both the ancestor blocks
 // and every recorded revocation.
 //
+// This is a thin wrapper over ImportCAMaterial for the case where the CA's
+// private key is a local PEM blob. When the key lives at a provider (an OpenBao
+// Transit key, a PKCS#11 token) there is no blob to pass and callers use
+// ImportCAMaterial directly with a crypto.Signer.
+//
 // This is an offline operation; no CA daemon is required.
 func ImportCA(ctx context.Context, store *storage.StorageService, certBundlePEM, keyPEM, crlPEM []byte) error {
-	// --- Parse and validate cert ---
-	block, _ := pem.Decode(certBundlePEM)
-	if block == nil {
-		return fmt.Errorf("cert-bundle does not contain a valid PEM block")
-	}
-	caCert, err := x509.ParseCertificate(block.Bytes)
-	if err != nil {
-		return fmt.Errorf("failed to parse CA cert: %w", err)
-	}
-	if !caCert.IsCA {
-		return fmt.Errorf("certificate is not a CA certificate (IsCA=false)")
-	}
-
-	// --- Parse and validate private key ---
 	keyBlock, _ := pem.Decode(keyPEM)
 	if keyBlock == nil {
 		return fmt.Errorf("private-key does not contain a valid PEM block")
 	}
-
 	caKey, err := parsePrivateKeyDER(keyBlock.Type, keyBlock.Bytes)
 	if err != nil {
 		return fmt.Errorf("failed to parse CA private key: %w", err)
 	}
 
-	// --- Verify key matches cert (algorithm-agnostic) ---
+	return ImportCAMaterial(ctx, store, certBundlePEM, keyPEM, crlPEM, caKey)
+}
+
+// ImportCAMaterial writes an externally-issued CA certificate bundle and its
+// CRL into storage, after proving that signer holds the private key the leading
+// certificate binds.
+//
+// signer is the proof, not the payload: it establishes that this CA will be
+// able to sign under the certificate being imported. keyPEM is the payload and
+// may be nil — when the key lives at a provider there is no blob to persist,
+// and passing nil skips the key write entirely while leaving every other check
+// in place. Callers holding a local key pass both; the two are redundant by
+// construction in that case, and deliberately so, because the roles differ.
+//
+// crlPEM may be nil, in which case a fresh empty CRL is generated and signed
+// with signer.
+func ImportCAMaterial(ctx context.Context, store *storage.StorageService, certBundlePEM, keyPEM, crlPEM []byte, signer crypto.Signer) error {
+	// --- Parse and validate the certificate bundle ---
+	certs, err := ParseCABundle(certBundlePEM)
+	if err != nil {
+		return fmt.Errorf("cert-bundle: %w", err)
+	}
+	if err := ValidateCABundleOrder(certs); err != nil {
+		return fmt.Errorf("cert-bundle: %w", err)
+	}
+	caCert := certs[0]
+
+	// --- SECURITY: prove the signer holds the key this certificate binds ---
+	// Without this the CA could be left in a state where it holds a certificate
+	// it cannot sign under: every issuance would fail, and every certificate
+	// already issued under the previous key would stop verifying. This is the
+	// single check that makes importing a certificate without its private key
+	// safe, so it is deliberately algorithm-agnostic (compare marshalled
+	// SubjectPublicKeyInfo) rather than type-switching.
+	// NIST 800-53: SC-12 (Cryptographic Key Establishment and Management)
 	certPubDER, err := x509.MarshalPKIXPublicKey(caCert.PublicKey)
 	if err != nil {
 		return fmt.Errorf("failed to marshal cert public key: %w", err)
 	}
-	keyPubDER, err := x509.MarshalPKIXPublicKey(caKey.Public())
+	keyPubDER, err := x509.MarshalPKIXPublicKey(signer.Public())
 	if err != nil {
-		return fmt.Errorf("failed to marshal private key's public component: %w", err)
+		return fmt.Errorf("failed to marshal signing key's public component: %w", err)
 	}
 	if !bytes.Equal(certPubDER, keyPubDER) {
-		return fmt.Errorf("private key does not match the certificate's public key")
+		return fmt.Errorf("the CA key does not match the certificate's public key: refusing to import a "+
+			"certificate this CA could not sign under (certificate subject %q)", caCert.Subject.CommonName)
 	}
 
 	// --- Ensure directories exist ---
@@ -98,22 +123,28 @@ func ImportCA(ctx context.Context, store *storage.StorageService, certBundlePEM,
 	// the authoritative decision is taken again under the CRL lock below, so
 	// that the read it depends on and the write that follows are atomic with
 	// respect to a concurrent revocation.
-	if _, _, _, err := planCRLImport(ctx, store, crlPEM, caCert, caKey); err != nil {
+	if _, _, _, err := planCRLImport(ctx, store, crlPEM, caCert, signer); err != nil {
 		return err
 	}
 
-	// --- Write CA key ---
-	if err := store.SaveCAKey(ctx, keyPEM); err != nil {
-		return fmt.Errorf("failed to write CA key: %w", err)
+	// --- Write CA key, when there is one to write ---
+	//
+	// Nil when the key lives at a provider: import-ca-cert proves the
+	// certificate binds the provider's key and never sees key material, so
+	// there is no blob to store.
+	if keyPEM != nil {
+		if err := store.SaveCAKey(ctx, keyPEM); err != nil {
+			return fmt.Errorf("failed to write CA key: %w", err)
+		}
 	}
 
-	// --- Write CA cert ---
+	// --- Write CA cert (the whole bundle, root last) ---
 	if err := store.SaveCACert(ctx, certBundlePEM); err != nil {
 		return fmt.Errorf("failed to write CA cert: %w", err)
 	}
 
 	// --- Write CA public key ---
-	pubKeyBytes, err := x509.MarshalPKIXPublicKey(caKey.Public())
+	pubKeyBytes, err := x509.MarshalPKIXPublicKey(signer.Public())
 	if err == nil {
 		pubKeyPEM := pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: pubKeyBytes})
 		_ = store.SaveCAPubKey(ctx, pubKeyPEM)
@@ -139,7 +170,7 @@ func ImportCA(ctx context.Context, store *storage.StorageService, certBundlePEM,
 	lockCtx, cancel := context.WithTimeout(ctx, LockTimeout)
 	defer cancel()
 	if err := store.WithLock(lockCtx, lockNameCRL, func() error {
-		plan, superseded, changed, err := planCRLImport(ctx, store, crlPEM, caCert, caKey)
+		plan, superseded, changed, err := planCRLImport(ctx, store, crlPEM, caCert, signer)
 		if err != nil {
 			return err
 		}
