@@ -73,6 +73,22 @@ var ErrCACertExists = errors.New("a CA certificate already exists")
 // Guidance about read-only mounts is only ever right for this one.
 var ErrCACertWrite = errors.New("writing the CA certificate")
 
+// incompleteImportError annotates a failure that happened after the CA
+// certificate was already written.
+//
+// Storage is then holding the new certificate beside a CRL — and possibly a
+// public key — belonging to the one it replaced, and nothing detects that
+// afterwards: loadCA compares the key to the certificate, and loadCRLCache
+// parses the CRL without checking who issued it. So a replica restarted in this
+// state comes up cleanly and serves a CRL no agent can verify against the CA
+// certificate it just fetched. The operator has to know to act, which means the
+// error has to say so.
+func incompleteImportError(err error) error {
+	return fmt.Errorf("%w. The CA certificate has already been replaced, so storage is "+
+		"now inconsistent: re-run this command with --force to finish the import, or run "+
+		"'openvox-ca-ctl reissue-crl' to re-sign the CRL under the new certificate", err)
+}
+
 // ImportCACertificate installs a CA certificate chain signed by an external
 // parent, for a CA whose private key is held elsewhere — a Transit key, a
 // PKCS#11 token, or a local blob this function never touches.
@@ -194,6 +210,13 @@ func ImportCAMaterial(ctx context.Context, store *storage.StorageService, certBu
 	// --- Write CA cert (the whole bundle, root last) ---
 	// Re-encoded from the parsed chain rather than passed through, so what is
 	// stored and served is exactly what was validated. The DER is unchanged.
+	//
+	// This is the point of no return. Everything after it can still fail, and a
+	// failure then leaves storage holding the new certificate beside material
+	// signed under the old one — a state nothing detects on the next start,
+	// because loadCA only checks key-against-certificate and loadCRLCache does
+	// not verify the CRL's issuer at all. So every later error is annotated
+	// with what already landed and what fixes it; see incompleteImportError.
 	if err := store.SaveCACert(ctx, EncodeCABundle(certs)); err != nil {
 		return fmt.Errorf("%w: %w", ErrCACertWrite, err)
 	}
@@ -205,7 +228,7 @@ func ImportCAMaterial(ctx context.Context, store *storage.StorageService, certBu
 	}
 	pubKeyPEM := pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: pubKeyBytes})
 	if err := store.SaveCAPubKey(ctx, pubKeyPEM); err != nil {
-		return fmt.Errorf("failed to write CA public key: %w", err)
+		return incompleteImportError(fmt.Errorf("failed to write CA public key: %w", err))
 	}
 
 	// --- Decide and write the CRL, both under the lock ---
