@@ -224,6 +224,41 @@ var _ = Describe("KeyProvider integration", func() {
 		Expect(hasCert).To(BeFalse(), "no CA certificate should have been bootstrapped over the existing key")
 	})
 
+	// The same guarantee for the default configuration, where the key is a
+	// local PEM blob and no provider is involved at all. This is the state
+	// "openvox-ca csr --create-key" leaves behind while the parent CA signs:
+	// bootstrapping over it destroys the key the outstanding request is bound
+	// to, and the signed chain that comes back can then never be imported.
+	It("does not bootstrap over a local key left by an outstanding signing request", func() {
+		ctx := context.Background()
+		localStore := storage.New(GinkgoT().TempDir())
+
+		pending := ca.New(localStore, asCfg, "puppet.test")
+		pending.CAKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
+		csrPEM, err := pending.BuildCSR(ctx, "puppet.test", true)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(csrPEM).NotTo(BeEmpty())
+
+		before, err := localStore.GetCAKey(ctx)
+		Expect(err).NotTo(HaveOccurred())
+
+		// A server start in the window before the signed chain comes back.
+		restarted := ca.New(localStore, asCfg, "puppet.test")
+		restarted.CAKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
+		err = restarted.Init(ctx)
+		Expect(err).To(HaveOccurred(), "Init must not bootstrap over a key with no certificate")
+		Expect(err).To(MatchError(ContainSubstring("import-ca-cert")),
+			"the error should name the command that resolves the state")
+
+		after, err := localStore.GetCAKey(ctx)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(after).To(Equal(before), "the key bound to the outstanding request must be untouched")
+
+		hasCert, err := localStore.HasCACert(ctx)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(hasCert).To(BeFalse())
+	})
+
 	It("rejects a CA configured with both ExternalSigner and KeyProvider", func() {
 		externalKey, err := rsa.GenerateKey(rand.Reader, 2048)
 		Expect(err).NotTo(HaveOccurred())

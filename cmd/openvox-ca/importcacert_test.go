@@ -97,6 +97,8 @@ var _ = Describe("openvox-ca import-ca-cert", func() {
 		Expect(os.WriteFile(emptyCf, []byte("{}\n"), 0o644)).To(Succeed())
 		GinkgoT().Setenv("PUPPET_CA_CONFIG", emptyCf)
 
+		clearServerEnv()
+
 		var err error
 		chain, err = testutil.GenerateTestChain("unused.example.com")
 		Expect(err).NotTo(HaveOccurred())
@@ -172,11 +174,14 @@ var _ = Describe("openvox-ca import-ca-cert", func() {
 		Expect(err).To(MatchError(ContainSubstring("already exists")))
 	})
 
-	It("re-signs the CRL when --force replaces a certificate", func() {
+	It("re-signs the CRL when --force replaces a certificate, keeping revocations", func() {
 		// The stored CRL was signed by the subject being replaced; after the
-		// import nothing could verify it unless it is re-signed.
+		// import nothing could verify it unless it is re-signed. The entries
+		// name serials this CA issued and must survive: dropping them would
+		// silently un-revoke every node already revoked.
 		bootstrapCAInDir(caDir, "puppet.example.com")
 		store := storage.New(caDir)
+		revokeInDir(caDir, "node1.example.com")
 		before, err := store.GetCRL(context.Background())
 		Expect(err).NotTo(HaveOccurred())
 
@@ -185,20 +190,56 @@ var _ = Describe("openvox-ca import-ca-cert", func() {
 		signed := signCSRAsParent([]byte(csrPEM), chain.RootCert, chain.RootKey, chain.RootPEM)
 		Expect(os.WriteFile(bundle, signed, 0o644)).To(Succeed())
 
-		_, err = runImport("--cadir", caDir, "--cert-bundle", bundle, "--force")
+		msg, err := runImport("--cadir", caDir, "--cert-bundle", bundle, "--force")
 		Expect(err).NotTo(HaveOccurred())
+		Expect(msg).To(ContainSubstring("restart every replica"))
 
 		after, err := store.GetCRL(context.Background())
 		Expect(err).NotTo(HaveOccurred())
 		Expect(after).NotTo(Equal(before))
 
-		// It verifies under the newly imported certificate.
+		// It verifies under the newly imported certificate, and still revokes.
 		myCA := ca.New(store, ca.AutosignConfig{Mode: "off"}, "puppet.example.com")
 		Expect(myCA.Init(context.Background())).To(Succeed())
 		block, _ := pem.Decode(after)
 		crl, err := x509.ParseRevocationList(block.Bytes)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(crl.CheckSignatureFrom(myCA.CACert)).To(Succeed())
+		Expect(crl.RevokedCertificateEntries).To(HaveLen(1))
+	})
+
+	It("refuses a bundle that does not bind the CA key under --out", func() {
+		// --out is the read-only-Secret path: without the key-binding proof
+		// here, a wrong bundle is discovered only after it has rolled out to
+		// every replica, with the previous certificate already overwritten.
+		_, err := runCSR("--cadir", caDir, "--hostname", "puppet.example.com", "--create-key")
+		Expect(err).NotTo(HaveOccurred())
+
+		Expect(os.WriteFile(bundle, chain.Bundle, 0o644)).To(Succeed())
+		validated := filepath.Join(caDir, "validated.pem")
+		_, err = runImport("--cadir", caDir, "--cert-bundle", bundle, "--out", validated)
+		Expect(err).To(MatchError(ContainSubstring("does not match the certificate's public key")))
+
+		// And nothing was written: a file that exists reads as success.
+		_, statErr := os.Stat(validated)
+		Expect(os.IsNotExist(statErr)).To(BeTrue())
+	})
+
+	It("refuses a bundle carrying the CA private key", func() {
+		// The stored certificate is world-readable and served unauthenticated,
+		// so a pem_bundle export that includes the key must not get through.
+		_, err := runCSR("--cadir", caDir, "--hostname", "puppet.example.com", "--create-key")
+		Expect(err).NotTo(HaveOccurred())
+
+		withKey := append(append([]byte{}, chain.InterKeyPEM...), chain.Bundle...)
+		Expect(os.WriteFile(bundle, withKey, 0o600)).To(Succeed())
+		_, err = runImport("--cadir", caDir, "--cert-bundle", bundle)
+		Expect(err).To(MatchError(ContainSubstring("PRIVATE KEY")))
+	})
+
+	It("reports a missing bundle file rather than panicking", func() {
+		_, err := runImport("--cadir", caDir, "--cert-bundle", filepath.Join(caDir, "absent.pem"))
+		Expect(err).To(MatchError(ContainSubstring("reading --cert-bundle")))
 	})
 
 	It("rejects --out together with --force", func() {

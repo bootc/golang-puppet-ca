@@ -19,6 +19,14 @@ package ca_test
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
+	"math/big"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -27,6 +35,30 @@ import (
 	"github.com/voxpupuli/openvox-ca/internal/storage"
 	"github.com/voxpupuli/openvox-ca/internal/testutil"
 )
+
+// caCertWithKeyUsage builds a single self-signed CA certificate carrying ku,
+// as a one-element chain ValidateCABundleOrder will accept structurally. A ku
+// of zero omits the extension entirely.
+func caCertWithKeyUsage(ku x509.KeyUsage) []*x509.Certificate {
+	GinkgoHelper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	Expect(err).NotTo(HaveOccurred())
+
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "Profile Test CA"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+		KeyUsage:              ku,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	Expect(err).NotTo(HaveOccurred())
+	cert, err := x509.ParseCertificate(der)
+	Expect(err).NotTo(HaveOccurred())
+	return []*x509.Certificate{cert}
+}
 
 var _ = Describe("CA bundle parsing and ordering", func() {
 	var chain *testutil.TestChain
@@ -46,17 +78,28 @@ var _ = Describe("CA bundle parsing and ordering", func() {
 			Expect(certs[1].Subject.CommonName).To(Equal("Test Root CA"))
 		})
 
-		It("skips non-certificate blocks rather than failing", func() {
-			// A key block alongside the certificates must not break the parse:
-			// operators paste bundles exported by other tools.
-			mixed := append(append([]byte{}, chain.InterKeyPEM...), chain.Bundle...)
-			certs, err := ca.ParseCABundle(mixed)
+		It("skips harmless non-certificate blocks rather than failing", func() {
+			// Operators paste bundles exported by other tools, which carry
+			// commentary and sometimes unrelated PEM. Nothing there is a secret.
+			noise := []byte("-----BEGIN CERTIFICATE REQUEST-----\nZm9v\n-----END CERTIFICATE REQUEST-----\n")
+			certs, err := ca.ParseCABundle(append(noise, chain.Bundle...))
 			Expect(err).NotTo(HaveOccurred())
 			Expect(certs).To(HaveLen(2))
 		})
 
+		It("rejects a bundle carrying a private key", func() {
+			// The shape `bao write pki/intermediate/generate/exported
+			// format=pem_bundle` produces. The CA certificate is stored 0644 and
+			// served unauthenticated, so a key that parsed through would be
+			// published to anything that can reach GET /certificate/ca.
+			mixed := append(append([]byte{}, chain.InterKeyPEM...), chain.Bundle...)
+			_, err := ca.ParseCABundle(mixed)
+			Expect(err).To(MatchError(ContainSubstring("PRIVATE KEY")))
+			Expect(err).To(MatchError(ContainSubstring("world-readable")))
+		})
+
 		It("rejects input with no certificates", func() {
-			_, err := ca.ParseCABundle(chain.InterKeyPEM)
+			_, err := ca.ParseCABundle([]byte("no PEM here\n"))
 			Expect(err).To(MatchError(ContainSubstring("no CERTIFICATE blocks")))
 		})
 
@@ -107,6 +150,35 @@ var _ = Describe("CA bundle parsing and ordering", func() {
 			Expect(ca.ValidateCABundleOrder(nil)).To(MatchError(ContainSubstring("no certificates")))
 		})
 
+		It("rejects a first certificate whose KeyUsage omits keyCertSign", func() {
+			// A parent signing with the wrong profile yields a certificate that
+			// installs cleanly and then cannot issue anything a conforming
+			// verifier accepts — discovered fleet-wide rather than at import.
+			certs := caCertWithKeyUsage(x509.KeyUsageCRLSign)
+			Expect(ca.ValidateCABundleOrder(certs)).To(MatchError(ContainSubstring("without keyCertSign")))
+		})
+
+		It("rejects a first certificate whose KeyUsage omits cRLSign", func() {
+			certs := caCertWithKeyUsage(x509.KeyUsageCertSign)
+			Expect(ca.ValidateCABundleOrder(certs)).To(MatchError(ContainSubstring("without cRLSign")))
+		})
+
+		It("accepts a first certificate with no KeyUsage extension at all", func() {
+			// RFC 5280 leaves an absent extension unconstrained; only a present
+			// extension that omits the bit is a refusal.
+			Expect(ca.ValidateCABundleOrder(caCertWithKeyUsage(0))).To(Succeed())
+		})
+
+		It("accepts pathlen:0, which is the correct profile for this CA", func() {
+			// pathlen:0 permits issuing end-entity certificates and forbids
+			// issuing further CAs. openvox-ca issues only end-entity
+			// certificates, so this is a well-formed sub-CA, not a fault.
+			certs := caCertWithKeyUsage(x509.KeyUsageCertSign | x509.KeyUsageCRLSign)
+			certs[0].MaxPathLen = 0
+			certs[0].MaxPathLenZero = true
+			Expect(ca.ValidateCABundleOrder(certs)).To(Succeed())
+		})
+
 		It("rejects a chain whose links do not verify", func() {
 			// Two unrelated roots concatenated: ordered plausibly, cryptographically
 			// unrelated.
@@ -117,6 +189,117 @@ var _ = Describe("CA bundle parsing and ordering", func() {
 			Expect(err).NotTo(HaveOccurred())
 			err = ca.ValidateCABundleOrder(certs)
 			Expect(err).To(MatchError(ContainSubstring("is not signed by certificate")))
+		})
+	})
+
+	Describe("EncodeCABundle", func() {
+		It("round-trips a chain with byte-identical DER", func() {
+			// The property that makes re-encoding on the way to storage safe:
+			// only PEM commentary is lost, never certificate content.
+			certs, err := ca.ParseCABundle(chain.Bundle)
+			Expect(err).NotTo(HaveOccurred())
+
+			again, err := ca.ParseCABundle(ca.EncodeCABundle(certs))
+			Expect(err).NotTo(HaveOccurred())
+			Expect(again).To(HaveLen(2))
+			Expect(again[0].Raw).To(Equal(certs[0].Raw))
+			Expect(again[1].Raw).To(Equal(certs[1].Raw))
+		})
+	})
+
+	Describe("ResignStoredCRL", func() {
+		var (
+			ctx   context.Context
+			store *storage.StorageService
+			myCA  *ca.CA
+		)
+
+		BeforeEach(func() {
+			ctx = context.Background()
+			store = storage.New(GinkgoT().TempDir())
+			myCA = ca.New(store, ca.AutosignConfig{Mode: "off"}, "puppet.example.com")
+			myCA.CAKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
+			Expect(myCA.Init(ctx)).To(Succeed())
+		})
+
+		It("carries every revocation entry across", func() {
+			// The entries name serials this CA issued and stay meaningful under
+			// a new certificate. Dropping them would silently un-revoke a node.
+			res, err := myCA.Generate(ctx, "node1.example.com", nil)
+			Expect(err).NotTo(HaveOccurred())
+			certBlock, _ := pem.Decode(res.CertificatePEM)
+			issued, err := x509.ParseCertificate(certBlock.Bytes)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(myCA.Revoke(ctx, "node1.example.com")).To(Succeed())
+
+			out, err := ca.ResignStoredCRL(ctx, store, myCA.CACert, myCA.CAKey, time.Hour)
+			Expect(err).NotTo(HaveOccurred())
+
+			block, _ := pem.Decode(out)
+			Expect(block).NotTo(BeNil())
+			crl, err := x509.ParseRevocationList(block.Bytes)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(crl.RevokedCertificateEntries).To(HaveLen(1))
+			Expect(crl.RevokedCertificateEntries[0].SerialNumber).To(Equal(issued.SerialNumber))
+		})
+
+		It("bumps the CRL number and honours the supplied validity", func() {
+			before, err := store.GetCRL(ctx)
+			Expect(err).NotTo(HaveOccurred())
+			beforeBlock, _ := pem.Decode(before)
+			old, err := x509.ParseRevocationList(beforeBlock.Bytes)
+			Expect(err).NotTo(HaveOccurred())
+
+			out, err := ca.ResignStoredCRL(ctx, store, myCA.CACert, myCA.CAKey, 90*time.Minute)
+			Expect(err).NotTo(HaveOccurred())
+			block, _ := pem.Decode(out)
+			crl, err := x509.ParseRevocationList(block.Bytes)
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(crl.Number.Cmp(old.Number)).To(Equal(1))
+			Expect(crl.NextUpdate.Sub(crl.ThisUpdate)).To(BeNumerically("~", 90*time.Minute, time.Minute))
+		})
+
+		It("returns nil when storage holds no CRL, leaving the caller to generate one", func() {
+			empty := storage.New(GinkgoT().TempDir())
+			out, err := ca.ResignStoredCRL(ctx, empty, myCA.CACert, myCA.CAKey, time.Hour)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(out).To(BeNil())
+		})
+
+		It("fails rather than discarding a stored CRL it cannot parse", func() {
+			Expect(store.UpdateCRL(ctx, []byte("not PEM at all\n"))).To(Succeed())
+			_, err := ca.ResignStoredCRL(ctx, store, myCA.CACert, myCA.CAKey, time.Hour)
+			Expect(err).To(MatchError(ContainSubstring("not PEM-encoded")))
+		})
+
+		It("fails on a PEM block that is not a parseable CRL", func() {
+			Expect(store.UpdateCRL(ctx, []byte("-----BEGIN X509 CRL-----\nZm9v\n-----END X509 CRL-----\n"))).To(Succeed())
+			_, err := ca.ResignStoredCRL(ctx, store, myCA.CACert, myCA.CAKey, time.Hour)
+			Expect(err).To(MatchError(ContainSubstring("parsing the existing CRL")))
+		})
+	})
+
+	Describe("AssertSignerMatchesCert", func() {
+		It("accepts a signer holding the certificate's key", func() {
+			store := storage.New(GinkgoT().TempDir())
+			myCA := ca.New(store, ca.AutosignConfig{Mode: "off"}, "puppet.example.com")
+			myCA.CAKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
+			Expect(myCA.Init(context.Background())).To(Succeed())
+
+			Expect(ca.AssertSignerMatchesCert(myCA.CACert, myCA.CAKey)).To(Succeed())
+		})
+
+		It("rejects a signer holding any other key", func() {
+			store := storage.New(GinkgoT().TempDir())
+			myCA := ca.New(store, ca.AutosignConfig{Mode: "off"}, "puppet.example.com")
+			myCA.CAKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
+			Expect(myCA.Init(context.Background())).To(Succeed())
+
+			other, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+			Expect(err).NotTo(HaveOccurred())
+			err = ca.AssertSignerMatchesCert(myCA.CACert, other)
+			Expect(err).To(MatchError(ContainSubstring("does not match the certificate's public key")))
 		})
 	})
 

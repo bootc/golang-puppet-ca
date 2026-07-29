@@ -18,6 +18,7 @@
 package main
 
 import (
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"os"
@@ -101,7 +102,10 @@ for deployments where the CA certificate is mounted read-only from outside
 			myCA.KeyProvider = rt.KeyProvider
 
 			// Validate before touching anything, so --out and a real import
-			// apply exactly the same checks.
+			// apply exactly the same checks. The key-binding proof is part of
+			// that: --out exists for read-only Secret mounts, where a bundle
+			// that does not bind this CA's key is otherwise discovered only
+			// after it has rolled out to every replica.
 			certs, err := ca.ParseCABundle(bundlePEM)
 			if err != nil {
 				return fmt.Errorf("--cert-bundle: %w", err)
@@ -118,40 +122,28 @@ for deployments where the CA certificate is mounted read-only from outside
 				}
 				return err
 			}
+			if err := ca.AssertSignerMatchesCert(certs[0], signer); err != nil {
+				return err
+			}
 
 			if outFile != "" {
-				return writeValidatedBundle(cmd, outFile, bundlePEM, certs[0].Subject.CommonName)
+				return writeValidatedBundle(cmd, outFile, certs)
 			}
 
-			hasCert, err := rt.Store.HasCACert(cmd.Context())
+			replaced, err := ca.ImportCACertificate(cmd.Context(), rt.Store, bundlePEM, signer,
+				myCA.CRLValidityDuration(), force)
 			if err != nil {
-				return fmt.Errorf("checking for an existing CA certificate: %w", err)
-			}
-			if hasCert && !force {
-				return fmt.Errorf("a CA certificate already exists: refusing to replace it, because every " +
-					"certificate issued under the current one stops verifying if the replacement does not " +
-					"chain to it. Pass --force if that is intended")
-			}
-
-			// --force always re-signs the CRL. The stored one was signed by the
-			// key being replaced and names the subject being replaced; whether
-			// this import is a re-key, a re-subject or both, nothing can verify
-			// it afterwards. Revocation entries are carried across.
-			var crlPEM []byte
-			if hasCert {
-				crlPEM, err = ca.ResignStoredCRL(cmd.Context(), rt.Store, certs[0], signer, myCA.CRLValidityDuration())
-				if err != nil {
-					return err
-				}
-			}
-
-			if err := ca.ImportCAMaterial(cmd.Context(), rt.Store, bundlePEM, nil, crlPEM, signer); err != nil {
 				return annotateOverlayWriteError(err, cfg)
 			}
 
-			_, err = fmt.Fprintf(cmd.ErrOrStderr(),
-				"Imported CA certificate %q (%d certificates in chain)\n",
+			msg := fmt.Sprintf("Imported CA certificate %q (%d certificates in chain)\n",
 				certs[0].Subject.CommonName, len(certs))
+			if replaced {
+				// The CA certificate is read once at startup, so a running
+				// replica keeps serving under the certificate it replaced.
+				msg += "The previous CA certificate was replaced: restart every replica before it issues again.\n"
+			}
+			_, err = fmt.Fprint(cmd.ErrOrStderr(), msg)
 			return err
 		},
 	}
@@ -167,30 +159,41 @@ for deployments where the CA certificate is mounted read-only from outside
 	return cmd
 }
 
-// writeValidatedBundle writes an already-validated bundle to path.
-func writeValidatedBundle(cmd *cobra.Command, path string, bundlePEM []byte, cn string) error {
+// writeValidatedBundle writes an already-validated chain to path.
+//
+// The chain is re-encoded rather than the operator's file copied through, so
+// what lands in the Secret is exactly what was validated — same DER, no PEM
+// commentary and nothing that was skipped on the way in.
+func writeValidatedBundle(cmd *cobra.Command, path string, certs []*x509.Certificate) error {
 	// G703: path is the operator's own --out argument on an offline command they
 	// are running deliberately, and the content is a certificate chain that has
 	// already been fully validated. There is no privilege boundary to cross:
 	// constraining where an operator may write their own file would add nothing.
-	if err := os.WriteFile(path, bundlePEM, storage.FilePermPublic); err != nil { //nolint:gosec // G703: operator-supplied --out path on an offline command
+	if err := os.WriteFile(path, ca.EncodeCABundle(certs), storage.FilePermPublic); err != nil { //nolint:gosec // G703: operator-supplied --out path on an offline command
 		return fmt.Errorf("writing %s: %w", path, err)
+	}
+	if err := os.Chmod(path, storage.FilePermPublic); err != nil {
+		return fmt.Errorf("setting permissions on %s: %w", path, err)
 	}
 	_, err := fmt.Fprintf(cmd.ErrOrStderr(),
 		"Validated CA certificate %q written to %s (not installed; load it into the configured ca_cert_file)\n",
-		cn, path)
+		certs[0].Subject.CommonName, path)
 	return err
 }
 
-// annotateOverlayWriteError appends guidance when a write failed and the CA
-// certificate is overlaid onto a local path.
+// annotateOverlayWriteError appends guidance when writing the CA certificate
+// failed and that certificate is overlaid onto a local path.
 //
-// The trigger is the configuration, not a filesystem probe: an overlay onto a
-// writable path is a supported configuration and must not be pre-emptively
-// refused. So the write is attempted, and only its failure is annotated — the
-// predicate cannot be wrong about writability because it never guesses.
+// It keys on ErrCACertWrite, not on any import failure: the remedy it names —
+// re-run with --out and load the result out of band — is right only for a
+// certificate blob that could not be written, and is actively misleading for a
+// key mismatch or a bad CRL, neither of which --out would fix.
+//
+// Writability itself is never guessed at. An overlay onto a writable path is a
+// supported configuration and must not be pre-emptively refused, so the write
+// is attempted and only its failure is annotated.
 func annotateOverlayWriteError(err error, cfg *serverConfig) error {
-	if err == nil || cfg.CACertFile == "" {
+	if err == nil || cfg.CACertFile == "" || !errors.Is(err, ca.ErrCACertWrite) {
 		return err
 	}
 	return fmt.Errorf("%w\n\nThe CA certificate is overlaid onto %s. If that path is read-only "+

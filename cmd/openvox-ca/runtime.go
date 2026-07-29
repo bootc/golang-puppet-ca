@@ -37,8 +37,6 @@ import (
 // is the failure mode openvox-ca-ctl already has (it can only ever address a
 // local filesystem directory).
 type caRuntime struct {
-	// AbsCADir is the resolved, absolute cadir.
-	AbsCADir string
 	// Store is the storage service for the configured backend.
 	Store *storage.StorageService
 	// KeyProvider is non-nil only when ca_key_provider names one. A nil
@@ -87,7 +85,7 @@ func resolveRuntime(ctx context.Context, cfg *serverConfig, withKeyProvider bool
 		return nil, err
 	}
 
-	rt := &caRuntime{AbsCADir: absCADir}
+	rt := &caRuntime{}
 
 	backendSpec, err := buildBackendSpec(cfg, absCADir)
 	if err != nil {

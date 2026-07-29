@@ -131,6 +131,9 @@ openvox-ca-ctl import \
                                # revocation checking. Every X509 CRL block must
                                # parse; other PEM block types are ignored and
                                # not stored.
+# The bundle must be a complete chain, nearest first, ending at a self-signed
+# root. If the CA's key is held by a provider rather than a file, there is no
+# --private-key to pass: use `openvox-ca import-ca-cert` instead (below).
 
 # Migrate an entire CA between storage backends offline (any pair of backends:
 # filesystem, sqlite, postgres, mysql, etcd, redis/valkey). Each backend is
@@ -154,6 +157,11 @@ is in PostgreSQL or whose key is in OpenBao Transit.
 
 Neither needs a running server.
 
+Both read the **server's** configuration, not `openvox-ca-ctl`'s: `--config`, or
+`PUPPET_CA_CONFIG`, defaulting to `/etc/puppet-ca/config.yaml`. A working
+`ctl.yaml` has no effect on them. `--cadir` overrides the configured storage
+directory for a one-off run.
+
 ```bash
 # Emit a certificate signing request for the CA's own key, for an external
 # parent CA to sign. Works for every ca_key_provider.
@@ -166,23 +174,41 @@ openvox-ca csr --hostname puppet.example.com --create-key --out ca-request.pem
 openvox-ca import-ca-cert --cert-bundle signed-chain.pem
 ```
 
-`csr` reuses an existing CA certificate's subject verbatim, so re-keying
-reproduces the established distinguished name exactly. When no certificate
-exists yet it builds the name from `hostname` and the `ca_subject_*` settings —
+`csr` reuses an existing CA certificate's subject verbatim — the encoded DN is
+carried across byte for byte, so re-issuance reproduces the established name
+exactly, including attributes the `ca_subject_*` settings cannot express. When
+no certificate exists yet it builds the name from `hostname` and those settings —
 the same name a self-signed bootstrap would use — and refuses if `hostname` is
 unset rather than guessing, because the request is about to be signed by a third
 party.
 
+`--create-key` creates the CA key when it does not exist, and never replaces one
+that does. Between `csr --create-key` and `import-ca-cert` the CA has a key but
+no certificate, and **the server will refuse to start** in that window rather
+than bootstrap over the key your parent CA is in the middle of signing. This
+holds for every `ca_key_provider`, including the default. Run the two steps
+together, or stop the service while you do.
+
 `import-ca-cert` requires a **complete chain, nearest first**: this CA's own
-certificate, each issuer after it, ending with a self-signed root. It never
-reads the private key; instead it proves the certificate binds the key the
-configured provider holds, which is what makes importing without a key file
-safe. Use `--force` to replace an existing CA certificate — it re-signs the
-stored CRL, which the replacement would otherwise invalidate.
+certificate, each issuer after it, ending with a self-signed root. Supply only
+certificates; a bundle carrying a private key is rejected, because this file is
+stored world-readable and served to every agent.
+
+The command never needs the private key *material*: it proves the certificate
+binds the key the configured `ca_key_provider` holds, which is what makes
+importing without a key file safe. With the default `file` provider that means
+reading the key from storage (and decrypting it, if `encrypt_ca_key` is set);
+with OpenBao Transit the key never leaves the vault and only its public
+component is compared.
+
+Use `--force` to replace an existing CA certificate — it re-signs the stored
+CRL, which the replacement would otherwise invalidate, and reminds you to
+restart every replica afterwards.
 
 When the CA certificate is mounted read-only from outside (`ca_cert_file`
-pointing at a Kubernetes Secret, say), `--out` validates the bundle and writes
-it to a file instead of to storage, for loading into the Secret out of band.
+pointing at a Kubernetes Secret, say), `--out` validates the bundle — including
+the key-binding proof — and writes it to a file instead of to storage, for
+loading into the Secret out of band.
 
 See [running under an external root CA](openbao-transit.md#running-under-an-external-root-ca)
 for the end-to-end procedure.

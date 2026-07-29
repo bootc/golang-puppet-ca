@@ -84,17 +84,12 @@ identically whether the key is a local PEM file or lives in OpenBao Transit.`,
 			}
 			myCA.KeyProvider = rt.KeyProvider
 
-			key, err := myCA.LoadOrCreateCAKey(cmd.Context(), createKey)
+			csrPEM, err := myCA.BuildCSR(cmd.Context(), cfg.Hostname, createKey)
 			if err != nil {
 				if errors.Is(err, ca.ErrKeyProviderKeyNotFound) {
 					return fmt.Errorf("no CA key exists yet: pass --create-key to create one, "+
 						"or provision it out of band first: %w", err)
 				}
-				return err
-			}
-
-			csrPEM, err := myCA.BuildCSR(cmd.Context(), key, cfg.Hostname)
-			if err != nil {
 				return err
 			}
 
@@ -104,9 +99,15 @@ identically whether the key is a local PEM file or lives in OpenBao Transit.`,
 			}
 			// 0644: a certificate signing request is public by construction —
 			// a subject and a public key — and is about to be handed to a third
-			// party. Restricting it would imply a confidentiality it does not have.
+			// party. Restricting it would imply a confidentiality it does not
+			// have. Chmod after the write because os.WriteFile applies the
+			// umask, so the mode is otherwise whatever the shell happened to
+			// have set; the storage layer does the same for the same reason.
 			if err := os.WriteFile(outFile, csrPEM, storage.FilePermPublic); err != nil {
 				return fmt.Errorf("writing %s: %w", outFile, err)
+			}
+			if err := os.Chmod(outFile, storage.FilePermPublic); err != nil {
+				return fmt.Errorf("setting permissions on %s: %w", outFile, err)
 			}
 			_, err = fmt.Fprintf(cmd.ErrOrStderr(), "Certificate signing request written to %s\n", outFile)
 			return err

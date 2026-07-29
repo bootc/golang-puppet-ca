@@ -26,6 +26,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 )
 
@@ -148,21 +149,52 @@ func (c *CA) LoadOrCreateCAKey(ctx context.Context, create bool) (crypto.Signer,
 		return nil, fmt.Errorf("%w: no CA key in storage", ErrKeyProviderKeyNotFound)
 	}
 
-	key, err := generateKey(keyCfg)
-	if err != nil {
-		return nil, fmt.Errorf("generating CA key: %w", err)
-	}
-	keyPEM, err := c.marshalCAKeyForStorage(key)
-	if err != nil {
+	// Creating the key is a storage mutation two operators can race — two
+	// `csr --create-key` runs against a shared backend — and the loser would
+	// overwrite a key the winner has already sent to a parent for signing. Take
+	// the lock bootstrap uses and re-check inside it.
+	lockCtx, cancel := context.WithTimeout(ctx, lockTimeout)
+	defer cancel()
+	var created crypto.Signer
+	if err := c.Storage.WithLock(lockCtx, lockNameBootstrap, func() error {
+		hasKey, err := c.Storage.HasCAKey(ctx)
+		if err != nil {
+			return fmt.Errorf("checking for an existing CA key: %w", err)
+		}
+		if hasKey {
+			return nil
+		}
+		key, err := generateKey(keyCfg)
+		if err != nil {
+			return fmt.Errorf("generating CA key: %w", err)
+		}
+		keyPEM, err := c.marshalCAKeyForStorage(key)
+		if err != nil {
+			return err
+		}
+		if err := c.Storage.EnsureDirs(ctx); err != nil {
+			return fmt.Errorf("creating CA directories: %w", err)
+		}
+		if err := c.Storage.SaveCAKey(ctx, keyPEM); err != nil {
+			return fmt.Errorf("writing CA key: %w", err)
+		}
+		created = key
+		return nil
+	}); err != nil {
 		return nil, err
 	}
-	if err := c.Storage.EnsureDirs(ctx); err != nil {
-		return nil, fmt.Errorf("creating CA directories: %w", err)
+	if created != nil {
+		return created, nil
 	}
-	if err := c.Storage.SaveCAKey(ctx, keyPEM); err != nil {
-		return nil, fmt.Errorf("writing CA key: %w", err)
+
+	// Lost the race: load what the winner wrote. Outside the storage lock, so
+	// c.mu is never taken while holding it.
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err := c.loadCAKeyFromDisk(ctx); err != nil {
+		return nil, err
 	}
-	return key, nil
+	return c.CAKey, nil
 }
 
 // marshalCAKeyForStorage encodes a freshly generated CA key for persistence,
@@ -192,24 +224,40 @@ func (c *CA) marshalCAKeyForStorage(key crypto.Signer) ([]byte, error) {
 }
 
 // BuildCSR produces a PKCS#10 certificate signing request for this CA's own
-// key, for an external parent to sign.
+// key, for an external parent to sign, resolving the key through
+// LoadOrCreateCAKey (see there for what create means).
 //
 // The subject is taken from an existing CA certificate when there is one, so a
-// re-key or renewal reproduces the established DN exactly; otherwise it is
+// re-issuance reproduces the established DN byte for byte; otherwise it is
 // built from hostname and the configured subject fields, identically to what
 // bootstrapCA would self-sign.
+//
+// The subject is resolved before the key, and deliberately so: a run that
+// cannot determine a subject must not leave a newly created CA key behind. At a
+// provider that key may not be removable with openvox-ca at all, and it is the
+// state Init refuses to start over.
 //
 // The request deliberately carries no BasicConstraints extension. A parent CA
 // sets basic constraints from its own policy, and openvox-ca's own signing path
 // rejects CSRs asserting CA:TRUE — so requesting it would produce an artefact a
 // sibling openvox-ca could not sign.
-func (c *CA) BuildCSR(ctx context.Context, key crypto.Signer, hostname string) ([]byte, error) {
-	subject, err := c.csrSubject(ctx, hostname)
+func (c *CA) BuildCSR(ctx context.Context, hostname string, create bool) ([]byte, error) {
+	subject, rawSubject, err := c.csrSubject(ctx, hostname)
 	if err != nil {
 		return nil, err
 	}
 
-	template := &x509.CertificateRequest{Subject: subject}
+	key, err := c.LoadOrCreateCAKey(ctx, create)
+	if err != nil {
+		return nil, err
+	}
+
+	// RawSubject preserves the established DN exactly. Re-encoding via
+	// pkix.Name would emit Go's fixed attribute order and silently drop any
+	// attribute pkix.Name does not model (DC, emailAddress) — on the one
+	// artefact whose entire purpose is that a third party signs it and every
+	// agent then matches the issuer against what it already trusts.
+	template := &x509.CertificateRequest{Subject: subject, RawSubject: rawSubject}
 	der, err := x509.CreateCertificateRequest(rand.Reader, template, key)
 	if err != nil {
 		return nil, fmt.Errorf("creating certificate request: %w", err)
@@ -217,18 +265,28 @@ func (c *CA) BuildCSR(ctx context.Context, key crypto.Signer, hostname string) (
 	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: der}), nil
 }
 
-// csrSubject resolves the DN a request should carry.
-func (c *CA) csrSubject(ctx context.Context, hostname string) (pkix.Name, error) {
-	if certPEM, err := c.Storage.GetCACert(ctx); err == nil {
+// csrSubject resolves the DN a request should carry, returning both the parsed
+// form and — when it comes from an existing certificate — its original DER.
+//
+// A storage failure is not "no certificate yet". Conflating them would let a
+// transient backend fault or an unreadable ca_cert_file overlay make an
+// established CA emit a request under a different DN, which a parent would then
+// sign and import-ca-cert would accept: nothing downstream compares subjects.
+func (c *CA) csrSubject(ctx context.Context, hostname string) (pkix.Name, []byte, error) {
+	certPEM, err := c.Storage.GetCACert(ctx)
+	switch {
+	case err == nil:
 		certs, err := ParseCABundle(certPEM)
 		if err != nil {
-			return pkix.Name{}, fmt.Errorf("reading the existing CA certificate to reuse its subject: %w", err)
+			return pkix.Name{}, nil, fmt.Errorf("reading the existing CA certificate to reuse its subject: %w", err)
 		}
-		return certs[0].Subject, nil
+		return certs[0].Subject, certs[0].RawSubject, nil
+	case !errors.Is(err, fs.ErrNotExist):
+		return pkix.Name{}, nil, fmt.Errorf("reading the existing CA certificate to reuse its subject: %w", err)
 	}
 	if hostname == "" {
-		return pkix.Name{}, fmt.Errorf("hostname is required to build a certificate request when no CA certificate " +
-			"exists yet: set --hostname, PUPPET_CA_HOSTNAME, or hostname in the config file")
+		return pkix.Name{}, nil, fmt.Errorf("hostname is required to build a certificate request when no CA " +
+			"certificate exists yet: set --hostname, PUPPET_CA_HOSTNAME, or hostname in the config file")
 	}
-	return CASubjectName(hostname, c.CASubject), nil
+	return CASubjectName(hostname, c.CASubject), nil, nil
 }

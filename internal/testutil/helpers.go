@@ -262,12 +262,8 @@ type TestChain struct {
 	RootCert    *x509.Certificate
 	RootKey     crypto.Signer
 	RootPEM     []byte
-	InterCert   *x509.Certificate
-	InterKey    crypto.Signer
 	InterPEM    []byte
 	InterKeyPEM []byte
-	LeafCert    *x509.Certificate
-	LeafKey     crypto.Signer
 	LeafPEM     []byte
 	Bundle      []byte
 }
@@ -283,7 +279,7 @@ func GenerateTestChain(leafCN string) (*TestChain, error) {
 	if err != nil {
 		return nil, err
 	}
-	leaf, leafKey, leafPEM, err := issueTestCert(leafCN, inter, interKey, false)
+	_, _, leafPEM, err := issueTestCert(leafCN, inter, interKey, false)
 	if err != nil {
 		return nil, err
 	}
@@ -297,12 +293,8 @@ func GenerateTestChain(leafCN string) (*TestChain, error) {
 		RootCert:    root,
 		RootKey:     rootKey,
 		RootPEM:     rootPEM,
-		InterCert:   inter,
-		InterKey:    interKey,
 		InterPEM:    interPEM,
 		InterKeyPEM: pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: interKeyDER}),
-		LeafCert:    leaf,
-		LeafKey:     leafKey,
 		LeafPEM:     leafPEM,
 		Bundle:      append(append([]byte{}, interPEM...), rootPEM...),
 	}, nil

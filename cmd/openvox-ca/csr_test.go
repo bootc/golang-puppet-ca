@@ -53,6 +53,7 @@ var _ = Describe("openvox-ca csr", func() {
 		emptyCfg := filepath.Join(GinkgoT().TempDir(), "empty.yaml")
 		Expect(os.WriteFile(emptyCfg, []byte("{}\n"), 0o644)).To(Succeed())
 		GinkgoT().Setenv("PUPPET_CA_CONFIG", emptyCfg)
+		clearServerEnv()
 	})
 
 	It("refuses without a key rather than silently creating one", func() {
@@ -123,6 +124,20 @@ var _ = Describe("openvox-ca csr", func() {
 		Expect(block.Type).To(Equal("CERTIFICATE REQUEST"))
 	})
 
+	It("does not clobber an established key when --create-key is passed again", func() {
+		// The no-clobber ordering inside LoadOrCreateCAKey is what stops a
+		// second --create-key orphaning every certificate already issued. The
+		// reuse spec above proves persistence, not this: transpose the checks
+		// and it still passes.
+		first, err := runCSR("--cadir", caDir, "--hostname", "puppet.example.com", "--create-key")
+		Expect(err).NotTo(HaveOccurred())
+
+		second, err := runCSR("--cadir", caDir, "--hostname", "puppet.example.com", "--create-key")
+		Expect(err).NotTo(HaveOccurred())
+
+		Expect(csrPublicKey(second)).To(Equal(csrPublicKey(first)))
+	})
+
 	It("reuses an established CA certificate's subject verbatim", func() {
 		// The re-key case: the DN must be reproduced exactly, including fields
 		// the flags cannot express, or the parent signs for a different name.
@@ -136,7 +151,69 @@ var _ = Describe("openvox-ca csr", func() {
 		Expect(err).NotTo(HaveOccurred())
 		Expect(csr.Subject.CommonName).To(Equal("Puppet CA: original.example.com"))
 	})
+
+	It("reproduces the stored DER subject byte for byte", func() {
+		// Re-encoding via pkix.Name would drop any attribute it does not model
+		// and reorder the rest. Agents match the issuer against what they
+		// already trust, so a reconstructed DN is a different name.
+		bootstrapCAInDir(caDir, "original.example.com")
+
+		store := storage.New(caDir)
+		stored, err := store.GetCACert(context.Background())
+		Expect(err).NotTo(HaveOccurred())
+		certs, err := ca.ParseCABundle(stored)
+		Expect(err).NotTo(HaveOccurred())
+
+		out, err := runCSR("--cadir", caDir)
+		Expect(err).NotTo(HaveOccurred())
+		block, _ := pem.Decode([]byte(out))
+		csr, err := x509.ParseCertificateRequest(block.Bytes)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(csr.RawSubject).To(Equal(certs[0].RawSubject))
+	})
+
+	It("creates no key when the subject cannot be resolved", func() {
+		// A run that cannot determine a subject must not leave a CA key behind:
+		// at a provider it may not be removable with openvox-ca at all, and it
+		// is the state Init now refuses to start over.
+		_, err := runCSR("--cadir", caDir, "--create-key")
+		Expect(err).To(HaveOccurred())
+
+		has, err := storage.New(caDir).HasCAKey(context.Background())
+		Expect(err).NotTo(HaveOccurred())
+		Expect(has).To(BeFalse())
+	})
+
+	It("encrypts the created key at rest when configured", func() {
+		// csr --create-key duplicates bootstrapCA's key handling; nothing else
+		// pins the two together, and the failure mode is silent — a CA key
+		// written in plaintext despite encrypt_ca_key.
+		cfgPath := filepath.Join(GinkgoT().TempDir(), "enc.yaml")
+		Expect(os.WriteFile(cfgPath, []byte("encrypt_ca_key: true\n"), 0o600)).To(Succeed())
+		GinkgoT().Setenv("PUPPET_CA_CONFIG", cfgPath)
+
+		_, err := runCSR("--cadir", caDir, "--hostname", "puppet.example.com", "--create-key")
+		Expect(err).NotTo(HaveOccurred())
+
+		keyPEM, err := storage.New(caDir).GetCAKey(context.Background())
+		Expect(err).NotTo(HaveOccurred())
+		block, _ := pem.Decode(keyPEM)
+		Expect(block).NotTo(BeNil())
+		Expect(block.Type).To(Equal("ENCRYPTED PRIVATE KEY"))
+	})
 })
+
+// csrPublicKey extracts the marshalled public key from a PEM-encoded request.
+func csrPublicKey(csrPEM string) []byte {
+	GinkgoHelper()
+	block, _ := pem.Decode([]byte(csrPEM))
+	Expect(block).NotTo(BeNil())
+	csr, err := x509.ParseCertificateRequest(block.Bytes)
+	Expect(err).NotTo(HaveOccurred())
+	pub, err := x509.MarshalPKIXPublicKey(csr.PublicKey)
+	Expect(err).NotTo(HaveOccurred())
+	return pub
+}
 
 func mustRead(path string) []byte {
 	GinkgoHelper()
@@ -153,4 +230,18 @@ func bootstrapCAInDir(dir, hostname string) {
 	myCA := ca.New(store, ca.AutosignConfig{Mode: "off"}, hostname)
 	myCA.CAKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
 	Expect(myCA.Init(context.Background())).To(Succeed())
+}
+
+// revokeInDir issues and then revokes a certificate, so the stored CRL carries
+// an entry that later operations must preserve.
+func revokeInDir(dir, subject string) {
+	GinkgoHelper()
+	store := storage.New(dir)
+	myCA := ca.New(store, ca.AutosignConfig{Mode: "off"}, "puppet.example.com")
+	myCA.CAKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
+	myCA.LeafKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
+	Expect(myCA.Init(context.Background())).To(Succeed())
+	_, err := myCA.Generate(context.Background(), subject, nil)
+	Expect(err).NotTo(HaveOccurred())
+	Expect(myCA.Revoke(context.Background(), subject)).To(Succeed())
 }

@@ -983,37 +983,28 @@ func runSignerMode(ctx context.Context, cfg *serverConfig, absCADir string) erro
 		"pid", os.Getpid(),
 	)
 
-	backendSpec, err := buildBackendSpec(cfg, absCADir)
+	// The signer role always holds the CA key, so it resolves its runtime with
+	// the key provider enabled.
+	//
+	// SECURITY: when an OpenBao provider is configured the CA's own private key
+	// is never loaded here at all -- it lives in the Transit engine, and only a
+	// digest ever crosses the wire to sign it. That is the same security
+	// posture class as the local-key case (key confined to this isolated
+	// process), extended one step further: the key doesn't exist in this
+	// process either.
+	rt, err := resolveRuntime(ctx, cfg, true)
 	if err != nil {
-		return fmt.Errorf("invalid storage backend config: %w", err)
+		return err
 	}
-	store, err := storage.NewServiceFromSpec(backendSpec)
-	if err != nil {
-		return fmt.Errorf("initialising storage backend: %w", err)
-	}
-	defer func() { _ = store.Backend().Close() }()
+	defer func() { _ = rt.Close() }()
 
 	// Full CA initialization: handles bootstrap on first run, loads existing
 	// CA on subsequent runs. This writes ca_crt.pem, CRL, inventory, etc.
-	myCA := ca.New(store, ca.AutosignConfig{}, cfg.Hostname)
+	myCA := ca.New(rt.Store, ca.AutosignConfig{}, cfg.Hostname)
 	if err := applyCAConfig(myCA, cfg); err != nil {
 		return err
 	}
-
-	// SECURITY: when configured, the CA's own private key is never loaded
-	// here at all -- it lives in OpenBao's Transit engine, and only a digest
-	// ever crosses the wire to sign it. This is the same security posture
-	// class as the local-key case (key confined to this isolated process),
-	// extended one step further: the key doesn't exist in this process
-	// either.
-	if cfg.UsesOpenBao() {
-		tm, provider, err := newOpenBaoKeyProvider(ctx, cfg)
-		if err != nil {
-			return fmt.Errorf("initialising OpenBao key provider: %w", err)
-		}
-		defer func() { _ = tm.Close() }()
-		myCA.KeyProvider = provider
-	}
+	myCA.KeyProvider = rt.KeyProvider
 
 	if err := myCA.Init(ctx); err != nil {
 		return fmt.Errorf("CA initialization failed: %w", err)

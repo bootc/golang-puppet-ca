@@ -252,14 +252,15 @@ $ openvox-ca csr --hostname puppet.example.com --create-key --out ca-request.pem
 Certificate signing request written to ca-request.pem
 ```
 
-`--create-key` creates `transit/keys/<ca_key_name>` when it does not exist. Omit
-it if you provisioned the key out of band, which is the recommended path — see
-[Provisioning the Transit key](#provisioning-the-transit-key).
+`--create-key` creates `transit/keys/<openbao.key_name>` when it does not exist.
+Omit it if you provisioned the key out of band, which is the recommended path —
+see [Provisioning the Transit key](#provisioning-the-transit-key). It never
+replaces a key that already exists.
 
 The request carries the same subject openvox-ca would otherwise self-sign, built
 from `hostname` and any `ca_subject_*` settings. If a CA certificate already
-exists the subject is reused verbatim instead, so re-keying reproduces the
-established name.
+exists its encoded subject is reused byte for byte instead, so re-issuance
+reproduces the established name exactly.
 
 ### 2. Sign it with the parent
 
@@ -286,30 +287,45 @@ $ openvox-ca import-ca-cert --cert-bundle signed-chain.pem
 Imported CA certificate "Puppet CA: puppet.example.com" (2 certificates in chain)
 ```
 
-The private key is never read. Instead the command proves the certificate binds
-the key Transit holds, refusing the import otherwise — a certificate this CA
-could not sign under would leave every issuance failing.
+The key material never leaves Transit. Instead the command proves the
+certificate binds the key Transit holds, refusing the import otherwise — a
+certificate this CA could not sign under would leave every issuance failing.
+
+The bundle must contain only certificates. One carrying a private key is
+rejected outright: the CA certificate is stored world-readable and served
+unauthenticated at `GET /certificate/ca`, so anything in that file is published.
+`bao write pki/intermediate/generate/exported ... format=pem_bundle` produces
+exactly that shape, which is why the check exists.
 
 ### The server will not start between steps 1 and 3
 
-This is by design and is worth expecting. After `csr --create-key` the Transit
-key exists but storage has no CA certificate, which is exactly the
-disaster-recovery state `Init` refuses to bootstrap over: bootstrapping there
-would rotate the live key and invalidate every certificate already issued. The
+This is by design and is worth expecting. After `csr --create-key` the key
+exists but storage has no CA certificate, and `Init` refuses to bootstrap over
+that state: doing so would replace the key your parent CA is in the middle of
+signing, and the chain that came back could then never be imported. The
 Deployment will crash-loop with
 
 ```
-CA key provider already holds a key but the CA certificate is missing from storage
+a CA key already exists at the configured key provider but the CA certificate is missing
 ```
 
 until `import-ca-cert` completes. Run the two steps together, or scale the
 Deployment to zero while you do.
 
-### Replacing the CA certificate later
+This applies to every `ca_key_provider`, not only Transit — with the default
+`file` provider the message names storage instead.
 
-Re-keying or re-issuing under a new parent needs an ordered procedure, because
-`--force` re-signs the stored CRL and every replica caches the CA certificate
-for its process lifetime:
+### Re-issuing the CA certificate later
+
+The procedure below re-issues the CA certificate: a new certificate, under a new
+parent or a longer validity, **bound to the same key**. It does not rotate the
+key. Neither `csr` nor `csr --create-key` can: both return the existing key
+untouched, and the Transit provider refuses to generate over a populated key
+slot. Rotating the CA key means provisioning a new key out of band and treating
+the result as a new CA, with every issued certificate reissued under it.
+
+Re-issuance needs an ordered procedure, because `--force` re-signs the stored
+CRL and every replica caches the CA certificate for its process lifetime:
 
 1. `openvox-ca csr --out ca-request.pem`, and have the parent sign it.
 2. `openvox-ca import-ca-cert --cert-bundle signed-chain.pem --force`.

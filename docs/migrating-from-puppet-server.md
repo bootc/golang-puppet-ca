@@ -76,6 +76,22 @@ openvox-ca-ctl import \
 echo "CA imported into $NEW_CADIR"
 ```
 
+`--cert-bundle` must be a **complete chain, ordered nearest first**: the CA's own
+certificate, each issuer after it, ending with a self-signed root. A self-signed
+Puppet Server CA already is exactly that — one certificate, which is its own
+root — so the common case needs nothing extra.
+
+If your Puppet Server ran under an external root, its `ca_crt.pem` may hold only
+its own intermediate certificate. Assemble the full chain before importing:
+
+```bash
+# ca_crt.pem first, then each issuer, then the root
+cat "$PUPPET_SSL/ca/ca_crt.pem" intermediate.pem root.pem > ca_chain.pem
+```
+
+Certificates only: a bundle containing the private key is rejected, because this
+file is stored world-readable and served to every agent.
+
 `--crl-chain` accepts a multi-CRL bundle in any order. Every `X509 CRL` block must
 parse, or the whole import is refused; PEM blocks of other types are ignored and
 are not stored, because the blob is served
