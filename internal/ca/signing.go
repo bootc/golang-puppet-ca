@@ -216,6 +216,17 @@ func ValidateSubject(subject string) error {
 // for a certificate this CA issued is attempted with one it did not issue.
 var ErrForeignCertificate = errors.New("certificate was not issued by this CA")
 
+// ErrRenewalSubjectMismatch is returned when the presented certificate is a
+// live one of ours, but for a different subject than the one being renewed.
+//
+// Separate from ErrForeignCertificate deliberately: that sentinel's message
+// asserts the certificate is not ours, which would be false here and is the
+// kind of false statement its own doc comment argues against. Keeping them
+// apart also separates the two in logs — a cross-subject re-key is an
+// authenticated caller reaching for another node's identity, while a foreign
+// certificate is usually a topology or migration problem.
+var ErrRenewalSubjectMismatch = errors.New("presented certificate is for a different subject")
+
 // assertOwnCertificate proves that cert was issued by this CA, and is the
 // issuer half of the gate on both renewal paths. The revocation half is
 // refuseIfRevoked, which runs immediately after it and re-reads the CRL from
@@ -808,8 +819,11 @@ func (c *CA) SaveRequest(ctx context.Context, subject string, csrPEM []byte) (bo
 // presentedCert is the client certificate the caller authenticated with. It is
 // required, and it must be one this CA issued and has not revoked: renewal
 // mints a new credential from an old one, so the old one has to be ours. A nil,
-// foreign or revoked certificate returns ErrForeignCertificate, which callers
-// map to 403.
+// foreign or revoked certificate returns ErrForeignCertificate.
+//
+// It must also be the certificate *for* subject. Renewing one subject while
+// presenting another's returns ErrRenewalSubjectMismatch. Callers map both to
+// 403.
 //
 // The caller is responsible for verifying that the CSR CN matches the
 // authenticated client's CN before calling Renew; this method enforces that
@@ -827,15 +841,18 @@ func (c *CA) SaveRequest(ctx context.Context, subject string, csrPEM []byte) (bo
 // certificate, and passes it. Nil is for callers with no authenticated peer at
 // all — today, only tests.
 func (c *CA) Renew(ctx context.Context, subject string, csrPEM []byte, presentedCert *x509.Certificate) ([]byte, error) {
-	if err := ValidateSubject(subject); err != nil {
-		return nil, err
-	}
-
 	// SECURITY: only a certificate this CA issued may be renewed. Without this
 	// the CN check below constrains the caller to a name some *other* CA gave
 	// them, while the certificate produced is issued by us — so a foreign
 	// issuer's namespace would become ours, and any name it hands out could be
 	// claimed here, including one already held by an agent.
+	//
+	// Ahead of ValidateSubject on purpose. Once a second issuer is trusted for
+	// client authentication, a foreign certificate is the one least likely to
+	// respect this CA's lowercase certname grammar — and ValidateSubject
+	// returns an unsentinelled error the handler can only render as a 500. The
+	// provenance question has to be answered first for the refusal to come out
+	// as the 403 the gate exists to give.
 	// NIST 800-53: AC-6 (Least Privilege), IA-5(2) (PKI-Based Authentication)
 	if presentedCert == nil {
 		return nil, fmt.Errorf("%w: no client certificate was presented", ErrForeignCertificate)
@@ -849,15 +866,24 @@ func (c *CA) Renew(ctx context.Context, subject string, csrPEM []byte, presented
 	// SECURITY: and it must be *this* subject's certificate. Provenance alone
 	// says the caller holds something we issued, not that they hold the thing
 	// they are renewing — without this, any live certificate we issued could
-	// re-key any other subject and revoke the incumbent's. The handler checks
-	// the equivalent invariant against the authenticated CN, but it does so by
-	// passing subject=clientCN, so that check is only load-bearing for the one
-	// caller that happens to. This makes the method self-sufficient, which is
-	// what the doc comment above already claims of it.
+	// re-key any other subject and revoke the incumbent's.
+	//
+	// The one shipping caller cannot trip this: it passes subject=clientCN and
+	// the same certificate, so it satisfies the invariant by construction
+	// rather than by checking it. (What the handler does check is the CSR's CN
+	// against the client's.) That is precisely why the check belongs here —
+	// the guarantee should not rest on every future caller happening to pass
+	// the two consistently.
 	// NIST 800-53: AC-3 (Access Enforcement), IA-5(2) (PKI-Based Authentication)
 	if presentedCert.Subject.CommonName != subject {
 		return nil, fmt.Errorf("%w: presented certificate is for %q, not %q",
-			ErrForeignCertificate, presentedCert.Subject.CommonName, subject)
+			ErrRenewalSubjectMismatch, presentedCert.Subject.CommonName, subject)
+	}
+
+	// After the gate: this guards a caller-supplied string that becomes a
+	// storage path, so it still has to run.
+	if err := ValidateSubject(subject); err != nil {
+		return nil, err
 	}
 
 	// Validate and parse the CSR before acquiring any lock.
@@ -976,23 +1002,23 @@ func (c *CA) AutoRenew(ctx context.Context, presentedCert *x509.Certificate) ([]
 	if presentedCert == nil {
 		return nil, fmt.Errorf("%w: no client certificate was presented", ErrForeignCertificate)
 	}
+	// SECURITY: only a certificate this CA issued may be renewed. The
+	// carry-forward of authorisation OIDs below depends on it; see
+	// assertOwnCertificate. Ahead of ValidateSubject for the reason given
+	// in Renew: a foreign certificate's CN need not be certname-shaped, and
+	// answering grammar first would turn the gate's 403 into a 500.
+	// NIST 800-53: AC-6 (Least Privilege), IA-5(2) (PKI-Based Authentication)
+	if err := c.assertOwnCertificate(presentedCert); err != nil {
+		return nil, err
+	}
+
 	subject := presentedCert.Subject.CommonName
 	if err := ValidateSubject(subject); err != nil {
 		return nil, err
 	}
 
-	// SECURITY: only a certificate this CA issued may be renewed. The
-	// carry-forward of authorisation OIDs below depends on it; see
-	// assertOwnCertificate.
-	// NIST 800-53: AC-6 (Least Privilege), IA-5(2) (PKI-Based Authentication)
-	if presentedCert == nil {
-		return nil, fmt.Errorf("%w: no client certificate was presented", ErrForeignCertificate)
-	}
-	if err := c.assertOwnCertificate(presentedCert); err != nil {
-		return nil, err
-	}
-	// Revocation first, ahead of the key-strength policy, and in the same order
-	// as Renew. Both checks refuse, so the order only decides which answer the
+	// Revocation ahead of the key-strength policy, and in the same order as
+	// Renew. Both checks refuse, so the order only decides which answer the
 	// client is given — and for a certificate that is both revoked and below
 	// policy, "renew with a new CSR" (422) is the wrong one: it points a revoked
 	// identity at the re-key path without mentioning that it is revoked. A
