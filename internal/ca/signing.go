@@ -805,6 +805,12 @@ func (c *CA) SaveRequest(ctx context.Context, subject string, csrPEM []byte) (bo
 // is a genuine re-key, so the old key/cert must not remain a valid credential
 // once the new one takes over.
 //
+// presentedCert is the client certificate the caller authenticated with. It is
+// required, and it must be one this CA issued and has not revoked: renewal
+// mints a new credential from an old one, so the old one has to be ours. A nil,
+// foreign or revoked certificate returns ErrForeignCertificate, which callers
+// map to 403.
+//
 // The caller is responsible for verifying that the CSR CN matches the
 // authenticated client's CN before calling Renew; this method enforces that
 // invariant a second time as defence-in-depth.
@@ -943,6 +949,13 @@ func (c *CA) Renew(ctx context.Context, subject string, csrPEM []byte, presented
 //
 // The caller must NOT hold c.mu. Same cross-node guarantees as Sign.
 func (c *CA) AutoRenew(ctx context.Context, presentedCert *x509.Certificate) ([]byte, error) {
+	// Guarded before the dereference, and for the same reason as Renew's: a
+	// caller that reaches here without a client certificate has no identity to
+	// renew, and panicking on it would turn an authorisation question into a
+	// crash.
+	if presentedCert == nil {
+		return nil, fmt.Errorf("%w: no client certificate was presented", ErrForeignCertificate)
+	}
 	subject := presentedCert.Subject.CommonName
 	if err := ValidateSubject(subject); err != nil {
 		return nil, err

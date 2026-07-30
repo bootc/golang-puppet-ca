@@ -1161,14 +1161,21 @@ func (s *Server) handlePostCertificateRenewal(w http.ResponseWriter, r *http.Req
 		// (hostcert_renewal_interval) they POST an empty body here, relying
 		// solely on the mTLS-presented client cert to prove identity and key
 		// possession, and expect the SAME key reissued with a fresh serial
-		// and validity. Reissuing without a fresh proof-of-possession is safe
-		// because newAuthMiddleware (the tierAnyClient path guarding this
-		// route) has already verified r.TLS.PeerCertificates[0] chains to our
-		// CA; clientCN(r) only reads its CN. Revocation is re-checked against
-		// storage rather than relying on the middleware's check, which answers
-		// from a cache that can lag a revocation performed on another replica —
-		// see the SECURITY note on ca.refuseIfRevoked, which both renewal paths
-		// go through.
+		// and validity.
+		//
+		// Reissuing without a fresh proof-of-possession is safe because the
+		// certificate is checked twice over. newAuthMiddleware verifies it
+		// chains to the configured trust anchor and is not revoked; AutoRenew
+		// then verifies it was issued by *this* CA specifically, rejecting with
+		// ErrForeignCertificate otherwise, and re-checks revocation against
+		// storage rather than the middleware's cache, which can lag a
+		// revocation performed on another replica — see the SECURITY note on
+		// ca.refuseIfRevoked, which both renewal paths go through. The issuer
+		// check is not redundant: the anchor the middleware trusts and this
+		// CA's own certificate are the same today, but the point of the
+		// intermediate-CA work is that they need not stay so — and renewal is
+		// the operation that mints new credentials from old ones. clientCN(r)
+		// only reads the CN.
 		certPEM, err = s.CA.AutoRenew(r.Context(), r.TLS.PeerCertificates[0])
 		if err != nil {
 			// A revoked certificate must not be renewed into a fresh one. This
@@ -1190,8 +1197,12 @@ func (s *Server) handlePostCertificateRenewal(w http.ResponseWriter, r *http.Req
 				return
 			}
 			if errors.Is(err, ca.ErrForeignCertificate) {
-				slog.Warn("Auto-renewal rejected: certificate not issued by this CA", "subject", cn, "error", err)
-				http.Error(w, "access denied", http.StatusForbidden)
+				// Deliberately not "access denied": that is the middleware's
+				// wording, and the authorisation oracle keys on it to tell a
+				// middleware rejection from a handler one. Sharing the string
+				// would make the oracle blind to the middleware's own checks.
+				slog.Warn("Auto-renewal rejected: certificate not eligible", "subject", cn, "error", err)
+				http.Error(w, "certificate not eligible for renewal", http.StatusForbidden)
 				return
 			}
 			slog.Warn("Auto-renewal failed", "subject", cn, "error", err)
@@ -1235,8 +1246,10 @@ func (s *Server) handlePostCertificateRenewal(w http.ResponseWriter, r *http.Req
 				return
 			}
 			if errors.Is(err, ca.ErrForeignCertificate) {
-				slog.Warn("Renewal rejected: certificate not issued by this CA", "subject", cn, "error", err)
-				http.Error(w, "access denied", http.StatusForbidden)
+				// See the auto-renewal branch: the body must not collide with
+				// the middleware's "access denied".
+				slog.Warn("Renewal rejected: certificate not eligible", "subject", cn, "error", err)
+				http.Error(w, "certificate not eligible for renewal", http.StatusForbidden)
 				return
 			}
 			slog.Warn("Renewal failed", "subject", cn, "error", err)
