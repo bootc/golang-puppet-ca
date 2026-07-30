@@ -233,12 +233,23 @@ var ErrRenewalSubjectMismatch = errors.New("presented certificate is for a diffe
 // storage first — fresher than anything this could ask, and the reason the two
 // are separate rather than one check.
 //
+// Neither half checks the validity window. Expiry is the middleware's:
+// newAuthMiddleware's Verify call enforces NotBefore/NotAfter against
+// time.Now() for every mTLS route, and the own-ca-expired client class in the
+// authorisation baseline pins that.
+//
 // Renewal reissues under this CA's authority using the presented certificate's
-// own subject and extensions. That is safe only while this CA is the only thing
-// that could have produced it: the subject was drawn from a namespace we
-// control, and the extensions were vetted by us at issuance. Neither holds for
-// a certificate some other CA issued, so renewing one would let its issuer
-// choose names and attributes inside our namespace.
+// own subject — and, on the empty-body path only, its Puppet OID extensions.
+// That is safe only while this CA is the only thing that could have produced
+// it: the subject was drawn from a namespace we control, and on that path the
+// extensions were vetted by us at issuance. Neither holds for a certificate
+// some other CA issued, so renewing one would let its issuer choose names, and
+// attributes, inside our namespace.
+//
+// The CSR path does not rely on prior vetting for its extensions — it takes
+// them from the submitted CSR and strips the authorisation arc — but it still
+// needs this gate for the subject, which it reissues from the presented
+// certificate's namespace.
 //
 // CheckSignatureFrom answers "did we issue this" with a signature check rather
 // than an issuer-name comparison, because a distinguished name is not a
