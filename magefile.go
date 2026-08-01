@@ -683,7 +683,12 @@ func (Test) Unit() error {
 		return err
 	}
 
-	testArgs := append([]string{"test", "-json", "-cover", "-coverprofile=coverage.out"}, pkgs...)
+	// -race is not optional here: the notification path (internal/sdnotify) is
+	// driven concurrently by the heartbeat, the reload watcher, and a deferred
+	// Close, and its locking is only verified by specs that fail exclusively
+	// under the race detector. It costs roughly 15% on the slowest package.
+	// It needs cgo, which is the default everywhere this runs.
+	testArgs := append([]string{"test", "-race", "-json", "-cover", "-coverprofile=coverage.out"}, pkgs...)
 	testCmd := exec.Command("go", testArgs...)
 	tparseCmd := exec.Command("go", "tool", "tparse", "-all")
 
@@ -1415,15 +1420,15 @@ func createTarGz(dst, srcDir string, files []archiveEntry) (retErr error) {
 		}
 	}()
 
-	for _, f := range files {
-		src := filepath.Join(srcDir, f.name)
+	for _, entry := range files {
+		src := filepath.Join(srcDir, entry.name)
 		fi, err := os.Stat(src)
 		if err != nil {
 			return err
 		}
 		if err := tw.WriteHeader(&tar.Header{
-			Name: f.name,
-			Mode: f.mode,
+			Name: entry.name,
+			Mode: entry.mode,
 			Size: fi.Size(),
 		}); err != nil {
 			return err
