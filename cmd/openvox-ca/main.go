@@ -228,6 +228,18 @@ func newRootCmd() *cobra.Command {
 			ctx, stop := signal.NotifyContext(cmd.Context(), syscall.SIGTERM, syscall.SIGINT)
 			defer stop()
 
+			// SIGHUP means "reload" for this service, but its default
+			// disposition is to terminate. Claim it here, before any of the
+			// slow startup work below — opening storage, waiting for the
+			// signer to bootstrap a CA key, binding the listener — so a reload
+			// that arrives while the CA is still coming up cannot kill it. The
+			// channel is handed to whichever role can act on it; a signal that
+			// arrives before then waits in the buffer rather than being fatal.
+			// (The signer overrides this with signal.Ignore; see runSignerMode.)
+			hupCh := make(chan os.Signal, 1)
+			signal.Notify(hupCh, syscall.SIGHUP)
+			defer signal.Stop(hupCh)
+
 			// Service-manager notifications (sd_notify). Inert unless started
 			// by a service manager that asked to be notified, so no
 			// configuration or branching is needed anywhere below.
@@ -365,7 +377,12 @@ func newRootCmd() *cobra.Command {
 				c := exec.Command(exe, os.Args[1:]...) //nolint:gosec // G204: re-execs this same binary (os.Executable) with the operator's own os.Args to daemonize
 				// Strip internal role/PSK vars to prevent stale values from a
 				// previous run from confusing the daemon child.
-				daemonEnv := filterEnv(os.Environ(), internalEnvKeys...)
+				// NOTIFY_SOCKET goes too: the child would otherwise report
+				// readiness for a unit whose main process has just exited.
+				// Copied rather than appended in place, so the shared
+				// internalEnvKeys backing array is never written through.
+				daemonEnv := filterEnv(os.Environ(),
+					append(append([]string{}, internalEnvKeys...), "NOTIFY_SOCKET")...)
 				c.Env = append(daemonEnv, "PUPPET_CA_DAEMON=1")
 				c.Stdin = nil
 				c.Stdout = nil
@@ -403,7 +420,7 @@ func newRootCmd() *cobra.Command {
 
 			// Launcher mode (default): spawn isolated signer + frontend children.
 			if role == "" && !singleProcess {
-				return runLauncher(cfg.shutdownDrain(), notifier)
+				return runLauncher(cfg.shutdownDrain(), notifier, hupCh)
 			}
 
 			// Frontend mode (role=frontend) or single-process mode: run HTTP server.
@@ -462,11 +479,7 @@ func newRootCmd() *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("invalid storage backend config: %w", err)
 			}
-			backendKind := backendSpec.Kind
-			if backendKind == "" {
-				backendKind = storage.BackendFilesystem
-			}
-			notifier.Status(fmt.Sprintf("Opening the %s storage backend", backendKind))
+			notifier.Status(fmt.Sprintf("Opening the %s storage backend", backendSpec.Kind))
 			store, err := storage.NewServiceFromSpec(backendSpec)
 			if err != nil {
 				return fmt.Errorf("failed to initialise storage backend: %w", err)
@@ -673,7 +686,7 @@ func newRootCmd() *cobra.Command {
 			if cfg.TLSCert != "" && cfg.TLSKey != "" {
 				certs, err = newCertReloader(cfg.TLSCert, cfg.TLSKey)
 				if err != nil {
-					return fmt.Errorf("failed to load TLS cert/key: %w", err)
+					return err
 				}
 
 				caCertPEM, err := myCA.Storage.GetCACert(ctx)
@@ -801,7 +814,7 @@ func newRootCmd() *cobra.Command {
 
 			// Both jobs are bound to ctx, so they stop on shutdown.
 			go runNotifyHeartbeat(ctx, notifier, heartbeatInterval(notifier), status)
-			go runReloadWatcher(ctx, notifier, reloader, status)
+			go runReloadWatcher(ctx, hupCh, notifier, reloader, status)
 
 			var serveErr error
 			if cfg.TLSCert != "" && cfg.TLSKey != "" {

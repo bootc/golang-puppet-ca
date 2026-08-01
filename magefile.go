@@ -357,16 +357,33 @@ func distVariants() []distVariantSpec {
 	}
 }
 
+// distUnitFile is the systemd unit shipped in every release archive, so a VM
+// install has a unit that matches this build's notification behaviour (see
+// docs/systemd.md). Named once: the same string is the name under
+// packaging/systemd/ and the name inside the tarball.
+const distUnitFile = "openvox-ca.service"
+
+// distArchiveFiles lists a release archive's contents with the mode each entry
+// must extract as. Stating the modes here rather than reading them back off the
+// staged files keeps the tarball identical whatever umask the release is built
+// under; deriving the executables from bins keeps the archive in step with what
+// is built. Separate from buildDistVariant so the manifest can be asserted
+// without cross-compiling four variants -- the CI job that used to unpack every
+// tarball and grep its listing cost a full release build to check a list.
+func distArchiveFiles(bins []string) []archiveEntry {
+	files := make([]archiveEntry, 0, len(bins)+1)
+	for _, b := range bins {
+		files = append(files, archiveEntry{name: b, mode: 0755})
+	}
+	return append(files, archiveEntry{name: distUnitFile, mode: 0644})
+}
+
 // buildDistVariant builds one variant's tarball into distDir and returns its
 // SHA-256 checksum. The artefact is named openvox-ca_VER_NAME.tar.gz and
 // contains both binaries plus the systemd unit.
 func buildDistVariant(distDir, ver string, v distVariantSpec) (string, error) {
 	bins := []string{"openvox-ca", "openvox-ca-ctl"}
-
-	// Shipped alongside the binaries so a VM install has a unit file that
-	// matches this build's notification behaviour (see docs/systemd.md).
-	const unitFile = "openvox-ca.service"
-	unitSrc := filepath.Join("packaging", "systemd", unitFile)
+	unitSrc := filepath.Join("packaging", "systemd", distUnitFile)
 	archive := filepath.Join(distDir, fmt.Sprintf("openvox-ca_%s_%s.tar.gz", ver, v.name))
 
 	tmpDir, err := os.MkdirTemp("", "openvox-ca-dist-*")
@@ -385,11 +402,11 @@ func buildDistVariant(distDir, ver string, v distVariantSpec) (string, error) {
 		}
 	}
 
-	if err := sh.Copy(filepath.Join(tmpDir, unitFile), unitSrc); err != nil {
-		return "", fmt.Errorf("stage %s for %s: %w", unitFile, v.name, err)
+	if err := sh.Copy(filepath.Join(tmpDir, distUnitFile), unitSrc); err != nil {
+		return "", fmt.Errorf("stage %s for %s: %w", distUnitFile, v.name, err)
 	}
 
-	if err := createTarGz(archive, tmpDir, append(append([]string{}, bins...), unitFile)); err != nil {
+	if err := createTarGz(archive, tmpDir, distArchiveFiles(bins)); err != nil {
 		return "", fmt.Errorf("archive %s: %w", v.name, err)
 	}
 	return sha256File(archive)
@@ -1369,7 +1386,16 @@ func runComposeWithSpinner(extraEnv map[string]string, spinMsg string, args ...s
 	return cmdErr
 }
 
-func createTarGz(dst, srcDir string, files []string) (retErr error) {
+// archiveEntry is one file in a release tarball, with the permissions it must
+// extract as. The archive mixes executables with plain data (the systemd unit),
+// and neither the build host's umask nor a single hard-coded mode gets both
+// right.
+type archiveEntry struct {
+	name string
+	mode int64
+}
+
+func createTarGz(dst, srcDir string, files []archiveEntry) (retErr error) {
 	f, err := os.Create(dst)
 	if err != nil {
 		return err
@@ -1389,18 +1415,15 @@ func createTarGz(dst, srcDir string, files []string) (retErr error) {
 		}
 	}()
 
-	for _, name := range files {
-		src := filepath.Join(srcDir, name)
+	for _, f := range files {
+		src := filepath.Join(srcDir, f.name)
 		fi, err := os.Stat(src)
 		if err != nil {
 			return err
 		}
-		// Take the mode from the staged file rather than hard-coding 0755: the
-		// archive carries both executables and plain data (the systemd unit),
-		// and a unit file installed as executable is wrong.
 		if err := tw.WriteHeader(&tar.Header{
-			Name: name,
-			Mode: int64(fi.Mode().Perm()),
+			Name: f.name,
+			Mode: f.mode,
 			Size: fi.Size(),
 		}); err != nil {
 			return err
