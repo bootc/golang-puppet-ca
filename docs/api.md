@@ -214,6 +214,10 @@ which is the conflation this endpoint just stopped making.
 Requires a valid CA-signed client certificate. The new certificate is issued immediately without entering the pending-CSR queue or autosign evaluation, and the certificate it replaces is retired once the new one is safely stored (see `revoke_on_auto_renew` below for the auto-renewal case). "Retired" means revoked before the response is returned, unless [`superseded_cert_revoke_after_sec`](configuration.md#delayed-supersession) grants an overlap window, in which case the replaced serial is recorded and a sweep revokes it once the window elapses — so both certificates verify for the length of the window, on this path including the replaced private key.
 
 - **CSR body (re-key):** the CSR Common Name must match the authenticated client CN — an agent can only renew its own certificate, not another's. Issues a certificate for the new key in the CSR. Puppet OID extensions are copied from the CSR **except** authorization-arc OIDs (`1.3.6.1.4.1.34380.1.3.*`, such as `pp_cli_auth`), which are stripped so a submitted CSR cannot request elevated privileges.
+Both renewal forms serialise on the same per-subject lock as signing, so either
+can answer `503 certificate authority busy, retry` when another replica holds
+that lock or the storage backend's lock service is unreachable. That is
+transient: retry.
 
 - **Empty body (wire-compatible auto-renewal):** matches the request real OpenVox/Puppet agents send by default (`hostcert_renewal_interval`, and the `puppet ssl renew_cert` CLI action). Identity and key possession come solely from the mTLS-presented client certificate; the same public key is reissued with a fresh serial and validity, carrying forward the original certificate's SANs and Puppet OID extensions unchanged. Unlike the CSR path, this **preserves authorization-arc OIDs** (e.g. `pp_cli_auth`): they were already vetted when the presented certificate was issued, so a cert that legitimately holds them keeps them across renewal.
 
