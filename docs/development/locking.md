@@ -212,11 +212,19 @@ path — still provides no cross-replica guarantee anyway.
 
 ## Known gaps (mostly tracked — check before re-reporting)
 
-- `CA.Generate` (the `POST /generate/{subject}` endpoint) is the one issuance
-  path that takes only `c.mu`, not the `subject:<name>` cluster lock. On an HA
-  backend, a `Generate` on one replica can race a `Sign`/`SaveRequest`/
-  `Generate` for the same subject on another and double-issue. Found during
-  the audit that produced this document; not yet tracked as an issue.
+- [#195](https://github.com/voxpupuli/openvox-ca/issues/195) — `CA.Generate`
+  (the `POST /generate/{subject}` endpoint) is the one issuance path that
+  takes only `c.mu`, not the `subject:<name>` cluster lock. On an HA backend,
+  a `Generate` on one replica can race a `Sign`/`SaveRequest`/`Generate` for
+  the same subject on another and double-issue.
+- [#196](https://github.com/voxpupuli/openvox-ca/issues/196) —
+  `DELETE /certificate_request/{subject}` deletes the CSR directly through
+  `StorageService`, bypassing the subject lock, so a deletion can be outrun
+  by an in-flight sign for the same subject.
+- [#197](https://github.com/voxpupuli/openvox-ca/issues/197) — OCSP's slow
+  path signs responses while holding `c.mu` exclusively (an IPC round trip
+  under key isolation), and nonced requests always take it; an efficiency
+  gap rather than a correctness one.
 - [#187](https://github.com/voxpupuli/openvox-ca/issues/187) — filesystem and
   SQLite backends have no same-host, cross-**process** locking; a `ctl`
   command (or the planned offline `generate`, #175) racing a running server on
