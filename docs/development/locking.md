@@ -80,14 +80,16 @@ has no read-only fast path:
 | --- | --- | --- |
 | `inventoryMu` | `inventory` + `inventory_hmac` | An append must scan for duplicate serials and advance the integrity head as one unit |
 | `crlMu` | `crl` | Plain read/write pairs |
-| `fileMu` | `ca_cert`, `ca_key`, `csr/<subject>`, `cert/<subject>`, per-subject private keys | One mutex spans all subjects; simple and sufficient at current scale |
+| `fileMu` | `ca_cert`, `ca_pubkey`, `ca_key`, `csr/<subject>`, `cert/<subject>`, per-subject private keys | One mutex spans all subjects; simple and sufficient at current scale |
 | `serialMu` | `serial` | Plain read/write pairs |
 
 These are **internal to `StorageService`** — callers never touch them, and no
 `StorageService` method calls another locked method while holding one (they are
 non-reentrant; doing so self-deadlocks). Methods that require a caller-held
-mutex follow the `...Locked` naming convention and say which lock in their doc
-comment.
+mutex generally carry the `...Locked` suffix and always say which lock in
+their doc comment. The doc comment is authoritative — a couple of helpers
+(`readInventoryForHMAC`, `computeInventoryHMAC`) require `inventoryMu`
+without carrying the suffix.
 
 ### Tier 3: CA in-memory state (`c.mu`)
 
@@ -194,9 +196,14 @@ path — still provides no cross-replica guarantee anyway.
    lose the lock while still inside `fn`, and Redis failover can hand the lock
    over early (see the note on `RedisBackend.AcquireLock`). Where corruption
    would be the consequence, back the lock with a storage-level invariant that
-   holds even without it — the inventory's unique serial index / CAS-guarded
-   append (`ErrDuplicateSerial`), or the backend's own transactionality — as
-   `AppendInventory` does.
+   holds even without it — and check the invariant's own scope.
+   `AppendInventory`'s duplicate-serial check (`ErrDuplicateSerial`) is the
+   worked example, but it is a cluster-wide guarantee only on SQL backends,
+   where the database's unique index enforces it; on blob backends the scan
+   runs under the process-local `inventoryMu` only, and etcd's CAS-guarded
+   append protects the blob against lost updates, not serial uniqueness (the
+   doc comment on `ErrDuplicateSerial` in
+   [storage.go](../../internal/storage/storage.go) spells this out).
 7. **New lock names are protocol.** Add them to the constants in
    [init.go](../../internal/ca/init.go), keep them stable across releases, and
    document them in the table above. All callers using a name contend on one
