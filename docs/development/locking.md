@@ -19,7 +19,7 @@ protects against a different class of interleaving.
 | Tier | Mechanism | Protects against | Defined in |
 | --- | --- | --- | --- |
 | Cluster-wide named locks | `StorageService.WithLock(ctx, name, fn)` | Concurrent mutations from **other replicas** sharing the same backend | [storage.go](../../internal/storage/storage.go) |
-| Storage-service mutexes | `serialMu`, `inventoryMu`, `crlMu`, `fileMu` (RW) | Interleaved compound storage operations **within this process** | [storage.go](../../internal/storage/storage.go) |
+| Storage-service mutexes | `serialMu`, `inventoryMu` (RW), `crlMu` (RW), `fileMu` (RW) | Interleaved compound storage operations **within this process** | [storage.go](../../internal/storage/storage.go) |
 | CA in-memory state | `ca.CA.mu` (RW) | Torn reads/writes of the CA's **in-memory caches** | [ca.go](../../internal/ca/ca.go) |
 
 ### Tier 1: cluster-wide named locks (`WithLock`)
@@ -64,15 +64,17 @@ enough that a crashed replica's stale lease doesn't hang requests forever.
 Caveat: that timeout bounds only the *distributed* half. The process-local
 mutexes (both the fallback path and the per-name gate in front of every
 distributed implementation) are plain `sync.Mutex` and do not honour context
-cancellation, so same-process waiters queue unboundedly.
-[PR #186](https://github.com/voxpupuli/openvox-ca/pull/186) records this in
-`StorageService.WithLock`'s godoc.
+cancellation, so same-process waiters queue unboundedly. The in-flight
+[PR #186](https://github.com/voxpupuli/openvox-ca/pull/186) adds this caveat
+to `StorageService.WithLock`'s godoc.
 
 ### Tier 2: storage-service mutexes
 
 `StorageService` guards each family of logical keys with its own process-local
-`sync.RWMutex` so a compound operation (read blob → transform → write blob)
-can't interleave with another goroutine's within the process:
+mutex so a compound operation (read blob → transform → write blob) can't
+interleave with another goroutine's within the process. Three are
+`sync.RWMutex`; `serialMu` is a plain `sync.Mutex`, since the serial counter
+has no read-only fast path:
 
 | Mutex | Guards | Why compound |
 | --- | --- | --- |
