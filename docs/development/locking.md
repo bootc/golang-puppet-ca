@@ -236,7 +236,8 @@ path — still provides no cross-replica guarantee anyway.
   gap rather than a correctness one.
 - [#187](https://github.com/voxpupuli/openvox-ca/issues/187) — filesystem and
   SQLite backends have no same-host, cross-**process** locking; a `ctl`
-  command (or the planned offline `generate`, #175) racing a running server on
+  command (or the planned offline `generate`,
+  [#175](https://github.com/voxpupuli/openvox-ca/issues/175)) racing a running server on
   the same cadir is uncoordinated. The related blob-backend gap — nothing
   wraps `AppendInventory` in a cluster lock on etcd/redis either — is
   explicitly split out of #187 for an issue of its own.
