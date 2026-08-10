@@ -85,10 +85,11 @@ less protocol for it.
 | --- | --- | --- |
 | `bootstrap` | First-run CA generation; seeding supporting state (CRL/inventory/serial) for a mounted cert+key; whole-store migration | `CA.Init`, `CA.seedSupportingState`, `storage.MigrateService` (which reuses the name deliberately so a migration and a bootstrapping server exclude each other) |
 | `crl` | Every CRL read-modify-write (read entries → re-sign → write), **and** the pending-supersession list's read-modify-write, which has to be mutual with the revocations it schedules | `Revoke`, `RevokeSerial`, `ReissueCRL`, `RefreshCRLIfDue`, `CleanupExpiredCerts`, `ReconcileSuperseded`, the revoke step inside `Clean`, and the retire step inside `Renew`, `AutoRenew` — "retire" because only those two can defer it to the list; `Clean` always revokes inline |
-| `subject:<name>` | The whole lifecycle of one subject: evict/save CSR/sign/delete CSR/import/clean/revoke | `SaveRequest`, `Sign`, `SignWithTTL`, `DeleteRequest`, `Renew`, `AutoRenew`, `Clean`, `ImportCertificate`, `Revoke` — but currently **not** `Generate` (see known gaps below) |
+| `subject:<name>` | The whole lifecycle of one subject: evict/save CSR/sign/delete CSR/renew/import/clean/revoke/generate | `SaveRequest`, `Sign`, `SignWithTTL`, `DeleteRequest`, `Renew`, `AutoRenew`, `Clean`, `ImportCertificate`, `Revoke`, `Generate`/`GenerateWithOptions` |
 | `hmac-key` | Generating and persisting the inventory HMAC key when none is usable — a cold start, or a stored blob of the wrong length | `StorageService.EnsureHMACKey`, reached from `CA.Init` → `InitHMAC` and from `MigrateService` → `RebuildInventoryHMAC`. Deliberately **not** `bootstrap`: the migration already holds that name across the rebuild, and `WithLock` is not reentrant |
 | `sql-schema-migrate` | One schema-migration run, so two replicas starting at once do not migrate concurrently (SQL backends only) | `SQLBackend.EnsureReady` |
 | `inventory-decompose` | One-time legacy inventory blob conversion (etcd backend only) on the first start after upgrading | `EtcdBackend.decomposeLegacyInventory`, from `EnsureReady` |
+| `capability-probe` | Nothing. Acquired and released immediately by `StorageService.SupportsDistributedLocking` to find out whether this backend coordinates locks across processes at all | The offline `openvox-ca generate` pre-flight. The name sits deliberately outside every namespace above so a probe can never contend with an operation in flight |
 
 How each backend provides the distributed lock (a summary — the full per-backend
 mechanism, key layouts and transaction/retry detail lives in
@@ -583,29 +584,6 @@ path — still provides no cross-replica guarantee anyway.
 Concurrency limitations that are understood and tracked. This list reflects the
 state when the document was last updated and is not guaranteed exhaustive.
 
-- [#195](https://github.com/voxpupuli/openvox-ca/issues/195) — `CA.Generate`
-  (the `POST /generate/{subject}` endpoint) is the one issuance path that
-  takes only `c.mu`, not the `subject:<name>` cluster lock. On an HA backend,
-  a `Generate` on one replica can race a `Sign`/`SaveRequest`/`Generate` for
-  the same subject on another and double-issue.
-
-  Four passages elsewhere assert that exception, and closing this gap
-  falsifies all four. They cite the issue only in passing, so search for the
-  claim — `Generate` — rather than for `#195`, which finds fewer:
-
-  - the `POST /generate/{subject}` paragraph under
-    [CSR management](../api.md#csr-management) — delete it;
-  - the `Generate` paragraph in `CA.DeleteRequest`'s godoc
-    ([signing.go](../../internal/ca/signing.go)) — delete it;
-  - the final sentence of the retired [#196](#known-gaps) entry below — drop
-    that sentence, keep the entry;
-  - the Tier 3 paragraph on `DeleteRequest` taking no `c.mu` — **rewrite, do
-    not delete**. Its first two sentences stay true whatever happens to this
-    gap; only the trailing clause about not serialising against `Generate`
-    dies with it.
-
-  The Tier 1 table's "but currently **not** `Generate`" goes as well, but that
-  cell is being edited anyway when `Generate` joins the takers.
 - [#197](https://github.com/voxpupuli/openvox-ca/issues/197) — OCSP's slow
   path signs responses while holding `c.mu` exclusively, so nonced requests
   (which always miss the cache) serialise process-wide behind the signing
@@ -676,6 +654,10 @@ state when the document was last updated and is not guaranteed exhaustive.
   ([#138](https://github.com/voxpupuli/openvox-ca/issues/138)). Whatever lock
   the fix takes, the single-node backends will get it cross-process for free
   now that `WithLock` reaches a same-host tier.
+  The offline `generate` still reports both capabilities in its pre-flight, via
+  `SupportsDistributedLocking`/`SupportsAtomicInventory`, and still tells the
+  operator to stop the server: neither is made true by the same-host tier, and
+  the inventory append above is why.
 - [#171](https://github.com/voxpupuli/openvox-ca/issues/171) — `cachedCRL` is
   per-replica, so authentication and renewal keep accepting a certificate
   revoked elsewhere until this process re-signs the CRL.
