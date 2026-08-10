@@ -32,6 +32,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -133,10 +135,7 @@ var _ = Describe("Auth Middleware", func() {
 
 		// "puppet-server" is the sole admin CN in the allow list.
 		server := api.New(myCA)
-		server.AuthConfig = &api.AuthConfig{
-			CACert:    caCert,
-			AllowList: map[string]bool{"puppet-server": true},
-		}
+		server.AuthConfig = api.NewAuthConfig(caCert, map[string]bool{"puppet-server": true})
 		mux = server.Routes()
 	})
 
@@ -733,11 +732,8 @@ var _ = Describe("Auth Middleware", func() {
 
 		BeforeEach(func() {
 			srv := api.New(myCA)
-			srv.AuthConfig = &api.AuthConfig{
-				CACert:            caCert,
-				AllowList:         map[string]bool{"puppet-server": true},
-				AllowPublicStatus: true,
-			}
+			srv.AuthConfig = api.NewAuthConfig(caCert, map[string]bool{"puppet-server": true})
+			srv.AuthConfig.AllowPublicStatus = true
 			publicStatusMux = srv.Routes()
 		})
 
@@ -781,10 +777,7 @@ var _ = Describe("Auth Middleware", func() {
 
 		BeforeEach(func() {
 			srv := api.New(myCA)
-			srv.AuthConfig = &api.AuthConfig{
-				CACert:    caCert,
-				AllowList: map[string]bool{},
-			}
+			srv.AuthConfig = api.NewAuthConfig(caCert, map[string]bool{})
 			muxNoCNList = srv.Routes()
 		})
 
@@ -852,10 +845,7 @@ var _ = Describe("Auth Middleware", func() {
 
 			// Step 2: Submit CSR; autosign signs it immediately.
 			srv := api.New(autosignCA)
-			srv.AuthConfig = &api.AuthConfig{
-				CACert:    caCert,
-				AllowList: map[string]bool{},
-			}
+			srv.AuthConfig = api.NewAuthConfig(caCert, map[string]bool{})
 			attackMux := srv.Routes()
 
 			rr := httptest.NewRecorder()
@@ -898,11 +888,8 @@ var _ = Describe("Auth Middleware", func() {
 
 		BeforeEach(func() {
 			srv := api.New(myCA)
-			srv.AuthConfig = &api.AuthConfig{
-				CACert:      caCert,
-				AllowList:   map[string]bool{},
-				NoPpCliAuth: true,
-			}
+			srv.AuthConfig = api.NewAuthConfig(caCert, map[string]bool{})
+			srv.AuthConfig.NoPpCliAuth = true
 			muxNoPpCli = srv.Routes()
 		})
 
@@ -917,11 +904,8 @@ var _ = Describe("Auth Middleware", func() {
 
 		It("still allows POST /sign/all for a CN in the allow list", func() {
 			srv := api.New(myCA)
-			srv.AuthConfig = &api.AuthConfig{
-				CACert:      caCert,
-				AllowList:   map[string]bool{"puppet-server": true},
-				NoPpCliAuth: true,
-			}
+			srv.AuthConfig = api.NewAuthConfig(caCert, map[string]bool{"puppet-server": true})
+			srv.AuthConfig.NoPpCliAuth = true
 			muxWithCN := srv.Routes()
 
 			clientCert := issueClientCert("puppet-server", caCert, caKey)
@@ -986,18 +970,12 @@ var _ = Describe("lookupTier classification", func() {
 		Expect(err).NotTo(HaveOccurred())
 
 		srv := api.New(myCA)
-		srv.AuthConfig = &api.AuthConfig{
-			CACert:    caCert,
-			AllowList: map[string]bool{"puppet-server": true},
-		}
+		srv.AuthConfig = api.NewAuthConfig(caCert, map[string]bool{"puppet-server": true})
 		muxDefault = srv.Routes()
 
 		srvPub := api.New(myCA)
-		srvPub.AuthConfig = &api.AuthConfig{
-			CACert:            caCert,
-			AllowList:         map[string]bool{"puppet-server": true},
-			AllowPublicStatus: true,
-		}
+		srvPub.AuthConfig = api.NewAuthConfig(caCert, map[string]bool{"puppet-server": true})
+		srvPub.AuthConfig.AllowPublicStatus = true
 		muxPublicState = srvPub.Routes()
 	})
 
@@ -1080,4 +1058,66 @@ var _ = Describe("lookupTier classification", func() {
 		Entry("status read becomes public (prefixed)", "GET", "/puppet-ca/v1/certificate_status/node1", "node1", "public"),
 		Entry("status mutation stays admin-only", "PUT", "/certificate_status/node1", "node1", "adminOnly"),
 	)
+})
+
+// The allow list is swapped while requests are in flight — that is what a
+// configuration reload does to withdraw a compile server's admin rights. These
+// specs pin the contract in the package that owns it; they only fail under
+// -race, which `mage test:unit` passes.
+var _ = Describe("AuthConfig allow-list swapping", func() {
+	It("returns the list it replaced", func() {
+		cfg := api.NewAuthConfig(nil, map[string]bool{"first.example.com": true})
+
+		previous := cfg.SetAllowList(map[string]bool{"second.example.com": true})
+
+		Expect(previous).To(Equal(map[string]bool{"first.example.com": true}),
+			"the audit log's added/removed diff is built from this")
+		Expect(cfg.IsAdminCN("second.example.com")).To(BeTrue())
+		Expect(cfg.IsAdminCN("first.example.com")).To(BeFalse())
+	})
+
+	It("serves reads while the list is being replaced", func() {
+		// Each request consults the list exactly once, so a lookup either
+		// predates the swap or follows it — there is no state in which one CN
+		// has moved and another has not. What has to hold is that the read
+		// and the swap are synchronised at all: without the lock this is a
+		// concurrent map read and write, which the Go runtime turns into a
+		// process-killing abort on the authorization path.
+		old := map[string]bool{"old.example.com": true}
+		fresh := map[string]bool{"new.example.com": true}
+		cfg := api.NewAuthConfig(nil, old)
+
+		var wg sync.WaitGroup
+		var reads atomic.Int64
+		stop := make(chan struct{})
+		for i := 0; i < 4; i++ {
+			wg.Add(1)
+			go func() {
+				defer GinkgoRecover()
+				defer wg.Done()
+				for {
+					select {
+					case <-stop:
+						return
+					default:
+					}
+					cfg.IsAdminCN("old.example.com")
+					cfg.IsAdminCN("new.example.com")
+					reads.Add(1)
+				}
+			}()
+		}
+
+		for i := 0; i < 200; i++ {
+			cfg.SetAllowList(fresh)
+			cfg.SetAllowList(old)
+		}
+		cfg.SetAllowList(fresh)
+		close(stop)
+		wg.Wait()
+
+		Expect(reads.Load()).To(BeNumerically(">", 0), "the readers must have raced the writer")
+		Expect(cfg.IsAdminCN("new.example.com")).To(BeTrue(), "the last write must be in force")
+		Expect(cfg.IsAdminCN("old.example.com")).To(BeFalse())
+	})
 })

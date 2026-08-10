@@ -51,28 +51,46 @@ const maxJSONBody = 1 << 20 // 1 MiB
 // concurrently by every request.
 type AuthConfig struct {
 	CACert            *x509.Certificate
-	AllowList         map[string]bool // admin CNs (puppet-server hostnames); read via IsAdminCN
-	NoPpCliAuth       bool            // when true, pp_cli_auth extension does not grant admin access
-	AllowPublicStatus bool            // when true, GET /certificate_status is public (no client cert required)
+	NoPpCliAuth       bool // when true, pp_cli_auth extension does not grant admin access
+	AllowPublicStatus bool // when true, GET /certificate_status is public (no client cert required)
 
-	// mu guards AllowList, which SetAllowList replaces while requests are in
+	// allowList holds the admin CNs (puppet-server hostnames). It is
+	// unexported so the compiler, not a comment, enforces that IsAdminCN and
+	// SetAllowList are the only ways in: a direct read would race the swap a
+	// configuration reload performs to withdraw a compile server's admin
+	// rights. Populate it with SetAllowList.
+	allowList map[string]bool
+
+	// mu guards allowList, which SetAllowList replaces while requests are in
 	// flight (the operator adding or removing a compile server, without a
 	// restart). The other fields are set once before the server starts
 	// serving and never change.
 	mu sync.RWMutex
 }
 
+// NewAuthConfig returns an AuthConfig with the admin allow list installed.
+// Because the map is unexported, this (or SetAllowList) is the only way to
+// populate it — which is the point: the lock discipline is enforced by the
+// compiler rather than by a comment. NoPpCliAuth and AllowPublicStatus stay
+// plain fields; they are set once before the server starts serving.
+func NewAuthConfig(caCert *x509.Certificate, allowList map[string]bool) *AuthConfig {
+	c := &AuthConfig{CACert: caCert}
+	c.SetAllowList(allowList)
+	return c
+}
+
 // IsAdminCN reports whether cn is on the admin allow list.
 //
-// SECURITY: this is the read side of the allow list and the only place the map
-// may be consulted from. Reading the field directly would race SetAllowList and
-// — because that swap is what a configuration reload uses to withdraw a
-// compile server's admin rights — could serve a stale authorization decision.
+// SECURITY: this is the read side of the allow list. The map is unexported so
+// this is the only place it can be consulted from: a direct read would race
+// SetAllowList and — because that swap is what a configuration reload uses to
+// withdraw a compile server's admin rights — could serve a stale authorization
+// decision.
 // NIST 800-53: AC-3 (Access Enforcement)
 func (c *AuthConfig) IsAdminCN(cn string) bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.AllowList[cn]
+	return c.allowList[cn]
 }
 
 // SetAllowList replaces the admin allow list and returns the list it replaced,
@@ -89,8 +107,8 @@ func (c *AuthConfig) IsAdminCN(cn string) bool {
 func (c *AuthConfig) SetAllowList(allowList map[string]bool) map[string]bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	previous := c.AllowList
-	c.AllowList = allowList
+	previous := c.allowList
+	c.allowList = allowList
 	return previous
 }
 

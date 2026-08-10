@@ -621,12 +621,9 @@ func newRootCmd() *cobra.Command {
 				if err != nil {
 					return err
 				}
-				srv.AuthConfig = &api.AuthConfig{
-					CACert:            myCA.CACert,
-					AllowList:         allowList,
-					NoPpCliAuth:       cfg.NoPpCliAuth,
-					AllowPublicStatus: cfg.AllowPublicStatus,
-				}
+				srv.AuthConfig = api.NewAuthConfig(myCA.CACert, allowList)
+				srv.AuthConfig.NoPpCliAuth = cfg.NoPpCliAuth
+				srv.AuthConfig.AllowPublicStatus = cfg.AllowPublicStatus
 				if !cfg.NoPpCliAuth {
 					// SECURITY: Inform the operator that pp_cli_auth OID grants admin access.
 					// Any certificate carrying this extension with value "true" will be treated

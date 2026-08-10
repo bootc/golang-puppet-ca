@@ -73,6 +73,19 @@ func startNotifyRecorder(env map[string]string) *notifyRecorder {
 	return r
 }
 
+// unsetSpecEnv removes an environment variable for the duration of the spec,
+// restoring it afterwards. The counterpart to setEnv, for specs that need a
+// variable absent rather than present.
+func unsetSpecEnv(key string) {
+	prev, had := os.LookupEnv(key)
+	ExpectWithOffset(1, os.Unsetenv(key)).To(Succeed())
+	DeferCleanup(func() {
+		if had {
+			Expect(os.Setenv(key, prev)).To(Succeed())
+		}
+	})
+}
+
 var _ = Describe("Service manager status text", func() {
 	// A fixed "now" keeps the rendered countdowns deterministic.
 	now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
@@ -167,6 +180,25 @@ var _ = Describe("Service manager status text", func() {
 	})
 
 	Describe("newStatusReport", func() {
+		It("maps the CA's certificate and CRL onto the report", func() {
+			// Rendering is covered above; this pins where the values come
+			// from. Sourcing caUntil from NotBefore, or the CN from the
+			// issuer, would render perfectly and report a CA as having
+			// decades left on the day it expires.
+			testCA, _ := newRefresherTestCA()
+
+			report := newStatusReport(testCA, "0.0.0.0:8140", true)
+			Expect(report.caCN).To(Equal(testCA.CACert.Subject.CommonName))
+			Expect(report.caUntil).To(BeTemporally("==", testCA.CACert.NotAfter))
+			Expect(report.crlOK).To(BeTrue())
+
+			snap, ok := testCA.CRLSnapshot()
+			Expect(ok).To(BeTrue())
+			Expect(report.crl.Number).To(Equal(snap.Number))
+			Expect(report.crl.Revoked).To(Equal(snap.Revoked))
+			Expect(report.crl.NextUpdate).To(BeTemporally("==", snap.NextUpdate))
+		})
+
 		It("reads the CA's certificate and cached CRL", func() {
 			// A CA that has never been initialised still has to produce a
 			// status line rather than panic: the heartbeat runs regardless.
@@ -179,6 +211,14 @@ var _ = Describe("Service manager status text", func() {
 })
 
 var _ = Describe("Service manager heartbeat", func() {
+	BeforeEach(func() {
+		// Start from a known environment: a developer or CI runner invoking
+		// the suite from inside a systemd unit would otherwise inherit a live
+		// notification socket and watchdog, and these specs assume neither.
+		unsetSpecEnv("NOTIFY_SOCKET")
+		unsetSpecEnv("WATCHDOG_USEC")
+	})
+
 	Describe("heartbeatInterval", func() {
 		It("refreshes the status text once a minute without a watchdog", func() {
 			startNotifyRecorder(nil)
@@ -254,6 +294,33 @@ var _ = Describe("Service manager heartbeat", func() {
 			Expect(buf.String()).To(ContainSubstring("WatchdogSec is very short"))
 			Expect(buf.String()).To(ContainSubstring("heartbeat=10ms"))
 		})
+
+		DescribeTable("warns exactly below the documented threshold",
+			func(usec string, wantInterval time.Duration, wantWarning bool) {
+				// The threshold is half the deadline against
+				// shortWatchdogWarnBelow, i.e. a 200ms WatchdogSec. Testing
+				// only far from it leaves a >= / > slip invisible.
+				var buf bytes.Buffer
+				orig := slog.Default()
+				slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+				defer slog.SetDefault(orig)
+
+				startNotifyRecorder(map[string]string{"WATCHDOG_USEC": usec})
+				n := sdnotify.New()
+				DeferCleanup(func() { Expect(n.Close()).To(Succeed()) })
+
+				Expect(heartbeatInterval(n)).To(Equal(wantInterval))
+				if wantWarning {
+					Expect(buf.String()).To(ContainSubstring("WatchdogSec is very short"))
+				} else {
+					Expect(buf.String()).To(BeEmpty())
+				}
+			},
+			Entry("exactly at the threshold stays quiet", "200000", 100*time.Millisecond, false),
+			Entry("one millisecond under it warns", "199000", 99500*time.Microsecond, true),
+			Entry("at twice the floor, half is still returned", "20000", absoluteMinHeartbeat, true),
+			Entry("below twice the floor, the floor wins", "19000", absoluteMinHeartbeat, true),
+		)
 
 		It("says nothing about a watchdog it can honour", func() {
 			var buf bytes.Buffer

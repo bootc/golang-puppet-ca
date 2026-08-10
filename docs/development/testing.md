@@ -8,7 +8,7 @@ For build/lint conventions and the full `mage` target list, see
 ## Common targets
 
 ```bash
-# Run all unit tests
+# Run all unit tests (under -race; needs cgo and a C compiler)
 mage test:unit
 
 # Run the magefile's own suite (build-tagged; not covered by `go test ./...`)

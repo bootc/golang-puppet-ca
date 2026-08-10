@@ -166,61 +166,112 @@ func runLauncher(drain time.Duration, notify *sdnotify.Notifier, hupCh <-chan os
 	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
 
 	// Wait for either child to exit.
-	type childResult struct {
-		name string
-		err  error
-	}
 	exitCh := make(chan childResult, 2)
 	go func() { exitCh <- childResult{"signer", signerCmd.Wait()} }()
 	go func() { exitCh <- childResult{"frontend", frontendCmd.Wait()} }()
 
-	shutdown := func() {
-		frontendCmd.Process.Signal(syscall.SIGTERM)
-		signerCmd.Process.Signal(syscall.SIGTERM)
-		timer := time.AfterFunc(gracefulShutdownTimeout, func() {
-			frontendCmd.Process.Kill()
-			signerCmd.Process.Kill()
-		})
-		<-exitCh
-		<-exitCh
-		timer.Stop()
-	}
+	return (&supervisor{
+		signer:   signerCmd.Process,
+		frontend: frontendCmd.Process,
+		notify:   notify,
+		hupCh:    hupCh,
+		sigCh:    sigCh,
+		exitCh:   exitCh,
+		drain:    gracefulShutdownTimeout,
+		crash:    crashShutdownTimeout,
+	}).run()
+}
 
+// childResult reports which child exited and why.
+type childResult struct {
+	name string
+	err  error
+}
+
+// childProcess is the slice of *os.Process the supervisor loop actually uses.
+// Naming it lets the loop — which owns reload forwarding and every status
+// notification the operator sees — be exercised without spawning children.
+type childProcess interface {
+	Signal(os.Signal) error
+	Kill() error
+}
+
+// supervisor is runLauncher's steady state: forward reloads, propagate
+// termination, and report whichever comes first to the service manager.
+type supervisor struct {
+	signer   childProcess
+	frontend childProcess
+	notify   *sdnotify.Notifier
+	hupCh    <-chan os.Signal
+	sigCh    <-chan os.Signal
+	exitCh   <-chan childResult
+
+	// drain is how long both children get to exit after a termination signal;
+	// crash is the shorter budget for tearing down the survivor when one child
+	// has already gone.
+	drain time.Duration
+	crash time.Duration
+}
+
+// run blocks until a termination signal arrives or a child exits, and returns
+// the launcher's exit status.
+func (s *supervisor) run() error {
 	for {
 		select {
-		case <-hupCh:
+		case <-s.hupCh:
 			// The configuration a reload affects (the TLS keypair, the admin
 			// allow list) belongs to the frontend, so the signal is forwarded
 			// there rather than acted on here.
 			slog.Info("Forwarding reload signal to the frontend process")
-			frontendCmd.Process.Signal(syscall.SIGHUP)
+			if err := s.frontend.Signal(syscall.SIGHUP); err != nil {
+				// Not teardown: the launcher keeps running, so a dropped
+				// signal would otherwise leave the operator believing a
+				// certificate or allow-list change had taken effect.
+				slog.Error("Failed to forward the reload signal; the running configuration is unchanged",
+					"error", err)
+			}
 			continue
 
-		case sig := <-sigCh:
+		case sig := <-s.sigCh:
 			slog.Info("Received signal, shutting down CA processes", "signal", sig)
-			notify.Stopping(fmt.Sprintf("Shutting down on %s (up to %s for the children to exit)",
-				sig, gracefulShutdownTimeout))
-			shutdown()
+			s.notify.Stopping(fmt.Sprintf("Shutting down on %s (up to %s for the children to exit)",
+				sig, s.drain))
+			timer := s.stopBoth(s.drain)
+			<-s.exitCh
+			<-s.exitCh
+			timer.Stop()
 			return nil
 
-		case result := <-exitCh:
+		case result := <-s.exitCh:
 			slog.Error("CA child process exited unexpectedly", "process", result.name, "error", result.err)
-			// Report the cause before tearing the rest down: the status text
-			// outlives the process and is what `systemctl status` shows next to
-			// the failure.
-			notify.Stopping(fmt.Sprintf("The %s process exited unexpectedly (%v); stopping", result.name, result.err))
-			// Shut down the surviving child.
-			frontendCmd.Process.Signal(syscall.SIGTERM)
-			signerCmd.Process.Signal(syscall.SIGTERM)
-			timer := time.AfterFunc(crashShutdownTimeout, func() {
-				frontendCmd.Process.Kill()
-				signerCmd.Process.Kill()
-			})
-			<-exitCh // wait for the other child
+			crashStatus := fmt.Sprintf("The %s process exited unexpectedly (%v); stopping", result.name, result.err)
+			s.notify.Stopping(crashStatus)
+			timer := s.stopBoth(s.crash)
+			<-s.exitCh // wait for the other child
 			timer.Stop()
+			// Re-send the cause: the surviving child publishes its own drain
+			// status on the way out, which would otherwise be the last thing
+			// on the socket and would replace the named failure in
+			// `systemctl status` at exactly the moment an operator looks.
+			s.notify.Stopping(crashStatus)
 			return fmt.Errorf("%s process exited unexpectedly: %w", result.name, result.err)
 		}
 	}
+}
+
+// stopBoth asks both children to exit and arms a hard kill after budget,
+// returning the timer so the caller can stop it once both have gone.
+func (s *supervisor) stopBoth(budget time.Duration) *time.Timer {
+	// Best-effort teardown: a child that has already exited returns
+	// os.ErrProcessDone, and the hard-kill timer below covers one that does
+	// not go quietly. Unlike the reload forward, there is nothing an operator
+	// could do with these errors — the launcher is on its way out either way.
+	_ = s.frontend.Signal(syscall.SIGTERM)
+	_ = s.signer.Signal(syscall.SIGTERM)
+	return time.AfterFunc(budget, func() {
+		_ = s.frontend.Kill()
+		_ = s.signer.Kill()
+	})
 }
 
 // internalEnvKeys are the variables the launcher and the --daemon re-exec strip

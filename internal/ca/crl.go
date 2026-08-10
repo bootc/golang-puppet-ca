@@ -292,6 +292,17 @@ func (c *CA) RefreshCRLIfDue(ctx context.Context, refreshBefore time.Duration) (
 			return err
 		}
 		if time.Until(stored.own.NextUpdate) > refreshBefore {
+			// Adopt the CRL another replica re-signed. Without this a replica
+			// that never wins the re-sign race keeps the copy it cached at
+			// startup, and once that window lapses everything reading the
+			// cache — CRLSnapshot, and through it the service manager's status
+			// text — reports a lapsed CRL indefinitely while storage holds a
+			// fresh one. The parse is already paid for and c.mu is held, so
+			// this costs only the comparison.
+			if stored.own.Number != nil && (c.cachedCRL == nil || c.cachedCRL.Number == nil ||
+				stored.own.Number.Cmp(c.cachedCRL.Number) > 0) {
+				c.cachedCRL = stored.own
+			}
 			return nil
 		}
 		if err := c.signCRLLocked(ctx, stored, stored.own.RevokedCertificateEntries); err != nil {
@@ -311,10 +322,12 @@ type CRLSnapshot struct {
 	// Number is the CRL number (RFC 5280 §5.2.3), which increases by one on
 	// every re-sign.
 	Number *big.Int
-	// NextUpdate bounds the CRL's validity window; a NextUpdate in the past
-	// means clients are being served a stale CRL. ThisUpdate is deliberately
-	// not carried: no caller needs it, and the Prometheus collector reads its
-	// own copy straight from storage.
+	// NextUpdate bounds the validity window of the CRL this process has cached.
+	// Requests are answered from storage rather than from this cache, so a
+	// NextUpdate in the past means this replica has not observed a re-sign
+	// since the window lapsed — which RefreshCRLIfDue corrects on its next
+	// pass. ThisUpdate is deliberately not carried: no caller needs it, and
+	// the Prometheus collector reads its own copy straight from storage.
 	NextUpdate time.Time
 	// Revoked is the number of certificates listed on the CRL.
 	Revoked int

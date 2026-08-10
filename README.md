@@ -47,6 +47,7 @@ wire-compatible with your existing Puppet/OpenVox fleet.
 - **Prometheus exporter:** optional `/metrics` listener (`--metrics-listen`) exposing Go runtime/process and HTTP metrics plus CA certificate, CRL, and per–leaf-certificate expiry and issuance-status series; ships with a [Jsonnet alerting mixin](mixin/). See [metrics & monitoring](docs/metrics.md)
 - **Kubernetes export (opt-in):** publish the CA certificate and/or CRL into any number of Kubernetes Secrets and ConfigMaps via in-cluster server-side apply, with configurable names, namespaces, data keys, labels, annotations, and Secret `type`; CRL-bearing objects are refreshed whenever the CRL changes. See [Kubernetes export](docs/kubernetes-export.md)
 - **Graceful shutdown:** `SIGTERM`/`SIGINT` drains in-flight requests with a configurable window (25s default) before exiting; deferred storage and signer cleanup always runs
+- **Configuration reload:** `SIGHUP` (or `systemctl reload`) re-reads the TLS keypair and the admin allow list without dropping connections, so renewing the CA's server certificate or decommissioning a compile server needs no restart. See [reloading configuration](docs/configuration.md#reloading-configuration)
 - **systemd integration:** `Type=notify` readiness (`systemctl start` returns once the listener is actually accepting), a live status line covering the listener, CA expiry and CRL freshness, watchdog keep-alives, and `systemctl reload` for TLS certificate renewal and admin allow-list changes; ships a hardened [unit file](packaging/systemd/openvox-ca.service). See [running under systemd](docs/systemd.md)
 - **FIPS-compatible:** the core CA uses the standard library only (`crypto/x509`, `net/http`); no CGO by default; FIPS build available via `GOEXPERIMENT=boringcrypto` (the optional Kubernetes export adds the `client-go` dependency)
 - **`openvox-ca-ctl`:** operator CLI matching `puppetserver ca` subcommands. See the [operator CLI reference](docs/operator-cli.md)
@@ -65,6 +66,21 @@ $ docker pull ghcr.io/voxpupuli/openvox-ca:latest
 See [container images](docs/container-images.md) for the available tags and a
 `docker run` example, or use the [compose.yml](compose.yml) at the repository
 root for a Docker/Podman Compose deployment.
+
+### Release tarballs
+
+Each release publishes `openvox-ca_linux_amd64.tar.gz`, `openvox-ca_linux_arm64.tar.gz`, and a FIPS build
+`openvox-ca_linux_amd64_fips.tar.gz`, plus `checksums.txt`. Every archive contains both binaries
+(`openvox-ca`, `openvox-ca-ctl`) and the systemd unit `openvox-ca.service`:
+
+```console
+$ curl -LO https://github.com/voxpupuli/openvox-ca/releases/latest/download/openvox-ca_linux_amd64.tar.gz
+$ curl -LO https://github.com/voxpupuli/openvox-ca/releases/latest/download/checksums.txt
+$ sha256sum --ignore-missing -c checksums.txt
+$ tar xzf openvox-ca_linux_amd64.tar.gz
+```
+
+See [running under systemd](docs/systemd.md) for the rest of a VM install.
 
 ### Building from source
 

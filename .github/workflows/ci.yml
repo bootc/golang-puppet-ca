@@ -76,6 +76,36 @@ jobs:
         run: npx --yes markdownlint-cli2@0.23.1
 
   # -- Unit tests --------------------------------------------------------------─
+  dist:
+    name: Release archives
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Install Mage
+        run: go install github.com/magefile/mage@v1.17.2
+      # Build.Dist stages a checked-in file (the systemd unit) into every
+      # archive. Without this job a rename or move breaks nothing until a tag
+      # is pushed, at which point the tag exists and no artefacts do.
+      - name: Build release archives
+        run: mage build:dist
+      - name: Check archive contents and modes
+        run: |
+          set -euo pipefail
+          for archive in dist/*.tar.gz; do
+            echo "== $archive"
+            listing=$(tar -tvzf "$archive")
+            echo "$listing"
+            for entry in openvox-ca openvox-ca-ctl openvox-ca.service; do
+              echo "$listing" | grep -q " $entry\$" || { echo "missing $entry"; exit 1; }
+            done
+            echo "$listing" | grep -qE '^-rwxr-xr-x .* openvox-ca$' || { echo "openvox-ca must be 0755"; exit 1; }
+            echo "$listing" | grep -qE '^-rw-r--r-- .* openvox-ca.service$' || { echo "the unit must be 0644"; exit 1; }
+          done
+
   unit:
     name: Unit tests
     runs-on: ubuntu-latest
@@ -362,6 +392,7 @@ jobs:
       - check
       - hadolint
       - markdownlint
+      - dist
       - unit
       - dist
       - puppet

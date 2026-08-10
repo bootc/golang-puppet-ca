@@ -47,6 +47,7 @@ import (
 // which is how the rotation specs work. Two keypairs that must coexist need
 // two directories.
 func writeTestKeypair(dir, cn string) (certPath, keyPath string) {
+	GinkgoHelper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	Expect(err).NotTo(HaveOccurred())
 
@@ -73,6 +74,7 @@ func writeTestKeypair(dir, cn string) (certPath, keyPath string) {
 // servedCN returns the common name of the certificate the reloader currently
 // hands to new handshakes.
 func servedCN(c *certReloader) string {
+	GinkgoHelper()
 	cert, err := c.GetCertificate(nil)
 	Expect(err).NotTo(HaveOccurred())
 	Expect(cert.Leaf).NotTo(BeNil())
@@ -115,6 +117,28 @@ var _ = Describe("Admin allow list construction", func() {
 	It("reports an unreadable allow-list file", func() {
 		_, err := buildAdminAllowList("", filepath.Join(dir, "missing.txt"))
 		Expect(err).To(HaveOccurred())
+	})
+})
+
+var _ = Describe("diffAllowList", func() {
+	It("names the CNs that gained and lost admin access", func() {
+		// The audit record: a count alone cannot distinguish "unchanged" from
+		// "one compile server swapped for another".
+		added, removed := diffAllowList(
+			map[string]bool{"stays.example.com": true, "goes.example.com": true},
+			map[string]bool{"stays.example.com": true, "arrives.example.com": true},
+		)
+		Expect(added).To(Equal([]string{"arrives.example.com"}))
+		Expect(removed).To(Equal([]string{"goes.example.com"}))
+	})
+
+	It("reports no change when the allow list is rewritten identically", func() {
+		added, removed := diffAllowList(
+			map[string]bool{"a.example.com": true},
+			map[string]bool{"a.example.com": true},
+		)
+		Expect(added).To(BeEmpty())
+		Expect(removed).To(BeEmpty())
 	})
 })
 
@@ -191,7 +215,7 @@ var _ = Describe("Configuration reloading", func() {
 
 		allowList, err := buildAdminAllowList("puppet.example.com", cnFile)
 		Expect(err).NotTo(HaveOccurred())
-		auth = &api.AuthConfig{AllowList: allowList}
+		auth = api.NewAuthConfig(nil, allowList)
 
 		certPath, keyPath := writeTestKeypair(dir, "first.example.com")
 		certs, err := newCertReloader(certPath, keyPath)
@@ -272,26 +296,6 @@ var _ = Describe("Configuration reloading", func() {
 		Expect(logged).To(ContainSubstring("removed=[compile-1.example.com]"))
 	})
 
-	It("names the CNs that gained and lost admin access", func() {
-		// The audit record: a count alone cannot distinguish "unchanged" from
-		// "one compile server swapped for another".
-		added, removed := diffAllowList(
-			map[string]bool{"stays.example.com": true, "goes.example.com": true},
-			map[string]bool{"stays.example.com": true, "arrives.example.com": true},
-		)
-		Expect(added).To(Equal([]string{"arrives.example.com"}))
-		Expect(removed).To(Equal([]string{"goes.example.com"}))
-	})
-
-	It("reports no change when the allow list is rewritten identically", func() {
-		added, removed := diffAllowList(
-			map[string]bool{"a.example.com": true},
-			map[string]bool{"a.example.com": true},
-		)
-		Expect(added).To(BeEmpty())
-		Expect(removed).To(BeEmpty())
-	})
-
 	It("keeps a failure visible in the status until a reload succeeds", func() {
 		// Otherwise the next heartbeat overwrites the notice and the operator
 		// is left believing the reload took effect.
@@ -338,7 +342,7 @@ var _ = Describe("Reload watcher", func() {
 
 		allowList, err := buildAdminAllowList("", cnFile)
 		Expect(err).NotTo(HaveOccurred())
-		auth = &api.AuthConfig{AllowList: allowList}
+		auth = api.NewAuthConfig(nil, allowList)
 		reloader = &configReloader{auth: auth, cnFile: cnFile}
 
 		rec = startNotifyRecorder(nil)
@@ -384,6 +388,21 @@ var _ = Describe("Reload watcher", func() {
 		Eventually(rec.msgs).Should(Receive(HavePrefix("RELOADING=1")))
 		Eventually(rec.msgs).Should(Receive(Equal("READY=1\nSTATUS=serving | last reload FAILED, see the logs\n")))
 		Expect(auth.IsAdminCN("compile-1.example.com")).To(BeTrue(), "the previous allow list is still in force")
+	})
+
+	It("applies a reload that arrived before the watcher started", func() {
+		// This is the guarantee that justifies registering SIGHUP at the top
+		// of RunE, ahead of storage, the signer handshake and the listener:
+		// a reload delivered during a slow start waits in the buffer instead
+		// of killing the process, and is applied when the loop reaches it.
+		Expect(os.WriteFile(cnFile, []byte("early.example.com\n"), 0600)).To(Succeed())
+		Expect(syscall.Kill(os.Getpid(), syscall.SIGHUP)).To(Succeed())
+		Eventually(hupCh).Should(HaveLen(1), "the signal must be queued, not dropped")
+
+		startWatcher()
+
+		Eventually(func() bool { return auth.IsAdminCN("early.example.com") }).Should(BeTrue())
+		Eventually(rec.msgs).Should(Receive(HavePrefix("RELOADING=1")))
 	})
 
 	It("handles repeated reloads", func() {

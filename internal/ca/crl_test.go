@@ -187,6 +187,52 @@ var _ = Describe("CA CRL reissuance", func() {
 			Expect(snap.Revoked).To(Equal(len(stored.RevokedCertificateEntries)))
 		})
 
+		It("counts the certificates actually on the CRL", func() {
+			// The seeded CRL is empty, so asserting against a length read back
+			// from the same CRL compares 0 with 0 — an implementation that
+			// returned a constant would pass. Revoke something and assert the
+			// literal count, since this is the number the service manager's
+			// status line renders.
+			csrPEM, err := testutil.GenerateCSR("crl-snapshot-node")
+			Expect(err).NotTo(HaveOccurred())
+			_, err = myCA.SaveRequest(context.Background(), "crl-snapshot-node", csrPEM)
+			Expect(err).NotTo(HaveOccurred())
+			_, err = myCA.Sign(context.Background(), "crl-snapshot-node")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(myCA.Revoke(context.Background(), "crl-snapshot-node")).To(Succeed())
+
+			snap, ok := myCA.CRLSnapshot()
+			Expect(ok).To(BeTrue())
+			Expect(snap.Revoked).To(Equal(1))
+		})
+
+		It("adopts a CRL another replica re-signed", func() {
+			// A replica that never wins the re-sign race would otherwise serve
+			// the window it cached at startup forever, and report EXPIRED in
+			// the status line while storage holds a fresh CRL.
+			before, ok := myCA.CRLSnapshot()
+			Expect(ok).To(BeTrue())
+
+			// Stand in for the other replica: re-sign through a second CA
+			// instance over the same storage, leaving this one's cache stale.
+			other := ca.New(store, ca.AutosignConfig{Mode: "off"}, "puppet.test")
+			Expect(other.Init(context.Background())).To(Succeed())
+			Expect(other.ReissueCRL(context.Background())).To(Succeed())
+
+			stale, _ := myCA.CRLSnapshot()
+			Expect(stale.Number).To(Equal(before.Number), "this replica has not noticed yet")
+
+			// A due-check that finds the CRL fresh must still adopt it.
+			reissued, err := myCA.RefreshCRLIfDue(context.Background(), time.Hour)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(reissued).To(BeFalse(), "another replica already re-signed it")
+
+			after, ok := myCA.CRLSnapshot()
+			Expect(ok).To(BeTrue())
+			Expect(after.Number.Cmp(before.Number)).To(Equal(1))
+			Expect(after.NextUpdate).To(BeTemporally(">", before.NextUpdate))
+		})
+
 		It("tracks re-signs of the CRL", func() {
 			before, ok := myCA.CRLSnapshot()
 			Expect(ok).To(BeTrue())

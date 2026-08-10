@@ -11,15 +11,23 @@ None of it needs configuration. The protocol is driven entirely by `$NOTIFY_SOCK
 
 ## Installing the unit
 
-A ready-to-use unit ships in [`packaging/systemd/openvox-ca.service`](../packaging/systemd/openvox-ca.service) (and in the release tarballs):
+A ready-to-use unit ships in [`packaging/systemd/openvox-ca.service`](../packaging/systemd/openvox-ca.service) and in every [release tarball](../README.md#release-tarballs), alongside the two binaries. Starting from a downloaded release:
 
 ```console
+$ tar xzf openvox-ca_linux_amd64.tar.gz
+$ sha256sum --ignore-missing -c checksums.txt
 $ sudo useradd --system --home-dir /var/lib/puppet-ca --shell /usr/sbin/nologin puppet-ca
 $ sudo install -m 0755 openvox-ca openvox-ca-ctl /usr/local/bin/
 $ sudo install -m 0644 openvox-ca.service /etc/systemd/system/
+$ sudo install -d -m 0755 /etc/puppet-ca
+$ sudo install -o root -g puppet-ca -m 0640 config.yaml /etc/puppet-ca/config.yaml
 $ sudo systemctl daemon-reload
 $ sudo systemctl enable --now openvox-ca.service
 ```
+
+Building from source instead? `mage build:all` puts the binaries in `bin/` and the unit stays at `packaging/systemd/openvox-ca.service`; install from there.
+
+`config.yaml` is **0640 root:puppet-ca** because it can hold credentials — `etcd_password`, or an inline OpenBao `role_id` — and the service only needs to read it. The server auto-detects that path, so the unit passes no `--config` and `PUPPET_CA_CONFIG` still works in a drop-in.
 
 The unit expects the binary at `/usr/local/bin/openvox-ca` and its configuration at `/etc/puppet-ca/config.yaml`. See [configuring the server](configuration.md).
 
@@ -64,7 +72,7 @@ It is refreshed on a timer, so the countdowns stay true. An elapsed deadline is 
 Status: "Serving HTTPS on 0.0.0.0:8140 | CA \"Puppet CA: puppet.example.com\" expires in 1824d | CRL #7 (3 revoked) EXPIRED 2d ago"
 ```
 
-Everything in the line is read from memory. Certificate counts are deliberately absent: that means listing the inventory in the storage backend, which is scrape-weight work and belongs in the [Prometheus exporter](metrics.md), not in a status line refreshed every minute.
+Everything in the line is read from memory. Certificate counts are deliberately absent: that means listing the inventory in the storage backend, which is scrape-weight work and belongs in the [Prometheus exporter](metrics.md), not in a status line refreshed on a timer (every minute with no watchdog, or half `WatchdogSec=` when one is set — 45 seconds for the shipped unit).
 
 ## Reloading
 
@@ -75,9 +83,11 @@ Everything in the line is read from memory. Certificate counts are deliberately 
 | `--tls-cert` / `--tls-key` | The CA's own server certificate expires like any other and has to be renewed |
 | `--puppet-server-file` | A compile server is added, or a decommissioned one must stop being an admin |
 
+`--puppet-server` itself is frozen at startup — reload re-reads only the file — and a certificate carrying `pp_cli_auth` stays an admin whatever the allow list says, so decommissioning a host means revoking its certificate too. See [admin credential resolution](api.md#admin-credential-resolution).
+
 Connections in flight keep the certificate they negotiated with; the next TLS handshake picks up the new one. The allow list is swapped atomically with respect to in-flight requests: each request sees either the whole old list or the whole new one, and any CN that gained or lost admin rights is named in the log so the change is auditable.
 
-Everything else — listen address, storage backend, CA key custody, CA properties, autosign configuration — needs a restart. Those are bound to state established at startup, and re-reading them behind your back would be worse than telling you to restart.
+Everything else — the listen address, the storage backend, CA key custody, CA properties, and which autosign configuration is in use — needs a restart. Those are bound to state established at startup, and re-reading them behind your back would be worse than telling you to restart. (The autosign allowlist or script, and the OpenBao AppRole credential files, are read live on every use and need neither a reload nor a restart.)
 
 A reload that fails (a half-written certificate, a deleted allow-list file) leaves the previous configuration in place and the CA serving. The failure is logged and stays in the status text until a reload succeeds:
 

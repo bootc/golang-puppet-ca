@@ -66,7 +66,21 @@ type Notifier struct {
 	// watchdog is the WatchdogSec= interval the service manager expects to be
 	// fed within, or zero when the watchdog is disabled.
 	watchdog time.Duration
+
+	// warnedSendFailure records whether a write failure has already been
+	// reported at Warn, so a persistently unreachable socket does not flood
+	// the journal at heartbeat rate. Guarded by mu.
+	warnedSendFailure bool
 }
+
+// writeTimeout bounds a single notification write. The socket is a datagram
+// socket, so a write only blocks when the service manager's receive queue is
+// full — but Go parks the goroutine indefinitely when it does, and send holds
+// mu across the write. Without this, a wedged service manager would stall the
+// heartbeat goroutine, block Close, and hang shutdown until the unit's
+// TimeoutStopSec escalated to SIGKILL, truncating the drain. A lost status
+// update is the outcome the package promises instead.
+const writeTimeout = time.Second
 
 // New returns a Notifier for the current environment. When $NOTIFY_SOCKET is
 // unset — or names a socket that cannot be reached — the returned Notifier is
@@ -213,7 +227,22 @@ func (n *Notifier) send(msg string) {
 	if n.conn == nil { // never connected, or closed while this call was queued
 		return
 	}
+	if err := n.conn.SetWriteDeadline(time.Now().Add(writeTimeout)); err != nil {
+		slog.Debug("Failed to set the notification write deadline", "error", err)
+	}
 	if _, err := n.conn.Write([]byte(msg)); err != nil {
+		// The first failure after a successful connect is worth an operator's
+		// attention: the socket was reachable at startup, so something has
+		// changed, and with a watchdog configured this path ends in the
+		// service manager killing an otherwise healthy CA. Subsequent
+		// failures drop to Debug so a persistent fault cannot flood the
+		// journal at heartbeat rate.
+		if !n.warnedSendFailure {
+			n.warnedSendFailure = true
+			slog.Warn("Failed to notify the service manager; further failures will be logged at debug level",
+				"error", err)
+			return
+		}
 		slog.Debug("Failed to notify the service manager", "error", err)
 	}
 }

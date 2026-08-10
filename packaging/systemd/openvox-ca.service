@@ -21,13 +21,21 @@ NotifyAccess=all
 # "systemctl reload" wait for the new configuration to be in effect.
 ExecReload=/bin/kill -HUP $MAINPID
 
-ExecStart=/usr/local/bin/openvox-ca --config /etc/puppet-ca/config.yaml
+# No --config: the binary already auto-detects /etc/puppet-ca/config.yaml when
+# it exists, and pinning the path here would make PUPPET_CA_CONFIG inert and
+# turn an env-only deployment (no YAML on disk) into a start failure.
+ExecStart=/usr/local/bin/openvox-ca
 
 # The frontend feeds the watchdog on a timer, so a frontend that has died or
 # whose heartbeat has stalled is restarted rather than left half-alive. It is
 # not a backend health check -- see docs/systemd.md for what it does and does
 # not catch.
-WatchdogSec=60s
+#
+# 90s, not 60s: composing the status text takes the CA's read lock, and a
+# storage operation holding the write lock is bounded by a 60s cluster-lock
+# timeout. An equal budget would leave no headroom between "slow backend" and
+# "kill the service".
+WatchdogSec=90s
 Restart=on-failure
 RestartSec=5s
 

@@ -1151,6 +1151,19 @@ func (Dev) Check() error {
 	if err := verifyDistVariants(); err != nil {
 		return err
 	}
+	// Vet the one package with a non-Linux build-tagged file. Every CI check
+	// runs on Linux, so internal/sdnotify/monotonic_other.go is otherwise
+	// never compiled and can rot unnoticed — while the comment in that file
+	// names developer workstations as the audience it serves. Scoped to that
+	// package rather than ./...: a module-wide cross-vet would make "every
+	// dependency must type-check on darwin" a standing constraint on future
+	// dependency choices, which is a much bigger commitment than this file
+	// needs.
+	fmt.Println("Vetting the non-Linux build of internal/sdnotify...")
+	if err := sh.RunWith(map[string]string{"GOOS": "darwin", "GOARCH": "arm64"},
+		"go", "vet", "./internal/sdnotify/..."); err != nil {
+		return fmt.Errorf("go vet failed for GOOS=darwin: %w", err)
+	}
 	return Dev{}.Lint()
 }
 

@@ -212,6 +212,8 @@ A client certificate is considered an admin credential if **either** condition i
 
 The `pp_cli_auth` check is enabled by default. Disable it with `--no-pp-cli-auth` (or `no_pp_cli_auth: true` in the config file) if you prefer strict CN-only authorization.
 
-The CN allow list is not fixed for the life of the process: `SIGHUP` (or `systemctl reload`) rebuilds it from `--puppet-server` plus the current contents of `--puppet-server-file`, so admin access can be granted or **withdrawn** without a restart. The swap is atomic with respect to in-flight requests, and the CNs added or removed are named in the log. See [reloading configuration](configuration.md#reloading-configuration).
+The CN allow list is not fixed for the life of the process: `SIGHUP` (or `systemctl reload`) rebuilds it from the current contents of `--puppet-server-file`, merged with the `--puppet-server` value the process started with, so CN-based admin access can be granted or withdrawn without a restart. The swap is atomic with respect to in-flight requests, and the CNs added or removed are named in the log. See [reloading configuration](configuration.md#reloading-configuration).
+
+Two limits are worth knowing before relying on that to decommission a host. `--puppet-server` itself is frozen at startup — only the file is re-read — and condition 2 is untouched by a reload: a certificate carrying `pp_cli_auth=true`, which OpenVox Server issues to itself by default, remains an admin credential until it is revoked or the server is restarted with `--no-pp-cli-auth`. Revoking the certificate (`openvox-ca-ctl revoke`, or `PUT /certificate_status/{subject}` with `desired_state: revoked`) is the step that actually removes admin authority.
 
 > **OID source:** [`lib/puppet/ssl/oids.rb`](https://github.com/puppetlabs/puppet/blob/main/lib/puppet/ssl/oids.rb)

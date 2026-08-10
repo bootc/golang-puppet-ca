@@ -27,6 +27,7 @@ import (
 	"sort"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"github.com/voxpupuli/openvox-ca/internal/api"
 	"github.com/voxpupuli/openvox-ca/internal/sdnotify"
@@ -77,6 +78,20 @@ func (c *certReloader) reload() error {
 			"cert", c.certFile,
 			"subject", cert.Leaf.Subject.CommonName,
 			"not_after", cert.Leaf.NotAfter)
+
+		// LoadX509KeyPair checks only that the certificate and key correspond,
+		// and a Go TLS server does not validate its own leaf — so a rotation
+		// that installed a stale or not-yet-valid keypair would otherwise
+		// report success while every new handshake failed at the agent.
+		now := time.Now()
+		switch {
+		case now.After(cert.Leaf.NotAfter):
+			slog.Warn("The TLS certificate just loaded has already expired; clients will reject it",
+				"cert", c.certFile, "not_after", cert.Leaf.NotAfter)
+		case now.Before(cert.Leaf.NotBefore):
+			slog.Warn("The TLS certificate just loaded is not valid yet; clients will reject it until then",
+				"cert", c.certFile, "not_before", cert.Leaf.NotBefore)
+		}
 	}
 	return nil
 }
@@ -156,12 +171,16 @@ func (r *configReloader) reload() error {
 			// this is the only moment the change is observable — the file can be
 			// rewritten again straight afterwards. CNs are hostnames, not secrets.
 			// NIST 800-53: AU-2 (Event Logging), AC-6 (Least Privilege)
+			// Read everything the log line needs before the swap: once
+			// SetAllowList returns, the map belongs to the AuthConfig and
+			// request goroutines are reading it under the lock.
+			count := len(allowList)
 			added, removed := diffAllowList(r.auth.SetAllowList(allowList), allowList)
 			if len(added) > 0 || len(removed) > 0 {
 				slog.Info("Reloaded admin allow list",
-					"added", added, "removed", removed, "admin_cns", len(allowList))
+					"added", added, "removed", removed, "admin_cns", count)
 			} else {
-				slog.Info("Reloaded admin allow list, unchanged", "admin_cns", len(allowList))
+				slog.Info("Reloaded admin allow list, unchanged", "admin_cns", count)
 			}
 		}
 	}

@@ -31,12 +31,33 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"github.com/voxpupuli/openvox-ca/internal/sdnotify"
+	"golang.org/x/sys/unix"
 )
 
 // fakeManager stands in for the service manager: it owns the datagram socket
 // named by $NOTIFY_SOCKET and records every message the Notifier sends.
 type fakeManager struct {
 	msgs chan string
+
+	mu      sync.Mutex
+	conn    *net.UnixConn
+	path    string
+	stopped bool
+}
+
+// stop closes the manager's socket and unlinks it, so a Notifier that
+// connected successfully now fails on every write — the "service manager went
+// away" case. Idempotent, so the spec and the cleanup can both call it.
+func (m *fakeManager) stop() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.stopped {
+		return nil
+	}
+	m.stopped = true
+	err := m.conn.Close()
+	os.Remove(m.path)
+	return err
 }
 
 // newFakeManager binds a datagram socket in a temporary directory, points
@@ -50,9 +71,9 @@ func newFakeManager() *fakeManager {
 	path := filepath.Join(dir, "notify.sock")
 	conn, err := net.ListenUnixgram("unixgram", &net.UnixAddr{Name: path, Net: "unixgram"})
 	Expect(err).NotTo(HaveOccurred())
-	DeferCleanup(func() { conn.Close() })
 
-	m := &fakeManager{msgs: make(chan string, 32)}
+	m := &fakeManager{msgs: make(chan string, 32), conn: conn, path: path}
+	DeferCleanup(func() { Expect(m.stop()).To(Succeed()) })
 	go func() {
 		buf := make([]byte, 8192)
 		for {
@@ -61,7 +82,14 @@ func newFakeManager() *fakeManager {
 				close(m.msgs)
 				return
 			}
-			m.msgs <- string(buf[:n])
+			// Never block on the channel: a spec that ignores the messages
+			// (the concurrency one sends hundreds) would otherwise park this
+			// goroutine on a full buffer, stop draining the socket, and leak
+			// it — while the sender blocks on a full receive queue.
+			select {
+			case m.msgs <- string(buf[:n]):
+			default:
+			}
 		}
 	}()
 
@@ -182,8 +210,22 @@ var _ = Describe("Notifier", func() {
 			if runtime.GOOS != "linux" {
 				Skip("MONOTONIC_USEC is only sent on Linux")
 			}
+			var before, after unix.Timespec
+			Expect(unix.ClockGettime(unix.CLOCK_MONOTONIC, &before)).To(Succeed())
 			n.Reloading("")
-			Expect(mgr.next()).To(MatchRegexp(`\ARELOADING=1\nMONOTONIC_USEC=[0-9]+\n\z`))
+			Expect(unix.ClockGettime(unix.CLOCK_MONOTONIC, &after)).To(Succeed())
+
+			msg := mgr.next()
+			Expect(msg).To(MatchRegexp(`\ARELOADING=1\nMONOTONIC_USEC=[0-9]+\n\z`))
+
+			// Bracket the value: systemd compares this stamp against the
+			// moment it sent SIGHUP, so a zero or wrong-magnitude reading
+			// makes it treat a genuine acknowledgement as stale.
+			field := strings.TrimSuffix(strings.SplitN(msg, "MONOTONIC_USEC=", 2)[1], "\n")
+			usec, err := strconv.ParseUint(field, 10, 64)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(usec).To(BeNumerically(">=", uint64(before.Nano())/uint64(time.Microsecond)))
+			Expect(usec).To(BeNumerically("<=", uint64(after.Nano())/uint64(time.Microsecond)))
 		})
 
 		It("reports the start of shutdown", func() {
@@ -195,6 +237,19 @@ var _ = Describe("Notifier", func() {
 			n.Watchdog()
 			n.Status("sentinel")
 			Expect(mgr.next()).To(Equal("STATUS=sentinel\n"))
+		})
+
+		It("survives a service manager that has gone away", func() {
+			// The third failure mode named in send's comment: connected at
+			// startup, peer gone later. systemd restarting mid-run does this.
+			Expect(mgr.stop()).To(Succeed())
+
+			n.Ready("still here")
+			n.Status("still here")
+			n.Watchdog()
+
+			Expect(n.Enabled()).To(BeTrue(), "a failed write must not disable the notifier")
+			Expect(n.Close()).To(Succeed())
 		})
 
 		It("is safe to close twice", func() {
@@ -227,6 +282,28 @@ var _ = Describe("Notifier", func() {
 				n.Status("before\x1b[31mred\tafter")
 				Expect(mgr.next()).To(Equal("STATUS=before [31mred after\n"))
 			})
+
+			DescribeTable("keeps the datagram well-formed for input that is not valid UTF-8",
+				func(status string) {
+					// Certificate subjects are ASN.1 byte strings with no
+					// UTF-8 guarantee, and strings.Map turns each invalid byte
+					// into a three-byte replacement rune — which can push an
+					// otherwise-short subject past the byte cap.
+					n.Status(status)
+					msg := mgr.next()
+
+					Expect(strings.Count(msg, "\n")).To(Equal(1), "exactly one assignment")
+					Expect(msg).To(HavePrefix("STATUS="))
+					value := strings.TrimSuffix(strings.TrimPrefix(msg, "STATUS="), "\n")
+					Expect(utf8.ValidString(value)).To(BeTrue())
+					Expect(len(value)).To(BeNumerically("<=", 256))
+				},
+				Entry("a lone continuation byte", "node\x80.example.com"),
+				Entry("a truncated sequence", "node\xe2\x82.example.com"),
+				Entry("an overlong encoding", "node\xc0\xaf.example.com"),
+				Entry("invalid bytes straddling the cap", strings.Repeat("x", 250)+strings.Repeat("\x80", 20)),
+				Entry("nothing but invalid bytes", strings.Repeat("\xff", 300)),
+			)
 
 			It("truncates an over-long status", func() {
 				n.Status(strings.Repeat("x", 500))
@@ -277,6 +354,12 @@ var _ = Describe("Notifier", func() {
 			DeferCleanup(func() { Expect(n.Close()).To(Succeed()) })
 
 			Expect(n.WatchdogInterval()).To(Equal(10 * time.Second))
+
+			// The deviation from sd_watchdog_enabled(3) is specifically about
+			// still sending from a process that is not the main PID, so the
+			// datagram is the part worth pinning.
+			n.Watchdog()
+			Expect(mgr.next()).To(Equal("WATCHDOG=1\n"))
 		})
 
 		DescribeTable("rejects an unusable interval",
@@ -333,7 +416,7 @@ var _ = Describe("Notifier", func() {
 			name := "@openvox-ca-sdnotify-test-" + strconv.Itoa(os.Getpid())
 			conn, err := net.ListenUnixgram("unixgram", &net.UnixAddr{Name: name, Net: "unixgram"})
 			Expect(err).NotTo(HaveOccurred())
-			DeferCleanup(func() { conn.Close() })
+			DeferCleanup(func() { Expect(conn.Close()).To(Succeed()) })
 
 			received := make(chan string, 1)
 			go func() {
