@@ -81,10 +81,12 @@ Operations that perform a read-modify-write against shared state — CA
 bootstrap, CRL rotation during revocation, CSR-then-autosign sequencing — are
 serialised across replicas by distributed locks implemented on top of etcd's
 `concurrency.Mutex`. The backend keeps a lease-backed session (30s TTL) and
-grabs per-name mutexes under `<prefix>/locks/<name>`. The lock names, every
-operation that holds each one, and the ordering invariant are documented in
-[locking and concurrency](locking.md) — that table is authoritative, so it is
-not duplicated here.
+grabs per-name mutexes under `<prefix>/locks/<name>`. This section owns the
+per-backend *mechanism*; the lock *names*, every operation that holds each one,
+and the ordering invariant are documented in
+[locking and concurrency](locking.md) — that table is authoritative for those,
+so they are not duplicated here (its own backend table is only a summary of the
+mechanism detail below).
 
 If a replica holding a lock crashes without calling Unlock, the etcd lease
 expires after 30s and the lock is released automatically. For the filesystem
