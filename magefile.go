@@ -2436,20 +2436,45 @@ func (Dev) Check() error {
 		return fmt.Errorf("these files need formatting (run 'mage dev:tidy'):\n%s", out)
 	}
 	fmt.Println("Checking go mod tidy...")
+	// Snapshot the bytes rather than restoring with `git checkout --`, which
+	// cannot tell this function's edit from the developer's own uncommitted one:
+	// running Check mid dependency-bump used to discard the bump silently. Only
+	// what tidy changed is put back.
+	const goModFile, goSumFile = "go.mod", "go.sum"
+	before := map[string][]byte{}
+	for _, f := range []string{goModFile, goSumFile} {
+		body, err := os.ReadFile(f)
+		if err != nil {
+			return fmt.Errorf("reading %s before the tidy check: %w", f, err)
+		}
+		before[f] = body
+	}
 	if err := sh.Run("go", "mod", "tidy"); err != nil {
 		return err
 	}
-	changed, err := sh.Output("git", "diff", "--name-only", "--", "go.mod", "go.sum")
-	if err != nil {
-		return err
-	}
-	if strings.TrimSpace(changed) != "" {
-		// Restore so Check leaves no side effects; the developer fixes via dev:tidy.
-		if rerr := sh.Run("git", "checkout", "--", "go.mod", "go.sum"); rerr != nil {
-			return fmt.Errorf("go.mod/go.sum are not tidy (%s); run 'mage dev:tidy' and commit. "+
-				"Additionally failed to restore them: %w", strings.TrimSpace(changed), rerr)
+	var untidy []string
+	var restoreErrs []error
+	for _, f := range []string{goModFile, goSumFile} {
+		after, err := os.ReadFile(f)
+		if err != nil {
+			return fmt.Errorf("reading %s after the tidy check: %w", f, err)
 		}
-		return fmt.Errorf("go.mod/go.sum are not tidy (%s); run 'mage dev:tidy' and commit", strings.TrimSpace(changed))
+		if bytes.Equal(after, before[f]) {
+			continue
+		}
+		untidy = append(untidy, f)
+		if werr := os.WriteFile(f, before[f], 0o644); werr != nil {
+			restoreErrs = append(restoreErrs, fmt.Errorf("restoring %s: %w", f, werr))
+		}
+	}
+	if len(untidy) > 0 {
+		if len(restoreErrs) > 0 {
+			return fmt.Errorf("go.mod/go.sum are not tidy (%s); run 'mage dev:tidy' and commit. "+
+				"Additionally failed to restore them: %w",
+				strings.Join(untidy, ", "), errors.Join(restoreErrs...))
+		}
+		return fmt.Errorf("go.mod/go.sum are not tidy (%s); run 'mage dev:tidy' and commit",
+			strings.Join(untidy, ", "))
 	}
 	if err := sh.Run("go", "vet", "./..."); err != nil {
 		return err
