@@ -59,6 +59,22 @@ for arg in "$@"; do
     esac
 done
 
+# -- Helper: replay a service's container logs to our stderr ---------------
+# Shared by the readiness aborts and the end-of-run failure dump, both of
+# which need the container's own account of what went wrong.
+dump_logs() {  # service-name  [tail-lines]
+    local _svc="$1" _tail="${2:-80}"
+    printf '# ---- last %s log lines from %s ----\n' "$_tail" "$_svc" >&2
+    # Send both the container's stdout and stderr to our stderr. Do NOT add
+    # `2>/dev/null`: with `>&2` alone, fd1 is redirected to the current stderr
+    # and fd2 already points there, so both streams reach the operator. A
+    # `2>/dev/null` would instead route the command's stderr to the bit-bucket
+    # -- and under `podman logs` a container's stderr (where Go services write
+    # their startup/abort diagnostics) is replayed to *our* stderr, so the very
+    # lines that explain the failed bootstrap would be discarded.
+    "${_COMPOSE[@]}" logs --tail "$_tail" "$_svc" >&2 || true
+}
+
 # -- Helper: abort a readiness wait loudly, dumping the culprit's logs ------
 # The wait loops below used to print " OK" whether or not the endpoint ever
 # answered, so a replica that never came up surfaced only as a downstream
@@ -68,15 +84,7 @@ done
 abort_not_ready() {  # human-description  service-name
     printf ' TIMEOUT\n'
     printf 'FATAL: %s did not become ready in time\n' "$1" >&2
-    printf '# ---- last 80 log lines from %s ----\n' "$2" >&2
-    # Send both the container's stdout and stderr to our stderr. Do NOT add
-    # `2>/dev/null`: with `>&2` alone, fd1 is redirected to the current stderr
-    # and fd2 already points there, so both streams reach the operator. A
-    # `2>/dev/null` would instead route the command's stderr to the bit-bucket
-    # -- and under `podman logs` a container's stderr (where Go services write
-    # their startup/abort diagnostics) is replayed to *our* stderr, so the very
-    # lines that explain the failed bootstrap would be discarded.
-    "${_COMPOSE[@]}" logs --tail 80 "$2" >&2 || true
+    dump_logs "$2"
     exit 1
 }
 
@@ -1152,6 +1160,20 @@ printf '\n# Phase 2 results: %d/%d passed, %d failed\n' \
 if [ "$FAILURES" -ne 0 ] || [ "$PHASE1_RC" -ne 0 ]; then
     printf '# Overall: FAIL  (phase1_rc=%d phase2_failures=%d)\n' \
         "$PHASE1_RC" "$FAILURES"
+    # A failed assertion used to print its TAP line and nothing else: the CA's
+    # own account of *why* -- say, the error behind a 409 on every revocation in
+    # the Race E storm -- lived in the container logs, which the EXIT trap then
+    # tore down unread. On a flake that cannot be reproduced locally that is the
+    # difference between a diagnosis and a re-run, so dump both replicas here,
+    # while the stack is still up. Readiness timeouts already dump via
+    # abort_not_ready; this covers everything after that point.
+    dump_logs openvox-ca 200
+    dump_logs openvox-ca-2 200
+    # Phase 1 is the puppet-stack suite, so a failure there usually needs the
+    # master's side of the conversation too.
+    if [ "$PHASE1_RC" -ne 0 ]; then
+        dump_logs puppet-master 200
+    fi
     exit 1
 fi
 printf '# Overall: PASS\n'
