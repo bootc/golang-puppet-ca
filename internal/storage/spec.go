@@ -121,8 +121,11 @@ type SQLSpec struct {
 	DSN string
 
 	RequestTimeoutSec int
-	MaxOpenConns      int
-	MaxIdleConns      int
+	// MigrationTimeoutSec bounds a whole schema-migration run rather than one
+	// statement. Zero uses ten minutes.
+	MigrationTimeoutSec int
+	MaxOpenConns        int
+	MaxIdleConns        int
 
 	// TLS file paths apply to the networked dialects (PostgreSQL, MySQL); they
 	// are ignored by SQLite.
@@ -257,6 +260,9 @@ func NewServiceFromSpec(spec BackendSpec) (*StorageService, error) {
 			DSN:          spec.SQL.DSN,
 			MaxOpenConns: spec.SQL.MaxOpenConns,
 			MaxIdleConns: spec.SQL.MaxIdleConns,
+		}
+		if spec.SQL.MigrationTimeoutSec > 0 {
+			cfg.MigrationTimeout = time.Duration(spec.SQL.MigrationTimeoutSec) * time.Second
 		}
 		if spec.SQL.RequestTimeoutSec > 0 {
 			cfg.RequestTimeout = time.Duration(spec.SQL.RequestTimeoutSec) * time.Second

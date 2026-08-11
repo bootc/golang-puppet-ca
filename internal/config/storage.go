@@ -72,11 +72,16 @@ type StorageConfig struct {
 	// networked engines. SQLTLS* apply only to the networked dialects.
 	SQLDSN               string `yaml:"sql_dsn"`
 	SQLRequestTimeoutSec int    `yaml:"sql_request_timeout_sec"`
-	SQLMaxOpenConns      int    `yaml:"sql_max_open_conns"`
-	SQLMaxIdleConns      int    `yaml:"sql_max_idle_conns"`
-	SQLTLSCAFile         string `yaml:"sql_tls_ca_file"`
-	SQLTLSCertFile       string `yaml:"sql_tls_cert_file"`
-	SQLTLSKeyFile        string `yaml:"sql_tls_key_file"`
+	// SQLMigrationTimeoutSec bounds a whole schema-migration run, not one
+	// statement. Zero uses ten minutes. Raise it when an index build over a
+	// large inventory needs longer: a run cut short is what leaves a schema
+	// half-migrated.
+	SQLMigrationTimeoutSec int    `yaml:"sql_migration_timeout_sec"`
+	SQLMaxOpenConns        int    `yaml:"sql_max_open_conns"`
+	SQLMaxIdleConns        int    `yaml:"sql_max_idle_conns"`
+	SQLTLSCAFile           string `yaml:"sql_tls_ca_file"`
+	SQLTLSCertFile         string `yaml:"sql_tls_cert_file"`
+	SQLTLSKeyFile          string `yaml:"sql_tls_key_file"`
 
 	// Local-file overrides. When set, the named asset is read/written via
 	// this filesystem path regardless of the selected backend. Typical use:
@@ -135,13 +140,14 @@ func (c StorageConfig) ToBackendSpec(localDir string) (storage.BackendSpec, erro
 		}
 	case storage.BackendSQLite, storage.BackendPostgres, storage.BackendMySQL:
 		spec.SQL = storage.SQLSpec{
-			DSN:               c.SQLDSN,
-			RequestTimeoutSec: c.SQLRequestTimeoutSec,
-			MaxOpenConns:      c.SQLMaxOpenConns,
-			MaxIdleConns:      c.SQLMaxIdleConns,
-			TLSCAFile:         c.SQLTLSCAFile,
-			TLSCertFile:       c.SQLTLSCertFile,
-			TLSKeyFile:        c.SQLTLSKeyFile,
+			DSN:                 c.SQLDSN,
+			RequestTimeoutSec:   c.SQLRequestTimeoutSec,
+			MigrationTimeoutSec: c.SQLMigrationTimeoutSec,
+			MaxOpenConns:        c.SQLMaxOpenConns,
+			MaxIdleConns:        c.SQLMaxIdleConns,
+			TLSCAFile:           c.SQLTLSCAFile,
+			TLSCertFile:         c.SQLTLSCertFile,
+			TLSKeyFile:          c.SQLTLSKeyFile,
 		}
 	}
 	return spec, nil

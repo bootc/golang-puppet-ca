@@ -31,6 +31,7 @@ var _ = Describe("applyServerEnv SQL settings", func() {
 		setEnv("PUPPET_CA_SQL_REQUEST_TIMEOUT_SEC", "15")
 		setEnv("PUPPET_CA_SQL_MAX_OPEN_CONNS", "8")
 		setEnv("PUPPET_CA_SQL_MAX_IDLE_CONNS", "4")
+		setEnv("PUPPET_CA_SQL_MIGRATION_TIMEOUT_SEC", "1800")
 
 		cfg := &serverConfig{}
 		applyServerEnv(cfg)
@@ -40,6 +41,12 @@ var _ = Describe("applyServerEnv SQL settings", func() {
 		Expect(cfg.SQLRequestTimeoutSec).To(Equal(15), "SQLRequestTimeoutSec = %d, want 15", cfg.SQLRequestTimeoutSec)
 		Expect(cfg.SQLMaxOpenConns).To(Equal(8), "SQLMaxOpenConns = %d, want 8", cfg.SQLMaxOpenConns)
 		Expect(cfg.SQLMaxIdleConns).To(Equal(4), "SQLMaxIdleConns = %d, want 4", cfg.SQLMaxIdleConns)
+		// This spec's name claims every SQL variable, and the migration budget
+		// shipped without one: the YAML key and the docs advertised it while the
+		// env hop did not exist, so a container deployment silently got the
+		// default -- which is the half-migrated schema the knob exists to prevent.
+		Expect(cfg.SQLMigrationTimeoutSec).To(Equal(1800),
+			"SQLMigrationTimeoutSec = %d, want 1800", cfg.SQLMigrationTimeoutSec)
 	})
 })
 

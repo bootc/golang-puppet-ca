@@ -263,6 +263,13 @@ backend creates and upgrades its own tables automatically on startup, so
 multiple replicas can start against the same database safely. `cadir` is still
 required for per-subject keys and ancillary local state.
 
+SQL backends additionally maintain a certificate index: `GET
+/certificate_statuses` (`puppetserver ca list`) is answered from indexed
+columns instead of reading and parsing every stored certificate, which matters
+for large fleets. The index is a rebuildable projection of the stored
+certificates and the CRL — after migrating from another backend it is
+backfilled automatically on the next server start.
+
 ### SQLite backend
 
 Stores the entire CA in one SQLite database file — a convenient, dependency-free
@@ -277,6 +284,7 @@ cadir: /var/lib/puppet-ca                # still needed for per-subject keys
 sql_dsn: "file:/var/lib/puppet-ca/ca.db" # SQLite database file path / URI
 
 sql_request_timeout_sec: 10              # per-operation timeout (default 10)
+sql_migration_timeout_sec: 600           # whole schema-migration run (default 600)
 ```
 
 `openvox-ca` adds safe SQLite defaults to the DSN (WAL journal, immediate write
@@ -307,7 +315,8 @@ cadir: /var/lib/puppet-ca                # still needed for per-subject keys
 sql_dsn: "postgres://puppetca:secret@db.example.com:5432/puppetca?sslmode=require"
 
 sql_request_timeout_sec: 10              # per-operation timeout (default 10)
-sql_max_open_conns: 0                    # 0 = database/sql default
+sql_migration_timeout_sec: 600           # whole schema-migration run (default 600)
+sql_max_open_conns: 0                    # 0 = database/sql default; min 4 when set
 sql_max_idle_conns: 0                    # 0 = database/sql default
 
 # Optional mTLS to PostgreSQL (alternative to sslmode/ssl params in the DSN).
@@ -342,6 +351,7 @@ cadir: /var/lib/puppet-ca                # still needed for per-subject keys
 sql_dsn: "puppetca:secret@tcp(db.example.com:3306)/puppetca"
 
 sql_request_timeout_sec: 10              # per-operation timeout (default 10)
+sql_migration_timeout_sec: 600           # whole schema-migration run (default 600)
 
 # Optional TLS to the server (registered with the driver automatically;
 # no need to add tls= to the DSN).
@@ -373,12 +383,23 @@ The SQL backends share one set of config keys and environment variables:
 | `sql_request_timeout_sec` | `PUPPET_CA_SQL_REQUEST_TIMEOUT_SEC` |
 | `sql_max_open_conns` | `PUPPET_CA_SQL_MAX_OPEN_CONNS` |
 | `sql_max_idle_conns` | `PUPPET_CA_SQL_MAX_IDLE_CONNS` |
+| `sql_migration_timeout_sec` | `PUPPET_CA_SQL_MIGRATION_TIMEOUT_SEC` |
 | `sql_tls_ca_file` | `PUPPET_CA_SQL_TLS_CA_FILE` |
 | `sql_tls_cert_file` | `PUPPET_CA_SQL_TLS_CERT_FILE` |
 | `sql_tls_key_file` | `PUPPET_CA_SQL_TLS_KEY_FILE` |
 
 The pool-tuning and TLS settings apply only to the networked SQL dialects;
 SQLite ignores them.
+
+`sql_max_open_conns`, when set to a non-zero value below 4, is raised to 4 and
+the effective value is logged at startup. The distributed locks are
+session-scoped (PostgreSQL advisory locks and MySQL `GET_LOCK` both bind to
+their connection), so each lock held occupies a connection for its lifetime
+while the work under it needs another. A `migrate` run nests three deep — the
+bootstrap lock, the migration lock inside it, and the migration's own
+statements. A smaller pool would not merely be slow, it would deadlock, so the
+floor is not negotiable. Leave the setting at 0 unless you have measured a
+reason to cap it.
 
 ---
 

@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"io/fs"
+	"log/slog"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -66,6 +67,29 @@ const (
 	sqlBusyTimeoutMS = 10000
 
 	sqlDefaultTimeout = 10 * time.Second
+
+	// sqlMinOpenConns is the floor MaxOpenConns is held to on the networked
+	// dialects. Distributed locks are session-scoped (pg_advisory_lock and
+	// GET_LOCK both bind to their connection), so every lock held ties up a
+	// connection for its whole lifetime while the work done under it needs one
+	// of its own. The deepest nesting is a storage migration: the bootstrap
+	// lock, the migration lock inside it, and the migration's own statements —
+	// three at once, plus one spare. A smaller pool would not run slowly, it
+	// would deadlock, so an operator setting cannot lower it.
+	sqlMinOpenConns = 4
+
+	// sqlMigrationTimeout bounds a whole migration run, replacing the
+	// per-statement RequestTimeout for the duration of EnsureReady. It has to
+	// cover the slowest legitimate migration (an index build over a large
+	// inventory) plus any wait for a peer replica holding the migration lock,
+	// because a run cut short is exactly what leaves a schema half-migrated.
+	sqlMigrationTimeout = 10 * time.Minute
+
+	// lockNameSQLMigrate is the distributed-lock name held for a migration run.
+	// It is deliberately distinct from the CA's "bootstrap" lock: EnsureReady
+	// runs before (and, via MigrateService, inside) that one, so sharing a name
+	// would deadlock.
+	lockNameSQLMigrate = "sql-schema-migrate"
 )
 
 // SQLConfig configures an SQLBackend.
@@ -85,6 +109,17 @@ type SQLConfig struct {
 	// RequestTimeout bounds each individual operation. Zero uses 10s.
 	RequestTimeout time.Duration
 
+	// MigrationTimeout bounds a whole migration run, replacing RequestTimeout for
+	// the duration of EnsureReady. Zero uses 10 minutes.
+	//
+	// Configurable because the default is a guess about someone else's hardware:
+	// the slowest legitimate run is an index build over an inventory whose size
+	// this code cannot know, plus any wait for a peer replica holding the
+	// migration lock. A run cut short is exactly what leaves a schema
+	// half-migrated, so an operator who needs longer must be able to say so
+	// without a code change.
+	MigrationTimeout time.Duration
+
 	// MaxOpenConns / MaxIdleConns tune the underlying database/sql pool. Zero
 	// leaves the database/sql defaults in place, except SQLite which is pinned
 	// to a single open connection (see NewSQLBackend).
@@ -95,6 +130,9 @@ type SQLConfig struct {
 func (c *SQLConfig) applyDefaults() {
 	if c.RequestTimeout == 0 {
 		c.RequestTimeout = sqlDefaultTimeout
+	}
+	if c.MigrationTimeout == 0 {
+		c.MigrationTimeout = sqlMigrationTimeout
 	}
 }
 
@@ -127,6 +165,8 @@ type SQLBackend struct {
 	db      *bun.DB
 	owned   bool // true when Close should close the underlying *sql.DB
 	timeout time.Duration
+	// migrationTimeout bounds a whole EnsureReady run rather than one statement.
+	migrationTimeout time.Duration
 
 	appendMu sync.Mutex // serialises AppendLine within this process
 
@@ -159,28 +199,24 @@ func NewSQLBackend(cfg SQLConfig) (*SQLBackend, error) {
 		sqldb.SetMaxOpenConns(1)
 	} else {
 		if cfg.MaxOpenConns > 0 {
-			sqldb.SetMaxOpenConns(cfg.MaxOpenConns)
+			if cfg.MaxOpenConns < sqlMinOpenConns {
+				slog.Warn("Raising SQL connection limit to the minimum the distributed locks require",
+					"requested", cfg.MaxOpenConns, "effective", sqlMinOpenConns)
+			}
+			sqldb.SetMaxOpenConns(max(cfg.MaxOpenConns, sqlMinOpenConns))
 		}
 		if cfg.MaxIdleConns > 0 {
 			sqldb.SetMaxIdleConns(cfg.MaxIdleConns)
 		}
 	}
 
-	return newSQLBackend(bun.NewDB(sqldb, bunDialect), true, cfg.RequestTimeout), nil
+	return newSQLBackend(bun.NewDB(sqldb, bunDialect), true, cfg.RequestTimeout, cfg.MigrationTimeout), nil
 }
 
-// NewSQLBackendFromDB wraps an existing *bun.DB. The backend does not take
-// ownership and Close leaves the handle open. Used by tests that want to share
-// a single database across backends to simulate multiple replicas.
-func NewSQLBackendFromDB(db *bun.DB, requestTimeout time.Duration) *SQLBackend {
-	if requestTimeout == 0 {
-		requestTimeout = sqlDefaultTimeout
-	}
-	return newSQLBackend(db, false, requestTimeout)
-}
-
-func newSQLBackend(db *bun.DB, owned bool, timeout time.Duration) *SQLBackend {
-	return &SQLBackend{db: db, owned: owned, timeout: timeout}
+// newSQLBackend takes both budgets already defaulted: applyDefaults is the single
+// place that decides them, so there is no second guard here to drift from it.
+func newSQLBackend(db *bun.DB, owned bool, timeout, migrationTimeout time.Duration) *SQLBackend {
+	return &SQLBackend{db: db, owned: owned, timeout: timeout, migrationTimeout: migrationTimeout}
 }
 
 // openSQLDB opens the database/sql handle and matching bun dialect for cfg.
@@ -263,21 +299,84 @@ func (b *SQLBackend) callCtx(parent context.Context) (context.Context, context.C
 }
 
 // EnsureReady verifies connectivity and brings the schema up to date by running
-// the bun migrations. Safe to call multiple times: the migrator records applied
-// versions and serialises concurrent runners with its lock table.
+// the bun migrations. Safe to call multiple times, and safe to call from several
+// processes at once: the run is serialised by the backend's distributed lock and
+// the migrator records applied versions.
 func (b *SQLBackend) EnsureReady(ctx context.Context) error {
-	ctx, cancel := b.callCtx(ctx)
-	defer cancel()
-	if err := b.db.PingContext(ctx); err != nil {
+	pingCtx, cancelPing := b.callCtx(ctx)
+	err := b.db.PingContext(pingCtx)
+	cancelPing()
+	if err != nil {
 		return fmt.Errorf("sql database not reachable: %w", err)
 	}
 
-	migrator := migrate.NewMigrator(b.db, sqlMigrations)
+	// Schema changes get their own budget. RequestTimeout bounds one ordinary
+	// statement; a migration run can legitimately take far longer (building an
+	// index over a large inventory) and must never be cut off part-way.
+	ctx, cancel := context.WithTimeout(ctx, b.migrationTimeout)
+	defer cancel()
+
+	// Serialise runners before any migration state is read. bun's Migrate does
+	// not lock — Migrator.Lock exists but Migrate never calls it — so without
+	// this two starters (replicas, or the signer and frontend of one replica)
+	// both read "unapplied", both record the version, and both run the DDL. The
+	// loser then fails on work the winner already did, and with bun's default of
+	// recording a migration before running it, the version stays recorded and is
+	// never retried. That is how a schema ends up permanently half-migrated.
+	// Announced before the lock, not after it. A replica queued behind a peer
+	// blocks here for up to the whole budget, and that wait was the silence this
+	// line exists to break -- logging after the lock only ever described the part
+	// that was already visible from the completion line.
+	slog.Info("Checking the SQL schema, waiting for the migration lock if another replica holds it",
+		"timeout", b.migrationTimeout)
+	unlock, lockErr := b.AcquireLock(ctx, lockNameSQLMigrate)
+	switch {
+	case lockErr == nil:
+		defer func() {
+			// Same treatment StorageService.WithLock gives a failed release: a
+			// lost unlock is not worth failing a successful migration over, but
+			// it must not be silent — a session-scoped lock left held is what
+			// the next start would block on.
+			if err := unlock.Unlock(); err != nil {
+				slog.Warn("Failed to release migration lock", "name", lockNameSQLMigrate, "error", err)
+			}
+		}()
+	case errors.Is(lockErr, ErrDistributedLockingUnsupported):
+		// SQLite has no distributed lock. Two processes sharing one file can
+		// still race here; the migrations are transactional and idempotent, so
+		// the loser fails cleanly and succeeds on its next start rather than
+		// leaving the schema half-changed. The process-local mutex at least
+		// serialises goroutines within this process.
+		local := b.localLockFor(lockNameSQLMigrate)
+		local.Lock()
+		defer local.Unlock()
+	default:
+		return fmt.Errorf("acquiring migration lock (raise sql_migration_timeout_sec if a peer's "+
+			"migration legitimately takes longer): %w", lockErr)
+	}
+
+	// WithMarkAppliedOnSuccess reverses bun's default of recording a migration
+	// before running it, so a migration that fails is retried on the next start
+	// instead of being remembered as done.
+	migrator := migrate.NewMigrator(b.db, sqlMigrations, migrate.WithMarkAppliedOnSuccess(true))
 	if err := migrator.Init(ctx); err != nil {
 		return fmt.Errorf("initialising migrations: %w", err)
 	}
-	if _, err := migrator.Migrate(ctx); err != nil {
-		return fmt.Errorf("running migrations: %w", err)
+	// Logged either side, because a migration can legitimately run for minutes
+	// -- an index build over a large inventory -- and from outside there is
+	// nothing to distinguish that from a start that has wedged. The lock wait
+	// above is inside the same window, so a replica queued behind a peer looks
+	// identical without these.
+	group, err := migrator.Migrate(ctx)
+	if err != nil {
+		return fmt.Errorf("running migrations (raise sql_migration_timeout_sec if this is a large "+
+			"inventory): %w", err)
+	}
+	if group.IsZero() {
+		slog.Info("SQL schema is already up to date")
+	} else {
+		slog.Info("SQL schema migrations applied",
+			"group", group.ID, "migrations", len(group.Migrations))
 	}
 	return nil
 }
