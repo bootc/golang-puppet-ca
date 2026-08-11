@@ -110,9 +110,11 @@ systemd then sends `SIGHUP` itself and — because the CA stamps its reload ackn
 ## Watchdog
 
 ```ini
-WatchdogSec=60s
+WatchdogSec=90s
 Restart=on-failure
 ```
+
+The shipped unit uses 90 seconds, not 60: composing the status text takes the CA's read lock, and a storage operation holding the write lock is bounded by a 60-second cluster-lock timeout. An equal budget would leave no headroom between a slow backend and a kill.
 
 The keep-alive is sent by the frontend process on a timer at half the configured interval — not by the launcher, which would only ever prove the supervisor was alive.
 

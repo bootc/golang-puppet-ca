@@ -24,11 +24,15 @@ import (
 	"math/big"
 	"net"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"sync"
+	"syscall"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	"github.com/voxpupuli/openvox-ca/internal/api"
 	"github.com/voxpupuli/openvox-ca/internal/ca"
 	"github.com/voxpupuli/openvox-ca/internal/sdnotify"
 )
@@ -334,6 +338,59 @@ var _ = Describe("Service manager heartbeat", func() {
 
 			Expect(heartbeatInterval(n)).To(Equal(30 * time.Second))
 			Expect(buf.String()).To(BeEmpty())
+		})
+	})
+
+	// The magefile makes -race mandatory because main.go drives one Notifier
+	// from three places at once: the heartbeat, the reload watcher, and a
+	// deferred Close. Each was only ever exercised in isolation, so the
+	// combination the rationale names was never actually reproduced.
+	Describe("the heartbeat, a reload, and a close together", func() {
+		It("survives all three running against one notifier", func() {
+			// Claim SIGHUP before anything can send one; the default
+			// disposition would take the test binary down.
+			hupCh := make(chan os.Signal, 1)
+			signal.Notify(hupCh, syscall.SIGHUP)
+			DeferCleanup(func() { signal.Stop(hupCh) })
+
+			dir := GinkgoT().TempDir()
+			cnFile := filepath.Join(dir, "servers.txt")
+			Expect(os.WriteFile(cnFile, []byte("compile-1.example.com\n"), 0600)).To(Succeed())
+			allowList, err := buildAdminAllowList("", cnFile)
+			Expect(err).NotTo(HaveOccurred())
+			reloader := &configReloader{auth: api.NewAuthConfig(nil, allowList), cnFile: cnFile}
+
+			startNotifyRecorder(map[string]string{"WATCHDOG_USEC": "20000"})
+			n := sdnotify.New()
+			Expect(n.Enabled()).To(BeTrue())
+
+			ctx, cancel := context.WithCancel(context.Background())
+			var wg sync.WaitGroup
+			wg.Add(2)
+			go func() {
+				defer GinkgoRecover()
+				defer wg.Done()
+				runNotifyHeartbeat(ctx, n, time.Millisecond, func() string { return "serving" })
+			}()
+			go func() {
+				defer GinkgoRecover()
+				defer wg.Done()
+				runReloadWatcher(ctx, hupCh, n, reloader, func() string { return "serving" })
+			}()
+
+			// Drive a real reload while the heartbeat is ticking.
+			Expect(os.WriteFile(cnFile, []byte("compile-2.example.com\n"), 0600)).To(Succeed())
+			Expect(syscall.Kill(os.Getpid(), syscall.SIGHUP)).To(Succeed())
+			Eventually(func() bool { return reloader.auth.IsAdminCN("compile-2.example.com") }).Should(BeTrue())
+
+			// Close underneath both of them, exactly as the deferred Close in
+			// main.go can, before the context is cancelled.
+			Expect(n.Close()).To(Succeed())
+			Consistently(func() bool { return true }, 20*time.Millisecond).Should(BeTrue())
+
+			cancel()
+			wg.Wait()
+			Expect(n.Enabled()).To(BeFalse())
 		})
 	})
 

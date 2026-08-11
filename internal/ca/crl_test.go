@@ -233,6 +233,29 @@ var _ = Describe("CA CRL reissuance", func() {
 			Expect(after.NextUpdate).To(BeTemporally(">", before.NextUpdate))
 		})
 
+		It("populates an empty cache from a CRL that is not due", func() {
+			// The c.cachedCRL == nil arm of the adoption guard: a CA whose
+			// cache was never seeded still has to pick up what storage holds,
+			// which is the shape of the failure the guard exists to close.
+			fresh := ca.New(store, ca.AutosignConfig{Mode: "off"}, "puppet.test")
+			_, ok := fresh.CRLSnapshot()
+			Expect(ok).To(BeFalse(), "nothing cached yet")
+
+			// LoadKey reads the key and cert without the rest of Init, so the
+			// CRL cache stays empty — the state a replica is in before its
+			// first refresh pass.
+			_, err := fresh.LoadKey(context.Background())
+			Expect(err).NotTo(HaveOccurred())
+
+			reissued, err := fresh.RefreshCRLIfDue(context.Background(), time.Hour)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(reissued).To(BeFalse(), "the stored CRL is still well within its window")
+
+			snap, ok := fresh.CRLSnapshot()
+			Expect(ok).To(BeTrue(), "the not-due branch must still populate the cache")
+			Expect(snap.Number).NotTo(BeNil())
+		})
+
 		It("tracks re-signs of the CRL", func() {
 			before, ok := myCA.CRLSnapshot()
 			Expect(ok).To(BeTrue())

@@ -275,6 +275,43 @@ var _ = Describe("Notifier", func() {
 				Expect(mgr.next()).To(Equal("STATUS=a b c\n"))
 			})
 
+			// Ready, Reloading and Stopping carry the same attacker-influenced
+			// text through the same statusLine call. They are thin wrappers
+			// today, but the SECURITY contract is theirs too, so pin it at
+			// each of them rather than only at Status.
+			DescribeTable("holds at every method that carries status text",
+				func(send func(string), want []string) {
+					send("evil.example.com\nREADY=1\nMAINPID=1\x1b[31m")
+					msg := mgr.next()
+
+					// The datagram must contain exactly the assignments the
+					// method is supposed to send — the injected READY=1 and
+					// MAINPID= have to end up inside the STATUS value, not
+					// beside it as fields of their own.
+					lines := strings.Split(strings.TrimSuffix(msg, "\n"), "\n")
+					Expect(lines).To(Equal(want))
+					Expect(msg).NotTo(ContainSubstring("\x1b"))
+				},
+				Entry("Ready", func(v string) { n.Ready(v) },
+					[]string{"READY=1", "STATUS=evil.example.com READY=1 MAINPID=1 [31m"}),
+				Entry("Status", func(v string) { n.Status(v) },
+					[]string{"STATUS=evil.example.com READY=1 MAINPID=1 [31m"}),
+				Entry("Stopping", func(v string) { n.Stopping(v) },
+					[]string{"STOPPING=1", "STATUS=evil.example.com READY=1 MAINPID=1 [31m"}),
+			)
+
+			It("holds for Reloading, which carries an extra field", func() {
+				// Reloading emits MONOTONIC_USEC on Linux, so it is the one
+				// method whose datagram legitimately has two newlines before
+				// the status; assert the status itself is still folded.
+				n.Reloading("evil.example.com\nREADY=1\x1b[31m")
+				msg := mgr.next()
+
+				Expect(msg).To(HavePrefix("RELOADING=1\n"))
+				Expect(msg).To(HaveSuffix("STATUS=evil.example.com READY=1 [31m\n"))
+				Expect(msg).NotTo(ContainSubstring("\x1b"))
+			})
+
 			It("folds every other control character too", func() {
 				// Only the newline can break framing, but the status text is
 				// relayed to a terminal by `systemctl status`, so escape

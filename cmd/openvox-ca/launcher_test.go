@@ -29,6 +29,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -449,11 +450,37 @@ func (f *fakeChild) Kill() error {
 	return nil
 }
 
+// syncBuffer is a log sink that is safe to read while another goroutine
+// writes. bytes.Buffer is not, and the supervisor logs from its own goroutine.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
 // got returns the signals received so far.
 func (f *fakeChild) got() []os.Signal {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]os.Signal(nil), f.signals...)
+}
+
+// killed reports how many times the child was hard-killed.
+func (f *fakeChild) killed() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.kills
 }
 
 var _ = Describe("Launcher supervisor loop", func() {
@@ -537,15 +564,69 @@ var _ = Describe("Launcher supervisor loop", func() {
 			// os.Process.Signal returns ErrProcessDone for a child that has
 			// already exited. Dropping that silently would leave the operator
 			// believing a rotated certificate was live.
+			var buf syncBuffer
+			orig := slog.Default()
+			slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelError})))
+			defer slog.SetDefault(orig)
+
 			frontend.err = errors.New("os: process already finished")
 			done := run()
 			hupCh <- syscall.SIGHUP
 			Eventually(frontend.got).Should(HaveLen(1))
+			Eventually(buf.String).Should(ContainSubstring("Failed to forward the reload signal"))
 
 			sigCh <- syscall.SIGTERM
 			exitCh <- childResult{"signer", nil}
 			exitCh <- childResult{"frontend", nil}
 			Eventually(done).Should(Receive(BeNil()))
+		})
+	})
+
+	Describe("the hard-kill fallback", func() {
+		BeforeEach(func() {
+			// Budgets short enough for the timer to fire inside a spec. In
+			// production these are the drain budget and the shorter crash
+			// budget; what matters is that a child which ignores SIGTERM is
+			// eventually killed rather than left running — the signer holds
+			// the CA private key.
+			sup.drain = 10 * time.Millisecond
+			sup.crash = 10 * time.Millisecond
+		})
+
+		It("kills both children when they do not exit within the drain budget", func() {
+			done := run()
+			sigCh <- syscall.SIGTERM
+
+			// Withhold the exit reports: this is a child that has taken the
+			// SIGTERM and not gone.
+			Eventually(signer.killed).Should(BeNumerically(">", 0))
+			Eventually(frontend.killed).Should(BeNumerically(">", 0))
+
+			exitCh <- childResult{"signer", nil}
+			exitCh <- childResult{"frontend", nil}
+			Eventually(done).Should(Receive(BeNil()))
+		})
+
+		It("kills the survivor when one child has already crashed", func() {
+			done := run()
+			exitCh <- childResult{"signer", errors.New("boom")}
+
+			Eventually(frontend.killed).Should(BeNumerically(">", 0))
+
+			exitCh <- childResult{"frontend", nil}
+			Eventually(done).Should(Receive(HaveOccurred()))
+		})
+
+		It("does not kill children that exit in time", func() {
+			sup.drain = time.Minute
+			done := run()
+			sigCh <- syscall.SIGTERM
+			exitCh <- childResult{"signer", nil}
+			exitCh <- childResult{"frontend", nil}
+			Eventually(done).Should(Receive(BeNil()))
+
+			Consistently(signer.killed).Should(BeZero())
+			Consistently(frontend.killed).Should(BeZero())
 		})
 	})
 
