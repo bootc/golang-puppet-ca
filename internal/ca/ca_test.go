@@ -1662,9 +1662,9 @@ func (b *cleanFailBackend) Delete(ctx context.Context, key string) error {
 	return b.Backend.Delete(ctx, key)
 }
 
-var _ = Describe("CA Clean when a half of it fails", func() {
+var _ = Describe("CA Clean when part of it fails", func() {
 	// docs/api.md publishes this as the contract operators have to guard
-	// against: DELETE /certificate_status answers 204 whichever half failed, so
+	// against: DELETE /certificate_status answers 204 whichever step failed, so
 	// a 204 records that the subject existed and nothing more. Nothing else
 	// pins it — every other Clean spec runs the path where both halves succeed,
 	// so a change that turned either warning into an early return would move no
@@ -1763,8 +1763,6 @@ var _ = Describe("CA Clean when a half of it fails", func() {
 		// The third swallow in Clean, and the one with no certificate in play:
 		// a subject that only ever got as far as a request. Same shape as the
 		// other two — logged, carried on, 204 — so the same guard applies.
-		Expect(myCA.Clean(ctx, "doomed-node")).To(Succeed())
-
 		csrPEM, err := testutil.GenerateCSR("pending-node")
 		Expect(err).NotTo(HaveOccurred())
 		_, err = myCA.SaveRequest(ctx, "pending-node", csrPEM)

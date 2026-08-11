@@ -232,15 +232,16 @@ certificate goes away:
   displaces it. Eviction reads the same per-process CRL cache as the admission
   check described below, so on the HA backends a peer that has not yet seen the
   revocation instead answers `200 OK` and silently discards the CSR.
-- `DELETE /certificate_status/{subject}` revokes and then deletes, both against
-  shared storage, so neither step depends on any replica's cache. Both are
-  best-effort: a failure in either is logged and the handler carries on, and the
-  endpoint answers `204` regardless — so a `204` records that the subject
-  existed, not that it was revoked or removed. Since admission reads the CRL
-  rather than storage, the dangerous combination is a delete whose revocation
-  failed: the file is gone and the certificate still works. Confirm the serial
-  in `GET /certificate_revocation_list/ca`. The server's `Clean: revoke failed`
-  and `Clean: delete cert failed` warnings are the complete signal;
+- `DELETE /certificate_status/{subject}` revokes, then deletes the certificate
+  and any pending request, all against shared storage, so no step depends on a
+  replica's cache. All three are best-effort: each failure is logged and the
+  handler carries on, and the endpoint answers `204` regardless — so a `204`
+  records that the subject existed, not that it was revoked or removed. Since
+  admission reads the CRL rather than storage, the dangerous combination is a
+  delete whose revocation failed: the file is gone and the certificate still
+  works. Confirm the serial in `GET /certificate_revocation_list/ca`. The
+  server's `Clean: revoke failed`, `Clean: delete cert failed` and
+  `Clean: delete CSR failed` warnings are the complete signal;
   `puppetca_crl_update_failures_total` covers most of the first — a CRL that
   could not be read, signed or written all count — but not a revocation that
   never reached the CRL (a lock it could not take, or a subject whose serial the
@@ -263,14 +264,22 @@ When containing a compromised agent, apply the levers that hold, in this order:
    serves it, so address the replicas individually: sent through a load
    balancer it refreshes whichever one the VIP picked, and the rest stay stale
    while the call reports success. The re-sign refreshes the cache in the
-   process that served it, so a success from a replica's own address is the
-   confirmation for that replica — and the only one available. Nothing reports
-   a replica's in-process CRL from outside: `GET /certificate_revocation_list/ca`
-   serves shared storage, `puppetca_crl_number` and
-   `puppetca_crl_revoked_certificates` are gathered from it too, and `/ocsp`
-   answers from a pre-signed per-serial cache that a re-sign does not clear
-   (and reports `Unknown` for a serial issued by a peer since this replica
-   started). Restarting a replica is the other way to be sure.
+   process that served it, so a success from a replica's own address confirms
+   that replica.
+
+   To check independently, ask that same address. `GET
+   /certificate_status/{subject}` reports `revoked` from the very cache the
+   admission check reads, and an `/ocsp` query carrying a nonce (`openssl ocsp`
+   sends one unless you pass `-no_nonce`) resolves status from it too. Both are
+   reliable only while issuance stays closed off, per step 1, since the status
+   answer describes whatever certificate is in storage for that subject now;
+   OCSP additionally answers `Unknown` for a serial a peer issued since this
+   replica started, and a nonce-free query may be served from a pre-signed
+   cache the re-sign does not clear. What cannot answer it at all is anything
+   reading shared storage: `GET /certificate_revocation_list/ca`,
+   `puppetca_crl_number` and `puppetca_crl_revoked_certificates` all read the
+   same on a stale replica as on a fresh one. Restarting a replica is the
+   fallback when it cannot be reached.
 
 The order matters. Step 3 is also what makes a stale replica willing to evict
 the revoked certificate and issue a replacement, so running it while autosign
