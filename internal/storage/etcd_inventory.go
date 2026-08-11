@@ -84,6 +84,12 @@ const (
 	etcdPruneBatch  = 30
 )
 
+// etcdImportProgressEvery is how many imported entries pass between progress
+// log lines during a bulk inventory import (legacy conversion, migration).
+// One line per ~32 transactions keeps a fleet-scale conversion observable
+// without flooding the log on small ones.
+const etcdImportProgressEvery = 1024
+
 // etcdPruneMaxBatchesPerCall bounds one PruneEntries call to this many
 // committed batches (currently 900 entries) — a budget shared across the
 // call's retry attempts, so a fence conflict cannot grant a fresh allowance.
@@ -837,6 +843,14 @@ func (b *EtcdBackend) replaceInventoryOnce(ctx context.Context, recs []CertRecor
 		ops = append(ops, clientv3.OpPut(b.invPhys(etcdInvSeqSub), strconv.Itoa(start+len(batch))))
 		if seqRev, conflict, err = commit(seqRev, ops); err != nil || conflict {
 			return conflict, err
+		}
+		// A fleet-scale conversion is thousands of sequential transactions;
+		// report progress periodically so the first post-upgrade start reads
+		// as a moving import rather than an apparent hang (the same reasoning
+		// as the certificate-index backfill's progress log).
+		imported := start + len(batch)
+		if imported/etcdImportProgressEvery != start/etcdImportProgressEvery && imported < len(recs) {
+			slog.Info("Inventory import progress", "imported", imported, "total", len(recs))
 		}
 	}
 

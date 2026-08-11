@@ -48,7 +48,7 @@ import (
 // exactly the ones removed, so the CRL/blob cleanup below runs even when the
 // prune itself reports an error — on its own small context, so in the worst
 // case (a prune that exhausted its deadline) the CRL lock is held for up to
-// lockTimeout plus that cleanup budget. An entry that cannot be time-parsed
+// LockTimeout plus that cleanup budget. An entry that cannot be time-parsed
 // is conservatively kept, never dropped.
 func (c *CA) CleanupExpiredCerts(ctx context.Context, retain time.Duration) (int, error) {
 	if retain < 0 {
@@ -96,9 +96,9 @@ func (c *CA) CleanupExpiredCerts(ctx context.Context, retain time.Duration) (int
 		// the prune's. The CRL lock (and c.mu) is still held throughout, so
 		// keep the extra budget modest — one CRL re-sign plus at most a
 		// bounded batch of blob deletions — rather than granting a second
-		// full lockTimeout: a concurrent Revoke waits on the same lock with a
-		// lockTimeout budget of its own.
-		cleanupCtx, cancelCleanup := context.WithTimeout(context.WithoutCancel(ctx), lockTimeout/2)
+		// full LockTimeout: a concurrent Revoke waits on the same lock with a
+		// LockTimeout budget of its own.
+		cleanupCtx, cancelCleanup := context.WithTimeout(context.WithoutCancel(ctx), LockTimeout/2)
 		defer cancelCleanup()
 
 		// Collect the removed serials (normalised) and refresh in-memory caches.

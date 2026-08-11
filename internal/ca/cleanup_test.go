@@ -331,6 +331,42 @@ var _ = Describe("CA CleanupExpiredCerts", func() {
 			"the CRL entry legitimately survives the failed rewrite")
 	})
 
+	It("surfaces the prune and CRL errors together when both fail", func() {
+		// The joined-error return must carry BOTH failures — dropping either
+		// would hide a durable state change (the prune) or a rewrite that
+		// still needs retrying (the CRL) — and the blob cleanup must run
+		// regardless.
+		injected := fmt.Errorf("simulated mid-prune failure")
+		inner, err := storage.NewSQLBackend(storage.SQLConfig{
+			Dialect: storage.SQLitePure,
+			DSN:     "file:" + filepath.Join(tmpDir, "both-fail.db"),
+		})
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(func() { _ = inner.Close() })
+		Expect(inner.EnsureReady(ctx)).To(Succeed())
+		wrapper := &partialPruneBackend{SQLBackend: inner, pruneErr: injected}
+		store = storage.NewWithBackend(wrapper, filepath.Join(tmpDir, "both-fail-private"))
+		myCA = ca.New(store, ca.AutosignConfig{Mode: "off"}, "puppet.test")
+		Expect(store.EnsureDirs(ctx)).To(Succeed())
+		Expect(store.SaveCAKey(ctx, cachedKeyPEM)).To(Succeed())
+		Expect(store.SaveCACert(ctx, cachedCrtPEM)).To(Succeed())
+		Expect(store.UpdateCRL(ctx, cachedCrlPEM)).To(Succeed())
+		Expect(store.WriteSerial(ctx, "0001")).To(Succeed())
+		Expect(store.TouchInventory(ctx)).To(Succeed())
+		Expect(myCA.Init(ctx)).To(Succeed())
+
+		seedCert("expired-node", big.NewInt(0xEE04), time.Now().Add(-3*365*24*time.Hour))
+
+		wrapper.failCRLPut = true
+		removed, err := myCA.CleanupExpiredCerts(ctx, time.Hour)
+		wrapper.failCRLPut = false
+		Expect(err).To(MatchError(ContainSubstring("simulated mid-prune failure")), "the prune error must survive the join")
+		Expect(err).To(MatchError(ContainSubstring("simulated CRL write failure")), "the CRL error must survive the join")
+		Expect(removed).To(Equal(1))
+		Expect(store.HasCert(ctx, "expired-node")).To(BeFalse(),
+			"the stored cert must be deleted despite both failures")
+	})
+
 	It("still cleans up when the prune exhausts the context deadline", func() {
 		// The deadline case is when a partial prune is most likely, and it is
 		// exactly when the cleanup would be skipped if it shared the prune's

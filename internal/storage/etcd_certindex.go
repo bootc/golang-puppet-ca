@@ -206,6 +206,9 @@ func (b *EtcdBackend) mutateRecordBySerial(ctx context.Context, serial string, m
 		if !mutate(&rec) {
 			return nil
 		}
+		if b.mutateRecordHook != nil {
+			b.mutateRecordHook()
+		}
 		val, err := encodeInventoryRecord(rec)
 		if err != nil {
 			return err

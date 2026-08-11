@@ -1142,9 +1142,14 @@ path "transit/sign/test-*" { capabilities = ["update"] }
 // BackendsEtcd runs the etcd-backend Go integration suite (build tag
 // etcd_integration). The suite boots an in-process embedded etcd, so unlike the
 // Redis suite it needs no external service, compose stack, or network pulls.
+// The suite is heavily concurrent by design (cross-replica append races,
+// concurrent decompositions, contended locks), so it runs under the race
+// detector; -race needs cgo, hence the explicit CGO_ENABLED override of the
+// repository's CGO_ENABLED=0 default.
 func (Test) BackendsEtcd() error {
 	fmt.Println("Running etcd-backend integration tests...")
-	return sh.RunV("go", "test", "-tags", "etcd_integration", "-count=1", "./internal/storage/...")
+	return sh.RunWithV(map[string]string{"CGO_ENABLED": "1"},
+		"go", "test", "-tags", "etcd_integration", "-race", "-count=1", "./internal/storage/...")
 }
 
 // PuppetFIPS is like Puppet but compiles with GOEXPERIMENT=boringcrypto so the

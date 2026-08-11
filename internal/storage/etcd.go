@@ -84,11 +84,13 @@ type EtcdBackend struct {
 	appendMu sync.Mutex // serialises inventory mutations within this process
 
 	// pruneBatchHook and importBatchHook, when non-nil, run after each
-	// committed prune/import transaction. Test seams only: they let the
-	// suite interleave conflicting writes between batches to exercise the
-	// partial-completion and guard-retry paths deterministically.
-	pruneBatchHook  func()
-	importBatchHook func()
+	// committed prune/import transaction; mutateRecordHook runs between an
+	// index write's entry read and its guarded commit. Test seams only:
+	// they let the suite interleave conflicting writes deterministically to
+	// exercise the partial-completion and guard-retry paths.
+	pruneBatchHook   func()
+	importBatchHook  func()
+	mutateRecordHook func()
 
 	// session is the lease-backed concurrency session used for distributed
 	// mutexes. It is created lazily on the first AcquireLock call and

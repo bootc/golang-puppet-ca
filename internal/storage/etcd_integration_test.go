@@ -1572,6 +1572,108 @@ var _ = Describe("EtcdCertIndex", func() {
 		Expect(err).NotTo(HaveOccurred(), "index writes must not touch the integrity chain")
 	})
 
+	It("serialises concurrent index writers on one serial through the CAS retry", func() {
+		// SetRevoked/ClearRevoked/SetProjection all funnel through
+		// mutateRecordBySerial's read-mutate-CAS loop; this drives real
+		// ModRevision conflicts from four goroutines across two backends
+		// (two replicas) and proves every write lands atomically — no torn
+		// record, no lost retry, no disturbed chain.
+		cli, stop := startEmbeddedEtcd()
+		defer stop()
+		svcA, _ := seedEtcdCertIndex(cli, "/test-certindex-race")
+		svcB := NewWithBackend(newBackend(cli, "/test-certindex-race"), filepath.Join(GinkgoT().TempDir(), "private"))
+		Expect(svcB.InitHMAC(context.Background())).To(Succeed())
+		ctx := context.Background()
+
+		const writers = 4
+		const perWriter = 10
+		var wg sync.WaitGroup
+		wg.Add(writers)
+		for w := 0; w < writers; w++ {
+			svc := svcA
+			if w%2 == 1 {
+				svc = svcB
+			}
+			go func() {
+				defer GinkgoRecover()
+				defer wg.Done()
+				for i := 0; i < perWriter; i++ {
+					switch (w + i) % 3 {
+					case 0:
+						Expect(svc.SetCertProjection(ctx, "0003",
+							CertProjection{Fingerprint: fmt.Sprintf("%02d:%02d", w, i)})).To(Succeed())
+					case 1:
+						Expect(svc.MarkCertRevoked(ctx, "0003", time.Now())).To(Succeed())
+					default:
+						Expect(svc.ClearCertRevoked(ctx, "0003")).To(Succeed())
+					}
+				}
+			}()
+		}
+		wg.Wait()
+
+		// The record survived the contention intact: it decodes, the chain
+		// verifies, and a final deterministic write pair lands coherently.
+		_, err := svcA.ReadInventory(ctx)
+		Expect(err).NotTo(HaveOccurred(), "index-write races must never disturb the chain")
+		Expect(svcA.SetCertProjection(ctx, "0003", CertProjection{Fingerprint: "fi:na:le"})).To(Succeed())
+		revokedAt := time.Date(2025, 6, 1, 12, 0, 0, 0, time.UTC)
+		Expect(svcA.ClearCertRevoked(ctx, "0003")).To(Succeed())
+		Expect(svcA.MarkCertRevoked(ctx, "0003", revokedAt)).To(Succeed())
+		recs, _, err := svcA.CertStatuses(ctx, "")
+		Expect(err).NotTo(HaveOccurred())
+		for _, rec := range recs {
+			if rec.Subject == "node1" {
+				Expect(rec.Fingerprint).To(Equal("fi:na:le"))
+				Expect(rec.State).To(Equal(CertStateRevoked))
+				Expect(rec.RevokedAt).NotTo(BeNil())
+				Expect(*rec.RevokedAt).To(BeTemporally("~", revokedAt, time.Second))
+			}
+		}
+	})
+
+	It("retries an index write once past a CAS conflict, and errors out when conflicts never stop", func() {
+		cli, stop := startEmbeddedEtcd()
+		defer stop()
+		svc, b := seedEtcdCertIndex(cli, "/test-certindex-cas")
+		ctx := context.Background()
+
+		// The seeded 0003 record is the second append: entry key seq 2.
+		entryKey := fmt.Sprintf("/test-certindex-cas/inventory/entries/%020d", 2)
+		bump := func() {
+			resp, err := cli.Get(ctx, entryKey)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(resp.Kvs).To(HaveLen(1))
+			_, err = cli.Put(ctx, entryKey, string(resp.Kvs[0].Value))
+			Expect(err).NotTo(HaveOccurred(), "hook: bump entry ModRevision")
+		}
+
+		// One-shot conflict: the CAS must fail once and the retry succeed.
+		fired := false
+		b.mutateRecordHook = func() {
+			if !fired {
+				fired = true
+				bump()
+			}
+		}
+		Expect(svc.SetCertProjection(ctx, "0003", CertProjection{Fingerprint: "re:tr:yd"})).To(Succeed())
+		Expect(fired).To(BeTrue(), "the conflict must actually have been injected")
+		recs, _, err := svc.CertStatuses(ctx, "")
+		Expect(err).NotTo(HaveOccurred())
+		for _, rec := range recs {
+			if rec.Subject == "node1" {
+				Expect(rec.Fingerprint).To(Equal("re:tr:yd"), "the retried write must land")
+			}
+		}
+
+		// Persistent conflict: the bounded loop must give up loudly.
+		b.mutateRecordHook = bump
+		err = svc.SetCertProjection(ctx, "0003", CertProjection{Fingerprint: "ne:ve:rr"})
+		b.mutateRecordHook = nil
+		Expect(err).To(HaveOccurred(), "unbounded contention must surface, not spin")
+		Expect(err.Error()).To(ContainSubstring("too many concurrent writers"))
+	})
+
 	It("treats unknown serials as no-ops for revocation and projection writes", func() {
 		cli, stop := startEmbeddedEtcd()
 		defer stop()
