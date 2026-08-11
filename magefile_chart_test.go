@@ -81,7 +81,8 @@ var _ = Describe("verifyChartPins", func() {
 	// names it.
 	Describe("drift detection", func() {
 		goodChart := []byte("apiVersion: v2\nversion: 0.9.0-dev\nappVersion: \"0.9.0-dev\"\nkubeVersion: \">=" + kubeconformFloorVersion + "-0\"\n")
-		goodCI := []byte("jobs:\n  chart:\n    strategy:\n      matrix:\n        helm: [v3.21.3, v4.2.3]\n")
+		goodCI := []byte("jobs:\n  chart:\n    strategy:\n      matrix:\n        helm: [v3.21.3, v4.2.3]\n" +
+			"    steps:\n      - uses: azure/setup-helm@abc\n        with:\n          version: ${{ matrix.helm }}\n")
 		goodPublish := []byte("jobs:\n  publish:\n    steps:\n      - uses: azure/setup-helm@abc\n        with:\n          version: v3.21.3\n")
 
 		It("accepts synthetic files that agree", func() {
@@ -120,7 +121,8 @@ var _ = Describe("verifyChartPins", func() {
 		// a decoy ahead of the real value must not be picked up.
 		It("ignores a decoy helm matrix in another job", func() {
 			decoy := []byte("jobs:\n  other:\n    strategy:\n      matrix:\n        helm: [v9.9.9]\n" +
-				"  chart:\n    strategy:\n      matrix:\n        helm: [v3.21.3]\n")
+				"  chart:\n    strategy:\n      matrix:\n        helm: [v3.21.3]\n" +
+				"    steps:\n      - uses: azure/setup-helm@abc\n        with:\n          version: ${{ matrix.helm }}\n")
 			Expect(verifyChartPinsIn(goodChart, decoy, goodPublish)).To(Succeed())
 		})
 
@@ -157,6 +159,23 @@ var _ = Describe("verifyChartPins", func() {
 			Expect(verifyChartPinsIn(goodChart,
 				[]byte("jobs:\n  chart:\n    strategy:\n      matrix:\n        other: [a]\n"), goodPublish)).To(
 				MatchError(ContainSubstring("no helm matrix entries")))
+		})
+
+		// The link the matrix depends on: a literal here would make both legs
+		// install the same Helm and both pass, with one leg named for a version
+		// it never ran.
+		It("refuses a chart job that installs a literal instead of the matrix", func() {
+			bad := []byte("jobs:\n  chart:\n    strategy:\n      matrix:\n        helm: [v3.21.3, v4.2.3]\n" +
+				"    steps:\n      - uses: azure/setup-helm@abc\n        with:\n          version: v3.21.3\n")
+			Expect(verifyChartPinsIn(goodChart, bad, goodPublish)).To(
+				MatchError(ContainSubstring("instead of ${{ matrix.helm }}")))
+		})
+
+		It("refuses a chart job whose matrix installs nothing", func() {
+			bad := []byte("jobs:\n  chart:\n    strategy:\n      matrix:\n        helm: [v3.21.3]\n" +
+				"    steps:\n      - uses: actions/checkout@abc\n")
+			Expect(verifyChartPinsIn(goodChart, bad, goodPublish)).To(
+				MatchError(ContainSubstring("no azure/setup-helm step")))
 		})
 	})
 })

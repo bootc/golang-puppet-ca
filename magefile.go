@@ -815,12 +815,11 @@ var chartKubeVersionRe = regexp.MustCompile(`(?m)^kubeVersion: "[^0-9]*([0-9]+\.
 // ciChartHelmMatrix returns the Helm versions ci.yml's chart job validates the
 // chart against.
 //
-// It trusts the matrix declaration and does not check that the chart job's own
-// setup-helm step interpolates it: doing so would mean asserting the shape of a
-// `${{ matrix.helm }}` expression, which is a weaker check than it looks, and a
-// chart job that pinned a literal instead would fail its own two-major matrix
-// visibly (both legs running the same Helm) rather than silently. The publish
-// side is checked at step level because there the wrong pin ships a chart.
+// It also asserts the chart job's own setup-helm step actually consumes that
+// matrix. A literal there instead would make both legs install the same Helm
+// and both pass green — the leg *named* for the other version silently running
+// the wrong one — so the link is checked rather than assumed. It is an equality
+// against one expression string, no weaker than the publish-side check.
 func ciChartHelmMatrix(src []byte) ([]string, error) {
 	var doc struct {
 		Jobs map[string]struct {
@@ -829,6 +828,10 @@ func ciChartHelmMatrix(src []byte) ([]string, error) {
 					Helm []string `yaml:"helm"`
 				} `yaml:"matrix"`
 			} `yaml:"strategy"`
+			Steps []struct {
+				Uses string            `yaml:"uses"`
+				With map[string]string `yaml:"with"`
+			} `yaml:"steps"`
 		} `yaml:"jobs"`
 	}
 	if err := yaml.Unmarshal(src, &doc); err != nil {
@@ -841,7 +844,19 @@ func ciChartHelmMatrix(src []byte) ([]string, error) {
 	if len(j.Strategy.Matrix.Helm) == 0 {
 		return nil, fmt.Errorf("ci.yml's chart job has no helm matrix entries")
 	}
-	return j.Strategy.Matrix.Helm, nil
+
+	const matrixExpr = "${{ matrix.helm }}"
+	for _, step := range j.Steps {
+		if !strings.HasPrefix(step.Uses, "azure/setup-helm@") {
+			continue
+		}
+		if v := step.With["version"]; v != matrixExpr {
+			return nil, fmt.Errorf("ci.yml's chart job installs Helm %q instead of %s, so both matrix legs "+
+				"would run the same version while one is named for the other", v, matrixExpr)
+		}
+		return j.Strategy.Matrix.Helm, nil
+	}
+	return nil, fmt.Errorf("ci.yml's chart job has no azure/setup-helm step, so its helm matrix installs nothing")
 }
 
 // publishHelmVersion returns the Helm version helm-chart.yml packages with,
@@ -1262,15 +1277,17 @@ func (Chart) Test() error {
 			notWants: []string{"kind: Role\n", "kind: RoleBinding\n"},
 		},
 		{
-			name:     "the ServiceAccount token stays unmounted when nothing needs the API",
-			sets:     []string{tls},
-			wants:    []string{"automountServiceAccountToken: false"},
-			notWants: []string{"automountServiceAccountToken: true"},
+			name: "the ServiceAccount token stays unmounted when nothing needs the API",
+			sets: []string{tls},
+			// Anchored to the pod template: serviceaccount.yaml emits the same
+			// key at column 0 unconditionally, so a bare want cannot fail.
+			wants:    []string{"serviceAccountName: openvox-ca\n      automountServiceAccountToken: false"},
+			notWants: []string{"serviceAccountName: openvox-ca\n      automountServiceAccountToken: true"},
 		},
 		{
 			name:  "OpenBao Kubernetes auth mounts the token too",
 			sets:  []string{tls, "config.ca_key_provider=openbao", "config.openbao.auth_method=kubernetes"},
-			wants: []string{"automountServiceAccountToken: true"},
+			wants: []string{"serviceAccountName: openvox-ca\n      automountServiceAccountToken: true"},
 		},
 		{
 			name: "export targets set through config alone still mount the token",
@@ -1278,7 +1295,7 @@ func (Chart) Test() error {
 			// kubernetesExport.enabled says, so the token decision has to read
 			// the merged config rather than the chart's own flag.
 			sets:  []string{tls, "config.kubernetes_export.targets[0].kind=Secret", "config.kubernetes_export.targets[0].metadata.name=trust", "config.kubernetes_export.targets[0].cert=true"},
-			wants: []string{"automountServiceAccountToken: true"},
+			wants: []string{"serviceAccountName: openvox-ca\n      automountServiceAccountToken: true"},
 		},
 		{
 			name: "a config the chart cannot read mounts the token conservatively",
@@ -1286,7 +1303,7 @@ func (Chart) Test() error {
 			// costs nothing, a missing one fails the export or the key provider
 			// while readiness stays green.
 			sets:  []string{"existingConfigMap=mine"},
-			wants: []string{"automountServiceAccountToken: true"},
+			wants: []string{"serviceAccountName: openvox-ca\n      automountServiceAccountToken: true"},
 		},
 		{
 			name: "a config change rolls the pods",
@@ -1431,8 +1448,10 @@ func (Chart) Test() error {
 			// the note gives must not claim OpenBao.
 			sets: []string{tls, "networkPolicy.enabled=true", "networkPolicy.egress.enabled=true",
 				"config.kubernetes_export.targets[0].kind=Secret", "config.kubernetes_export.targets[0].metadata.name=trust", "config.kubernetes_export.targets[0].cert=true"},
-			wants:    []string{"egress is restricted"},
-			notWants: []string{"OpenBao Kubernetes auth"},
+			// The export reason is the regression anchor: this route printed no
+			// reason at all before apiAccessReason existed.
+			wants:    []string{"egress is restricted", "(Kubernetes export)"},
+			notWants: []string{"(OpenBao Kubernetes auth)"},
 		},
 		{
 			name:  "the egress NOTE names Kubernetes export when that is the reason",
@@ -1459,20 +1478,65 @@ func (Chart) Test() error {
 			// is not an uncertainty case — it must be detected outright, the way
 			// tlsConfigured detects PUPPET_CA_TLS_CERT there.
 			sets:  []string{tls, "config.ca_key_provider=openbao", "env.PUPPET_CA_OPENBAO_AUTH_METHOD=kubernetes"},
-			wants: []string{"automountServiceAccountToken: true"},
+			wants: []string{"serviceAccountName: openvox-ca\n      automountServiceAccountToken: true"},
 		},
 		{
 			name:     "a non-Kubernetes auth method through env does not",
 			sets:     []string{tls, "config.ca_key_provider=openbao", "env.PUPPET_CA_OPENBAO_AUTH_METHOD=approle"},
-			wants:    []string{"automountServiceAccountToken: false"},
-			notWants: []string{"automountServiceAccountToken: true"},
+			wants:    []string{"serviceAccountName: openvox-ca\n      automountServiceAccountToken: false"},
+			notWants: []string{"serviceAccountName: openvox-ca\n      automountServiceAccountToken: true"},
+		},
+		{
+			name: "an auth method supplied through extraEnv with a readable value mounts the token",
+			// The readable arm of the extraEnv scan, distinct from the valueFrom
+			// arm below: only that one is reached by `not .value`.
+			sets: []string{tls, "config.ca_key_provider=openbao",
+				"extraEnv[0].name=PUPPET_CA_OPENBAO_AUTH_METHOD", "extraEnv[0].value=kubernetes"},
+			wants: []string{"serviceAccountName: openvox-ca\n      automountServiceAccountToken: true"},
+		},
+		{
+			name: "a non-Kubernetes auth method through extraEnv does not",
+			sets: []string{tls, "config.ca_key_provider=openbao",
+				"extraEnv[0].name=PUPPET_CA_OPENBAO_AUTH_METHOD", "extraEnv[0].value=approle"},
+			wants: []string{"serviceAccountName: openvox-ca\n      automountServiceAccountToken: false"},
+		},
+		{
+			name: "an auth method passed through extraArgs mounts the token",
+			// extraArgs is appended to the argv the chart builds, so unlike
+			// `args` the chart can read it — and the flag outranks both the
+			// config file and the environment.
+			sets:  []string{tls, "config.ca_key_provider=openbao", "extraArgs[0]=--openbao-auth-method=kubernetes"},
+			wants: []string{"serviceAccountName: openvox-ca\n      automountServiceAccountToken: true"},
+		},
+		{
+			name:  "a non-Kubernetes auth method through extraArgs does not",
+			sets:  []string{tls, "config.ca_key_provider=openbao", "extraArgs[0]=--openbao-auth-method=approle"},
+			wants: []string{"serviceAccountName: openvox-ca\n      automountServiceAccountToken: false"},
+		},
+		{
+			name: "an empty env value does not erase the auth method the config set",
+			// The server ignores an empty variable, so the chart must too; an
+			// unguarded assignment here would withhold the token from a
+			// correctly configured pod.
+			sets: []string{tls, "config.ca_key_provider=openbao", "config.openbao.auth_method=kubernetes",
+				"env.PUPPET_CA_OPENBAO_AUTH_METHOD="},
+			wants: []string{"serviceAccountName: openvox-ca\n      automountServiceAccountToken: true"},
+		},
+		{
+			name:  "the egress NOTE names export even when the wider config is unknown",
+			notes: true,
+			// kubernetesExport.enabled stays readable under existingConfigMap, so
+			// suppressing the reason there would lose one the chart does have.
+			sets: []string{"existingConfigMap=mine", "kubernetesExport.enabled=true",
+				"networkPolicy.enabled=true", "networkPolicy.egress.enabled=true"},
+			wants: []string{"(Kubernetes export)"},
 		},
 		{
 			name: "an auth method fed from a Secret mounts the token, since the chart cannot read it",
 			sets: []string{tls, "config.ca_key_provider=openbao",
 				"extraEnv[0].name=PUPPET_CA_OPENBAO_AUTH_METHOD",
 				"extraEnv[0].valueFrom.secretKeyRef.name=openbao", "extraEnv[0].valueFrom.secretKeyRef.key=method"},
-			wants: []string{"automountServiceAccountToken: true"},
+			wants: []string{"serviceAccountName: openvox-ca\n      automountServiceAccountToken: true"},
 		},
 		{
 			name: "a lowercase export target kind passes through as written",

@@ -211,12 +211,19 @@ on, because they all outrank or replace the config file the chart renders:
 PUPPET_CA_OPENBAO_AUTH_METHOD through a ConfigMap or Secret named in `envFrom`
 (see docs/openbao-transit.md). The chart cannot read any of them.
 
-It can read `env` and `extraEnv`, though, and those carry the same variable —
-so they are scanned here exactly as openvox-ca.tlsConfigured scans them for
-PUPPET_CA_TLS_CERT/KEY. Without that, `config.ca_key_provider: openbao` plus
-`env.PUPPET_CA_OPENBAO_AUTH_METHOD: kubernetes` would leave the config fully
-known, the merged config's openbao.auth_method empty, and the pod without the
-projected token its key provider needs.
+It can read `env`, `extraEnv` and `extraArgs`, though, and each of those carries
+the same setting — so all three are scanned here, the way
+openvox-ca.tlsConfigured scans env/extraEnv for PUPPET_CA_TLS_CERT/KEY. Without
+that, `config.ca_key_provider: openbao` plus any of
+`env.PUPPET_CA_OPENBAO_AUTH_METHOD: kubernetes`, the same variable in
+`extraEnv`, or `extraArgs: [--openbao-auth-method=kubernetes]` would leave the
+config fully known, the merged config's openbao.auth_method empty, and the pod
+without the projected token its key provider needs.
+
+Each scan follows the server's own precedence: an empty value does not override
+what the config file said (cmd/openvox-ca/config.go only assigns when the
+variable is non-empty), and a value the chart cannot read counts as needing the
+token, because that is the fail-open direction.
 */}}
 {{- define "openvox-ca.needsAPIAccess" -}}
 {{- if ne (include "openvox-ca.configFullyKnown" .) "true" -}}
@@ -225,7 +232,7 @@ true
 {{- $config := include "openvox-ca.config" . | fromYaml -}}
 {{- $authMethod := dig "openbao" "auth_method" "" $config -}}
 {{- range $name, $value := .Values.env -}}
-{{- if eq $name "PUPPET_CA_OPENBAO_AUTH_METHOD" }}{{ $authMethod = $value }}{{ end -}}
+{{- if and (eq $name "PUPPET_CA_OPENBAO_AUTH_METHOD") $value }}{{ $authMethod = $value }}{{ end -}}
 {{- end -}}
 {{- range .Values.extraEnv -}}
 {{- if and (eq .name "PUPPET_CA_OPENBAO_AUTH_METHOD") .value }}{{ $authMethod = .value }}{{ end -}}
@@ -236,7 +243,18 @@ true
 */}}
 {{- if and (eq .name "PUPPET_CA_OPENBAO_AUTH_METHOD") (not .value) }}{{ $authMethod = "kubernetes" }}{{ end -}}
 {{- end -}}
-{{- if or .Values.kubernetesExport.enabled (dig "kubernetes_export" "targets" list $config) -}}
+{{/*
+  extraArgs is appended to the argument list the chart builds, so unlike `args`
+  the chart can read it. `--openbao-auth-method=x` gives the method outright; the
+  separated form leaves it in the next element, which is not worth reassembling
+  — treat the bare flag as needing the token, again failing open.
+*/}}
+{{- range .Values.extraArgs -}}
+{{- $arg := . | toString -}}
+{{- if hasPrefix "--openbao-auth-method=" $arg }}{{ $authMethod = trimPrefix "--openbao-auth-method=" $arg }}{{ end -}}
+{{- if eq $arg "--openbao-auth-method" }}{{ $authMethod = "kubernetes" }}{{ end -}}
+{{- end -}}
+{{- if eq (include "openvox-ca.exportConfigured" .) "true" -}}
 true
 {{- else if eq ($authMethod | toString) "kubernetes" -}}
 true
@@ -247,22 +265,46 @@ false
 {{- end -}}
 
 {{/*
+Whether Kubernetes export is configured, by either route the server honours:
+the chart's own flag, or targets set directly in config.
+
+One definition, because this predicate is read by both the token decision and
+the reason the NOTES warning gives, and an earlier pair of copies had already
+drifted — the NOTE tested only kubernetesExport.enabled and so gave no reason
+for a config-supplied export.
+*/}}
+{{- define "openvox-ca.exportConfigured" -}}
+{{- $config := include "openvox-ca.config" . | fromYaml -}}
+{{- if or .Values.kubernetesExport.enabled (dig "kubernetes_export" "targets" list $config) -}}
+true
+{{- else -}}
+false
+{{- end -}}
+{{- end -}}
+
+{{/*
 Why the pod needs the Kubernetes API, as an operator-facing phrase, or empty
-when the chart cannot tell.
+when the chart cannot name a reason.
 
 Exists so the NOTES warning names the same reason the token decision acted on
 instead of re-deriving it: an earlier copy tested only
 .Values.kubernetesExport.enabled, so an export configured through
 config.kubernetes_export got no reason at all even though that is precisely
-what had made needsAPIAccess true.
+what had made needsAPIAccess true. Both now go through
+openvox-ca.exportConfigured.
+
+Export is reported whenever it is configured, including when the wider
+configuration is unknown — kubernetesExport.enabled and config are readable
+whatever existingConfigMap or args are doing, so suppressing a reason the chart
+does have would be a step backwards. Empty means only that no reason is
+visible, which is the honest answer when the token is being mounted because the
+chart cannot see far enough to rule anything out.
 */}}
 {{- define "openvox-ca.apiAccessReason" -}}
-{{- if ne (include "openvox-ca.configFullyKnown" .) "true" -}}
-{{- else -}}
-{{- $config := include "openvox-ca.config" . | fromYaml -}}
-{{- if or .Values.kubernetesExport.enabled (dig "kubernetes_export" "targets" list $config) -}}
+{{- if eq (include "openvox-ca.exportConfigured" .) "true" -}}
 Kubernetes export
-{{- else if eq (include "openvox-ca.needsAPIAccess" .) "true" -}}
+{{- else if eq (include "openvox-ca.configFullyKnown" .) "true" -}}
+{{- if eq (include "openvox-ca.needsAPIAccess" .) "true" -}}
 OpenBao Kubernetes auth
 {{- end -}}
 {{- end -}}

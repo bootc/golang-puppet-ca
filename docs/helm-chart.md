@@ -486,10 +486,18 @@ binding. `rbac.scope: ClusterRole` grants it cluster-wide instead, which is
 worth it only if you export into many namespaces.
 
 The chart mounts the ServiceAccount token automatically when this (or OpenBao's
-Kubernetes auth) is enabled, and leaves it unmounted otherwise — except that
-`existingConfigMap`, `args` and `envFrom` can each configure either feature
-somewhere the chart does not read, so in those modes it mounts the token rather
-than guess. `automountServiceAccountToken` forces the decision either way.
+Kubernetes auth) is enabled, and leaves it unmounted otherwise. Four things
+count as enabled, three of them because the chart cannot see far enough to rule
+them out:
+
+| Input | Why it mounts |
+| --- | --- |
+| `kubernetesExport.enabled`, or `config.kubernetes_export.targets` | Export is configured, so the exporter needs the API |
+| `config.openbao.auth_method: kubernetes`, or `PUPPET_CA_OPENBAO_AUTH_METHOD` in `env`/`extraEnv` | The key provider authenticates with the pod's own token. Environment variables outrank the config file, so the chart reads those two values too |
+| An `extraEnv` entry for `PUPPET_CA_OPENBAO_AUTH_METHOD` fed by `valueFrom` | The chart cannot read which method the Secret names, so it assumes the one that needs a token |
+| `existingConfigMap`, `args` or `envFrom` | Each can configure either feature somewhere the chart does not read at all |
+
+`automountServiceAccountToken` forces the decision either way.
 
 ## OpenBao CA key custody
 

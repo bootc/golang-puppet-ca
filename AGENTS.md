@@ -27,7 +27,7 @@ Task. Invoke targets with `go run mage.go <Target>` or the `mage` binary:
 | `mage test:backendsRedisGo` | Redis backend Go integration suite (build tag `redis_integration`) |
 | `mage test:backendsOpenBao` | OpenBao Transit signer integration suite (build tag `openbao_integration`, `test/compose-backends-openbao.yml`) |
 | `mage chart:lint` | Run `helm lint --strict` over the Helm chart, once per fixture in `charts/openvox-ca/ci/` |
-| `mage chart:validate` | Lint the Helm chart and check every rendered fixture against the Kubernetes schemas (needs `helm` and `kubeconform`; caches the remote schemas under `.test-output/`, which `mage dev:clean` clears) |
+| `mage chart:validate` | Lint the Helm chart and check every rendered fixture against the Kubernetes schemas (needs `helm` and `kubeconform`; caches the remote schemas under `.test-output/kubeconform-cache/`, which `mage dev:clean` removes) |
 | `mage chart:test` | Assert what the chart renders, and that each precondition refuses what it claims to |
 | `mage chart:version` | Assert `charts/openvox-ca/Chart.yaml` still tracks `internal/version` |
 | `mage chart:package` | Package the Helm chart to `dist/openvox-ca-<version>.tgz`, as CI does before the publish workflow pushes it |
