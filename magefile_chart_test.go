@@ -82,7 +82,7 @@ var _ = Describe("verifyChartPins", func() {
 	Describe("drift detection", func() {
 		goodChart := []byte("apiVersion: v2\nversion: 0.9.0-dev\nappVersion: \"0.9.0-dev\"\nkubeVersion: \">=" + kubeconformFloorVersion + "-0\"\n")
 		goodCI := []byte("jobs:\n  chart:\n    strategy:\n      matrix:\n        helm: [v3.21.3, v4.2.3]\n")
-		goodPublish := []byte("      - name: Set up Helm\n        uses: azure/setup-helm@abc\n        with:\n          version: v3.21.3\n")
+		goodPublish := []byte("jobs:\n  publish:\n    steps:\n      - uses: azure/setup-helm@abc\n        with:\n          version: v3.21.3\n")
 
 		It("accepts synthetic files that agree", func() {
 			Expect(verifyChartPinsIn(goodChart, goodCI, goodPublish)).To(Succeed())
@@ -109,9 +109,40 @@ var _ = Describe("verifyChartPins", func() {
 			Expect(verifyChartPinsIn([]byte("apiVersion: v2\n"), goodCI, goodPublish)).To(
 				MatchError(ContainSubstring("could not parse the kubeVersion floor")))
 			Expect(verifyChartPinsIn(goodChart, []byte("jobs: {}\n"), goodPublish)).To(
-				MatchError(ContainSubstring("could not parse the chart job's helm matrix")))
-			Expect(verifyChartPinsIn(goodChart, goodCI, []byte("steps: []\n"))).To(
-				MatchError(ContainSubstring("could not parse the setup-helm version")))
+				MatchError(ContainSubstring("ci.yml has no 'chart' job")))
+			Expect(verifyChartPinsIn(goodChart, goodCI, []byte("jobs: {}\n"))).To(
+				MatchError(ContainSubstring("helm-chart.yml has no 'publish' job")))
+		})
+
+		// The failure mode a positional parse admits: reading a pin that
+		// belongs to something else and passing anyway. Both parsers key on the
+		// job (and the publish one on the action) rather than on file order, so
+		// a decoy ahead of the real value must not be picked up.
+		It("ignores a decoy helm matrix in another job", func() {
+			decoy := []byte("jobs:\n  other:\n    strategy:\n      matrix:\n        helm: [v9.9.9]\n" +
+				"  chart:\n    strategy:\n      matrix:\n        helm: [v3.21.3]\n")
+			Expect(verifyChartPinsIn(goodChart, decoy, goodPublish)).To(Succeed())
+		})
+
+		It("ignores a decoy version on an earlier action step", func() {
+			decoy := []byte("jobs:\n  publish:\n    steps:\n" +
+				"      - uses: actions/setup-go@abc\n        with:\n          version: v9.9.9\n" +
+				"      - uses: azure/setup-helm@abc\n        with:\n          version: v3.21.3\n")
+			Expect(verifyChartPinsIn(goodChart, goodCI, decoy)).To(Succeed())
+		})
+
+		It("still catches the real mismatch past a decoy", func() {
+			decoy := []byte("jobs:\n  publish:\n    steps:\n" +
+				"      - uses: actions/setup-go@abc\n        with:\n          version: v3.21.3\n" +
+				"      - uses: azure/setup-helm@abc\n        with:\n          version: v9.9.9\n")
+			Expect(verifyChartPinsIn(goodChart, goodCI, decoy)).To(
+				MatchError(ContainSubstring("not in ci.yml's chart matrix")))
+		})
+
+		It("refuses a publish job with no setup-helm step at all", func() {
+			Expect(verifyChartPinsIn(goodChart, goodCI,
+				[]byte("jobs:\n  publish:\n    steps:\n      - uses: actions/checkout@abc\n"))).To(
+				MatchError(ContainSubstring("no azure/setup-helm step")))
 		})
 	})
 })

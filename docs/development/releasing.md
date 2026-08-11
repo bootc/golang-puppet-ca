@@ -253,7 +253,8 @@ hand-editing.
 ## Pre-1.0 and pre-release tags
 
 A **semver pre-release tag** — any tag with a hyphen, e.g. `v0.9.0-rc1` — is
-handled specially by the Release and Container images workflows: the GitHub release is created with
+handled specially by the Release and Container images workflows: the GitHub
+release is created with
 `--prerelease` (it will not appear as the latest stable release), and
 `docker/metadata-action` withholds the `latest` container tags. The Helm chart
 workflow treats it like any other tag — the chart publishes at that exact

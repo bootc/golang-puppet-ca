@@ -9,10 +9,8 @@
 # volume source must not go null) and `backendPort: metrics` (the Ingress must
 # get the port name, the Gateway routes the number).
 #
-# `service.loadBalancerIP` and `service.loadBalancerClass` are not covered
-# anywhere: the template only emits them for `type: LoadBalancer`, and this
-# fixture needs `type: NodePort` for `nodePort`/`metricsNodePort`. They are
-# plain pass-throughs guarded by that `if`.
+# The LoadBalancer-only Service values are covered by full-values.yaml, which
+# uses that Service type; this fixture uses NodePort.
 
 fullnameOverride: ca-edge
 

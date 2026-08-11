@@ -799,14 +799,69 @@ func verifyChartPins() error {
 	return verifyChartPinsIn(chartSrc, ciSrc, publishSrc)
 }
 
-var (
-	// kubeVersion: ">=1.26.0-0" — capture the bare version.
-	chartKubeVersionRe = regexp.MustCompile(`(?m)^kubeVersion: "[^0-9]*([0-9]+\.[0-9]+\.[0-9]+)[^"]*"`)
-	// ci.yml's chart job: helm: [v3.21.3, v4.2.3]
-	ciHelmMatrixRe = regexp.MustCompile(`(?m)^\s*helm: \[([^\]]+)\]`)
-	// helm-chart.yml's setup-helm step: version: v3.21.3
-	publishHelmRe = regexp.MustCompile(`(?m)^\s*version: (v[0-9]+\.[0-9]+\.[0-9]+)`)
-)
+// kubeVersion: ">=1.26.0-0" — capture the bare version. Chart.yaml is parsed
+// textually rather than as YAML, matching chartVersions: the file's exact
+// line shapes are load-bearing for four other parsers, so reading it the same
+// way keeps this guard sensitive to the same reformatting they are.
+var chartKubeVersionRe = regexp.MustCompile(`(?m)^kubeVersion: "[^0-9]*([0-9]+\.[0-9]+\.[0-9]+)[^"]*"`)
+
+// ciChartHelmMatrix returns the Helm versions ci.yml's chart job validates the
+// chart against.
+func ciChartHelmMatrix(src []byte) ([]string, error) {
+	var doc struct {
+		Jobs map[string]struct {
+			Strategy struct {
+				Matrix struct {
+					Helm []string `yaml:"helm"`
+				} `yaml:"matrix"`
+			} `yaml:"strategy"`
+		} `yaml:"jobs"`
+	}
+	if err := yaml.Unmarshal(src, &doc); err != nil {
+		return nil, err
+	}
+	j, ok := doc.Jobs["chart"]
+	if !ok {
+		return nil, fmt.Errorf("ci.yml has no 'chart' job")
+	}
+	if len(j.Strategy.Matrix.Helm) == 0 {
+		return nil, fmt.Errorf("ci.yml's chart job has no helm matrix entries")
+	}
+	return j.Strategy.Matrix.Helm, nil
+}
+
+// publishHelmVersion returns the Helm version helm-chart.yml packages with,
+// read from the azure/setup-helm step's own `with.version` rather than from the
+// first version-shaped line in the file — the publish job runs several pinned
+// actions, and a gate that matched the wrong one would pass while validating
+// nothing.
+func publishHelmVersion(src []byte) (string, error) {
+	var doc struct {
+		Jobs map[string]struct {
+			Steps []struct {
+				Uses string            `yaml:"uses"`
+				With map[string]string `yaml:"with"`
+			} `yaml:"steps"`
+		} `yaml:"jobs"`
+	}
+	if err := yaml.Unmarshal(src, &doc); err != nil {
+		return "", err
+	}
+	j, ok := doc.Jobs["publish"]
+	if !ok {
+		return "", fmt.Errorf("helm-chart.yml has no 'publish' job")
+	}
+	for _, step := range j.Steps {
+		if !strings.HasPrefix(step.Uses, "azure/setup-helm@") {
+			continue
+		}
+		if v := step.With["version"]; v != "" {
+			return v, nil
+		}
+		return "", fmt.Errorf("helm-chart.yml's azure/setup-helm step sets no with.version")
+	}
+	return "", fmt.Errorf("helm-chart.yml's publish job has no azure/setup-helm step")
+}
 
 // verifyChartPinsIn is verifyChartPins over caller-supplied file contents, so
 // the mismatch branches are testable without editing the real files.
@@ -821,20 +876,15 @@ func verifyChartPinsIn(chartSrc, ciSrc, publishSrc []byte) error {
 			kubeconformFloorVersion, chartDir, floor)
 	}
 
-	m = ciHelmMatrixRe.FindSubmatch(ciSrc)
-	if m == nil {
-		return fmt.Errorf("could not parse the chart job's helm matrix from ci.yml")
+	validated, err := ciChartHelmMatrix(ciSrc)
+	if err != nil {
+		return fmt.Errorf("could not read the chart job's helm matrix: %w", err)
 	}
-	var validated []string
-	for _, v := range strings.Split(string(m[1]), ",") {
-		validated = append(validated, strings.TrimSpace(v))
+	packaging, err := publishHelmVersion(publishSrc)
+	if err != nil {
+		return fmt.Errorf("could not read the setup-helm version: %w", err)
 	}
-
-	m = publishHelmRe.FindSubmatch(publishSrc)
-	if m == nil {
-		return fmt.Errorf("could not parse the setup-helm version from helm-chart.yml")
-	}
-	if packaging := string(m[1]); !slices.Contains(validated, packaging) {
+	if !slices.Contains(validated, packaging) {
 		return fmt.Errorf("helm-chart.yml packages with Helm %s, which is not in ci.yml's chart matrix (%s); "+
 			"the chart would ship packaged by a Helm it was never validated against",
 			packaging, strings.Join(validated, ", "))
@@ -930,10 +980,16 @@ func (Chart) Validate() error {
 				"-strict",
 				"-summary",
 				// Both schema locations are remote, and this runs once per
-				// fixture per Helm major — fourteen times a CI run. Without a
-				// cache each invocation re-downloads the same documents from
+				// fixture — seven times per invocation. Without a cache each
+				// one re-downloads the same documents from
 				// raw.githubusercontent.com, so a rate limit there blocks every
-				// merge.
+				// merge. (Each CI matrix leg still fetches once: the cache is
+				// per-job, not shared between runs.)
+				//
+				// kubeconform's cache is write-once and never revalidates,
+				// while `default` below resolves to a mutable upstream branch,
+				// so a long-lived local copy can pass what CI fails. `mage
+				// dev:clean` removes it.
 				"-cache", cacheDir,
 				"-kubernetes-version", kubeVersion,
 				"-schema-location", "default",
@@ -1294,8 +1350,23 @@ func (Chart) Test() error {
 			name: "a TLSRoute routed to the metrics port numbers it",
 			// ...while a Gateway API backendRef takes the number, which is the
 			// asymmetry openvox-ca.routeBackendName/routeBackendPort exist for.
-			sets:  []string{tls, "metrics.enabled=true", "gateway.tlsRoute.enabled=true", "gateway.tlsRoute.backendPort=metrics"},
-			wants: []string{"port: 9140"},
+			//
+			// Anchored to the backendRef's own nesting: a bare "port: 9140"
+			// also matches the Service's metrics port, so it would pass even if
+			// the route had regressed to the https port.
+			sets: []string{tls, "metrics.enabled=true", "gateway.tlsRoute.enabled=true", "gateway.tlsRoute.backendPort=metrics"},
+			wants: []string{
+				"- backendRefs:\n        - name: openvox-ca\n          port: 9140",
+			},
+		},
+		{
+			name: "a TLSRoute left on the default backendPort numbers the https port",
+			// The other selection, so the pair prove routeBackendPort chooses
+			// rather than that either number appears somewhere.
+			sets: []string{tls, "metrics.enabled=true", "gateway.tlsRoute.enabled=true"},
+			wants: []string{
+				"- backendRefs:\n        - name: openvox-ca\n          port: 443",
+			},
 		},
 		{
 			name:  "NOTES warns when every CSR is signed unreviewed",
@@ -1324,6 +1395,31 @@ func (Chart) Test() error {
 			notes: true,
 			sets:  []string{"existingConfigMap=mine", "kubernetesExport.enabled=true"},
 			wants: []string{"patch on every"},
+		},
+		{
+			name:  "NOTES warns that an ephemeral cadir throws the CA away",
+			notes: true,
+			// The most consequential of the nine warnings: the filesystem
+			// backend's private key living in an emptyDir.
+			sets:  []string{tls, "persistence.enabled=false"},
+			wants: []string{"regenerated from scratch"},
+		},
+		{
+			name:  "NOTES warns that the metrics exporter is unrestricted",
+			notes: true,
+			sets:  []string{tls, "metrics.enabled=true"},
+			wants: []string{"leaf-certificate series carry node hostnames"},
+		},
+		{
+			name:  "NOTES warns that restricted egress may not reach the API server",
+			notes: true,
+			// The second consumer of needsAPIAccess, and the one no case
+			// covered. With export configured through config alone the reason
+			// the note gives must not claim OpenBao.
+			sets: []string{tls, "networkPolicy.enabled=true", "networkPolicy.egress.enabled=true",
+				"config.kubernetes_export.targets[0].kind=Secret", "config.kubernetes_export.targets[0].metadata.name=trust", "config.kubernetes_export.targets[0].cert=true"},
+			wants:    []string{"egress is restricted"},
+			notWants: []string{"OpenBao Kubernetes auth"},
 		},
 		{
 			name: "a lowercase export target kind passes through as written",
@@ -2239,9 +2335,17 @@ func (Dev) Tidy() error {
 	return sh.Run("go", "fmt", "./...")
 }
 
-// Clean removes the bin/ directory.
+// Clean removes the bin/ directory and the schema cache chart:validate keeps.
+//
+// The cache is included because kubeconform's on-disk cache is write-once and
+// never revalidates, while its default schema location is a mutable upstream
+// branch: a stale local copy can therefore pass a validation that CI, which
+// always starts empty, fails. This is the documented way to clear it.
 func (Dev) Clean() error {
 	fmt.Println("Cleaning...")
+	if err := sh.Rm(filepath.Join(".test-output", "kubeconform-cache")); err != nil {
+		return err
+	}
 	return sh.Rm("bin")
 }
 

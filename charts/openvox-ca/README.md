@@ -178,7 +178,7 @@ Helm 3.21 or 4.2; both are exercised in CI.
 | `priorityClassName` / `runtimeClassName` / `schedulerName` | `""` | |
 | `dnsPolicy` / `dnsConfig` / `hostAliases` | `""` / `{}` / `[]` | |
 | `enableServiceLinks` | `false` | |
-| `automountServiceAccountToken` | `null` | `null` mounts the token only when the pod needs the API (Kubernetes export, OpenBao Kubernetes auth) |
+| `automountServiceAccountToken` | `null` | `null` mounts the token when the pod needs the API (Kubernetes export, OpenBao Kubernetes auth), and whenever `existingConfigMap`, `args` or `envFrom` leave the chart unable to tell |
 | `initContainers` / `extraContainers` | `[]` | Templated, so they can reference `.Values` |
 | `extraVolumes` | `[]` | Templated |
 | `extraVolumeMounts` | `[]` | Passed through as written |

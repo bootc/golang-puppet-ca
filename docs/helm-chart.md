@@ -163,8 +163,10 @@ at startup and has no reload path, so when cert-manager rotates the Secret the
 running pods keep serving the old certificate. The probes talk to that same
 listener, so readiness stays green right up to expiry, at which point every
 agent fails at once. Restart on renewal with `kubectl rollout restart`, or let a
-controller do it — a `reloader.stakater.com/secret-auto` pod annotation is what
-`ci/postgres-ha-values.yaml` uses.
+controller do it: `ci/postgres-ha-values.yaml` sets
+`reloader.stakater.com/auto: "true"` under `podAnnotations`, which has
+[Reloader](https://github.com/stakater/Reloader) watch every Secret and
+ConfigMap the pod mounts.
 
 Two further consequences follow from the CA terminating its own TLS:
 
@@ -240,6 +242,8 @@ env:
 
 With `persistence.enabled: false` and the default `emptyDir.medium: Memory`, the
 cadir tmpfs counts against the same limit.
+
+### Shutdown and drain
 
 The 30-second default `terminationGracePeriodSeconds` nests the server's
 25-second drain plus the supervisor's 3-second headroom. If you raise
@@ -482,8 +486,10 @@ binding. `rbac.scope: ClusterRole` grants it cluster-wide instead, which is
 worth it only if you export into many namespaces.
 
 The chart mounts the ServiceAccount token automatically when this (or OpenBao's
-Kubernetes auth) is enabled, and leaves it unmounted otherwise.
-`automountServiceAccountToken` forces the decision either way.
+Kubernetes auth) is enabled, and leaves it unmounted otherwise — except that
+`existingConfigMap`, `args` and `envFrom` can each configure either feature
+somewhere the chart does not read, so in those modes it mounts the token rather
+than guess. `automountServiceAccountToken` forces the decision either way.
 
 ## OpenBao CA key custody
 

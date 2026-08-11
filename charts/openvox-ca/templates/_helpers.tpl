@@ -203,6 +203,13 @@ And when the configuration is not fully known the answer is "true", matching
 what openvox-ca.tlsConfigured does with the same uncertainty: an unnecessary
 projected token costs nothing, whereas a missing one makes the export or the
 key provider fail while readiness still reports healthy.
+
+That covers all three of configFullyKnown's inputs deliberately, not just
+existingConfigMap. Every one of them can carry the settings this decision turns
+on, because they all outrank or replace the config file the chart renders:
+`--openbao-auth-method=kubernetes` through `args`, and
+PUPPET_CA_OPENBAO_AUTH_METHOD through a ConfigMap or Secret named in `envFrom`
+(see docs/openbao-transit.md). The chart cannot read any of them.
 */}}
 {{- define "openvox-ca.needsAPIAccess" -}}
 {{- if ne (include "openvox-ca.configFullyKnown" .) "true" -}}
@@ -526,10 +533,10 @@ networkPolicy.enabled: true.
 {{- end }}
 {{- if and .Values.networkPolicy.enabled .Values.networkPolicy.egress.enabled (eq (include "openvox-ca.needsAPIAccess" .) "true") }}
 
-NOTE: this pod talks to the Kubernetes API ({{ if .Values.kubernetesExport.enabled }}Kubernetes export{{ else }}OpenBao Kubernetes auth{{ end }}), but
-egress is restricted and the chart cannot know your API server's address. Add a
-rule for it to networkPolicy.egress.rules, or the feature will fail while
-readiness still reports healthy.
+NOTE: this pod may talk to the Kubernetes API{{ if .Values.kubernetesExport.enabled }} (Kubernetes export){{ else if eq (dig "openbao" "auth_method" "" $config) "kubernetes" }} (OpenBao Kubernetes auth){{ end }}, but
+egress is restricted and the chart cannot know your API server's address. If it
+does, add a rule for it to networkPolicy.egress.rules, or the feature will fail
+while readiness still reports healthy.
 {{- end }}
 {{- if not (or .Values.puppetServers (dig "puppet_server" "" $config) (dig "puppet_server_file" "" $config)) }}
 

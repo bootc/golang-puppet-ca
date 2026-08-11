@@ -182,6 +182,7 @@ service:
   sessionAffinityConfig:
     clientIP:
       timeoutSeconds: 10800
+  loadBalancerIP: 192.0.2.10
   loadBalancerClass: io.cilium/bgp-control-plane
   loadBalancerSourceRanges:
     - 10.0.0.0/8

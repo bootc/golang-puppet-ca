@@ -141,9 +141,10 @@ autosign:
 # path. When cert-manager renews the Secret the running pods keep serving the
 # old certificate until they restart — and the probes speak to that same
 # listener, so readiness stays green until it expires and every agent fails at
-# once. Restart on renewal: `kubectl rollout restart`, a
-# `reloader.stakater.com/secret-auto` pod annotation (see
-# ci/postgres-ha-values.yaml), or your own controller.
+# once. Restart on renewal: `kubectl rollout restart`, a Reloader annotation on
+# the pod template (`reloader.stakater.com/auto: "true"` watches every mounted
+# Secret and ConfigMap; ci/postgres-ha-values.yaml sets it under
+# podAnnotations), or your own controller.
 tls:
   existingSecret: ""
   certKey: tls.crt
@@ -408,8 +409,13 @@ hostAliases: []
 
 enableServiceLinks: false
 
-# null lets the chart decide: mounted only when the pod needs the Kubernetes
-# API (kubernetesExport, or OpenBao Kubernetes auth). Set true/false to force.
+# null lets the chart decide: mounted when the pod needs the Kubernetes API —
+# Kubernetes export (from either `kubernetesExport.targets` or
+# `config.kubernetes_export`) or OpenBao Kubernetes auth — and also whenever the
+# chart cannot see the whole configuration, because `existingConfigMap`, `args`
+# and `envFrom` can each carry those settings somewhere it does not read. A spare
+# token costs nothing; a missing one fails the feature while readiness stays
+# green. Set true/false to force the decision.
 automountServiceAccountToken: null
 
 initContainers: []
