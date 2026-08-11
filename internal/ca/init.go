@@ -173,17 +173,11 @@ func (c *CA) seedSupportingState(ctx context.Context) error {
 		} else if !errors.Is(err, fs.ErrNotExist) {
 			return fmt.Errorf("re-checking CRL: %w", err)
 		}
-		now := time.Now().UTC()
-		crlTemplate := &x509.RevocationList{
-			Number:     big.NewInt(1),
-			ThisUpdate: now,
-			NextUpdate: now.Add(c.crlValidity()),
-		}
-		crlBytes, err := x509.CreateRevocationList(rand.Reader, crlTemplate, c.CACert, c.CAKey)
+		crl, err := newEmptyCRL(c.CACert, c.CAKey, c.crlValidity())
 		if err != nil {
 			return fmt.Errorf("creating initial CRL: %w", err)
 		}
-		crlPEM := pem.EncodeToMemory(&pem.Block{Type: "X509 CRL", Bytes: crlBytes})
+		crlPEM := pem.EncodeToMemory(&pem.Block{Type: "X509 CRL", Bytes: crl.Raw})
 		// Bootstrap-only write: runs before any CRL consumer exists, so it
 		// deliberately skips the crlNotify signal (see signCRLLocked).
 		if err := c.Storage.UpdateCRL(ctx, crlPEM); err != nil {
@@ -450,28 +444,20 @@ func (c *CA) bootstrapCA(ctx context.Context) error {
 	}
 
 	// Generate empty CRL.
-	crlTemplate := &x509.RevocationList{
-		Number:     big.NewInt(1),
-		ThisUpdate: now,
-		NextUpdate: now.Add(c.crlValidity()),
-	}
-	crlBytes, err := x509.CreateRevocationList(rand.Reader, crlTemplate, c.CACert, c.CAKey)
+	crl, err := newEmptyCRL(c.CACert, c.CAKey, c.crlValidity())
 	if err != nil {
-		return fmt.Errorf("failed to create initial CRL: %w", err)
+		return err
 	}
-	crlPEM := pem.EncodeToMemory(&pem.Block{Type: "X509 CRL", Bytes: crlBytes})
+	crlPEM := pem.EncodeToMemory(&pem.Block{Type: "X509 CRL", Bytes: crl.Raw})
 	// Bootstrap-only write: runs before any CRL consumer exists, so it
 	// deliberately skips the crlNotify signal (see signCRLLocked).
 	if err := c.Storage.UpdateCRL(ctx, crlPEM); err != nil {
 		return fmt.Errorf("failed to write initial CRL: %w", err)
 	}
 
-	// Cache the CRL we just created.
-	parsedCRL, err := x509.ParseRevocationList(crlBytes)
-	if err != nil {
-		return fmt.Errorf("failed to parse initial CRL for cache: %w", err)
-	}
-	c.cachedCRL = parsedCRL
+	// Cache the CRL we just created. newEmptyCRL returns it parsed, so there is
+	// nothing to re-parse and no second failure mode to report.
+	c.cachedCRL = crl
 
 	// Touch inventory.
 	if err := c.Storage.TouchInventory(ctx); err != nil {

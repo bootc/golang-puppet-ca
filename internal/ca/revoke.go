@@ -81,14 +81,14 @@ func (c *CA) revokeSerialLocked(ctx context.Context, serialStr string) error {
 
 	// 1. Load CRL. readStoredCRL counts its own failures now, so this path must
 	// not add a second increment for the same event.
-	crl, err := c.readStoredCRL(ctx)
+	stored, err := c.readStoredCRL(ctx)
 	if err != nil {
 		return err
 	}
 
 	// 2. Check for duplicate revocation: a serial that's already in the CRL
 	// should not be appended again (prevents unbounded CRL growth on retries).
-	for _, entry := range crl.RevokedCertificateEntries {
+	for _, entry := range stored.own.RevokedCertificateEntries {
 		if entry.SerialNumber.Cmp(serialInt) == 0 {
 			slog.Debug("Certificate already revoked", "serial", serialStr)
 			return nil
@@ -103,10 +103,10 @@ func (c *CA) revokeSerialLocked(ctx context.Context, serialStr string) error {
 		RevocationTime: time.Now(),
 	}
 
-	revokedCerts := crl.RevokedCertificateEntries
+	revokedCerts := stored.own.RevokedCertificateEntries
 	revokedCerts = append(revokedCerts, newRevoked)
 
-	if err := c.signCRLLocked(ctx, crl.Number, revokedCerts); err != nil {
+	if err := c.signCRLLocked(ctx, stored, revokedCerts); err != nil {
 		return err
 	}
 

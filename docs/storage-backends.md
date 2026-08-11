@@ -42,7 +42,7 @@ Server CA, so you can swap in `openvox-ca` without reorganising your SSL tree:
 <cadir>/
 ├── ca_crt.pem              CA certificate
 ├── ca_pub.pem              CA public key
-├── ca_crl.pem              Certificate Revocation List
+├── ca_crl.pem              Certificate Revocation List (see note)
 ├── inventory.txt           Issued/revoked certificate log
 ├── private/
 │   ├── ca_key.pem          CA private key                    0600
@@ -52,6 +52,13 @@ Server CA, so you can swap in `openvox-ca` without reorganising your SSL tree:
 └── signed/
     └── <subject>.pem       issued certificates
 ```
+
+> **`ca_crl.pem` may hold more than one CRL.** Once a chain has been imported
+> with `--crl-chain`, the blob is this CA's own CRL followed by its ancestors', so
+> agents can do full-chain revocation checking. Every backend stores it as one
+> logical value — a single file here, a single key elsewhere — so nothing below
+> changes; only the number of PEM blocks inside it does. See
+> [storage internals](development/storage-internals.md).
 
 (The directory also holds small internal integrity files; leave them in place.)
 File permissions are fixed: `0600` for anything under `private/`, `0644` for

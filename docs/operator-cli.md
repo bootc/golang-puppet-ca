@@ -91,9 +91,13 @@ openvox-ca-ctl import \
                                # stored, and the import is refused if nothing
                                # stored was signed by the certificate being
                                # imported -- pass --crl-chain to replace it.
-# --crl-chain may hold several concatenated CRLs in any order. This CA's own is
-# identified by signature and moved to the front; the rest are kept and served
-# so agents can do full-chain revocation checking. Every X509 CRL block must parse; other PEM block types are ignored and not stored.
+                               # --crl-chain may hold several concatenated
+                               # CRLs in any order. This CA's own is identified
+                               # by signature and moved to the front; the rest
+                               # are kept and served so agents can do full-chain
+                               # revocation checking. Every X509 CRL block must
+                               # parse; other PEM block types are ignored and
+                               # not stored.
 
 # Migrate an entire CA between storage backends offline (any pair of backends:
 # filesystem, sqlite, postgres, mysql, etcd, redis/valkey). Each backend is

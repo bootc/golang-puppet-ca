@@ -34,6 +34,7 @@ import (
 	"log/slog"
 	"math/big"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -282,11 +283,10 @@ var _ = Describe("CRL chain preservation", func() {
 
 var _ = Describe("CRL chain read failures", func() {
 	It("fails the re-sign rather than flattening the chain", func() {
-		// The chain-preserving read is the second read of the blob, so the only
-		// reachable trigger is a transient backend failure. Treating it as
-		// "nothing upstream to preserve" would write a single block over
-		// ancestors that are still there — permanently, since this CA cannot
-		// re-sign an ancestor's list.
+		// A backend read that fails must not be read as "nothing upstream to
+		// preserve": that would write a single block over ancestors which are
+		// still there — permanently, since this CA cannot re-sign an ancestor's
+		// list.
 		ctx := context.Background()
 		dir := GinkgoT().TempDir()
 		backend := &flakyCRLBackend{Backend: storage.NewFilesystemBackend(dir)}
@@ -302,16 +302,113 @@ var _ = Describe("CRL chain read failures", func() {
 		Expect(store.UpdateCRL(ctx, append(append([]byte{}, ours...), upsCRL...))).To(Succeed())
 		before := mustGetCRL(ctx, store)
 
-		// readStoredCRL reads first and succeeds; crlChainLocked's read fails.
-		backend.failGetCRLAfter(1)
-		Expect(myCA.ReissueCRL(ctx)).To(MatchError(ContainSubstring("preserve its upstream blocks")))
+		// Fail the read the re-sign depends on. It used to take two — this spec
+		// skipped the first and failed the second, which was the only trigger
+		// then reachable, because the chain-preserving read was its own fetch.
+		// There is one read now, so failing it from the start is the same test.
+		backend.failGetCRLAfter(0)
+		Expect(myCA.ReissueCRL(ctx)).To(MatchError(ContainSubstring("failed to load CRL")))
 
 		backend.stopFailing()
 		Expect(mustGetCRL(ctx, store)).To(Equal(before), "the stored chain must be untouched")
-		// Exactly one: readStoredCRL succeeded and crlChainLocked failed, so a
-		// second increment would mean the counting moved back to the call sites
-		// this change centralised it away from.
+		// Exactly one: readStoredCRL counts, and a second increment would mean
+		// the counting moved back to the call sites this change centralised it
+		// away from.
 		Expect(myCA.CRLUpdateFailures()).To(BeNumerically("==", 1))
+	})
+
+	It("fails the re-sign when an ancestor block will not decode", func() {
+		// Block 0 parses and is ours, so the read succeeds and the failure lands
+		// in the chain assembly. The alternative — carrying the bad block
+		// forward, or dropping it — publishes a blob that agents doing
+		// full-chain revocation checking reject, from a CA that reported success.
+		ctx := context.Background()
+		store := storage.New(GinkgoT().TempDir())
+
+		myCA := ca.New(store, ca.AutosignConfig{Mode: "off"}, "puppet.test")
+		myCA.CAKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
+		Expect(myCA.Init(ctx)).To(Succeed())
+
+		ours, err := store.GetCRL(ctx)
+		Expect(err).NotTo(HaveOccurred())
+		corrupt := []byte("-----BEGIN X509 CRL-----\nZm9v\n-----END X509 CRL-----\n")
+		Expect(store.UpdateCRL(ctx, append(append([]byte{}, ours...), corrupt...))).To(Succeed())
+		before := mustGetCRL(ctx, store)
+
+		Expect(myCA.ReissueCRL(ctx)).To(MatchError(ContainSubstring("decoding the stored CRL chain")))
+		Expect(mustGetCRL(ctx, store)).To(Equal(before), "nothing may be overwritten")
+		Expect(myCA.CRLUpdateFailures()).To(BeNumerically("==", 1),
+			"a re-sign that did not happen is a CRL-update failure, counted once")
+	})
+
+	It("still deletes a certificate when the CRL cannot be amended, and says what that leaves", func() {
+		// Clean's job is to remove the certificate, so a revoke failure does not
+		// stop it -- but the outcome is a certificate that is gone from storage
+		// and still a valid credential until it expires. A foreign stored CRL
+		// reaches this state, and reaches it *because* this branch lets a CA
+		// start with one rather than refusing: the write path then fails closed
+		// on the first Clean.
+		ctx := context.Background()
+		store := storage.New(GinkgoT().TempDir())
+
+		myCA := ca.New(store, ca.AutosignConfig{Mode: "off"}, "puppet.test")
+		myCA.CAKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
+		myCA.LeafKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
+		Expect(myCA.Init(ctx)).To(Succeed())
+		_, err := myCA.Generate(ctx, "doomed.example.com", nil)
+		Expect(err).NotTo(HaveOccurred())
+
+		_, upsCRL := upstreamCA("Upstream Root CA")
+		Expect(store.UpdateCRL(ctx, upsCRL)).To(Succeed())
+		before := mustGetCRL(ctx, store)
+
+		var buf bytes.Buffer
+		orig := slog.Default()
+		slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+		defer slog.SetDefault(orig)
+
+		Expect(myCA.Clean(ctx, "doomed.example.com")).To(Succeed(),
+			"a CRL that cannot be amended must not leave the certificate in place too")
+
+		_, err = store.GetCert(ctx, "doomed.example.com")
+		Expect(err).To(HaveOccurred(), "the certificate must be gone from storage")
+
+		// Unrevoked, and specifically so: the stored CRL is untouched, which is
+		// what makes the deleted certificate still valid.
+		Expect(mustGetCRL(ctx, store)).To(Equal(before))
+		Expect(crlBlocks(mustGetCRL(ctx, store))[0].RevokedCertificateEntries).To(BeEmpty())
+		Expect(buf.String()).To(ContainSubstring("stays a valid credential until it expires"))
+	})
+
+	It("reads the stored blob once per re-sign, not once per purpose", func() {
+		// The re-sign needs two things from storage — the number and entries to
+		// carry forward, and the ancestor blocks to preserve — and used to fetch
+		// the blob once for each. Under the cluster CRL lock on a network backend
+		// that is a wasted round trip, and the two reads could disagree: the
+		// entries came from one and the ancestors from the other.
+		ctx := context.Background()
+		dir := GinkgoT().TempDir()
+		backend := &countingCRLBackend{Backend: storage.NewFilesystemBackend(dir)}
+		store := storage.NewWithBackend(backend, filepath.Join(dir, "private"))
+
+		myCA := ca.New(store, ca.AutosignConfig{Mode: "off"}, "puppet.test")
+		myCA.CAKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
+		Expect(myCA.Init(ctx)).To(Succeed())
+
+		_, upsCRL := upstreamCA("Upstream Root CA")
+		ours, err := store.GetCRL(ctx)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(store.UpdateCRL(ctx, append(append([]byte{}, ours...), upsCRL...))).To(Succeed())
+
+		backend.resetCRLGets()
+		Expect(myCA.ReissueCRL(ctx)).To(Succeed())
+		Expect(backend.crlGets()).To(Equal(1),
+			"one read serves both halves of the re-sign; two means the chain "+
+				"assembly went back to the backend for its own copy")
+
+		// And the ancestor is still there, so the single read is not a saving
+		// made by dropping what the second read was for.
+		Expect(crlBlocks(mustGetCRL(ctx, store))).To(HaveLen(2))
 	})
 
 	// Counting was moved into readStoredCRL precisely because reissue, refresh
@@ -342,6 +439,16 @@ var _ = Describe("CRL chain read failures", func() {
 			// A window wide enough that the stored CRL is always due.
 			_, err := c.RefreshCRLIfDue(ctx, 100*365*24*time.Hour)
 			return err
+		}),
+		Entry("revoke", func(c *ca.CA, ctx context.Context) error {
+			// The one path whose own increment this change *removed*, because
+			// readStoredCRL counts now — so it is the entry that would catch
+			// either half of the mistake: a double count, or a lost one. It
+			// needs a certificate to revoke, which the other two do not.
+			if _, err := c.Generate(ctx, "doomed.example.com", nil); err != nil {
+				return err
+			}
+			return c.Revoke(ctx, "doomed.example.com")
 		}),
 		// The cleanup path is not driven here: dropCRLEntriesLocked only reaches
 		// readStoredCRL once there are expired inventory entries to remove, so
@@ -403,6 +510,20 @@ func (b *countingCRLBackend) crlPuts() int {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.puts
+}
+
+func (b *countingCRLBackend) crlGets() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.gets
+}
+
+// resetCRLGets zeroes the read counter so a spec can count the reads made by one
+// operation rather than by the setup that preceded it.
+func (b *countingCRLBackend) resetCRLGets() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.gets = 0
 }
 
 // mutateBeforeGet arranges for blob to be written just before the nth CRL read
@@ -704,6 +825,29 @@ var _ = Describe("CRL chain ordering at import", func() {
 		Expect(buf.String()).To(ContainSubstring("more than one CRL for the same ancestor"))
 	})
 
+	It("warns once, not once per copy, when the chain carries three of one ancestor", func() {
+		// The dedup latch is a counter zeroed after it fires, and with exactly
+		// two copies "fires once" and "fires once per copy above the first" are
+		// the same number -- so the spec above passes either way. Three copies
+		// separate them: a latch that only skipped the block it had already
+		// reported would warn twice here, and an operator refreshing ancestors
+		// from a backup directory is exactly who produces three.
+		_, extra := upstreamCA("Shared Root CA")
+		three := append(append([]byte{}, extra...), extra...)
+		three = append(three, extra...)
+
+		var buf bytes.Buffer
+		orig := slog.Default()
+		slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+		defer slog.SetDefault(orig)
+
+		Expect(ca.ImportCA(ctx, store, certPEM, keyPEM, append(append([]byte{}, ourCRL...), three...))).To(Succeed())
+		Expect(strings.Count(buf.String(), "more than one CRL for the same ancestor")).To(Equal(1))
+		// And it reported the right number, so the count is not merely deduped
+		// by dropping copies.
+		Expect(buf.String()).To(ContainSubstring("copies=3"))
+	})
+
 	It("keeps the highest-numbered copy when the bundle carries two of ours", func() {
 		// A bundle assembled from a backup directory easily contains a stale
 		// export alongside the current one. Taking whichever came first made
@@ -945,6 +1089,56 @@ var _ = Describe("CRL cache loading", func() {
 		Expect(err).NotTo(HaveOccurred())
 		Expect(wasRevoked).To(BeTrue(),
 			"a certificate we revoked must stay revoked whatever order the blob is in")
+	})
+
+	It("starts on a foreign block 0 whose chain will not decode, saying it could not look further", func() {
+		// The fallback's own failure branch. Block 0 is foreign, so the search
+		// for our own block later in the chain begins -- and the chain does not
+		// decode, so there is nothing to find. Startup must still succeed, with
+		// both warnings: the read path's availability trade-off holds here too,
+		// and the second line is what tells an operator why the first one could
+		// not be improved on.
+		ctx := context.Background()
+		store := storage.New(GinkgoT().TempDir())
+
+		myCA := ca.New(store, ca.AutosignConfig{Mode: "off"}, "puppet.test")
+		myCA.CAKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
+		myCA.LeafKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
+		Expect(myCA.Init(ctx)).To(Succeed())
+		_, err := myCA.Generate(ctx, "doomed.example.com", nil)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(myCA.Revoke(ctx, "doomed.example.com")).To(Succeed())
+		revoked := crlBlocks(mustGetCRL(ctx, store))[0].RevokedCertificateEntries
+		Expect(revoked).To(HaveLen(1))
+		serial := revoked[0].SerialNumber
+
+		// Our own block is not in this blob at all, so the search has nothing to
+		// find even before the decode fails.
+		_, upsCRL := upstreamCA("Upstream Root CA")
+		corrupt := []byte("-----BEGIN X509 CRL-----\nZm9v\n-----END X509 CRL-----\n")
+		Expect(store.UpdateCRL(ctx, append(append([]byte{}, upsCRL...), corrupt...))).To(Succeed())
+
+		var buf bytes.Buffer
+		orig := slog.Default()
+		slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+		defer slog.SetDefault(orig)
+
+		restarted := ca.New(store, ca.AutosignConfig{Mode: "off"}, "puppet.test")
+		restarted.CAKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
+		Expect(restarted.Init(ctx)).To(Succeed(),
+			"an undecodable chain behind a foreign block 0 must not stop the CA starting")
+		Expect(buf.String()).To(ContainSubstring("does not lead with this CA's own CRL"))
+		Expect(buf.String()).To(ContainSubstring("Could not decode the stored CRL chain"))
+
+		// The consequence, recorded rather than implied: it is answering from the
+		// foreign block, so a certificate this CA revoked reads as not revoked.
+		// That is the availability trade-off the read path makes deliberately --
+		// a running CA with two loud warnings, rather than one that will not
+		// start -- and the reason the write path fails closed on the same state.
+		wasRevoked, err := restarted.IsRevokedSerial(ctx, serial)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(wasRevoked).To(BeFalse(),
+			"an ancestor's list holds none of our serials; this is what the warnings are for")
 	})
 })
 

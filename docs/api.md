@@ -10,7 +10,7 @@ All endpoints are served under both the bare path and `/puppet-ca/v1/<path>`, so
 | Method | Path | Description |
 | --- | --- | --- |
 | `GET` | `/certificate_status/{subject}` | Get status: `signed`, `requested`, or `revoked` |
-| `PUT` | `/certificate_status/{subject}` | Change state (`signed` or `revoked`); supports `cert_ttl` (seconds) |
+| `PUT` | `/certificate_status/{subject}` | Change state (`signed` or `revoked`); supports `cert_ttl` (seconds). `revoked` returns `409 Conflict` when the stored CRL was not signed by the CA certificate this process loaded — see the note below |
 | `DELETE` | `/certificate_status/{subject}` | Revoke + delete cert and CSR (`puppet cert clean`) |
 
 `PUT` body:
@@ -18,6 +18,14 @@ All endpoints are served under both the bare path and `/puppet-ca/v1/<path>`, so
 ```json
 { "desired_state": "signed", "cert_ttl": 86400 }
 ```
+
+> **Note:** revoking amends this CA's own CRL, so it fails with `409 Conflict`
+> when the stored CRL was not signed by the CA certificate this process loaded —
+> re-signing it would destroy a list this CA cannot reproduce. The usual cause is
+> a CA certificate replaced under a running process, since it is read once at
+> startup; the response body names the cause and the remedy, which is to restart
+> the replica holding the stale certificate. `PUT /certificate_revocation_list/ca`
+> refuses the same state for the same reason.
 
 `GET` response:
 

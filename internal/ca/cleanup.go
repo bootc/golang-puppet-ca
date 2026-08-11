@@ -112,14 +112,14 @@ func (c *CA) CleanupExpiredCerts(ctx context.Context, retain time.Duration) (int
 // removed serials currently appear in the CRL. The cluster CRL lock and c.mu
 // must both be held by the caller.
 func (c *CA) dropCRLEntriesLocked(ctx context.Context, removed map[string]*big.Int) error {
-	crl, err := c.readStoredCRL(ctx)
+	stored, err := c.readStoredCRL(ctx)
 	if err != nil {
 		return err
 	}
 
-	kept := make([]x509.RevocationListEntry, 0, len(crl.RevokedCertificateEntries))
+	kept := make([]x509.RevocationListEntry, 0, len(stored.own.RevokedCertificateEntries))
 	changed := false
-	for _, entry := range crl.RevokedCertificateEntries {
+	for _, entry := range stored.own.RevokedCertificateEntries {
 		if _, drop := removed[serialHexStr(entry.SerialNumber)]; drop {
 			changed = true
 			continue
@@ -129,7 +129,7 @@ func (c *CA) dropCRLEntriesLocked(ctx context.Context, removed map[string]*big.I
 	if !changed {
 		return nil
 	}
-	return c.signCRLLocked(ctx, crl.Number, kept)
+	return c.signCRLLocked(ctx, stored, kept)
 }
 
 // deleteStoredCertIfSerialMatches deletes the signed certificate stored for

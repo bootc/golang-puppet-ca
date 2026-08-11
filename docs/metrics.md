@@ -103,6 +103,22 @@ refresh can fix and not something these series track.
 > default `certificate_revocation = chain`, while both alerts stay green. Until
 > a chain-aware series exists, track ancestor `nextUpdate` deadlines out of band
 > and re-import before they lapse.
+>
+> **No series tracks the chain's length either, so watch the log during a rolling
+> upgrade.** A replica running a build from before chain preservation re-signs the
+> CRL by writing one block, dropping every ancestor — and nothing detects it,
+> because the next re-sign on an upgraded replica then reads one block and writes
+> one block while `puppetca_crl_number` keeps climbing. Upgrade every replica
+> before importing a chain, and keep the imported bundle so it can be re-imported
+> if this does happen. A re-sign that *can* see a difference says so, at `WARN`:
+>
+> ```text
+> level=WARN msg="Stored CRL chain length changed while re-signing" blocks_read=2 blocks_written=1
+> ```
+>
+> On a healthy CA that line never appears: every block that is not ours is carried
+> across, and import discards duplicates of our own. Treat one as a chain to
+> inspect.
 
 ### Leaf certificates
 

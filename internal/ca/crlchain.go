@@ -19,12 +19,9 @@ package ca
 
 import (
 	"bytes"
-	"context"
 	"crypto/x509"
 	"encoding/pem"
-	"errors"
 	"fmt"
-	"io/fs"
 	"log/slog"
 	"time"
 )
@@ -110,29 +107,18 @@ func encodeCRLChain(crls []*x509.RevocationList) []byte {
 // regenerated here: dropping one is unrecoverable, while keeping one costs a
 // wasted block at worst.
 //
+// storedBlob is the blob readStoredCRL already read, not a fresh fetch. It used
+// to fetch its own copy, which cost a second backend round trip inside the
+// cluster CRL lock and, worse, could disagree with the first: the number and
+// entries being carried forward came from one read and the ancestors from
+// another. A nil blob means there was no previous read at all, which no caller
+// does today — bootstrap and import write through Storage.UpdateCRL directly.
+//
 // c.mu must be held by the caller.
-func (c *CA) crlChainLocked(ctx context.Context, ourCRL *x509.RevocationList) ([]byte, error) {
+func (c *CA) crlChainLocked(ourCRL *x509.RevocationList, storedBlob []byte) ([]byte, error) {
 	chain := []*x509.RevocationList{ourCRL}
 
-	existing, err := c.Storage.GetCRL(ctx)
-	if err != nil {
-		if !errors.Is(err, fs.ErrNotExist) {
-			// Not "nothing to preserve" — this is a read that failed. Treating
-			// it as an empty chain writes a single block over upstream CRLs
-			// that are still there, permanently, because this CA cannot
-			// re-sign an ancestor's list. Fail the re-sign instead: the caller
-			// counts the failure and the next attempt finds the chain intact.
-			return nil, fmt.Errorf("reading the stored CRL to preserve its upstream blocks: %w", err)
-		}
-		// Genuinely absent. Defensive rather than routine: every caller of
-		// signCRLLocked has already read the CRL successfully through
-		// readStoredCRL, so reaching here means the blob was deleted between
-		// the two reads. Bootstrap and import do not come through here at all —
-		// both call Storage.UpdateCRL directly.
-		return encodeCRLChain(chain), nil
-	}
-
-	stored, err := decodeCRLChain(existing)
+	stored, err := decodeCRLChain(storedBlob)
 	if err != nil {
 		return nil, fmt.Errorf("decoding the stored CRL chain: %w", err)
 	}
@@ -142,16 +128,21 @@ func (c *CA) crlChainLocked(ctx context.Context, ourCRL *x509.RevocationList) ([
 		}
 	}
 
-	// Every block that is not ours is kept, so the length can only change by
-	// collapsing duplicates of our own CRL — worth a line, because it is also
-	// the only signal available here. Loss caused by a replica running an older
-	// build during a rolling upgrade is invisible from inside this function:
-	// that replica writes a single block and the next re-sign simply finds
-	// nothing upstream. Every CRL metric derives from block 0, so such a chain
-	// going 2 -> 1 moves crl_number upward and looks healthy. Detection is the
-	// operator's, via the log below and the chain length they expect.
+	// Every block that is not ours is kept, so on a healthy CA the length never
+	// changes here: it can only move by collapsing duplicates of our own CRL,
+	// which import already drops. That makes any change worth a Warn rather than
+	// an Info — it means the stored blob held something orderCRLChain would have
+	// rejected, and the operator has no other signal for it. Every CRL metric
+	// derives from block 0, so a chain going 2 -> 1 moves crl_number upward and
+	// looks healthy on every dashboard.
+	//
+	// Loss caused by a replica running an older build during a rolling upgrade is
+	// invisible even here: that replica writes a single block, and the next
+	// re-sign on an upgraded replica reads one block and writes one block, with
+	// nothing to compare against. docs/metrics.md names that blind spot and the
+	// order to upgrade in; this line covers only what is observable in-process.
 	if before, after := len(stored), len(chain); after != before {
-		slog.Info("Stored CRL chain length changed while re-signing",
+		slog.Warn("Stored CRL chain length changed while re-signing",
 			"blocks_read", before, "blocks_written", after)
 	}
 	return encodeCRLChain(chain), nil

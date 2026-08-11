@@ -21,14 +21,11 @@ import (
 	"bytes"
 	"context"
 	"crypto"
-	"crypto/rand"
 	"crypto/x509"
 	"encoding/pem"
 	"errors"
 	"fmt"
 	"io/fs"
-	"math/big"
-	"time"
 
 	"github.com/voxpupuli/openvox-ca/internal/storage"
 )
@@ -214,7 +211,7 @@ func planCRLImport(ctx context.Context, store *storage.StorageService, crlPEM []
 			}
 			return ordered, nil
 		}
-		generated, err := generateEmptyCRL(caCert, caKey)
+		generated, err := newEmptyCRL(caCert, caKey, CRLValidity)
 		if err != nil {
 			return nil, err
 		}
@@ -250,7 +247,7 @@ func planCRLImport(ctx context.Context, store *storage.StorageService, crlPEM []
 		// silently un-revokes the fleet.
 		ourCRL := ownCRLIn(stored, caCert)
 		if ourCRL == nil {
-			ourCRL, err = generateEmptyCRL(caCert, caKey)
+			ourCRL, err = newEmptyCRL(caCert, caKey, CRLValidity)
 			if err != nil {
 				return nil, err
 			}
@@ -321,28 +318,4 @@ func ownCRLIn(chain []*x509.RevocationList, cert *x509.Certificate) *x509.Revoca
 		}
 	}
 	return nil
-}
-
-// generateEmptyCRL signs a fresh, empty CRL for cert.
-//
-// Number 1 is correct because every caller has established that storage holds
-// no CRL of ours to advance from — either storage is empty, or the imported
-// chain carries only ancestors and nothing of ours was stored either.
-// Re-signing an existing CRL goes through signCRLLocked, which bumps.
-func generateEmptyCRL(cert *x509.Certificate, key crypto.Signer) (*x509.RevocationList, error) {
-	now := time.Now().UTC()
-	template := &x509.RevocationList{
-		Number:     big.NewInt(1),
-		ThisUpdate: now,
-		NextUpdate: now.Add(CRLValidity),
-	}
-	der, err := x509.CreateRevocationList(rand.Reader, template, cert, key)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create initial CRL: %w", err)
-	}
-	crl, err := x509.ParseRevocationList(der)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse the generated CRL: %w", err)
-	}
-	return crl, nil
 }
