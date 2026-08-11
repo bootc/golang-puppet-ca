@@ -97,7 +97,7 @@ The re-read is best-effort in one direction: if the storage read itself fails, t
 
 `revoke_on_auto_renew` (env `PUPPET_CA_REVOKE_ON_AUTO_RENEW`, default `true`) controls whether the certificate replaced by an auto-renewal (empty body) is revoked. The default keeps only the newest serial per subject valid. Set to `false` to match OpenVox Server's own (Clojure) CA exactly, which leaves the replaced certificate valid — for the same key — until it naturally expires. This setting has no effect on the CSR-body (re-key) path, which always revokes the certificate it replaces.
 
-> **CRL growth:** with the default `true`, every auto-renewal appends the retired serial to the CRL, and the entry stays there until the certificate expires. Entries are only pruned by the expired-certificate cleanup job, which is off by default — enable `enable_expired_cert_cleanup` to bound CRL size on busy CAs, and watch `puppetca_crl_revoked_certificates` to keep an eye on it. Revocation is best-effort (a failure never fails the renewal); the `puppetca_crl_update_failures_total` metric counts any failure to amend the CRL, including a superseded certificate that could not be revoked.
+> **CRL growth:** with the default `true`, every auto-renewal appends the retired serial to the CRL, and the entry stays there until the certificate expires. Entries are only pruned by the expired-certificate cleanup job, which is off by default — enable `enable_expired_cert_cleanup` to bound CRL size on busy CAs, and watch `puppetca_crl_revoked_certificates` to keep an eye on it. Revocation is best-effort (a failure never fails the renewal); the `puppetca_crl_update_failures_total` metric counts a CRL that could not be read, re-signed or written, so it catches most — but not all — of a superseded certificate that could not be revoked. A CRL lock the renewal could not take is logged only. See [Authorization tiers](#authorization-tiers) for the same distinction on the clean path.
 
 ## Bulk signing
 
@@ -262,11 +262,15 @@ When containing a compromised agent, apply the levers that hold, in this order:
    certificate from a stale cache. Each call refreshes only the replica that
    serves it, so address the replicas individually: sent through a load
    balancer it refreshes whichever one the VIP picked, and the rest stay stale
-   while the call reports success. To check one landed, ask that replica's
-   `/ocsp` about the serial — OCSP answers from the same in-process CRL the
-   admission check reads. `puppetca_crl_number` and
-   `puppetca_crl_revoked_certificates` cannot tell you: they are gathered from
-   shared storage, so a stale replica reports the same numbers as a fresh one.
+   while the call reports success. The re-sign refreshes the cache in the
+   process that served it, so a success from a replica's own address is the
+   confirmation for that replica — and the only one available. Nothing reports
+   a replica's in-process CRL from outside: `GET /certificate_revocation_list/ca`
+   serves shared storage, `puppetca_crl_number` and
+   `puppetca_crl_revoked_certificates` are gathered from it too, and `/ocsp`
+   answers from a pre-signed per-serial cache that a re-sign does not clear
+   (and reports `Unknown` for a serial issued by a peer since this replica
+   started). Restarting a replica is the other way to be sure.
 
 The order matters. Step 3 is also what makes a stale replica willing to evict
 the revoked certificate and issue a replacement, so running it while autosign

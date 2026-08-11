@@ -1731,7 +1731,6 @@ var _ = Describe("CA Clean when a half of it fails", func() {
 		Expect(revoked).To(BeFalse(),
 			"the serial never reached the CRL, so the deleted certificate still authenticates")
 
-		backend.failPut = ""
 		crlPEM, err := store.GetCRL(ctx)
 		Expect(err).NotTo(HaveOccurred())
 		crlBlock, _ := pem.Decode(crlPEM)
@@ -1747,7 +1746,7 @@ var _ = Describe("CA Clean when a half of it fails", func() {
 	It("revokes, reports success, and leaves the certificate in storage", func() {
 		// The other half, published in the same paragraph: a failed delete is
 		// logged and swallowed too, so 204 does not mean the record is gone.
-		backend.failDelete = "cert/doomed-node"
+		backend.failDelete = storage.CertKey("doomed-node")
 
 		Expect(myCA.Clean(ctx, "doomed-node")).To(Succeed(),
 			"Clean swallows the delete failure; the handler turns this into 204")
@@ -1757,6 +1756,26 @@ var _ = Describe("CA Clean when a half of it fails", func() {
 		revoked, err := myCA.IsRevokedSerial(ctx, cert.SerialNumber)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(revoked).To(BeTrue(),
-			"the revoke half ran first and succeeded")
+			"the revoke half succeeded; the failed delete does not undo it")
+	})
+
+	It("reports success when the pending CSR cannot be deleted either", func() {
+		// The third swallow in Clean, and the one with no certificate in play:
+		// a subject that only ever got as far as a request. Same shape as the
+		// other two — logged, carried on, 204 — so the same guard applies.
+		Expect(myCA.Clean(ctx, "doomed-node")).To(Succeed())
+
+		csrPEM, err := testutil.GenerateCSR("pending-node")
+		Expect(err).NotTo(HaveOccurred())
+		_, err = myCA.SaveRequest(ctx, "pending-node", csrPEM)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(store.HasCSR(ctx, "pending-node")).To(BeTrue())
+
+		backend.failDelete = storage.CSRKey("pending-node")
+
+		Expect(myCA.Clean(ctx, "pending-node")).To(Succeed(),
+			"Clean swallows the CSR delete failure too")
+		Expect(store.HasCSR(ctx, "pending-node")).To(BeTrue(),
+			"the request is still pending despite the 204")
 	})
 })
