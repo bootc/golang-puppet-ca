@@ -190,6 +190,10 @@ var _ = Describe("launcher fd contract", func() {
 		Expect(err).To(HaveOccurred(), "child without a PSK pipe on fd 4 should exit non-zero; output: %s", out.String())
 		Expect(out.String()).To(ContainSubstring("not spawned by the launcher"),
 			"child should report the missing PSK pipe")
+		// Named, because that substring is shared by both fd 4 branches, both fd 3
+		// branches and the read timeout -- so on its own it cannot say which guard
+		// fired, which is the whole claim of the comment above.
+		Expect(out.String()).To(ContainSubstring("fd 4 is not a pipe"))
 	})
 })
 
@@ -297,6 +301,17 @@ var _ = Describe("spawnChild and its cleanup", func() {
 		cmd, err := spawnChild(exe, os.Environ(), "signer", sock, hex.EncodeToString(psk))
 		Expect(err).NotTo(HaveOccurred())
 		DeferCleanup(func() { killAndReap(cmd) })
+
+		// The fd contract itself: position in ExtraFiles *is* the descriptor
+		// number, and nothing asserted the slice the helper builds -- the
+		// end-to-end spec hand-rolls its own. Swapping the two entries, or
+		// dropping the pipe, left the whole suite green and produced a CA whose
+		// children both refuse to start.
+		Expect(cmd.ExtraFiles).To(HaveLen(2), "both descriptors must be handed over")
+		Expect(cmd.ExtraFiles[signer.InheritedFD-3]).To(BeIdenticalTo(sock),
+			"the socketpair end belongs on fd 3")
+		Expect(cmd.ExtraFiles[signer.PSKFD-3]).To(BeIdenticalTo(pipe()),
+			"the PSK pipe belongs on fd 4")
 
 		// Two descriptors handed over, two closed. A second Close on an *os.File
 		// returns ErrClosed rather than closing a recycled fd, so this is a safe

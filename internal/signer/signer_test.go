@@ -454,6 +454,42 @@ var _ = Describe("awaitShutdown", func() {
 	})
 })
 
+var _ = Describe("handshake nonce freshness", func() {
+	// The table below pins that all three inputs are *bound* into the MAC, but it
+	// works on fixed fixtures, so it says nothing about what goes on the wire.
+	// Leave the server nonce as 32 zero bytes and every spec in the suite stays
+	// green -- both sides derive from the same value -- while the signer's
+	// challenge becomes a constant and a recorded frontend flight replays.
+	It("sends a different challenge on every handshake", func() {
+		psk := make([]byte, pskLen)
+		_, err := rand.Read(psk)
+		Expect(err).NotTo(HaveOccurred())
+
+		nonceOf := func() []byte {
+			GinkgoHelper()
+			serverConn, clientConn := net.Pipe()
+			DeferCleanup(serverConn.Close)
+			DeferCleanup(clientConn.Close)
+
+			go func() {
+				defer GinkgoRecover()
+				defer serverConn.Close()
+				_ = serverHandshake(serverConn, psk)
+			}()
+
+			nonce := make([]byte, nonceLen)
+			_, err := io.ReadFull(clientConn, nonce)
+			Expect(err).NotTo(HaveOccurred())
+			return nonce
+		}
+
+		first, second := nonceOf(), nonceOf()
+		Expect(first).NotTo(Equal(bytes.Repeat([]byte{0}, nonceLen)),
+			"a constant challenge makes the frontend's proof replayable")
+		Expect(first).NotTo(Equal(second), "each handshake must challenge freshly")
+	})
+})
+
 var _ = DescribeTable("every handshake proof input is bound into the MAC",
 	// The labels were unpinned until a reflection spec caught them; the nonces are
 	// in the same position. Dropping either mac.Write leaves every handshake spec
