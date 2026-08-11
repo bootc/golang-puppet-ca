@@ -75,7 +75,7 @@ jobs:
       - name: Run markdownlint-cli2
         run: npx --yes markdownlint-cli2@0.23.1
 
-  # -- Unit tests --------------------------------------------------------------─
+  # -- Release archives --------------------------------------------------------─
   dist:
     name: Release archives
     runs-on: ubuntu-latest
@@ -106,6 +106,7 @@ jobs:
             echo "$listing" | grep -qE '^-rw-r--r-- .* openvox-ca.service$' || { echo "the unit must be 0644"; exit 1; }
           done
 
+  # -- Unit tests --------------------------------------------------------------─
   unit:
     name: Unit tests
     runs-on: ubuntu-latest

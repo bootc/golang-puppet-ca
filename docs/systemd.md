@@ -11,11 +11,9 @@ None of it needs configuration. The protocol is driven entirely by `$NOTIFY_SOCK
 
 ## Installing the unit
 
-A ready-to-use unit ships in [`packaging/systemd/openvox-ca.service`](../packaging/systemd/openvox-ca.service) and in every [release tarball](../README.md#release-tarballs), alongside the two binaries. Starting from a downloaded release:
+A ready-to-use unit ships in [`packaging/systemd/openvox-ca.service`](../packaging/systemd/openvox-ca.service) and in every [release tarball](../README.md#release-tarballs), alongside the two binaries. Download, verify and extract one as the README describes, then, from the extracted directory:
 
 ```console
-$ tar xzf openvox-ca_linux_amd64.tar.gz
-$ sha256sum --ignore-missing -c checksums.txt
 $ sudo useradd --system --home-dir /var/lib/puppet-ca --shell /usr/sbin/nologin puppet-ca
 $ sudo install -m 0755 openvox-ca openvox-ca-ctl /usr/local/bin/
 $ sudo install -m 0644 openvox-ca.service /etc/systemd/system/
@@ -40,7 +38,7 @@ Type=notify
 NotifyAccess=all
 ```
 
-`NotifyAccess=all` is required, not optional hardening slack. In the default deployment `openvox-ca` runs as three processes — a launcher supervising an isolated signer that holds the CA key, and a frontend that serves the API (see [CA key security](ca-key-security.md)) — and readiness is reported by the **frontend child**, because only it knows when the listener is accepting. systemd's default (`NotifyAccess=main`) accepts notifications only from the launcher, silently discards the frontend's, and the start job then fails on `TimeoutStartSec`.
+`NotifyAccess=all` is required, not optional hardening slack. In the default deployment `openvox-ca` runs as three processes — a launcher supervising an isolated signer that holds the CA key, and a frontend that serves the API (`--single-process` collapses them; see [CA key security](ca-key-security.md#process-isolation)) — and readiness is reported by the **frontend child**, because only it knows when the listener is accepting. systemd's default (`NotifyAccess=main`) accepts notifications only from the launcher, silently discards the frontend's, and the start job then fails on `TimeoutStartSec`.
 
 The notification socket is withheld from the signer process, so it never notifies in normal operation. Treat that as hygiene rather than as an access control: `NotifyAccess=all` authorises every process in the unit's cgroup, and the socket path is well known, so the isolation is defence in depth — the residual cost of the multi-process design.
 

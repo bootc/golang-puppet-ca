@@ -215,9 +215,12 @@ func (n *Notifier) Close() error {
 	return err
 }
 
-// send writes one notification datagram. Errors are logged at debug level and
-// dropped: a service manager that has gone away, or a full socket buffer, is
-// not a reason to disturb the CA.
+// send writes one notification datagram. Every failure is dropped rather than
+// propagated — a service manager that has gone away, or a full socket buffer,
+// is not a reason to disturb the CA. The first failure after a successful
+// connect is logged at Warn, since something has changed since startup and
+// with a watchdog configured this path ends in a kill; subsequent ones fall to
+// Debug so a persistent fault cannot flood the journal at heartbeat rate.
 func (n *Notifier) send(msg string) {
 	if n == nil || msg == "" {
 		return

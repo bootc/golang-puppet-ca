@@ -51,6 +51,10 @@ the launcher's pipe refuses to start rather than proceeding unauthenticated.
 > seconds to produce a valid pre-shared key before the process gives up and says
 > so — and fails at once if it is already at end-of-file or carries anything else.
 
+The same isolation is why the shipped systemd unit sets `LimitCORE=0` and
+withholds `$NOTIFY_SOCKET` from the signer — see
+[running under systemd](systemd.md).
+
 ## CA key encryption at rest
 
 By default, the CA private key is stored as unencrypted PEM at `<cadir>/private/ca_key.pem`.

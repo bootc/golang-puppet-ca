@@ -528,6 +528,21 @@ var _ = Describe("Launcher supervisor loop", func() {
 		return done
 	}
 
+	// terminate drives the SIGTERM path to completion. The waits are
+	// load-bearing: both arms of the loop's select become ready if exitCh is
+	// fed before the signal has been taken, and Go picks between ready arms at
+	// random, so a spec that skipped them would fail intermittently down the
+	// crash path instead.
+	terminate := func(done chan error) {
+		GinkgoHelper()
+		sigCh <- syscall.SIGTERM
+		Eventually(signer.got).Should(ContainElement(syscall.SIGTERM))
+		Eventually(frontend.got).Should(ContainElement(syscall.SIGTERM))
+		exitCh <- childResult{"signer", nil}
+		exitCh <- childResult{"frontend", nil}
+		Eventually(done).Should(Receive(BeNil()))
+	}
+
 	Describe("reload forwarding", func() {
 		It("forwards SIGHUP to the frontend and to nobody else", func() {
 			// This hop is the entire delivery path for `systemctl reload` in
@@ -541,10 +556,7 @@ var _ = Describe("Launcher supervisor loop", func() {
 
 			Consistently(done).ShouldNot(Receive(), "a reload must not end the launcher")
 
-			sigCh <- syscall.SIGTERM
-			exitCh <- childResult{"signer", nil}
-			exitCh <- childResult{"frontend", nil}
-			Eventually(done).Should(Receive(BeNil()))
+			terminate(done)
 		})
 
 		It("keeps supervising after several reloads", func() {
@@ -554,10 +566,7 @@ var _ = Describe("Launcher supervisor loop", func() {
 				Eventually(frontend.got).Should(HaveLen(i + 1))
 			}
 
-			sigCh <- syscall.SIGTERM
-			exitCh <- childResult{"signer", nil}
-			exitCh <- childResult{"frontend", nil}
-			Eventually(done).Should(Receive(BeNil()))
+			terminate(done)
 		})
 
 		It("reports a signal it could not deliver", func() {
@@ -575,10 +584,7 @@ var _ = Describe("Launcher supervisor loop", func() {
 			Eventually(frontend.got).Should(HaveLen(1))
 			Eventually(buf.String).Should(ContainSubstring("Failed to forward the reload signal"))
 
-			sigCh <- syscall.SIGTERM
-			exitCh <- childResult{"signer", nil}
-			exitCh <- childResult{"frontend", nil}
-			Eventually(done).Should(Receive(BeNil()))
+			terminate(done)
 		})
 	})
 
@@ -620,10 +626,7 @@ var _ = Describe("Launcher supervisor loop", func() {
 		It("does not kill children that exit in time", func() {
 			sup.drain = time.Minute
 			done := run()
-			sigCh <- syscall.SIGTERM
-			exitCh <- childResult{"signer", nil}
-			exitCh <- childResult{"frontend", nil}
-			Eventually(done).Should(Receive(BeNil()))
+			terminate(done)
 
 			Consistently(signer.killed).Should(BeZero())
 			Consistently(frontend.killed).Should(BeZero())
