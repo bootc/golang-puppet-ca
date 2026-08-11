@@ -263,7 +263,8 @@ path — still provides no cross-replica guarantee anyway.
    `"bootstrap"` independently) and backend-internal names as constants in the
    owning backend package (e.g. `etcdDecomposeLockName` in
    [etcd_inventory.go](../../internal/storage/etcd_inventory.go)); keep them
-   all stable across releases, and document them in the table above. All callers using a name contend on one lock, so
+   all stable across releases, and document them in the table above. All
+   callers using a name contend on one lock, so
    never derive a name from unvalidated input (subject names pass
    `ValidateSubject` first). `ValidateSubject` is necessary but not sufficient
    on the SQL backends: there the lock identity is a 64-bit FNV-1a hash of the
