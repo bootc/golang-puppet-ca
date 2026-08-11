@@ -199,6 +199,14 @@ SELECT column_name FROM information_schema.columns
 SELECT id, name, group_id, migrated_at FROM bun_migrations ORDER BY id;
 ```
 
+SQLite has no `information_schema`; list the columns there with the pragma
+form instead (the `bun_migrations` query works unchanged), mirroring the
+dialect split `columnExists` implements in code:
+
+```sql
+SELECT name FROM pragma_table_info('puppet_ca_inventory');
+```
+
 Two rows for one version, recorded milliseconds apart, are the fingerprint of
 two runners having raced. To recover, stop every replica, delete the duplicate
 rows for the affected version, and start one replica: migrations are idempotent,
