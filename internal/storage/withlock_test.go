@@ -112,10 +112,12 @@ var _ = Describe("WithLock", func() {
 		Expect(got).To(MatchError(boom))
 	})
 
-	// TestWithLockFallsBackOnUnsupported covers the OverlayBackend-over-filesystem
-	// case: the wrapping backend advertises Locker but reports that the base
-	// backend can't provide one, and WithLock must fall back to the process-local
-	// mutex rather than erroring.
+	// TestWithLockFallsBackOnUnsupported drives the case a wrapping backend
+	// produces — e.g. OverlayBackend over a base with no Locker: the backend
+	// advertises Locker but reports ErrDistributedLockingUnsupported, and
+	// WithLock must fall back to the process-local mutex rather than erroring.
+	// A stubLocker stands in for the wrapper here; the real OverlayBackend
+	// delegation is covered in overlay_test.go.
 	It("falls back to the local mutex when distributed locking is unsupported", func() {
 		dir := GinkgoT().TempDir()
 		base := NewFilesystemBackend(dir)
@@ -159,6 +161,23 @@ var _ = Describe("WithLock", func() {
 
 		err := svc.WithLock(context.Background(), "crl", func() error { return nil })
 		Expect(err).To(MatchError(sentinel))
+	})
+
+	// TestWithLockSwallowsUnlockError asserts a failed lock release does not
+	// mask fn's result: WithLock logs the Unlock error and still returns
+	// whatever fn returned. A refactor that surfaced the Unlock error instead
+	// would turn a committed mutation into a spurious caller-visible failure.
+	It("returns fn's result even when Unlock fails", func() {
+		dir := GinkgoT().TempDir()
+		sl := &stubLocker{Backend: NewFilesystemBackend(dir), unlockErr: errors.New("release failed")}
+		svc := NewWithBackend(sl, filepath.Join(dir, "private"))
+
+		// fn succeeds: the Unlock error must not turn it into a failure.
+		Expect(svc.WithLock(context.Background(), "crl", func() error { return nil })).To(Succeed())
+
+		// fn fails: WithLock returns fn's error, not the Unlock error.
+		boom := errors.New("fn failed")
+		Expect(svc.WithLock(context.Background(), "crl", func() error { return boom })).To(MatchError(boom))
 	})
 
 	// TestWithLockReleasesLockOnPanic sanity-checks defer-based unlock. If fn

@@ -20,6 +20,7 @@ package storage
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -48,6 +49,48 @@ func overlayTestSetup() (*OverlayBackend, string, string, string) {
 	Expect(err).NotTo(HaveOccurred(), "overlay EnsureReady: %v", err)
 	return ov, baseDir, certPath, keyPath
 }
+
+var _ = Describe("OverlayBackend AcquireLock", func() {
+	// overlayOverKey returns a valid single-override map; the path need not
+	// exist for lock delegation, which never touches the override files.
+	overlayOverKey := func() map[string]string {
+		return map[string]string{KeyCACert: filepath.Join(GinkgoT().TempDir(), "ca_crt.pem")}
+	}
+
+	It("reports distributed locking unsupported when the base has no Locker", func() {
+		base := NewFilesystemBackend(GinkgoT().TempDir())
+		ov, err := NewOverlayBackend(base, overlayOverKey())
+		Expect(err).NotTo(HaveOccurred())
+
+		_, err = ov.AcquireLock(context.Background(), "crl")
+		Expect(err).To(MatchError(ErrDistributedLockingUnsupported))
+	})
+
+	It("forwards to the base backend's Locker and returns its unlocker", func() {
+		unlocked := make(chan struct{})
+		base := &stubLocker{Backend: NewFilesystemBackend(GinkgoT().TempDir()), unlockedCh: unlocked}
+		ov, err := NewOverlayBackend(base, overlayOverKey())
+		Expect(err).NotTo(HaveOccurred())
+
+		ul, err := ov.AcquireLock(context.Background(), "crl")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(ul).NotTo(BeNil())
+		// The unlocker is the base Locker's: releasing it closes the channel
+		// the stub was handed.
+		Expect(ul.Unlock()).To(Succeed())
+		Expect(unlocked).To(BeClosed())
+	})
+
+	It("propagates the base Locker's acquisition error", func() {
+		sentinel := errors.New("base locker down")
+		base := &stubLocker{Backend: NewFilesystemBackend(GinkgoT().TempDir()), err: sentinel}
+		ov, err := NewOverlayBackend(base, overlayOverKey())
+		Expect(err).NotTo(HaveOccurred())
+
+		_, err = ov.AcquireLock(context.Background(), "crl")
+		Expect(err).To(MatchError(sentinel))
+	})
+})
 
 var _ = Describe("OverlayBackendPutGetDelete", func() {
 	It("routes overridden keys to explicit paths and delegates the rest", func() {

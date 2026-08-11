@@ -1,0 +1,353 @@
+# Locking and concurrency
+
+Reference for contributors (human or AI) touching any code path that reads or
+mutates shared CA state. Deploying `openvox-ca` needs none of this. Companion
+documents: [storage internals](storage-internals.md) for the backend contract
+and [the inventory store](inventory-store.md) for inventory integrity.
+
+The one-paragraph version: **mutations serialise on cluster-wide named locks
+taken through `StorageService.WithLock`; read-only paths never take a
+distributed lock** — they use in-memory caches and process-local read locks
+only. When you add a code path, decide which side of that line it is on first,
+and everything else follows.
+
+## The three tiers
+
+Locking happens at three distinct levels. They are not interchangeable — each
+protects against a different class of interleaving.
+
+| Tier | Mechanism | Protects against | Defined in |
+| --- | --- | --- | --- |
+| Cluster-wide named locks | `StorageService.WithLock(ctx, name, fn)` | Concurrent mutations from **other replicas** sharing the same backend | [storage.go](../../internal/storage/storage.go) |
+| Storage-service mutexes | `serialMu`, `inventoryMu` (RW), `crlMu` (RW), `fileMu` (RW) | Interleaved compound storage operations **within this process** | [storage.go](../../internal/storage/storage.go) |
+| CA in-memory state | `ca.CA.mu` (RW) | Torn reads/writes of the CA's **in-memory caches** | [ca.go](../../internal/ca/ca.go) |
+
+### Tier 1: cluster-wide named locks (`WithLock`)
+
+`StorageService.WithLock` runs `fn` while holding a named lock. When the
+backend implements the optional `Locker` capability the lock is coordinated
+across every replica sharing that backend; otherwise it falls back to a
+process-local named `sync.Mutex`, which is correct for genuinely single-node
+backends (filesystem, SQLite).
+
+The lock names are part of the cross-replica protocol: every replica must agree
+on them, so they are **stable across releases**. They are defined in
+[init.go](../../internal/ca/init.go) — with one mirror: `migrateLockName` in
+[migrate.go](../../internal/storage/migrate.go) redefines `"bootstrap"`
+independently (the `internal/storage` package cannot import `internal/ca`), so
+the two are coupled only by the string literal and must be renamed together.
+
+| Lock name | Serialises | Taken by |
+| --- | --- | --- |
+| `bootstrap` | First-run CA generation; seeding supporting state (CRL/inventory/serial) for a mounted cert+key; whole-store migration | `CA.Init`, `CA.seedSupportingState`, `storage.MigrateService` (which reuses the name deliberately so a migration and a bootstrapping server exclude each other) |
+| `crl` | Every CRL read-modify-write (read entries → re-sign → write) | `Revoke`, `ReissueCRL`, `RefreshCRLIfDue`, `CleanupExpiredCerts`, and the revoke step inside `Clean`, `Renew`, `AutoRenew` |
+| `subject:<name>` | The whole lifecycle of one subject: evict/save CSR/sign/import/clean | `SaveRequest`, `Sign`, `SignWithTTL`, `Renew`, `AutoRenew`, `Clean`, `ImportCertificate` — but currently **not** `Generate` (see known gaps below) |
+
+How each backend provides the distributed lock (a summary — the full per-backend
+mechanism, key layouts and transaction/retry detail lives in
+[storage internals](storage-internals.md), which owns it):
+
+| Backend | Mechanism | Crash recovery |
+| --- | --- | --- |
+| etcd | `concurrency.Mutex` under `<prefix>/locks/<name>` on a lease-backed session (30 s TTL) | Lease expires within the TTL, lock releases |
+| Redis/Valkey | `SET NX PX` with a per-acquisition random token; a heartbeat goroutine extends the TTL while held; unlock is a Lua compare-token-and-delete | Key expires within the TTL, lock releases |
+| PostgreSQL | `pg_advisory_lock` (session-level) on a dedicated pooled connection | Only when the server reaps the session — no TTL (see below) |
+| MySQL/MariaDB | `GET_LOCK` on a dedicated connection, polled with a 1 s server-side wait so context cancellation is honoured | Only when the server reaps the session — no TTL (see below) |
+| SQLite, filesystem | None — `ErrDistributedLockingUnsupported` / no `Locker`; `WithLock` falls back to a process-local mutex | n/a (single process assumed; see [#187](https://github.com/voxpupuli/openvox-ca/issues/187)) |
+| Overlay | Delegates to the base backend's `Locker`; reports unsupported when the base has none | as base |
+
+Crash recovery is not uniform across those backends. etcd and Redis self-heal
+within the lock TTL (30 s): a crashed holder's lease or key expires and the lock
+frees itself, which is what the 60 s `lockTimeout` below is sized to ride out.
+The SQL advisory locks have **no TTL** — `pg_advisory_lock` and `GET_LOCK`
+persist until the database tears the holder's session down, and after a hard
+host loss or network partition that is governed by the server's own keepalive
+settings (PostgreSQL `tcp_keepalives_idle`, MySQL `wait_timeout`), whose
+defaults are measured in hours. A crashed replica can therefore hold `crl` or
+`subject:<name>` far beyond `lockTimeout` while every surviving replica's
+revoke/sign fails at that timeout; the recovery action is to terminate the
+orphaned backend session (`pg_terminate_backend` / `KILL`) or to lower those
+server-side keepalives for HA deployments.
+
+Every distributed implementation first takes a **per-name process-local mutex**
+before touching the network. This is load-bearing, not an optimisation: etcd's
+`concurrency.Mutex` is not safe for re-entry on one session, and on the SQL
+backends it stops N in-process callers each pinning a pooled connection just to
+queue on the same lock.
+
+CA request paths bound lock acquisition *and* the critical section together
+with `lockTimeout` (60 s, [init.go](../../internal/ca/init.go)) via
+`context.WithTimeout` — long enough to ride out a brief leader election, short
+enough that a crashed replica's stale lease doesn't hang requests forever. Two
+things that timeout does *not* cover. First, it bounds only the *distributed*
+half: the process-local mutexes (both the fallback path and the per-name gate
+in front of every distributed implementation) are plain `sync.Mutex` and do not
+honour context cancellation, so same-process waiters queue unboundedly. Second,
+the offline `openvox-ca-ctl migrate` path applies no timeout at all —
+`MigrateService` inherits the caller's context, which is signal-cancellable but
+carries no deadline — so a migration waits indefinitely on a contended
+`bootstrap` lock; interrupt it and stop the server rather than waiting.
+
+### Tier 2: storage-service mutexes
+
+`StorageService` guards each family of logical keys with its own process-local
+mutex so a compound operation (read blob → transform → write blob) can't
+interleave with another goroutine's within the process. Three are
+`sync.RWMutex`; `serialMu` is a plain `sync.Mutex`, since the serial counter
+has no read-only fast path:
+
+| Mutex | Guards | Why compound |
+| --- | --- | --- |
+| `inventoryMu` | `inventory` + `inventory_hmac` | An append must scan for duplicate serials and advance the integrity head as one unit |
+| `crlMu` | `crl` | Plain read/write pairs |
+| `fileMu` | `ca_cert`, `ca_pubkey`, `ca_key`, `csr/<subject>`, `cert/<subject>`, per-subject private keys | One mutex spans all subjects; simple and sufficient at current scale |
+| `serialMu` | `serial` | Plain read/write pairs |
+
+One shared-state key is deliberately absent from this table: `hmac_key`. Its
+initialisation (`EnsureHMACKey`, reached via `InitHMAC` *before* any lock is
+taken) is an unlocked read-modify-write, guarded by neither a mutex nor a
+cluster lock today — a genuine gap, tracked as
+[#202](https://github.com/voxpupuli/openvox-ca/issues/202) (see known gaps).
+
+These are **internal to `StorageService`** — callers never touch them, and no
+`StorageService` method calls another locked method while holding one (they are
+non-reentrant; doing so self-deadlocks). Methods that require a caller-held
+mutex generally carry the `...Locked` suffix and always say which lock in
+their doc comment. The doc comment is authoritative — a couple of helpers
+(`readInventoryForHMAC`, `computeInventoryHMAC`) require `inventoryMu`
+without carrying the suffix.
+
+### Tier 3: CA in-memory state (`c.mu`)
+
+`ca.CA.mu` protects the fields that make the hot read paths fast:
+`CACert`/`CAKey` (readiness), `serialIndex` (OCSP subject lookup), `ocspCache`
+(pre-signed responses), and `cachedCRL` (revocation checks for authentication
+without a storage round-trip).
+
+Mutating operations hold `c.mu` (write) across the storage mutation *and* the
+cache update, so within a process the caches can never be observed out of step
+with what the same process just wrote. Read paths take `c.mu.RLock` only.
+
+`c.mu` is also held across the signing call itself. Every issuance path (`Sign`,
+`SignWithTTL`, `SaveRequest`'s autosign, `Renew`, `AutoRenew`,
+`ImportCertificate`, `Generate`) calls `issueLeafLocked` with `c.mu` held, and
+`x509.CreateCertificate` runs inside it — so with an external key provider
+(`ca_key_provider: openbao`, or the isolated signer) `c.mu`, not the per-subject
+cluster lock, is the process-wide issuance serialiser, and it spans a
+network/IPC round trip. Issuance therefore proceeds at roughly one signing
+round trip at a time within a process, and a stalled signer backend pins the
+mutex and stalls all issuance — see the "Performance and outage behaviour"
+section of [the OpenBao Transit guide](../openbao-transit.md). This is the one
+deliberate exception to rule 3 (keep expensive work outside the lock): the
+signature is inside the lock because the cache update it guards must be atomic
+with the issuance.
+
+`c.mu` is non-reentrant. The same `...Locked` suffix convention applies: e.g.
+`revokeLocked` requires the cluster `crl` lock **and** `c.mu`; each `...Locked`
+function's comment states exactly which locks its caller must hold.
+
+## Lock ordering
+
+Nested acquisition always follows one global order:
+
+```text
+subject:<name>  →  crl  →  c.mu  →  (StorageService internal mutexes)
+```
+
+- `Clean`, `Renew`, and `AutoRenew` are the paths that take all three: the
+  subject lock around the whole operation, then the `crl` lock + `c.mu` for the
+  revocation step. Note both release and re-acquire `c.mu` between the signing
+  and revocation steps — `c.mu` is not held across a `WithLock` acquisition.
+- No code path acquires `subject:<name>` while holding `crl`, and none acquires
+  either while holding `c.mu`. Keep it that way; the comments in
+  [signing.go](../../internal/ca/signing.go) record this invariant at each
+  nesting site.
+- Two *different* subject locks are never held at once (bulk operations like
+  `SignMultiple` loop, taking one at a time).
+- `CA.Init` inverts the order (it holds `c.mu` while acquiring `bootstrap`).
+  The inversion itself is safe only because `Init` runs to completion before
+  the server starts serving, so nothing else can be holding a distributed lock
+  while waiting on `c.mu`; do not copy this pattern into anything that runs
+  while serving. Init also has a *separate*, unfixed hazard on the same lock —
+  its slow path can re-enter `bootstrap` and deadlock startup
+  ([#201](https://github.com/voxpupuli/openvox-ca/issues/201)); see known gaps.
+- `MigrateService` holds two `bootstrap` locks (source backend, then
+  destination). Pointing both at the same distributed backend would deadlock;
+  migrating a store onto itself is unsupported.
+
+## Read paths take no distributed locks — by design
+
+Read-only operations must stay cheap and must keep working while another
+replica holds a lock. The pattern:
+
+- **Authentication revocation checks** (`IsRevokedSerial`) and **OCSP**
+  (`OCSPResponse` fast path) answer from `cachedCRL`/`ocspCache`/`serialIndex`
+  under `c.mu.RLock`.
+- **HTTP GETs** (certificate, CRL, status listings) read straight through
+  `StorageService` getters, which take only the relevant tier-2 read lock.
+- `ReadInventory` verifies the integrity HMAC under `inventoryMu.RLock` but
+  takes no cluster lock.
+
+The costs of this choice are deliberate and documented:
+
+- A replica's in-memory caches learn about other replicas' activity only when
+  this process next writes them: `cachedCRL` staleness for authentication is
+  [#171](https://github.com/voxpupuli/openvox-ca/issues/171) (being fixed by
+  [PR #182](https://github.com/voxpupuli/openvox-ca/pull/182)'s background
+  sync), and `serialIndex`/`ocspCache` staleness for OCSP is
+  [#183](https://github.com/voxpupuli/openvox-ca/issues/183).
+- A read racing a mutation sees either the old or the new state, never a torn
+  one — every backend's `Put` is atomic with respect to readers (see the
+  `Backend` contract in [backend.go](../../internal/storage/backend.go)).
+
+When you add a read-only endpoint or check, follow this pattern. Do not
+"defensively" wrap a read in `WithLock`: it adds a cluster round-trip per
+request, serialises hot paths behind slow mutations, and — on the fallback
+path — still provides no cross-replica guarantee anyway.
+
+## Rules for new or changed code
+
+1. **Classify the operation first.** Pure read → tier-2/3 read locks only,
+   never `WithLock`. Any read-modify-write of shared backend state → the
+   narrowest applicable cluster lock (`subject:<name>` where the unit of
+   contention is one subject; `crl` for the CRL; `bootstrap` only for
+   whole-store lifecycle).
+2. **Hold the lock across the whole decision, not just the write.** The
+   check that justifies a mutation (duplicate cert? already revoked? CRL still
+   fresh?) must run *inside* the same `WithLock` as the mutation, or it is a
+   TOCTOU bug. `RefreshCRLIfDue` (check-then-re-sign under one lock) and
+   `SaveRequest` (evict-then-save-then-autosign under one lock) are the
+   patterns to copy. [#173](https://github.com/voxpupuli/openvox-ca/issues/173)
+   / [PR #186](https://github.com/voxpupuli/openvox-ca/pull/186) exist because
+   a renewal once did such a re-check outside the lock.
+3. **Keep expensive, shared-state-free work outside the lock.** Key
+   generation and CSR assembly in `Generate` run before any lock is taken;
+   parsing and validation in `Renew`/`SaveRequest` likewise. Only the
+   storage-touching tail belongs inside. The deliberate exception is the CA
+   signature itself: `x509.CreateCertificate` runs under `c.mu` (see Tier 3),
+   because the cache update it guards must be atomic with the issuance.
+4. **Respect the ordering** (`subject` → `crl` → `c.mu`), never acquire the
+   same lock reentrantly, and release `c.mu` before entering another
+   `WithLock`. Use the closure-with-defer shape from `Renew`/`AutoRenew` so a
+   panic can't wedge a mutex.
+5. **Calling convention:** public CA methods take their own locks and say so
+   ("The caller must NOT hold c.mu"); internal `...Locked` helpers document
+   which locks the caller must already hold. Preserve both halves when
+   refactoring, and never call a public locking method from inside a locked
+   region.
+6. **A distributed lock is a serialiser, not a guarantee.** All the
+   implementations are lease/session-based with no fencing tokens: a process
+   paused longer than the TTL (GC pause, VM freeze, network partition) can
+   lose the lock while still inside `fn`, and Redis failover can hand the lock
+   over early (see the note on `RedisBackend.AcquireLock`). Where corruption
+   would be the consequence, back the lock with a storage-level invariant that
+   holds even without it — and check the invariant's own scope.
+   `AppendInventory`'s duplicate-serial check (`ErrDuplicateSerial`) is the
+   worked example, but it is a cluster-wide guarantee only on SQL backends,
+   where the database's unique index enforces it; on blob backends the scan
+   runs under the process-local `inventoryMu` only, and etcd's CAS-guarded
+   append protects the blob against lost updates, not serial uniqueness (the
+   doc comment on `ErrDuplicateSerial` in
+   [storage.go](../../internal/storage/storage.go) spells this out, and the
+   blob-backend gap is tracked as
+   [#204](https://github.com/voxpupuli/openvox-ca/issues/204)).
+7. **New lock names are protocol.** Add them to the constants in
+   [init.go](../../internal/ca/init.go) (and keep `migrateLockName` in
+   [migrate.go](../../internal/storage/migrate.go) in sync — it redefines
+   `"bootstrap"` independently), keep them stable across releases, and document
+   them in the table above. All callers using a name contend on one lock, so
+   never derive a name from unvalidated input (subject names pass
+   `ValidateSubject` first). `ValidateSubject` is necessary but not sufficient
+   on the SQL backends: there the lock identity is a 64-bit FNV-1a hash of the
+   name (`advisoryLockKey`), so distinct names can alias and a crafted subject
+   could collide with `crl`/`bootstrap`
+   ([#203](https://github.com/voxpupuli/openvox-ca/issues/203)).
+8. **SQL pool sizing:** on PostgreSQL/MySQL every *held* distributed lock pins
+   one pooled connection. A single in-flight `Clean`/`Renew`/`AutoRenew` needs
+   at least three connections at once — one for the `subject:<name>` lock, a
+   second for the nested `crl` lock, and a third for the reads/writes inside
+   the revocation step — so `sql_max_open_conns` must be at least 3 per
+   concurrently mutating request. Set below that and a single request
+   hard-stalls (not only under load), bounded only by the 60 s `lockTimeout`.
+   See the `sql_max_open_conns` knob in
+   [storage backends](../storage-backends.md).
+9. **Offline `openvox-ca-ctl` commands** (import, migrate) assume the server
+   is stopped. `MigrateService` holds `bootstrap` on both stores, which
+   excludes a booting server but deliberately not per-subject signing — and on
+   filesystem/SQLite the fallback mutex has no cross-process effect at all
+   ([#187](https://github.com/voxpupuli/openvox-ca/issues/187)). It also
+   inherits the caller's context with no `lockTimeout`, so it waits
+   indefinitely on a contended `bootstrap` lock (see Tier 1).
+
+## Known gaps
+
+Concurrency limitations that are understood and tracked. This list reflects the
+state when the document was last updated and is not guaranteed exhaustive.
+
+- [#195](https://github.com/voxpupuli/openvox-ca/issues/195) — `CA.Generate`
+  (the `POST /generate/{subject}` endpoint) is the one issuance path that
+  takes only `c.mu`, not the `subject:<name>` cluster lock. On an HA backend,
+  a `Generate` on one replica can race a `Sign`/`SaveRequest`/`Generate` for
+  the same subject on another and double-issue.
+- [#196](https://github.com/voxpupuli/openvox-ca/issues/196) —
+  `DELETE /certificate_request/{subject}` deletes the CSR directly through
+  `StorageService`, bypassing the subject lock, so a deletion can be outrun
+  by an in-flight sign for the same subject.
+- [#197](https://github.com/voxpupuli/openvox-ca/issues/197) — OCSP's slow
+  path signs responses while holding `c.mu` exclusively, so nonced requests
+  (which always miss the cache) serialise process-wide behind the signing
+  round trip. This is the same "signature under `c.mu`" property as the
+  issuance paths (see Tier 3) surfacing on the OCSP responder; an efficiency
+  gap rather than a correctness one.
+- [#201](https://github.com/voxpupuli/openvox-ca/issues/201) — `CA.Init`'s slow
+  path can re-enter the `bootstrap` lock (via `finishLoadExisting` →
+  `seedSupportingState`) and deadlock startup, because `WithLock` is not
+  reentrant and its process-local gate ignores the context. Reachable when a
+  replica loads a CA bootstrapped elsewhere but then finds the CRL absent.
+- [#202](https://github.com/voxpupuli/openvox-ca/issues/202) — `hmac_key`
+  initialisation (`EnsureHMACKey`, called by `InitHMAC` *before* the
+  `bootstrap` lock) is an unlocked read-modify-write, so two replicas
+  cold-starting against a fresh shared backend can generate divergent keys and
+  one then fails inventory-HMAC verification.
+- [#203](https://github.com/voxpupuli/openvox-ca/issues/203) — on the SQL
+  backends the distributed-lock identity is a 64-bit FNV-1a hash of the name,
+  so distinct names can alias; a crafted subject that passes `ValidateSubject`
+  could collide with the `crl`/`bootstrap` key and deny revocation.
+- [#187](https://github.com/voxpupuli/openvox-ca/issues/187) — filesystem and
+  SQLite backends have no same-host, cross-**process** locking; a `ctl`
+  command (or the planned offline `generate`,
+  [#175](https://github.com/voxpupuli/openvox-ca/issues/175)) racing a running
+  server on the same cadir is uncoordinated. The related blob-backend gap —
+  nothing wraps `AppendInventory` in a cluster lock on etcd/Redis either, so
+  its duplicate-serial check is not cross-replica there — is tracked separately
+  as [#204](https://github.com/voxpupuli/openvox-ca/issues/204).
+- [#171](https://github.com/voxpupuli/openvox-ca/issues/171) — `cachedCRL` is
+  per-replica, so authentication and renewal keep accepting a certificate
+  revoked elsewhere until this process re-signs the CRL.
+  [PR #182](https://github.com/voxpupuli/openvox-ca/pull/182) fixes it with a
+  background poll (monotonic in the CRL number, deliberately lock-free).
+- [#183](https://github.com/voxpupuli/openvox-ca/issues/183) — OCSP's
+  `serialIndex` is built once at startup, so certificates issued on another
+  replica answer `unknown`; the `ocspCache` half can even keep serving a
+  pre-signed `good` for a certificate revoked elsewhere.
+- [#173](https://github.com/voxpupuli/openvox-ca/issues/173) — renewal
+  re-checked revocation before acquiring the subject lock.
+  [PR #186](https://github.com/voxpupuli/openvox-ca/pull/186) fixes it
+  (re-check from *storage* under the subject lock) and also moves `Revoke`
+  itself under `subject:<name>` → `crl`; the Tier 1 lock table describes
+  current `main`, and that PR carries its own update to the table when it lands.
+- On blob backends (filesystem/etcd/redis), an inventory append and its HMAC
+  update are two writes, not one atomic unit; the failure window is documented
+  at the write site in `AppendInventory` and the structured (SQL) inventory is
+  the durable answer. See [the inventory store](inventory-store.md).
+
+## Tests
+
+`WithLock`'s fallback semantics, its overlay/unsupported delegation, and its
+unlock-error handling are covered in
+[withlock_test.go](../../internal/storage/withlock_test.go); each distributed
+implementation's mutual exclusion is exercised in its backend integration
+suite (build-tagged; see [testing](testing.md)). The nested lock-ordering
+invariant and a race-detector run over the concurrency tests are not yet
+automated — tracked as
+[#205](https://github.com/voxpupuli/openvox-ca/issues/205).
