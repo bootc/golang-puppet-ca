@@ -26,10 +26,11 @@ name: openvox-ca
 
 services:
   openvox-ca:
-    # Pin to a specific release tag (e.g. :1.2.3) for reproducible
+    # `:latest` is deliberately left unpinned so this example tracks the
+    # newest release, but a floating tag carries no supply-chain integrity
+    # guarantee: two pulls at different times can yield different images.
+    # Pin a release tag (e.g. :1.2.3) or a digest for production
     # deployments; a `-alpine` variant of every tag is also published.
-    # NOTE: the healthcheck below uses curl, which the Alpine variant does
-    # not ship.
     image: ghcr.io/voxpupuli/openvox-ca:latest
     command:
       - --cadir=/data
@@ -45,8 +46,10 @@ services:
       - ca-data:/data
     restart: unless-stopped
     healthcheck:
-      # -k because the CA's own cert does not carry localhost as a SAN.
-      test: ["CMD", "curl", "-skf", "https://localhost:8140/healthz/ready"]
+      # curl exists in the default image, busybox wget in the -alpine
+      # variant; certificate verification is disabled because the CA's own
+      # cert does not carry localhost as a SAN.
+      test: ["CMD-SHELL", "curl -skf https://localhost:8140/healthz/ready || wget -q --no-check-certificate -O /dev/null https://localhost:8140/healthz/ready"]
       interval: 30s
       timeout: 5s
       retries: 3
