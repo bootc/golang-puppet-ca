@@ -19,6 +19,7 @@ package storage
 
 import (
 	"context"
+	"path/filepath"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -290,5 +291,63 @@ var _ = Describe("SQLiteCertIndex", func() {
 		Expect(svc.MarkCertRevoked(ctx, "0001", time.Now())).To(Succeed())
 		Expect(svc.ClearCertRevoked(ctx, "0001")).To(Succeed())
 		Expect(svc.SetCertProjection(ctx, "0001", CertProjection{Fingerprint: "aa"})).To(Succeed())
+	})
+})
+
+// The CertIndex capability is reached through a type assertion, so a wrapper
+// backend that does not implement it must be unwrapped or the capability
+// disappears. Its InventoryStore sibling has this exact regression test because
+// the exact bug shipped once: ca_key_file wraps the backend in an OverlayBackend,
+// the assertion failed on the wrapper, and StorageService silently fell back --
+// there to a whole-blob HMAC that did not match, here to the O(N) scan the index
+// exists to replace, which is slower but correct and so would not be noticed.
+var _ = Describe("CertIndex through an OverlayBackend", func() {
+	It("still answers from the index when the backend is wrapped", func() {
+		ctx := context.Background()
+		dir := GinkgoT().TempDir()
+
+		b, err := NewSQLBackend(SQLConfig{
+			Dialect: SQLitePure,
+			DSN:     "file:" + filepath.Join(dir, "ca.db"),
+		})
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(func() { _ = b.Close() })
+		Expect(b.EnsureReady(ctx)).To(Succeed())
+
+		// The shape an operator gets from ca_key_file: the CA key on local disk,
+		// everything else in the database.
+		overlay, err := NewOverlayBackend(b, map[string]string{
+			KeyCAKey: filepath.Join(dir, "ca_key.pem"),
+		})
+		Expect(err).NotTo(HaveOccurred())
+
+		svc := NewWithBackend(overlay, dir)
+		Expect(svc.EnsureDirs(ctx)).To(Succeed())
+		Expect(svc.TouchInventory(ctx)).To(Succeed())
+
+		Expect(svc.AppendInventoryRecord(ctx, "0a 2026-01-01T00:00:00UTC 2036-01-01T00:00:00UTC /node1",
+			&CertProjection{Fingerprint: "SHA256:AA:BB"})).To(Succeed())
+		Expect(svc.SaveCert(ctx, "node1", []byte("cert-pem"))).To(Succeed())
+
+		recs, ok, err := svc.CertStatuses(ctx, "")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(ok).To(BeTrue(), "the capability must survive the wrapper")
+		Expect(recs).To(HaveLen(1))
+		Expect(recs[0].Subject).To(Equal("node1"))
+		Expect(recs[0].Fingerprint).To(Equal("SHA256:AA:BB"),
+			"the projection must come back through the wrapper, not from a re-parse")
+
+		// And the mutating half of the capability.
+		Expect(svc.MarkCertRevoked(ctx, "0a", time.Now())).To(Succeed())
+		recs, _, err = svc.CertStatuses(ctx, "")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(recs).To(HaveLen(1))
+		Expect(recs[0].State).To(Equal(CertStateRevoked))
+		Expect(recs[0].RevokedAt).NotTo(BeNil())
+
+		Expect(svc.ClearCertRevoked(ctx, "0a")).To(Succeed())
+		recs, _, err = svc.CertStatuses(ctx, "")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(recs[0].State).To(Equal(CertStateSigned))
 	})
 })

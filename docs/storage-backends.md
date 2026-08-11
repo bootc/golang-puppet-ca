@@ -284,6 +284,7 @@ cadir: /var/lib/puppet-ca                # still needed for per-subject keys
 sql_dsn: "file:/var/lib/puppet-ca/ca.db" # SQLite database file path / URI
 
 sql_request_timeout_sec: 10              # per-operation timeout (default 10)
+sql_migration_timeout_sec: 600           # whole schema-migration run (default 600)
 ```
 
 `openvox-ca` adds safe SQLite defaults to the DSN (WAL journal, immediate write
@@ -314,6 +315,7 @@ cadir: /var/lib/puppet-ca                # still needed for per-subject keys
 sql_dsn: "postgres://puppetca:secret@db.example.com:5432/puppetca?sslmode=require"
 
 sql_request_timeout_sec: 10              # per-operation timeout (default 10)
+sql_migration_timeout_sec: 600           # whole schema-migration run (default 600)
 sql_max_open_conns: 0                    # 0 = database/sql default; min 4 when set
 sql_max_idle_conns: 0                    # 0 = database/sql default
 
@@ -349,6 +351,7 @@ cadir: /var/lib/puppet-ca                # still needed for per-subject keys
 sql_dsn: "puppetca:secret@tcp(db.example.com:3306)/puppetca"
 
 sql_request_timeout_sec: 10              # per-operation timeout (default 10)
+sql_migration_timeout_sec: 600           # whole schema-migration run (default 600)
 
 # Optional TLS to the server (registered with the driver automatically;
 # no need to add tls= to the DSN).

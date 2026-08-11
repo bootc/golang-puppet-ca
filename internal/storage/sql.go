@@ -109,6 +109,17 @@ type SQLConfig struct {
 	// RequestTimeout bounds each individual operation. Zero uses 10s.
 	RequestTimeout time.Duration
 
+	// MigrationTimeout bounds a whole migration run, replacing RequestTimeout for
+	// the duration of EnsureReady. Zero uses 10 minutes.
+	//
+	// Configurable because the default is a guess about someone else's hardware:
+	// the slowest legitimate run is an index build over an inventory whose size
+	// this code cannot know, plus any wait for a peer replica holding the
+	// migration lock. A run cut short is exactly what leaves a schema
+	// half-migrated, so an operator who needs longer must be able to say so
+	// without a code change.
+	MigrationTimeout time.Duration
+
 	// MaxOpenConns / MaxIdleConns tune the underlying database/sql pool. Zero
 	// leaves the database/sql defaults in place, except SQLite which is pinned
 	// to a single open connection (see NewSQLBackend).
@@ -119,6 +130,9 @@ type SQLConfig struct {
 func (c *SQLConfig) applyDefaults() {
 	if c.RequestTimeout == 0 {
 		c.RequestTimeout = sqlDefaultTimeout
+	}
+	if c.MigrationTimeout == 0 {
+		c.MigrationTimeout = sqlMigrationTimeout
 	}
 }
 
@@ -151,6 +165,8 @@ type SQLBackend struct {
 	db      *bun.DB
 	owned   bool // true when Close should close the underlying *sql.DB
 	timeout time.Duration
+	// migrationTimeout bounds a whole EnsureReady run rather than one statement.
+	migrationTimeout time.Duration
 
 	appendMu sync.Mutex // serialises AppendLine within this process
 
@@ -194,7 +210,7 @@ func NewSQLBackend(cfg SQLConfig) (*SQLBackend, error) {
 		}
 	}
 
-	return newSQLBackend(bun.NewDB(sqldb, bunDialect), true, cfg.RequestTimeout), nil
+	return newSQLBackend(bun.NewDB(sqldb, bunDialect), true, cfg.RequestTimeout, cfg.MigrationTimeout), nil
 }
 
 // NewSQLBackendFromDB wraps an existing *bun.DB. The backend does not take
@@ -204,11 +220,14 @@ func NewSQLBackendFromDB(db *bun.DB, requestTimeout time.Duration) *SQLBackend {
 	if requestTimeout == 0 {
 		requestTimeout = sqlDefaultTimeout
 	}
-	return newSQLBackend(db, false, requestTimeout)
+	return newSQLBackend(db, false, requestTimeout, sqlMigrationTimeout)
 }
 
-func newSQLBackend(db *bun.DB, owned bool, timeout time.Duration) *SQLBackend {
-	return &SQLBackend{db: db, owned: owned, timeout: timeout}
+func newSQLBackend(db *bun.DB, owned bool, timeout, migrationTimeout time.Duration) *SQLBackend {
+	if migrationTimeout == 0 {
+		migrationTimeout = sqlMigrationTimeout
+	}
+	return &SQLBackend{db: db, owned: owned, timeout: timeout, migrationTimeout: migrationTimeout}
 }
 
 // openSQLDB opens the database/sql handle and matching bun dialect for cfg.
@@ -305,7 +324,7 @@ func (b *SQLBackend) EnsureReady(ctx context.Context) error {
 	// Schema changes get their own budget. RequestTimeout bounds one ordinary
 	// statement; a migration run can legitimately take far longer (building an
 	// index over a large inventory) and must never be cut off part-way.
-	ctx, cancel := context.WithTimeout(ctx, sqlMigrationTimeout)
+	ctx, cancel := context.WithTimeout(ctx, b.migrationTimeout)
 	defer cancel()
 
 	// Serialise runners before any migration state is read. bun's Migrate does
@@ -347,8 +366,21 @@ func (b *SQLBackend) EnsureReady(ctx context.Context) error {
 	if err := migrator.Init(ctx); err != nil {
 		return fmt.Errorf("initialising migrations: %w", err)
 	}
-	if _, err := migrator.Migrate(ctx); err != nil {
+	// Logged either side, because a migration can legitimately run for minutes
+	// -- an index build over a large inventory -- and from outside there is
+	// nothing to distinguish that from a start that has wedged. The lock wait
+	// above is inside the same window, so a replica queued behind a peer looks
+	// identical without these.
+	slog.Info("Running SQL schema migrations", "timeout", b.migrationTimeout)
+	group, err := migrator.Migrate(ctx)
+	if err != nil {
 		return fmt.Errorf("running migrations: %w", err)
+	}
+	if group.IsZero() {
+		slog.Info("SQL schema is already up to date")
+	} else {
+		slog.Info("SQL schema migrations applied",
+			"group", group.ID, "migrations", len(group.Migrations))
 	}
 	return nil
 }

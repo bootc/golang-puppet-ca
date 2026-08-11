@@ -142,7 +142,8 @@ recomputes the destination's integrity head from its entries
 
 The inventory table doubles as a **certificate index**: alongside the four
 canonical columns, each row carries a denormalised display projection
-(`fingerprint_sha256`, `dns_alt_names`, `auth_extensions`, filled at signing)
+(`fingerprint_sha256`, `dns_alt_names`, `auth_extensions`, filled at signing or
+import — see `issueLeafLocked` and `ImportCertificate`)
 and the one mutable fact, revocation (`state`, `revoked_at`). Backends owning
 the rows may advertise a second optional capability:
 
@@ -156,6 +157,19 @@ type CertIndex interface {
     SetProjection(ctx context.Context, serial string, proj CertProjection) error
 }
 ```
+
+As with `InventoryStore`, the `StorageService` wrapper and the capability use
+different names — the wrapper's are qualified because they sit beside the blob
+methods, the interface's are not because the receiver already says `CertIndex`:
+
+- `CertStatuses` → structured: `Statuses`; blob: falls back to the list-and-parse
+  scan
+- `MarkCertRevoked` → structured: `SetRevoked`; blob: no-op, since revocation
+  there is read from the CRL at display time
+- `ClearCertRevoked` → structured: `ClearRevoked`; blob: no-op
+- `SetCertProjection` → structured: `SetProjection`; blob: no-op
+- `AppendInventoryRecord` → structured: `AppendEntry` with the projection; blob:
+  `AppendInventory`, projection ignored
 
 `GET /certificate_statuses` probes it (via `StorageService.CertStatuses`,
 mirroring `asInventoryStore`) and collapses from an O(N) *list-certs →

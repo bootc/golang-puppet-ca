@@ -18,6 +18,7 @@
 package ca_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
@@ -25,6 +26,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/asn1"
 	"encoding/pem"
+	"log/slog"
 	"math/big"
 	"path/filepath"
 	"time"
@@ -151,6 +153,138 @@ var _ = Describe("CA certificate index", func() {
 			Expect(recs).To(HaveLen(1))
 			Expect(recs[0].State).To(Equal(storage.CertStateSigned))
 			Expect(recs[0].RevokedAt).To(BeNil())
+		})
+
+		It("leaves the projection empty when the stored certificate is not the one the row names", func() {
+			// The safety guard the backfill exists around. A row whose serial does
+			// not match the stored PEM does not describe that certificate -- a
+			// crash between the blob write and the inventory write produces exactly
+			// that -- and stamping it with the other certificate's fingerprint,
+			// validity and auth extensions would make the status API assert
+			// something untrue about a credential.
+			signLive(myCA, "node1")
+
+			// Replace the stored PEM with a different certificate under the same
+			// subject, so the row's serial no longer matches what is on disk.
+			other := signLeafWithAuthRole("node1", "webserver")
+			Expect(store.SaveCert(ctx, "node1", other)).To(Succeed())
+
+			// Clear the projection so the repair pass has something to backfill.
+			recs, _, err := store.CertStatuses(ctx, "")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(recs).To(HaveLen(1))
+			Expect(store.SetCertProjection(ctx, recs[0].Serial, storage.CertProjection{})).To(Succeed())
+
+			var buf bytes.Buffer
+			orig := slog.Default()
+			slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+			defer slog.SetDefault(orig)
+
+			restarted := ca.New(store, ca.AutosignConfig{Mode: "off"}, "puppet.test")
+			Expect(restarted.Init(ctx)).To(Succeed(),
+				"a mismatched row must not stop the CA starting")
+
+			recs, _, err = store.CertStatuses(ctx, "")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(recs).To(HaveLen(1))
+			Expect(recs[0].Fingerprint).To(BeEmpty(),
+				"the projection must stay empty rather than describe another certificate")
+			Expect(buf.String()).To(ContainSubstring("serial does not match index record"))
+		})
+
+		It("skips a malformed serial without abandoning the rest of the repair", func() {
+			// The repair walks every record, so one unparseable serial must not
+			// stop the records after it from being reconciled. A `continue` that
+			// was a `return` would leave the rest of the index stale, and the
+			// index is what the status API answers from.
+			signLive(myCA, "good-node")
+			Expect(myCA.Revoke(ctx, "good-node")).To(Succeed())
+
+			// A record whose serial is not hex at all. It needs a stored
+			// certificate blob as well as the row: CertStatuses reports only
+			// subjects that have one, so a row without a blob never reaches the
+			// repair loop at all -- which is why this branch was unreachable from
+			// the inventory alone.
+			Expect(store.AppendInventoryRecord(ctx, "zz-not-hex 2026-01-01T00:00:00UTC 2036-01-01T00:00:00UTC /broken-node",
+				&storage.CertProjection{})).To(Succeed())
+			Expect(store.SaveCert(ctx, "broken-node", signLeafWithAuthRole("broken-node", "webserver"))).To(Succeed())
+
+			// Restore the pristine CRL so the good record needs its revocation
+			// cleared -- work the repair can only do if it gets past the bad row.
+			Expect(store.UpdateCRL(ctx, cachedCrlPEM)).To(Succeed())
+
+			var buf bytes.Buffer
+			orig := slog.Default()
+			slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+			defer slog.SetDefault(orig)
+
+			restarted := ca.New(store, ca.AutosignConfig{Mode: "off"}, "puppet.test")
+			Expect(restarted.Init(ctx)).To(Succeed())
+
+			// Both layers report it: the serial index built from the inventory
+			// blob, and the index repair walking the rows.
+			Expect(buf.String()).To(ContainSubstring("skipping malformed serial in inventory"))
+			Expect(buf.String()).To(ContainSubstring("malformed serial in index record"))
+
+			recs, _, err := store.CertStatuses(ctx, "")
+			Expect(err).NotTo(HaveOccurred())
+			bySubject := map[string]storage.CertRecord{}
+			for _, r := range recs {
+				bySubject[r.Subject] = r
+			}
+			Expect(bySubject).To(HaveKey("good-node"))
+			Expect(bySubject["good-node"].State).To(Equal(storage.CertStateSigned),
+				"the record after the malformed one must still be reconciled")
+			Expect(bySubject["good-node"].RevokedAt).To(BeNil())
+		})
+
+		It("re-projects a revocation that was already recorded", func() {
+			// Revoke returns early when the serial is already in the CRL, which is
+			// the retry path -- an operator repeating a command, or a replica
+			// catching up. If the early return skipped the index write, an index
+			// row that missed the first projection would stay wrong for ever,
+			// because every later attempt takes the same early exit.
+			signLive(myCA, "node1")
+			Expect(myCA.Revoke(ctx, "node1")).To(Succeed())
+
+			recs, _, err := store.CertStatuses(ctx, "")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(recs).To(HaveLen(1))
+			Expect(store.ClearCertRevoked(ctx, recs[0].Serial)).To(Succeed())
+
+			Expect(myCA.Revoke(ctx, "node1")).To(Succeed(),
+				"revoking an already-revoked certificate is not an error")
+
+			recs, _, err = store.CertStatuses(ctx, "")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(recs).To(HaveLen(1))
+			Expect(recs[0].State).To(Equal(storage.CertStateRevoked),
+				"the retry must re-project the revocation the index had lost")
+			Expect(recs[0].RevokedAt).NotTo(BeNil())
+		})
+
+		It("projects an inventory record on a backend with no index, without failing", func() {
+			// AppendInventoryRecord's contract is that the projection is ignored on
+			// a backend without the capability. Nothing asserted it, so a change
+			// that made the projection mandatory would break every blob backend at
+			// signing time and pass here.
+			blobDir := GinkgoT().TempDir()
+			blobStore := storage.New(blobDir)
+			Expect(blobStore.EnsureDirs(ctx)).To(Succeed())
+			Expect(blobStore.TouchInventory(ctx)).To(Succeed())
+
+			line := "aa 2026-01-01T00:00:00UTC 2036-01-01T00:00:00UTC /node1"
+			Expect(blobStore.AppendInventoryRecord(ctx, line, &storage.CertProjection{
+				Fingerprint: "SHA256:whatever",
+			})).To(Succeed(), "the projection must be ignored, not rejected")
+
+			data, err := blobStore.ReadInventory(ctx)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(string(data)).To(ContainSubstring("/node1"))
+
+			_, ok, err := blobStore.CertStatuses(ctx, "")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(ok).To(BeFalse(), "a blob backend has no index to answer from")
 		})
 
 		It("projects auth extensions from an imported certificate through the index", func() {
