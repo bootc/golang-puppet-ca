@@ -289,6 +289,50 @@ var _ = Describe("Certificate statuses via the certificate index", func() {
 		Expect(getStatuses("?state=signed")).To(BeEmpty())
 	})
 
+	It("returns a signed certificate to signed when only the stale row's serial is revoked", func() {
+		// The mirror direction of the spec above: the fallback's re-derivation
+		// must also flip a row-derived "revoked" back to "signed" when the
+		// certificate actually served is not in the CRL — without it, a stale
+		// row naming a revoked serial would over-report revocation for a
+		// certificate the CA still stands behind. Revoke a donor subject,
+		// then give another subject a projection-less row carrying the
+		// zero-padded variant of the donor's serial: distinct as an inventory
+		// string (the duplicate-serial guard rejects a verbatim copy) yet a
+		// CRL hit through the same normalisation, so the row-derived state is
+		// "revoked" while the served certificate is not.
+		submitAndSign("idx-donor", generateCSRWithSANs("idx-donor", []string{"idx-donor"}))
+		Expect(myCA.Revoke(ctx, "idx-donor")).To(Succeed())
+		submitAndSign("idx-victim", generateCSRWithSANs("idx-victim", []string{"idx-victim"}))
+
+		donorPEM, err := store.GetCert(ctx, "idx-donor")
+		Expect(err).NotTo(HaveOccurred())
+		block, _ := pem.Decode(donorPEM)
+		Expect(block).NotTo(BeNil())
+		donor, err := x509.ParseCertificate(block.Bytes)
+		Expect(err).NotTo(HaveOccurred())
+		donorPadded := "00" + fmt.Sprintf("%X", donor.SerialNumber)
+		Expect(store.AppendInventory(ctx,
+			storage.FormatInventoryLine(donorPadded, donor.NotBefore, donor.NotAfter, "idx-victim"))).To(Succeed())
+
+		statuses := getStatuses("")
+		Expect(statuses).To(HaveLen(2))
+		states := map[string]string{}
+		for _, s := range statuses {
+			states[s.Name] = s.State
+		}
+		Expect(states).To(Equal(map[string]string{
+			"idx-donor":  "revoked",
+			"idx-victim": "signed",
+		}), "the served certificate's serial decides the state, not the stale row's")
+
+		signed := getStatuses("?state=signed")
+		Expect(signed).To(HaveLen(1))
+		Expect(signed[0].Name).To(Equal("idx-victim"))
+		revoked := getStatuses("?state=revoked")
+		Expect(revoked).To(HaveLen(1))
+		Expect(revoked[0].Name).To(Equal("idx-donor"))
+	})
+
 	It("matches a legacy zero-padded row serial against the CRL", func() {
 		// The CRL-derived map is keyed by canonical %X serials, while a
 		// blob-imported legacy inventory can carry the same serial
