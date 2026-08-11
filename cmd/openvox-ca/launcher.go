@@ -83,9 +83,18 @@ func runLauncher(drain time.Duration) error {
 	defer frontendSock.Close()
 
 	// Generate a PSK for authenticating the socketpair endpoints.
-	// Both children receive this via environment variable and verify it
-	// on first RPC call, preventing a rogue process from injecting a fake
-	// signer if the fd is somehow leaked.
+	// Both children receive this via an inherited pipe (fd 4) and run a
+	// mutual challenge-response handshake before the first RPC call: each
+	// endpoint proves knowledge of the PSK to the other, so a rogue process
+	// that somehow obtained a leaked fd could impersonate neither the
+	// frontend nor the signer.
+	//
+	// SECURITY: the PSK travels over a pipe rather than an environment
+	// variable because a child's exec-time environment stays visible in
+	// /proc/<pid>/environ for its whole lifetime (os.Unsetenv only mutates
+	// the process's own copy) and is captured verbatim by crash-dump and
+	// support tooling such as systemd-coredump. A pipe is consumed once and
+	// leaves no such residue.
 	psk := make([]byte, 32)
 	if _, err := rand.Read(psk); err != nil {
 		return fmt.Errorf("generating socketpair PSK: %w", err)
@@ -99,44 +108,27 @@ func runLauncher(drain time.Duration) error {
 
 	slog.Info("Starting isolated CA processes")
 
-	// Build base environment: strip role/daemon vars to prevent inheritance loops.
-	// Clip to len==cap so each append below allocates a fresh backing array,
-	// preventing the signer and frontend env slices from aliasing.
-	baseEnv := filterEnv(os.Environ(), "PUPPET_CA_ROLE", "PUPPET_CA_DAEMON", "PUPPET_CA_SIGNER_PSK")
-	baseEnv = baseEnv[:len(baseEnv):len(baseEnv)]
+	// Build base environment: strip role/daemon vars to prevent inheritance
+	// loops. PUPPET_CA_SIGNER_PSK is stripped defensively: the PSK travels
+	// over a pipe, and a variable by that name must never reach a child.
+	// spawnChild clips this before appending to it, so the two children cannot
+	// share a backing array.
+	baseEnv := filterEnv(os.Environ(), internalEnvKeys...)
 
-	// Spawn signer child.
-	signerCmd := exec.Command(exe, os.Args[1:]...) //nolint:gosec // G204: re-execs this same binary (os.Executable) with the operator's own os.Args
-	signerCmd.Env = append(baseEnv,
-		"PUPPET_CA_ROLE=signer",
-		"PUPPET_CA_DAEMON=1",
-		"PUPPET_CA_SIGNER_PSK="+pskHex,
-	)
-	signerCmd.ExtraFiles = []*os.File{signerSock} // fd 3
-	signerCmd.Stdout = os.Stdout
-	signerCmd.Stderr = os.Stderr
-	if err := signerCmd.Start(); err != nil {
-		return fmt.Errorf("starting signer process: %w", err)
+	signerCmd, err := spawnChild(exe, baseEnv, "signer", signerSock, pskHex)
+	if err != nil {
+		return err
 	}
-	// Close our copy of the signer's socket end; only the child should hold it.
-	signerSock.Close()
 
-	// Spawn frontend child.
-	frontendCmd := exec.Command(exe, os.Args[1:]...) //nolint:gosec // G204: re-execs this same binary (os.Executable) with the operator's own os.Args
-	frontendCmd.Env = append(baseEnv,
-		"PUPPET_CA_ROLE=frontend",
-		"PUPPET_CA_DAEMON=1",
-		"PUPPET_CA_SIGNER_PSK="+pskHex,
-	)
-	frontendCmd.ExtraFiles = []*os.File{frontendSock} // fd 3
-	frontendCmd.Stdout = os.Stdout
-	frontendCmd.Stderr = os.Stderr
-	if err := frontendCmd.Start(); err != nil {
-		signerCmd.Process.Kill()
-		return fmt.Errorf("starting frontend process: %w", err)
+	frontendCmd, err := spawnChild(exe, baseEnv, "frontend", frontendSock, pskHex)
+	if err != nil {
+		// The signer is already running and nothing will ever connect to it, so
+		// it has to go -- and be reaped, not merely signalled: Kill on its own
+		// leaves a zombie for as long as this process lives, and the launcher
+		// does not necessarily exit straight away.
+		killAndReap(signerCmd)
+		return err
 	}
-	// Close our copy of the frontend's socket end.
-	frontendSock.Close()
 
 	slog.Info("CA processes started",
 		"signer_pid", signerCmd.Process.Pid,
@@ -190,6 +182,108 @@ func runLauncher(drain time.Duration) error {
 		timer.Stop()
 		return fmt.Errorf("%s process exited unexpectedly: %w", result.name, result.err)
 	}
+}
+
+// internalEnvKeys are the variables the launcher and the --daemon re-exec strip
+// before handing an environment to a child. One list, because the two call sites
+// spelled it out separately and a fourth variable added to one and missed at the
+// other would reach a child stale, with nothing to notice.
+var internalEnvKeys = []string{"PUPPET_CA_ROLE", "PUPPET_CA_DAEMON", "PUPPET_CA_SIGNER_PSK"}
+
+// pskPipeFn is the pipe constructor spawnChild uses. A variable so a spec can
+// capture the descriptor the helper creates and assert directly that it was
+// closed -- the fd-slot arithmetic that stood in for that could not distinguish a
+// leaked pipe from a closed socket, so it passed either way.
+var pskPipeFn = pskPipe
+
+// spawnChild starts one isolated child in the given role, handing it the
+// socketpair end on fd 3 and a freshly loaded PSK pipe on fd 4.
+//
+// Extracted so the two spawns cannot drift apart and so the failure ordering is
+// testable: the parent's copies of both descriptors must be dropped as soon as
+// the child holds them, and a PSK pipe created for a child that never starts
+// must not be leaked. Both rules were open-coded twice.
+func spawnChild(exe string, baseEnv []string, role string, sock *os.File, pskHex string) (*exec.Cmd, error) {
+	pskRead, err := pskPipeFn(pskHex)
+	if err != nil {
+		// Including here, the earliest exit: os.Pipe fails under descriptor
+		// exhaustion, which is exactly the crash-looping launcher this helper's
+		// other failure path reasons about. Leaving fd 3 to the caller's defer on
+		// one exit and owning it on the other is the split the extraction removed.
+		sock.Close()
+		return nil, err
+	}
+
+	cmd := exec.Command(exe, os.Args[1:]...) //nolint:gosec // G204: re-execs this same binary (os.Executable) with the operator's own os.Args
+	// Clipped to len==cap here, beside the append that depends on it: filterEnv
+	// returns spare capacity whenever it stripped anything, so two spawns sharing
+	// an unclipped slice would share a backing array and the second would rewrite
+	// the first child's role -- leaving this process tree with no signer, or two.
+	// The guard used to live in the caller, one function away from the append it
+	// protects, which is how a third caller would have reintroduced it.
+	baseEnv = baseEnv[:len(baseEnv):len(baseEnv)]
+	cmd.Env = append(baseEnv,
+		"PUPPET_CA_ROLE="+role,
+		"PUPPET_CA_DAEMON=1",
+	)
+	cmd.ExtraFiles = []*os.File{sock, pskRead} // fd 3, fd 4
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	if err := cmd.Start(); err != nil {
+		// Both, so the helper owns both descriptors unconditionally. Closing only
+		// the pipe left fd 3 to the caller's defers, which runLauncher does have
+		// -- but that is the split-ownership shape this extraction exists to
+		// remove, and the second caller already got it wrong.
+		pskRead.Close()
+		sock.Close()
+		return nil, fmt.Errorf("starting %s process: %w", role, err)
+	}
+	// Only the child should hold these now. The socketpair end is the
+	// load-bearing one: while the launcher keeps a copy, both endpoints stay
+	// alive, which falsifies the property this whole topology rests on -- that
+	// only the two children hold endpoints -- and stops the signer seeing EOF
+	// when the frontend dies. The PSK pipe's read end is closed for hygiene
+	// rather than correctness: EOF for the child depends on the *write* end,
+	// which pskPipe already closed before returning. An earlier comment here had
+	// that backwards.
+	sock.Close()
+	pskRead.Close()
+	return cmd, nil
+}
+
+// killAndReap signals a started child and waits for it, so a launcher that fails
+// partway through leaves nothing behind. Errors are deliberately ignored: the
+// caller is already returning a failure, and a child that has exited on its own
+// is the outcome this wants anyway.
+func killAndReap(cmd *exec.Cmd) {
+	if cmd == nil || cmd.Process == nil {
+		return
+	}
+	_ = cmd.Process.Kill()
+	_, _ = cmd.Process.Wait()
+}
+
+// pskPipe returns the read end of a pipe pre-loaded with the hex-encoded
+// PSK, ready to be inherited by a child via ExtraFiles. The write end is
+// closed before returning, so the child reads the PSK followed immediately
+// by EOF. The payload (64 bytes) is far below the kernel pipe buffer, so
+// the write cannot block.
+func pskPipe(pskHex string) (*os.File, error) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		return nil, fmt.Errorf("creating PSK pipe: %w", err)
+	}
+	if _, err := w.WriteString(pskHex); err != nil {
+		r.Close()
+		w.Close()
+		return nil, fmt.Errorf("writing PSK to pipe: %w", err)
+	}
+	if err := w.Close(); err != nil {
+		r.Close()
+		return nil, fmt.Errorf("closing PSK pipe write end: %w", err)
+	}
+	return r, nil
 }
 
 // filterEnv returns a copy of env with the named keys removed.

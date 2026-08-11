@@ -352,3 +352,9 @@ signer holds a local key or an OpenBao client.
 `--single-process` disables that isolation (as it does for local keys):
 the one process authenticates to OpenBao and holds the resulting token
 itself.
+
+The launcher passes each child its socketpair end on **fd 3** and the read end of
+a pre-shared-key pipe on **fd 4**, so a wrapper script, systemd unit or process
+supervisor must not leave an inherited descriptor open at either number — see
+[process isolation](ca-key-security.md#process-isolation). This is unchanged by
+OpenBao mode.

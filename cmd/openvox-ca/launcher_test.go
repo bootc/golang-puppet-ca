@@ -1,0 +1,423 @@
+// Copyright (C) 2026 Trevor Vaughan
+// Copyright (C) 2026 Vox Pupuli and contributors
+//
+// This program is free software; you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation; either version 2 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License along
+// with this program; if not, write to the Free Software Foundation, Inc.,
+// 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+
+package main
+
+import (
+	"bytes"
+	"context"
+	"crypto"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"syscall"
+	"testing"
+	"time"
+
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
+
+	"github.com/voxpupuli/openvox-ca/internal/signer"
+)
+
+// pskChildEnv selects child mode when the test binary re-execs itself: the
+// fd-contract specs below spawn real child processes so the ExtraFiles
+// slice position ↔ fd number contract (socketpair on fd 3, PSK pipe on
+// fd 4) is exercised across a genuine exec boundary.
+const pskChildEnv = "OPENVOX_CA_TEST_PSK_CHILD"
+
+func TestMain(m *testing.M) {
+	if role := os.Getenv(pskChildEnv); role != "" {
+		os.Exit(runPSKChild(role))
+	}
+	os.Exit(m.Run())
+}
+
+// runPSKChild is the child side of the fd-contract specs. It uses only the
+// signer package's exported entry points — the same ones the production
+// signer and frontend roles use — so fd recovery, PSK loading, and the
+// mutual handshake all run exactly as they would under the real launcher.
+func runPSKChild(role string) int {
+	switch role {
+	case "signer":
+		key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+		if err := signer.Serve(key); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+		return 0
+	case "frontend":
+		rs, err := signer.Dial(nil)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+		defer rs.Close()
+		digest := sha256.Sum256([]byte("fd-contract"))
+		sig, err := rs.Sign(nil, digest[:], crypto.SHA256)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+		if len(sig) == 0 {
+			fmt.Fprintln(os.Stderr, "empty signature")
+			return 1
+		}
+		fmt.Println("SIGN-OK")
+		return 0
+	default:
+		fmt.Fprintf(os.Stderr, "unknown %s role %q\n", pskChildEnv, role)
+		return 2
+	}
+}
+
+// pskChildCmd builds a re-exec of the test binary in the given child role
+// with the supplied inherited files, capturing combined output.
+func pskChildCmd(ctx context.Context, role string, extraFiles []*os.File, out *bytes.Buffer) *exec.Cmd {
+	cmd := exec.CommandContext(ctx, os.Args[0])
+	cmd.Env = append(os.Environ(), pskChildEnv+"="+role)
+	cmd.ExtraFiles = extraFiles
+	cmd.Stdout = out
+	cmd.Stderr = out
+	return cmd
+}
+
+var _ = Describe("launcher fd contract", func() {
+	// verifies the full cross-process contract end to end: two real child
+	// processes recover the socketpair from fd 3 and the PSK from the fd 4
+	// pipe, complete the mutual handshake, and service a signing RPC.
+	It("delivers the socketpair on fd 3 and the PSK pipe on fd 4", func() {
+		psk := make([]byte, 32)
+		_, err := rand.Read(psk)
+		Expect(err).NotTo(HaveOccurred(), "generating PSK")
+		pskHex := hex.EncodeToString(psk)
+
+		signerSock, frontendSock, err := signer.Socketpair()
+		Expect(err).NotTo(HaveOccurred(), "creating socketpair")
+
+		signerPipe, err := pskPipe(pskHex)
+		Expect(err).NotTo(HaveOccurred(), "creating signer PSK pipe")
+		frontendPipe, err := pskPipe(pskHex)
+		Expect(err).NotTo(HaveOccurred(), "creating frontend PSK pipe")
+
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		DeferCleanup(cancel)
+
+		var signerOut, frontendOut bytes.Buffer
+		signerCmd := pskChildCmd(ctx, "signer", []*os.File{signerSock, signerPipe}, &signerOut)
+		frontendCmd := pskChildCmd(ctx, "frontend", []*os.File{frontendSock, frontendPipe}, &frontendOut)
+
+		// Mirror the launcher: drop the parent's copies of each child's files
+		// immediately after that child starts, so only the children hold the
+		// socketpair ends and pipe read ends.
+		Expect(signerCmd.Start()).To(Succeed(), "starting signer child")
+		// Registered before anything else can fail: a mid-spec failure aborts
+		// the body by panic, so relying on the Wait calls below to reap these
+		// leaves a child running whenever the spec fails -- which is exactly
+		// when it matters. The sibling spec below already does this.
+		DeferCleanup(func() { killAndReap(signerCmd) })
+		signerSock.Close()
+		signerPipe.Close()
+		Expect(frontendCmd.Start()).To(Succeed(), "starting frontend child")
+		DeferCleanup(func() { killAndReap(frontendCmd) })
+		frontendSock.Close()
+		frontendPipe.Close()
+
+		Expect(frontendCmd.Wait()).To(Succeed(), "frontend child failed: %s", frontendOut.String())
+		Expect(frontendOut.String()).To(ContainSubstring("SIGN-OK"),
+			"frontend should obtain a signature over the socketpair")
+		Expect(signerCmd.Wait()).To(Succeed(), "signer child failed: %s", signerOut.String())
+	})
+
+	// verifies the mandatory-handshake failure mode across the exec
+	// boundary: a child whose fd 4 is not the launcher's PSK pipe must fail
+	// closed rather than proceed unauthenticated.
+	//
+	// fd 4 is pinned to /dev/null rather than simply left out of ExtraFiles.
+	// Omitting it does not guarantee the child sees fd 4 closed: exec only
+	// rewrites fds 0-2 and the ExtraFiles range, so any descriptor this test
+	// binary inherited without FD_CLOEXEC from its own parent stays open at
+	// its original number in the child. Under a wrapper that leaks one at
+	// fd 4 (lefthook's pre-push hook does, as do some CI runners) the child
+	// would inherit a foreign pipe, satisfy loadPSK's S_IFIFO check, and then
+	// block or fail with an unrelated read error instead of the fd-contract
+	// message asserted here. A character device is never a FIFO, so this
+	// drives the guard deterministically wherever the suite runs.
+	It("fails closed when fd 4 is not the launcher's PSK pipe", func() {
+		signerSock, frontendSock, err := signer.Socketpair()
+		Expect(err).NotTo(HaveOccurred(), "creating socketpair")
+		// Both ends, registered before anything else can fail: the sibling spec
+		// above makes exactly this argument about itself, and this one relied on
+		// straight-line execution reaching its own Close for the other end.
+		DeferCleanup(func() { _ = signerSock.Close(); _ = frontendSock.Close() })
+
+		notAPipe, err := os.Open(os.DevNull)
+		Expect(err).NotTo(HaveOccurred(), "opening %s", os.DevNull)
+		DeferCleanup(func() { _ = notAPipe.Close() })
+
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		DeferCleanup(cancel)
+
+		var out bytes.Buffer
+		cmd := pskChildCmd(ctx, "frontend", []*os.File{frontendSock, notAPipe}, &out)
+		err = cmd.Run()
+
+		Expect(err).To(HaveOccurred(), "child without a PSK pipe on fd 4 should exit non-zero; output: %s", out.String())
+		Expect(out.String()).To(ContainSubstring("not spawned by the launcher"),
+			"child should report the missing PSK pipe")
+		// Named, because that substring is shared by both fd 4 branches, both fd 3
+		// branches and the read timeout -- so on its own it cannot say which guard
+		// fired, which is the whole claim of the comment above.
+		Expect(out.String()).To(ContainSubstring("fd 4 is not a pipe"))
+	})
+})
+
+// capturePSKPipe replaces spawnChild's pipe constructor for the current spec and
+// returns a handle on whatever it hands back, so a spec can assert the helper
+// closed it. Restored by DeferCleanup.
+//
+// This replaced an fd-slot comparison. That could only ever say "the lowest free
+// descriptor did not move up", which the socketpair close satisfies on its own --
+// so it passed with the PSK pipe leaked, the single thing it was written to
+// catch.
+func capturePSKPipe() func() *os.File {
+	GinkgoHelper()
+	orig := pskPipeFn
+	DeferCleanup(func() { pskPipeFn = orig })
+
+	var captured *os.File
+	pskPipeFn = func(pskHex string) (*os.File, error) {
+		f, err := orig(pskHex)
+		captured = f
+		return f, err
+	}
+	// A getter, because the pipe does not exist until spawnChild runs.
+	return func() *os.File { return captured }
+}
+
+var _ = DescribeTable("filterEnv strips exactly the named keys",
+	// Two call sites now -- the launcher's children and the --daemon re-exec --
+	// and no coverage at all. Swapping the key comparison for a prefix match
+	// would strip every PUPPET_CA_* variable from all three children, silently:
+	// the CA would come up with none of its configuration and the operator would
+	// have nothing pointing at the cause.
+	func(env []string, keys []string, want []string) {
+		Expect(filterEnv(env, keys...)).To(Equal(want))
+	},
+	Entry("removes a named key and keeps the rest",
+		[]string{"A=1", "PUPPET_CA_ROLE=signer", "B=2"},
+		[]string{"PUPPET_CA_ROLE"},
+		[]string{"A=1", "B=2"}),
+	Entry("matches the whole key, not a prefix of it",
+		[]string{"PUPPET_CA_ROLE=signer", "PUPPET_CA_ROLE_EXTRA=x"},
+		[]string{"PUPPET_CA_ROLE"},
+		[]string{"PUPPET_CA_ROLE_EXTRA=x"}),
+	Entry("keeps a value containing an equals sign",
+		[]string{"PUPPET_CA_AUTOSIGN=a=b", "PUPPET_CA_DAEMON=1"},
+		[]string{"PUPPET_CA_DAEMON"},
+		[]string{"PUPPET_CA_AUTOSIGN=a=b"}),
+	Entry("is a no-op when nothing matches",
+		[]string{"A=1"},
+		[]string{"PUPPET_CA_ROLE"},
+		[]string{"A=1"}),
+	Entry("keeps a bare name with no equals sign",
+		[]string{"WEIRD", "PUPPET_CA_ROLE=signer"},
+		[]string{"PUPPET_CA_ROLE"},
+		[]string{"WEIRD"}),
+)
+
+var _ = Describe("spawnChild and its cleanup", func() {
+	// runLauncher itself has no test and cannot easily have one -- it re-execs
+	// this binary twice and then blocks on signal forwarding -- so the two rules
+	// its failure path depends on are pinned on the extracted helpers instead.
+	It("reaps a child rather than only signalling it", func() {
+		// The launcher kills the signer when the frontend fails to start. Kill
+		// alone leaves a zombie for as long as the launcher lives, and the
+		// launcher does not necessarily exit straight away.
+		cmd := exec.Command("/bin/sh", "-c", "sleep 300")
+		Expect(cmd.Start()).To(Succeed())
+		pid := cmd.Process.Pid
+
+		killAndReap(cmd)
+
+		// Signal 0 probes for existence. A reaped child is gone; a zombie would
+		// still be found, because a zombie is still a process table entry owned
+		// by this process.
+		Expect(syscall.Kill(pid, 0)).To(MatchError(syscall.ESRCH),
+			"the child must be waited on, not merely signalled")
+	})
+
+	It("drops the parent's copies of both descriptors once the child holds them", func() {
+		// The success path, which no spec reached: the end-to-end fd-contract spec
+		// re-implements the spawn by hand and so satisfies this invariant itself,
+		// leaving the helper's copy of it unguarded. Deleting the socketpair close
+		// left the whole suite green while the launcher kept both endpoints alive
+		// for its lifetime -- falsifying "only the two children hold endpoints"
+		// and stopping the signer from ever seeing EOF when the frontend dies.
+		psk := make([]byte, 32)
+		_, err := rand.Read(psk)
+		Expect(err).NotTo(HaveOccurred())
+
+		sock, otherEnd, err := signer.Socketpair()
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(func() { _ = otherEnd.Close(); _ = sock.Close() })
+
+		// A child that exits immediately: this spec is about the parent's
+		// descriptors, not about the handshake.
+		exe, err := exec.LookPath("true")
+		Expect(err).NotTo(HaveOccurred())
+
+		// Capture the pipe the helper creates, so its close is asserted directly.
+		// The fd-slot arithmetic this replaces could not tell a leaked pipe from a
+		// closed socket -- the socket close alone satisfied it -- so it passed with
+		// the pipe leaked, which is the one thing it was named for.
+		pipe := capturePSKPipe()
+
+		cmd, err := spawnChild(exe, os.Environ(), "signer", sock, hex.EncodeToString(psk))
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(func() { killAndReap(cmd) })
+
+		// The fd contract itself: position in ExtraFiles *is* the descriptor
+		// number, and nothing asserted the slice the helper builds -- the
+		// end-to-end spec hand-rolls its own. Swapping the two entries, or
+		// dropping the pipe, left the whole suite green and produced a CA whose
+		// children both refuse to start.
+		Expect(cmd.ExtraFiles).To(HaveLen(2), "both descriptors must be handed over")
+		Expect(cmd.ExtraFiles[signer.InheritedFD-3]).To(BeIdenticalTo(sock),
+			"the socketpair end belongs on fd 3")
+		Expect(cmd.ExtraFiles[signer.PSKFD-3]).To(BeIdenticalTo(pipe()),
+			"the PSK pipe belongs on fd 4")
+
+		// Two descriptors handed over, two closed. A second Close on an *os.File
+		// returns ErrClosed rather than closing a recycled fd, so this is a safe
+		// probe -- and it returns nil if the helper skipped the close.
+		Expect(sock.Close()).To(MatchError(os.ErrClosed),
+			"the socketpair end must already be closed by the helper")
+		Expect(pipe().Close()).To(MatchError(os.ErrClosed),
+			"and so must the PSK pipe's read end")
+
+		// The role and daemon markers the children depend on. Dropping
+		// PUPPET_CA_DAEMON=1 makes each child re-daemonise under --daemon (the
+		// launcher strips the variable from baseEnv but forwards the operator's
+		// own --daemon flag), print "started in background", and exit 0 -- so the
+		// CA never starts, and no other spec notices.
+		Expect(cmd.Env).To(ContainElement("PUPPET_CA_ROLE=signer"))
+		Expect(cmd.Env).To(ContainElement("PUPPET_CA_DAEMON=1"))
+	})
+
+	It("does not let one child's role overwrite the other's", func() {
+		// The anti-aliasing clip. filterEnv returns spare capacity whenever it
+		// stripped anything, so two appends onto an unclipped slice share a
+		// backing array and the second child's role lands in the first child's
+		// env -- leaving this process tree with no signer, or two. Every other
+		// spec passes os.Environ(), which has len == cap, so the clip is a no-op
+		// there and could be deleted unnoticed.
+		psk := make([]byte, 32)
+		_, err := rand.Read(psk)
+		Expect(err).NotTo(HaveOccurred())
+		exe, err := exec.LookPath("true")
+		Expect(err).NotTo(HaveOccurred())
+
+		// Room for exactly the two variables spawnChild appends: with less, the
+		// append reallocates and the two children cannot share an array, so the
+		// fixture would prove nothing.
+		shared := filterEnv(
+			[]string{"A=1", "B=2", "PUPPET_CA_ROLE=stale", "PUPPET_CA_DAEMON=stale"},
+			"PUPPET_CA_ROLE", "PUPPET_CA_DAEMON")
+		Expect(cap(shared)-len(shared)).To(Equal(2), "the fixture needs room for both appends")
+
+		first, second, err := signer.Socketpair()
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(func() { _ = first.Close(); _ = second.Close() })
+
+		signerCmd, err := spawnChild(exe, shared, "signer", first, hex.EncodeToString(psk))
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(func() { killAndReap(signerCmd) })
+		frontendCmd, err := spawnChild(exe, shared, "frontend", second, hex.EncodeToString(psk))
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(func() { killAndReap(frontendCmd) })
+
+		Expect(signerCmd.Env).To(ContainElement("PUPPET_CA_ROLE=signer"),
+			"the second spawn must not have rewritten the first child's role")
+		Expect(frontendCmd.Env).To(ContainElement("PUPPET_CA_ROLE=frontend"))
+	})
+
+	It("is safe on a child that was never started", func() {
+		// The frontend-failure path calls this with whatever the signer spawn
+		// returned, and a spawn that failed before Start returns a nil Cmd.
+		killAndReap(nil)
+		killAndReap(&exec.Cmd{})
+	})
+
+	It("does not leak a PSK pipe when the child cannot start", func() {
+		// A pipe is created before the fork, so a Start that fails owns the only
+		// remaining reference to it. Leaking one per attempt is a descriptor
+		// leak in the one code path an operator hits repeatedly: a launcher
+		// crash-looping because the binary cannot exec.
+		psk := make([]byte, 32)
+		_, err := rand.Read(psk)
+		Expect(err).NotTo(HaveOccurred())
+
+		sock, otherEnd, err := signer.Socketpair()
+		Expect(err).NotTo(HaveOccurred())
+		// Both ends: spawnChild closes sock on the failure path now, and a second
+		// Close on an os.File is a no-op rather than a close of a reused fd.
+		DeferCleanup(func() { _ = otherEnd.Close(); _ = sock.Close() })
+
+		pipe := capturePSKPipe()
+		cmd, err := spawnChild(filepath.Join(GinkgoT().TempDir(), "does-not-exist"),
+			os.Environ(), "signer", sock, hex.EncodeToString(psk))
+		Expect(err).To(HaveOccurred(), "a missing executable must not start")
+		Expect(cmd).To(BeNil())
+		Expect(pipe().Close()).To(MatchError(os.ErrClosed),
+			"a pipe created for a child that never started must not be leaked")
+		Expect(sock.Close()).To(MatchError(os.ErrClosed),
+			"and the helper owns the socketpair end on this path too")
+	})
+})
+
+var _ = Describe("pskPipe", func() {
+	// verifies the returned read end yields exactly the hex PSK followed by
+	// EOF, which is what a child's parsePSK relies on to drain the pipe.
+	It("delivers the PSK followed by EOF", func() {
+		psk := make([]byte, 32)
+		_, err := rand.Read(psk)
+		Expect(err).NotTo(HaveOccurred(), "generating PSK")
+		pskHex := hex.EncodeToString(psk)
+
+		r, err := pskPipe(pskHex)
+		Expect(err).NotTo(HaveOccurred(), "pskPipe")
+		DeferCleanup(func() { _ = r.Close() })
+
+		// ReadAll only returns once the write end is closed, so this also
+		// proves pskPipe closed it before returning.
+		data, err := io.ReadAll(r)
+		Expect(err).NotTo(HaveOccurred(), "reading PSK pipe")
+		Expect(string(data)).To(Equal(pskHex), "pipe contents should be the hex PSK")
+	})
+})

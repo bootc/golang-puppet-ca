@@ -1,8 +1,55 @@
 # CA key security
 
-This page covers how the CA private key is protected at rest, the options for
-moving key custody off the CA host entirely, and the detective control that
-watches for anomalous destructive operations.
+This page covers how the CA private key is protected while the CA is running and
+at rest, the options for moving key custody off the CA host entirely, and the
+detective control that watches for anomalous destructive operations.
+
+## Process isolation
+
+By default `openvox-ca` runs as three processes, and **only one of them ever
+loads the CA private key**:
+
+| Process | Holds the key | Listens on the network |
+| --- | --- | --- |
+| launcher | no | no |
+| `openvox-ca [signer]` | yes | no |
+| `openvox-ca [frontend]` | no | yes |
+
+The frontend serves every API request and never has the key in its address
+space; when it needs a signature it sends the digest to the signer over a
+pre-connected Unix socketpair and gets the signature back. So a memory-disclosure
+bug in the HTTP layer — the part exposed to agents — cannot leak the key, because
+the key is not there to leak. `--single-process` collapses all three into one and
+gives that up; it exists for containers and debugging.
+
+The two children inherit two file descriptors from the launcher:
+
+| Descriptor | Contents |
+| --- | --- |
+| fd 3 | this child's end of the socketpair |
+| fd 4 | read end of a pipe holding a per-start pre-shared key |
+
+Before the first signing call the two ends run a **mutual** challenge-response
+over that pre-shared key: each proves knowledge of it to the other, with distinct
+domain-separation labels per direction. A process that somehow obtained a leaked
+socketpair descriptor can impersonate neither side, and a child whose fd 4 is not
+the launcher's pipe refuses to start rather than proceeding unauthenticated.
+
+> **The pre-shared key travels over a pipe, not the environment.** A process's
+> exec-time environment stays readable at `/proc/<pid>/environ` for its whole
+> lifetime — `os.Unsetenv` only mutates the process's own copy — and is captured
+> verbatim by crash-dump tooling such as `systemd-coredump`. A pipe is consumed
+> once and leaves no such residue.
+>
+> **Do not run a role process by hand with a descriptor open at fd 3 or fd 4.**
+> The launcher replaces both numbers in the children it spawns, so a descriptor
+> your supervisor or wrapper script leaks is harmless in the default topology. It
+> matters when you set `PUPPET_CA_ROLE` yourself: `execve` preserves every
+> descriptor not marked close-on-exec, so whatever your shell left at fd 4 is what
+> the process finds there. A descriptor that is not a pipe is refused immediately.
+> A *pipe* cannot be told from the launcher's by inspection, so it gets ten
+> seconds to produce a valid pre-shared key before the process gives up and says
+> so — and fails at once if it is already at end-of-file or carries anything else.
 
 ## CA key encryption at rest
 

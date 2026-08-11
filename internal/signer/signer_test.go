@@ -18,39 +18,28 @@
 package signer
 
 import (
+	"bytes"
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/rpc"
 	"os"
+	"strings"
 	"sync"
 	"syscall"
+	"testing/iotest"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
-
-// setPSKEnv sets the PSK environment variable for the duration of the current
-// spec, restoring its prior value (set or unset) via DeferCleanup. It replaces
-// the upstream tests' use of t.Setenv, which is unavailable inside Ginkgo
-// nodes.
-func setPSKEnv(value string) {
-	prev, had := os.LookupEnv(pskEnvVar)
-	Expect(os.Setenv(pskEnvVar, value)).To(Succeed())
-	DeferCleanup(func() {
-		if had {
-			Expect(os.Setenv(pskEnvVar, prev)).To(Succeed())
-		} else {
-			Expect(os.Unsetenv(pskEnvVar)).To(Succeed())
-		}
-	})
-}
 
 var _ = Describe("RemoteSigner over RPC", func() {
 	// verifies that a signing request can be sent over an RPC connection and
@@ -172,7 +161,9 @@ var _ = Describe("PSK handshake", func() {
 		Expect(<-errCh).NotTo(HaveOccurred(), "server handshake")
 	})
 
-	// verifies the handshake fails with mismatched PSKs.
+	// verifies the handshake fails on both sides with mismatched PSKs: the
+	// server rejects the frontend's proof, and the client consequently never
+	// receives a valid counter-proof.
 	It("fails with mismatched PSKs", func() {
 		serverPSK := make([]byte, 32)
 		clientPSK := make([]byte, 32)
@@ -185,14 +176,102 @@ var _ = Describe("PSK handshake", func() {
 
 		errCh := make(chan error, 1)
 		go func() {
-			errCh <- serverHandshake(serverConn, serverPSK)
+			err := serverHandshake(serverConn, serverPSK)
+			if err != nil {
+				// Close so the client's read of the never-sent counter-proof
+				// fails instead of blocking forever.
+				serverConn.Close()
+			}
+			errCh <- err
 		}()
 
-		// Client uses a different PSK; handshake should complete on client side
-		// but server should reject.
-		_ = clientHandshake(clientConn, clientPSK)
+		Expect(clientHandshake(clientConn, clientPSK)).To(
+			MatchError(ContainSubstring("reading signer proof")),
+			"client should fail once the server aborts")
+		Expect(<-errCh).To(
+			MatchError(ContainSubstring("frontend proof mismatch")),
+			"server should reject the mismatched frontend proof")
+	})
 
-		Expect(<-errCh).To(HaveOccurred(), "server handshake should have failed with wrong PSK")
+	// verifies the frontend rejects an endpoint that holds the socketpair but
+	// not the PSK — the impostor-signer case the mutual handshake exists to
+	// prevent.
+	It("rejects a signer that cannot prove knowledge of the PSK", func() {
+		psk := make([]byte, 32)
+		rand.Read(psk)
+
+		serverConn, clientConn := net.Pipe()
+		DeferCleanup(serverConn.Close)
+		DeferCleanup(clientConn.Close)
+
+		// Impostor signer: follows the message flow but forges the proof.
+		go func() {
+			defer GinkgoRecover()
+			// Closed on the way out: without it, a failing Expect in here unwinds
+			// this goroutine and leaves the spec body blocked for ever in
+			// clientHandshake's ReadFull, so the suite wedges to Ginkgo's default
+			// timeout instead of reporting. The mismatched-PSK spec above already
+			// does this.
+			defer serverConn.Close()
+			nonce := make([]byte, 32)
+			rand.Read(nonce)
+			_, err := serverConn.Write(nonce)
+			Expect(err).NotTo(HaveOccurred(), "impostor sending nonce")
+			buf := make([]byte, 32+sha256.Size)
+			_, err = io.ReadFull(serverConn, buf)
+			Expect(err).NotTo(HaveOccurred(), "impostor reading frontend flight")
+			forged := make([]byte, sha256.Size)
+			rand.Read(forged)
+			_, err = serverConn.Write(forged)
+			Expect(err).NotTo(HaveOccurred(), "impostor sending forged proof")
+		}()
+
+		Expect(clientHandshake(clientConn, psk)).To(
+			MatchError(ContainSubstring("signer proof mismatch")),
+			"client should reject a forged signer proof")
+	})
+
+	// verifies the property that makes the handshake *mutual* rather than merely
+	// two-way: the two directions are domain-separated, so a proof valid in one
+	// direction is not valid in the other.
+	//
+	// The impostor spec above cannot show this. It forges a random proof, which an
+	// HMAC comparison rejects whether or not the labels differ. Unify the two
+	// labels and every other spec in this suite still passes -- while an attacker
+	// holding a leaked socketpair descriptor and no PSK at all can impersonate the
+	// signer by *reflecting* the frontend's own proof straight back, and the
+	// frontend then hands CSR digests to it and accepts whatever comes back as a
+	// CA signature.
+	It("rejects a signer that reflects the frontend's own proof back", func() {
+		psk := make([]byte, pskLen)
+		_, err := rand.Read(psk)
+		Expect(err).NotTo(HaveOccurred())
+
+		serverConn, clientConn := net.Pipe()
+		DeferCleanup(serverConn.Close)
+		DeferCleanup(clientConn.Close)
+
+		go func() {
+			defer GinkgoRecover()
+			defer serverConn.Close()
+			nonce := make([]byte, nonceLen)
+			_, err := rand.Read(nonce)
+			Expect(err).NotTo(HaveOccurred())
+			_, err = serverConn.Write(nonce)
+			Expect(err).NotTo(HaveOccurred(), "impostor sending nonce")
+
+			buf := make([]byte, nonceLen+sha256.Size)
+			_, err = io.ReadFull(serverConn, buf)
+			Expect(err).NotTo(HaveOccurred(), "impostor reading frontend flight")
+
+			// No PSK needed: echo the frontend's proof rather than forging one.
+			_, err = serverConn.Write(buf[nonceLen:])
+			Expect(err).NotTo(HaveOccurred(), "impostor reflecting the proof")
+		}()
+
+		Expect(clientHandshake(clientConn, psk)).To(
+			MatchError(ContainSubstring("signer proof mismatch")),
+			"a reflected proof must not authenticate the signer")
 	})
 
 	// verifies signing works after a successful PSK handshake.
@@ -219,10 +298,10 @@ var _ = Describe("PSK handshake", func() {
 			srv.ServeConn(serverConn)
 		}()
 
-		// Client side: handshake then create RemoteSigner.
-		setPSKEnv(pskHex)
-		loadedPSK, err := loadPSK()
-		Expect(err).NotTo(HaveOccurred(), "loadPSK")
+		// Client side: parse the PSK as the frontend would, handshake, then
+		// create a RemoteSigner.
+		loadedPSK, err := parsePSK(strings.NewReader(pskHex))
+		Expect(err).NotTo(HaveOccurred(), "parsePSK")
 		Expect(clientHandshake(clientConn, loadedPSK)).To(Succeed(), "client handshake")
 
 		rs := &RemoteSigner{
@@ -238,42 +317,67 @@ var _ = Describe("PSK handshake", func() {
 	})
 })
 
-var _ = Describe("loadPSK", func() {
-	// verifies loadPSK returns nil when env var is unset.
-	It("returns nil when the env var is empty", func() {
-		setPSKEnv("")
-		psk, err := loadPSK()
-		Expect(err).NotTo(HaveOccurred(), "unexpected error")
-		Expect(psk).To(BeNil(), "expected nil PSK when env var is empty")
-	})
-
-	// verifies loadPSK rejects non-hex values.
-	It("rejects non-hex values", func() {
-		setPSKEnv("not-hex-data")
-		_, err := loadPSK()
-		Expect(err).To(HaveOccurred(), "expected error for invalid hex PSK")
-	})
-
-	// verifies loadPSK rejects PSKs of wrong length.
-	It("rejects PSKs of wrong length", func() {
-		setPSKEnv(hex.EncodeToString([]byte("short")))
-		_, err := loadPSK()
-		Expect(err).To(HaveOccurred(), "expected error for wrong-length PSK")
-	})
-
-	// verifies loadPSK removes the env var after reading.
-	It("clears the env var after reading", func() {
+var _ = Describe("parsePSK", func() {
+	// verifies parsePSK drains a pre-loaded pipe to EOF, matching how the
+	// launcher delivers the PSK to a child on fd 4.
+	It("reads a PSK from a pre-loaded pipe", func() {
 		psk := make([]byte, 32)
 		rand.Read(psk)
-		// Note: loadPSK calls os.Unsetenv, so setPSKEnv's restore must not
-		// reintroduce the value; it saves the prior (unset) state and restores
-		// that, matching the upstream test's os.Setenv + t.Cleanup(os.Unsetenv).
-		setPSKEnv(hex.EncodeToString(psk))
 
-		_, err := loadPSK()
-		Expect(err).NotTo(HaveOccurred(), "unexpected error")
-		// After loadPSK, the env var should be cleared.
-		Expect(os.Getenv(pskEnvVar)).To(Equal(""), "env var should be cleared after loadPSK")
+		r, w, err := os.Pipe()
+		Expect(err).NotTo(HaveOccurred(), "creating pipe")
+		DeferCleanup(func() { _ = r.Close() })
+		_, err = w.WriteString(hex.EncodeToString(psk))
+		Expect(err).NotTo(HaveOccurred(), "writing PSK to pipe")
+		Expect(w.Close()).To(Succeed(), "closing pipe write end")
+
+		parsed, err := parsePSK(r)
+		Expect(err).NotTo(HaveOccurred(), "parsePSK")
+		Expect(parsed).To(Equal(psk), "parsed PSK should round-trip")
+	})
+
+	// verifies parsePSK rejects an empty stream via the length check: the
+	// handshake is mandatory, so a missing PSK must be an error rather than
+	// a silent downgrade.
+	It("rejects an empty stream", func() {
+		_, err := parsePSK(strings.NewReader(""))
+		Expect(err).To(MatchError(ContainSubstring("PSK must be 32 bytes, got 0")),
+			"empty stream should fail the length check")
+	})
+
+	// verifies parsePSK rejects non-hex values via the hex decoder.
+	It("rejects non-hex values", func() {
+		_, err := parsePSK(strings.NewReader("not-hex-data"))
+		Expect(err).To(MatchError(ContainSubstring("decoding PSK")),
+			"non-hex input should fail hex decoding")
+	})
+
+	// verifies parsePSK rejects a well-formed but short PSK via the length
+	// check.
+	It("rejects PSKs of wrong length", func() {
+		_, err := parsePSK(strings.NewReader(hex.EncodeToString([]byte("short"))))
+		Expect(err).To(MatchError(ContainSubstring("PSK must be 32 bytes, got 5")),
+			"short PSK should fail the length check")
+	})
+
+	// verifies parsePSK rejects trailing garbage after a valid PSK rather
+	// than silently truncating it. The one-byte read overshoot makes the
+	// input an odd-length hex string, so this surfaces as a decode error —
+	// never as the length check.
+	It("rejects trailing garbage", func() {
+		psk := make([]byte, 32)
+		rand.Read(psk)
+		_, err := parsePSK(strings.NewReader(hex.EncodeToString(psk) + "\n"))
+		Expect(err).To(MatchError(ContainSubstring("decoding PSK")),
+			"trailing bytes should surface as an odd-length hex decode error")
+	})
+
+	// verifies parsePSK propagates reader failures, covering the read-error
+	// branch distinctly from the validation branches.
+	It("propagates read errors", func() {
+		readErr := errors.New("pipe exploded")
+		_, err := parsePSK(iotest.ErrReader(readErr))
+		Expect(err).To(MatchError(readErr), "reader failure should propagate unwrapped")
 	})
 })
 
@@ -347,5 +451,211 @@ var _ = Describe("awaitShutdown", func() {
 		}
 
 		Expect(closer.Closed()).To(BeTrue(), "connection was not closed after signal; ServeConn would block forever")
+	})
+})
+
+var _ = Describe("handshake nonce freshness", func() {
+	// The table below pins that all three inputs are *bound* into the MAC, but it
+	// works on fixed fixtures, so it says nothing about what goes on the wire.
+	// Leave the server nonce as 32 zero bytes and every spec in the suite stays
+	// green -- both sides derive from the same value -- while the signer's
+	// challenge becomes a constant and a recorded frontend flight replays.
+	It("sends a different challenge on every handshake", func() {
+		psk := make([]byte, pskLen)
+		_, err := rand.Read(psk)
+		Expect(err).NotTo(HaveOccurred())
+
+		nonceOf := func() []byte {
+			GinkgoHelper()
+			serverConn, clientConn := net.Pipe()
+			DeferCleanup(serverConn.Close)
+			DeferCleanup(clientConn.Close)
+
+			go func() {
+				defer GinkgoRecover()
+				defer serverConn.Close()
+				_ = serverHandshake(serverConn, psk)
+			}()
+
+			nonce := make([]byte, nonceLen)
+			_, err := io.ReadFull(clientConn, nonce)
+			Expect(err).NotTo(HaveOccurred())
+			return nonce
+		}
+
+		first, second := nonceOf(), nonceOf()
+		Expect(first).NotTo(Equal(bytes.Repeat([]byte{0}, nonceLen)),
+			"a constant challenge makes the frontend's proof replayable")
+		Expect(first).NotTo(Equal(second), "each handshake must challenge freshly")
+	})
+})
+
+var _ = DescribeTable("every handshake proof input is bound into the MAC",
+	// The labels were unpinned until a reflection spec caught them; the nonces are
+	// in the same position. Dropping either mac.Write leaves every handshake spec
+	// green -- both sides compute proofs the same way, so success and mismatch are
+	// unaffected, and the reflection spec still passes because the *labels* still
+	// differ. The comment claims each proof is unique to its run; this holds it.
+	func(mutate func(label, serverNonce, clientNonce []byte) ([]byte, []byte, []byte)) {
+		psk := make([]byte, pskLen)
+		_, err := rand.Read(psk)
+		Expect(err).NotTo(HaveOccurred())
+		serverNonce := bytes.Repeat([]byte{0xA1}, nonceLen)
+		clientNonce := bytes.Repeat([]byte{0xB2}, nonceLen)
+
+		base := handshakeProof(psk, signerProofLabel, serverNonce, clientNonce)
+		label, sn, cn := mutate(signerProofLabel, serverNonce, clientNonce)
+		Expect(handshakeProof(psk, label, sn, cn)).NotTo(Equal(base))
+	},
+	Entry("the label", func(l, sn, cn []byte) ([]byte, []byte, []byte) {
+		return frontendProofLabel, sn, cn
+	}),
+	Entry("the server nonce", func(l, sn, cn []byte) ([]byte, []byte, []byte) {
+		return l, bytes.Repeat([]byte{0xC3}, nonceLen), cn
+	}),
+	Entry("the client nonce", func(l, sn, cn []byte) ([]byte, []byte, []byte) {
+		return l, sn, bytes.Repeat([]byte{0xD4}, nonceLen)
+	}),
+)
+
+var _ = Describe("PSK read timeout", func() {
+	// blockingPipe returns a pipe whose read end is blocking, as an inherited fd 4
+	// is: os.Pipe hands back a non-blocking read end, and Fd() -- which
+	// exec.Cmd.Start calls on every ExtraFiles entry -- clears the flag on the open
+	// file description the child shares.
+	//
+	// It is not a complete stand-in. This file stays registered with the runtime
+	// poller (os.Pipe built it as a pipe, and Fd only clears the flag), whereas the
+	// child's os.NewFile on an already-blocking descriptor is not pollable at all.
+	// That difference is exactly what made a read deadline appear to work here and
+	// fail in production -- which is why the bound is a timer now, and why this
+	// spec no longer depends on the distinction.
+	blockingPipe := func() (*os.File, *os.File) {
+		GinkgoHelper()
+		r, w, err := os.Pipe()
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(func() { _ = r.Close(); _ = w.Close() })
+		_ = r.Fd()
+		return r, w
+	}
+
+	It("gives up on a pipe nobody writes to, and says why", func() {
+		// A foreign FIFO at fd 4 whose write end is held open by an unrelated
+		// process satisfies checkPSKFD and then never reaches EOF, and
+		// io.LimitReader does not shorten a blocking read -- it only synthesises
+		// EOF once its own budget is spent. Unbounded, the signer hangs before it
+		// has logged anything: a wedged start with no diagnosis at all.
+		r, _ := blockingPipe()
+
+		done := make(chan error, 1)
+		go func() {
+			_, readErr := readPSK(r, 100*time.Millisecond)
+			done <- readErr
+		}()
+
+		var readErr error
+		Eventually(done, 5*time.Second).Should(Receive(&readErr),
+			"the read must not block for ever on a pipe whose write end is open")
+		Expect(readErr).To(MatchError(ContainSubstring("not spawned by the launcher")),
+			"a timeout must report the fd contract, not a bare deadline error")
+	})
+
+	It("still reads a PSK that is already there", func() {
+		// The companion: a bound that rejected everything would satisfy the
+		// assertion above just as well. Same blocking provenance, and the write
+		// end is closed before the read, exactly as the launcher does it.
+		psk := make([]byte, pskLen)
+		_, err := rand.Read(psk)
+		Expect(err).NotTo(HaveOccurred())
+
+		r, w := blockingPipe()
+		_, err = w.WriteString(hex.EncodeToString(psk))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(w.Close()).To(Succeed())
+
+		got, err := readPSK(r, 10*time.Second)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(got).To(Equal(psk))
+	})
+})
+
+var _ = Describe("socketpair descriptor check", func() {
+	// The sibling of the fd 4 check. Without it fd 3 was wrapped, converted and
+	// closed unexamined, so a role process started by hand -- with a wrapper's
+	// descriptor or its own log file at fd 3, which the lowest-available-fd rule
+	// makes likely -- had that descriptor closed out from under it, and reported a
+	// getsockopt error naming neither the launcher nor the contract.
+	It("refuses a descriptor that is not a socket", func() {
+		f, err := os.Open(os.DevNull)
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(func() { _ = f.Close() })
+
+		err = checkSocketFD(int(f.Fd()))
+		Expect(err).To(MatchError(ContainSubstring("is not a socket")))
+		Expect(err).To(MatchError(ContainSubstring("not spawned by the launcher")))
+	})
+
+	It("refuses a descriptor that was never open", func() {
+		err := checkSocketFD(900)
+		Expect(err).To(MatchError(ContainSubstring("unavailable")))
+		Expect(err).To(MatchError(ContainSubstring("not spawned by the launcher")))
+	})
+
+	It("accepts a socketpair end", func() {
+		a, b, err := Socketpair()
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(func() { _ = a.Close(); _ = b.Close() })
+
+		Expect(checkSocketFD(int(a.Fd()))).To(Succeed())
+	})
+
+	It("leaves a descriptor it refuses open", func() {
+		// The point of checking before wrapping: a descriptor whose provenance was
+		// not established must not be consumed. connFromFD closes only after
+		// net.FileConn has succeeded.
+		f, err := os.Open(os.DevNull)
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(func() { _ = f.Close() })
+
+		_, err = connFromFD(int(f.Fd()))
+		Expect(err).To(HaveOccurred())
+		Expect(f.Close()).To(Succeed(),
+			"the descriptor must still be open for us to close")
+	})
+})
+
+var _ = Describe("PSK descriptor check", func() {
+	// loadPSK has two independent fail-closed branches, and the end-to-end spec
+	// in cmd/openvox-ca covers only the second: it hands the child /dev/null,
+	// which is open but not a FIFO. The first -- fd 4 not open at all -- is what
+	// an operator running the signer role by hand hits, and it cannot be reached
+	// through a child process at all, because closing fd 4 there frees the slot
+	// for the runtime to reuse and the check then sees whatever took it.
+	It("refuses a descriptor that was never open", func() {
+		// Far above anything this process has opened, so Fstat gives EBADF.
+		const neverOpened = 900
+		err := checkPSKFD(neverOpened)
+		Expect(err).To(MatchError(ContainSubstring("unavailable")))
+		Expect(err).To(MatchError(ContainSubstring("not spawned by the launcher")))
+	})
+
+	It("refuses a descriptor that is open but not a pipe", func() {
+		f, err := os.Open(os.DevNull)
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(func() { _ = f.Close() })
+
+		err = checkPSKFD(int(f.Fd()))
+		Expect(err).To(MatchError(ContainSubstring("is not a pipe")))
+		Expect(err).To(MatchError(ContainSubstring("not spawned by the launcher")))
+	})
+
+	It("accepts a pipe", func() {
+		// The companion both refusals need: a check that rejected everything
+		// would satisfy them just as well.
+		r, w, err := os.Pipe()
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(func() { _ = r.Close(); _ = w.Close() })
+
+		Expect(checkPSKFD(int(r.Fd()))).To(Succeed())
 	})
 })
