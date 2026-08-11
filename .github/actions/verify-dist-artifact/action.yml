@@ -1,0 +1,60 @@
+name: Verify dist artifact
+description: >
+  Verifies one built dist tarball, shared by CI's dist job and the Release
+  workflow's build job so the artefacts actually published get the same
+  checks as the PR rehearsals: the artefact named for the internal/version
+  constant exists under dist/, both binaries execute and report that version,
+  and FIPS variants embed boringcrypto build info. Requires the repository to
+  be checked out, a Go toolchain on PATH (for `go version -m`), and a runner
+  native to the variant's architecture.
+
+inputs:
+  variant:
+    description: "Variant short name, e.g. linux_arm64_fips"
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Verify artifact
+      # Assert the expected artefact rather than just exit-zero: naming
+      # drift against the internal/version constant should fail here. The
+      # sed parse matches the one in verify-release-tag's version gate.
+      #
+      # shell: bash runs with pipefail, so a binary that prints the expected
+      # --version line but exits non-zero still fails the piped greps below.
+      shell: bash
+      env:
+        VARIANT: ${{ inputs.variant }}
+      run: |
+        ver="$(sed -n 's/^const Version = "\(.*\)"$/\1/p' internal/version/version.go)"
+        if [ -z "$ver" ]; then
+          echo "::error::Could not parse the Version constant from internal/version/version.go"
+          exit 1
+        fi
+        tarball="dist/openvox-ca_${ver}_${VARIANT}.tar.gz"
+        if [ ! -f "$tarball" ]; then
+          echo "::error::Expected artefact $tarball is missing"
+          exit 1
+        fi
+        tar xzf "$tarball" -C "$RUNNER_TEMP"
+        "$RUNNER_TEMP/openvox-ca" --version | grep -F "openvox-ca version $ver"
+        "$RUNNER_TEMP/openvox-ca-ctl" --version | grep -F "openvox-ca-ctl version $ver"
+        # The _fips artefacts must really be boringcrypto builds: fipsEnv in
+        # the magefile is the only thing setting GOEXPERIMENT for dist, so a
+        # regression there would otherwise ship standard-crypto binaries
+        # under a FIPS label. FIPS-ness is derived from the variant name
+        # rather than taken as an input, so there is no hand-maintained flag
+        # to drift; the suffix-implies-boringcrypto invariant is pinned by
+        # the distVariants spec in magefile_test.go. (grep without -q:
+        # reading all input avoids a SIGPIPE race under pipefail.)
+        case "$VARIANT" in
+          *_fips)
+            for bin in openvox-ca openvox-ca-ctl; do
+              if ! go version -m "$RUNNER_TEMP/$bin" | grep boringcrypto > /dev/null; then
+                echo "::error::${VARIANT}/${bin} is not a boringcrypto build"
+                exit 1
+              fi
+            done
+            ;;
+        esac

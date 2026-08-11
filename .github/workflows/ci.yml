@@ -32,6 +32,11 @@ jobs:
         run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2
       - name: Check formatting, vet, module tidy, and lint
         run: mage dev:check
+      - name: Magefile tests
+        # The magefile is build-tagged, so its Ginkgo suite is invisible to
+        # the ordinary `go test ./...` run; test:magefile is the canonical
+        # invocation, shared with the pre-push hook.
+        run: mage test:magefile
 
   # -- Dockerfile lint (hadolint) ----------------------------------------------
   # Lints every Dockerfile in the repo. hadolint has no auto-fix mode (it only
@@ -95,6 +100,63 @@ jobs:
             go tool cover -func=coverage.out
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # -- Release artefact build --------------------------------------------------
+  # Builds each dist tarball exactly as the Release workflow does — one
+  # variant per job, on a runner native to the target architecture (so the
+  # cgo/boringcrypto FIPS variants need no cross toolchain and every built
+  # binary can be executed for verification) — and discards the output.
+  # Without these legs, that build path would first run when a release tag is
+  # pushed, turning any breakage into a delete-tag/fix/retag cycle.
+  dist:
+    name: Release artefact build (${{ matrix.variant }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: linux_amd64
+            runner: ubuntu-latest
+          - variant: linux_arm64
+            runner: ubuntu-24.04-arm
+          - variant: linux_amd64_fips
+            runner: ubuntu-latest
+          - variant: linux_arm64_fips
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          # setup-go's cache is keyed only on go.sum, and that key is claimed
+          # by whichever job saves it first — none of whose build caches
+          # match this variant's build configuration. Use a per-variant cache
+          # below instead, shared with release.yml.
+          cache: false
+      - name: Go caches (${{ matrix.variant }})
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          # Unique key per commit so every run saves its updated cache;
+          # restore-keys fall back to the most recent cache for this variant.
+          # Caches saved on main are visible to all refs, including release
+          # tags.
+          key: dist-gocache-${{ matrix.variant }}-${{ hashFiles('go.mod', 'go.sum') }}-${{ github.sha }}
+          restore-keys: |
+            dist-gocache-${{ matrix.variant }}-${{ hashFiles('go.mod', 'go.sum') }}-
+            dist-gocache-${{ matrix.variant }}-
+      - name: Install Mage
+        run: go install github.com/magefile/mage@v1.17.2
+      - name: Build release artifact
+        run: mage build:distVariant ${{ matrix.variant }}
+      - name: Verify artifact
+        # Shared with the Release workflow's build job, so the artefacts that
+        # actually get published receive the same verification as PR builds.
+        uses: ./.github/actions/verify-dist-artifact
+        with:
+          variant: ${{ matrix.variant }}
 
   # -- Puppet stack integration tests ------------------------------------------
   # Runs the full OpenVox 8 stack: Go CA (TLS) → OpenVox Server (WEBrick) →
@@ -301,6 +363,7 @@ jobs:
       - hadolint
       - markdownlint
       - unit
+      - dist
       - puppet
       - migration
       - backends-redis

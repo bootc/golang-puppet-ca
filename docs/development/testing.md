@@ -11,6 +11,9 @@ For build/lint conventions and the full `mage` target list, see
 # Run all unit tests
 mage test:unit
 
+# Run the magefile's own suite (build-tagged; not covered by `go test ./...`)
+mage test:magefile
+
 # Format, vet, tidy modules, and lint (the CI gate)
 mage dev:check
 

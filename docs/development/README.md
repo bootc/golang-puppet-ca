@@ -18,3 +18,4 @@ style).
 | [Locking and concurrency](locking.md) | The three locking tiers, lock names and ordering, read-path policy, and rules for new code |
 | [Inventory store](inventory-store.md) | Internal design of the structured (`InventoryStore`) inventory capability |
 | [Publishing container images](publishing-images.md) | The GHCR publishing workflow and one-time repository setup |
+| [Cutting a release](releasing.md) | Tagging a release, what the automation publishes, release notes, and rehearsing on a fork |

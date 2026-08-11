@@ -7,7 +7,10 @@
 #
 # Hooks degrade gracefully: if a tool is missing the command prints a SKIP
 # notice and exits 0 rather than blocking the commit/push. Run the same checks
-# manually via `mage dev:check` (lint) and `go test ./...`.
+# manually via `mage dev:check` (lint), `go test ./...`, and
+# `mage test:magefile` (the build-tagged magefile suite); the pre-push hook
+# additionally refuses v* tags that do not match internal/version (see
+# .lefthook/pre-push/verify-tags.sh).
 
 pre-commit:
   parallel: false
@@ -32,6 +35,15 @@ pre-commit:
 
 pre-push:
   parallel: false
+  # verify-tags.sh (in .lefthook/pre-push/) is a script rather than a command:
+  # lefthook skips commands when the push-file list is empty, which is exactly
+  # the tag-push case the check exists for; scripts always run.
+  scripts:
+    "verify-tags.sh":
+      runner: sh
+      use_stdin: true  # git feeds the pushed refs to the pre-push hook on stdin
   commands:
     go-test:
-      run: go test ./...
+      # The second invocation covers the build-tagged magefile suite, which
+      # `go test ./...` cannot see (same suite CI runs via `mage test:magefile`).
+      run: go test ./... && go test -tags mage .

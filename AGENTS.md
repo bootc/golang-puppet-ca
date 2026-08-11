@@ -14,7 +14,11 @@ Task. Invoke targets with `go run mage.go <Target>` or the `mage` binary:
 | Command | What it does |
 | --- | --- |
 | `mage build:all` | Build `openvox-ca` and `openvox-ca-ctl` binaries |
+| `mage build:dist` | Cross-compile all release tarballs (and `checksums.txt`) to `dist/` |
+| `mage build:distVariant <name>` | Build one release tarball variant (e.g. `linux_arm64_fips`) into `dist/` |
+| `mage release:prepare <version>` | Open the version-bump PR that must precede a release tag — see [releasing](docs/development/releasing.md) |
 | `mage test:unit` | Run the unit suite (all packages, coverage to `coverage.out`) |
+| `mage test:magefile` | Run the magefile's own build-tagged suite (invisible to `go test ./...`) |
 | `mage dev:lint` | Run `golangci-lint` (gate; see `.golangci.yml`) |
 | `mage test:backendsPostgres` | SQL backend integration suite against PostgreSQL |
 | `mage test:backendsMySQL` | SQL backend integration suite against MySQL |

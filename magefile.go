@@ -26,12 +26,15 @@ import (
 	"bytes"
 	"compress/gzip"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -39,6 +42,7 @@ import (
 
 	"github.com/magefile/mage/mg"
 	"github.com/magefile/mage/sh"
+	yaml "go.yaml.in/yaml/v3"
 
 	"github.com/caarlos0/env/v11"
 	openbao "github.com/openbao/openbao/api/v2"
@@ -53,9 +57,10 @@ import (
 
 // -- Namespaces ----------------------------------------------------------------
 
-type Build mg.Namespace // build:all  build:fips  build:dist
-type Test mg.Namespace  // test:unit  test:integcompose  test:integcomposefips  test:loadcompose  test:bench  test:puppet  test:puppetfips  test:migration  test:backendsRedis  test:backendsEtcd
-type Dev mg.Namespace   // dev:check  dev:tidy    dev:clean  dev:container
+type Build mg.Namespace   // build:all  build:fips  build:dist  build:distVariant
+type Test mg.Namespace    // test:unit  test:magefile  test:integcompose  test:integcomposefips  test:loadcompose  test:bench  test:puppet  test:puppetfips  test:migration  test:backendsRedis  test:backendsEtcd
+type Dev mg.Namespace     // dev:check  dev:tidy    dev:clean  dev:container
+type Release mg.Namespace // release:prepare
 
 // -- Helpers ------------------------------------------------------------------─
 
@@ -173,15 +178,228 @@ func (Build) FIPS() error {
 		"./cmd/openvox-ca-ctl")
 }
 
+// releaseVersion extracts the Version constant from internal/version, the
+// single source of truth for the release version. Parsed from source rather
+// than imported so that editing the constant never requires rebuilding the
+// mage binary to be picked up.
+func releaseVersion() (string, error) {
+	src, err := os.ReadFile(filepath.Join("internal", "version", "version.go"))
+	if err != nil {
+		return "", err
+	}
+	m := regexp.MustCompile(`(?m)^const Version = "([^"]+)"$`).FindSubmatch(src)
+	if m == nil {
+		return "", fmt.Errorf("could not find the Version constant in internal/version/version.go")
+	}
+	return string(m[1]), nil
+}
+
+// fipsCrossCC returns the C compiler needed to link the boringcrypto syso for
+// a FIPS build targeting goarch. Cross-linking from a different architecture
+// needs the matching GNU cross toolchain (on Debian/Ubuntu: the
+// gcc-aarch64-linux-gnu / gcc-x86-64-linux-gnu packages). Returns "" when the
+// default compiler is fine (native Linux build) or when CC is already set in
+// the environment (respected as an override).
+func fipsCrossCC(goarch string) string {
+	if os.Getenv("CC") != "" {
+		return ""
+	}
+	if runtime.GOOS == "linux" && runtime.GOARCH == goarch {
+		return ""
+	}
+	switch goarch {
+	case "amd64":
+		return "x86_64-linux-gnu-gcc"
+	case "arm64":
+		return "aarch64-linux-gnu-gcc"
+	}
+	return ""
+}
+
+// workflowMatrixVariants extracts the `variant:` values from the
+// strategy.matrix.include list of the named job in a workflow YAML document.
+func workflowMatrixVariants(src []byte, job string) ([]string, error) {
+	var doc struct {
+		Jobs map[string]struct {
+			Strategy struct {
+				Matrix struct {
+					Include []map[string]any `yaml:"include"`
+				} `yaml:"matrix"`
+			} `yaml:"strategy"`
+		} `yaml:"jobs"`
+	}
+	if err := yaml.Unmarshal(src, &doc); err != nil {
+		return nil, err
+	}
+	j, ok := doc.Jobs[job]
+	if !ok {
+		return nil, fmt.Errorf("job %q not found", job)
+	}
+	var names []string
+	for _, inc := range j.Strategy.Matrix.Include {
+		if v, ok := inc["variant"].(string); ok {
+			names = append(names, v)
+		}
+	}
+	if len(names) == 0 {
+		return nil, fmt.Errorf("job %q has no matrix include entries with a variant key", job)
+	}
+	return names, nil
+}
+
+// shellVariantList extracts the variant names iterated by the
+// `for variant in ...; do` loop in the release workflow's checksum step.
+func shellVariantList(src []byte) ([]string, error) {
+	m := regexp.MustCompile(`for variant in ([a-z0-9_ ]+); do`).FindSubmatch(src)
+	if m == nil {
+		return nil, fmt.Errorf("no 'for variant in ...; do' loop found")
+	}
+	return strings.Fields(string(m[1])), nil
+}
+
+// verifyDistVariants asserts that every hand-maintained copy of the release
+// variant list in the workflows agrees with distVariants(), the single source
+// of truth. Wired into dev:check so a variant added or renamed in one place
+// but not the others fails CI loudly instead of silently shipping an
+// incomplete release. The checked copies: ci.yml's dist job matrix,
+// release.yml's build job matrix, and release.yml's checksum-step shell loop
+// and tarball-count literal.
+func verifyDistVariants() error {
+	ciSrc, err := os.ReadFile(filepath.Join(".github", "workflows", "ci.yml"))
+	if err != nil {
+		return err
+	}
+	relSrc, err := os.ReadFile(filepath.Join(".github", "workflows", "release.yml"))
+	if err != nil {
+		return err
+	}
+	return verifyDistVariantsIn(ciSrc, relSrc)
+}
+
+// verifyDistVariantsIn is verifyDistVariants over caller-supplied workflow
+// contents, split out so the mismatch branches are testable without touching
+// the real workflow files.
+func verifyDistVariantsIn(ciSrc, relSrc []byte) error {
+	want := make([]string, 0, len(distVariants()))
+	for _, v := range distVariants() {
+		want = append(want, v.name)
+	}
+	sortedWant := slices.Sorted(slices.Values(want))
+
+	checks := []struct {
+		where string
+		got   func() ([]string, error)
+	}{
+		{"ci.yml dist job matrix", func() ([]string, error) { return workflowMatrixVariants(ciSrc, "dist") }},
+		{"release.yml build job matrix", func() ([]string, error) { return workflowMatrixVariants(relSrc, "build") }},
+		{"release.yml checksum-step shell loop", func() ([]string, error) { return shellVariantList(relSrc) }},
+	}
+	for _, c := range checks {
+		got, err := c.got()
+		if err != nil {
+			return fmt.Errorf("%s: %w", c.where, err)
+		}
+		if !slices.Equal(slices.Sorted(slices.Values(got)), sortedWant) {
+			return fmt.Errorf("%s lists variants %v, but distVariants() in magefile.go defines %v; update them together",
+				c.where, got, want)
+		}
+	}
+
+	// The checksum step also asserts an exact tarball count.
+	m := regexp.MustCompile(`"\$tarballs" -ne (\d+)`).FindSubmatch(relSrc)
+	if m == nil {
+		return fmt.Errorf("release.yml: tarball-count check not found")
+	}
+	if count, _ := strconv.Atoi(string(m[1])); count != len(want) {
+		return fmt.Errorf("release.yml expects %s tarballs, but distVariants() defines %d; update them together",
+			m[1], len(want))
+	}
+	return nil
+}
+
+// distVariantSpec describes one release artefact: its short name (the
+// artefact-name suffix, e.g. "linux_arm64_fips") and the build environment
+// that produces it.
+type distVariantSpec struct {
+	name string
+	env  map[string]string
+}
+
+// distVariants returns the full set of release artefact variants. The FIPS
+// variants are cgo builds, so they need a Linux host with a C toolchain for
+// the target architecture (see fipsCrossCC); the pure-Go variants
+// cross-compile from anywhere.
+func distVariants() []distVariantSpec {
+	fipsEnv := func(goarch string) map[string]string {
+		env := map[string]string{"CGO_ENABLED": "1", "GOOS": "linux", "GOARCH": goarch, "GOEXPERIMENT": "boringcrypto"}
+		if cc := fipsCrossCC(goarch); cc != "" {
+			env["CC"] = cc
+		}
+		return env
+	}
+	return []distVariantSpec{
+		{
+			name: "linux_amd64",
+			env:  map[string]string{"CGO_ENABLED": "0", "GOOS": "linux", "GOARCH": "amd64"},
+		},
+		{
+			name: "linux_arm64",
+			env:  map[string]string{"CGO_ENABLED": "0", "GOOS": "linux", "GOARCH": "arm64"},
+		},
+		{
+			name: "linux_amd64_fips",
+			env:  fipsEnv("amd64"),
+		},
+		{
+			name: "linux_arm64_fips",
+			env:  fipsEnv("arm64"),
+		},
+	}
+}
+
+// buildDistVariant builds one variant's tarball into distDir and returns its
+// SHA-256 checksum. The artefact is named openvox-ca_VER_NAME.tar.gz and
+// contains both binaries.
+func buildDistVariant(distDir, ver string, v distVariantSpec) (string, error) {
+	bins := []string{"openvox-ca", "openvox-ca-ctl"}
+	archive := filepath.Join(distDir, fmt.Sprintf("openvox-ca_%s_%s.tar.gz", ver, v.name))
+
+	tmpDir, err := os.MkdirTemp("", "openvox-ca-dist-*")
+	if err != nil {
+		return "", err
+	}
+	defer os.RemoveAll(tmpDir)
+
+	for _, cmd := range bins {
+		// -trimpath keeps builder paths out of the binaries so artefacts are
+		// reproducible across build machines.
+		if err := sh.RunWith(v.env, "go", "build", "-trimpath",
+			"-o", filepath.Join(tmpDir, cmd),
+			"./cmd/"+cmd); err != nil {
+			return "", fmt.Errorf("build %s for %s: %w", cmd, v.name, err)
+		}
+	}
+
+	if err := createTarGz(archive, tmpDir, bins); err != nil {
+		return "", fmt.Errorf("archive %s: %w", v.name, err)
+	}
+	return sha256File(archive)
+}
+
 // Dist cross-compiles release artifacts for all supported platforms and writes
 // them to dist/. Each artifact is a .tar.gz containing openvox-ca and
 // openvox-ca-ctl. A SHA-256 checksums.txt is also written to dist/.
 //
-// Artifacts produced:
+// Artifacts produced (VERSION is the internal/version constant):
 //
-//	openvox-ca_linux_amd64.tar.gz       (standard; CGO_ENABLED=0)
-//	openvox-ca_linux_arm64.tar.gz       (standard; CGO_ENABLED=0)
-//	openvox-ca_linux_amd64_fips.tar.gz  (FIPS; GOEXPERIMENT=boringcrypto)
+//	openvox-ca_VERSION_linux_amd64.tar.gz       (standard; CGO_ENABLED=0)
+//	openvox-ca_VERSION_linux_arm64.tar.gz       (standard; CGO_ENABLED=0)
+//	openvox-ca_VERSION_linux_amd64_fips.tar.gz  (FIPS; GOEXPERIMENT=boringcrypto)
+//	openvox-ca_VERSION_linux_arm64_fips.tar.gz  (FIPS; GOEXPERIMENT=boringcrypto)
+//
+// CI and the Release workflow build one variant per (native) runner via
+// build:distVariant instead; this target remains the way to build everything
+// locally.
 func (Build) Dist() error {
 	distDir := "dist"
 	if err := os.RemoveAll(distDir); err != nil {
@@ -191,63 +409,193 @@ func (Build) Dist() error {
 		return err
 	}
 
-	type variant struct {
-		name string
-		env  map[string]string
-	}
-	variants := []variant{
-		{
-			name: "openvox-ca_linux_amd64",
-			env:  map[string]string{"CGO_ENABLED": "0", "GOOS": "linux", "GOARCH": "amd64"},
-		},
-		{
-			name: "openvox-ca_linux_arm64",
-			env:  map[string]string{"CGO_ENABLED": "0", "GOOS": "linux", "GOARCH": "arm64"},
-		},
-		{
-			name: "openvox-ca_linux_amd64_fips",
-			env:  map[string]string{"CGO_ENABLED": "1", "GOOS": "linux", "GOARCH": "amd64", "GOEXPERIMENT": "boringcrypto"},
-		},
+	ver, err := releaseVersion()
+	if err != nil {
+		return err
 	}
 
-	bins := []string{"openvox-ca", "openvox-ca-ctl"}
+	// The variants are independent, so build them concurrently; the Go build
+	// and module caches are safe under concurrent use. Checksums are collected
+	// per-index to keep checksums.txt in deterministic variant order, and
+	// every variant runs to completion so a failure report covers all broken
+	// variants, not just the first.
+	variants := distVariants()
+	var wg sync.WaitGroup
+	sums := make([]string, len(variants))
+	errs := make([]error, len(variants))
+	for i, v := range variants {
+		fmt.Printf("Building openvox-ca_%s_%s...\n", ver, v.name)
+		wg.Add(1)
+		go func(i int, v distVariantSpec) {
+			defer wg.Done()
+			sums[i], errs[i] = buildDistVariant(distDir, ver, v)
+		}(i, v)
+	}
+	wg.Wait()
+	if err := errors.Join(errs...); err != nil {
+		return err
+	}
 
-	var checksums []string
-	for _, v := range variants {
-		fmt.Printf("Building %s...\n", v.name)
+	var checksums strings.Builder
+	for i, v := range variants {
+		fmt.Fprintf(&checksums, "%s  openvox-ca_%s_%s.tar.gz\n", sums[i], ver, v.name)
+	}
+	return os.WriteFile(
+		filepath.Join(distDir, "checksums.txt"),
+		[]byte(checksums.String()),
+		0644,
+	)
+}
 
-		archive := filepath.Join(distDir, v.name+".tar.gz")
-		sum, err := func() (string, error) {
-			tmpDir, err := os.MkdirTemp("", "openvox-ca-dist-*")
-			if err != nil {
-				return "", err
-			}
-			defer os.RemoveAll(tmpDir)
+// DistVariant builds a single release artefact variant (by short name, e.g.
+// "linux_arm64_fips") into dist/ without touching other artefacts, and prints
+// its SHA-256 checksum. Used by CI and the Release workflow to build each
+// variant on a native runner for its architecture; checksums.txt aggregation
+// happens in the workflow, not here.
+func (Build) DistVariant(name string) error {
+	ver, err := releaseVersion()
+	if err != nil {
+		return err
+	}
 
-			for _, cmd := range bins {
-				if err := sh.RunWith(v.env, "go", "build",
-					"-o", filepath.Join(tmpDir, cmd),
-					"./cmd/"+cmd); err != nil {
-					return "", fmt.Errorf("build %s for %s: %w", cmd, v.name, err)
-				}
-			}
-
-			if err := createTarGz(archive, tmpDir, bins); err != nil {
-				return "", fmt.Errorf("archive %s: %w", v.name, err)
-			}
-			return sha256File(archive)
-		}()
+	for _, v := range distVariants() {
+		if v.name != name {
+			continue
+		}
+		if err := os.MkdirAll("dist", 0755); err != nil {
+			return err
+		}
+		fmt.Printf("Building openvox-ca_%s_%s...\n", ver, v.name)
+		sum, err := buildDistVariant("dist", ver, v)
 		if err != nil {
 			return err
 		}
-		checksums = append(checksums, fmt.Sprintf("%s  %s\n", sum, filepath.Base(archive)))
+		fmt.Printf("%s  openvox-ca_%s_%s.tar.gz\n", sum, ver, v.name)
+		return nil
 	}
 
-	return os.WriteFile(
-		filepath.Join(distDir, "checksums.txt"),
-		[]byte(strings.Join(checksums, "")),
-		0644,
-	)
+	var known []string
+	for _, v := range distVariants() {
+		known = append(known, v.name)
+	}
+	return fmt.Errorf("unknown dist variant %q (known: %s)", name, strings.Join(known, ", "))
+}
+
+// -- release:* -----------------------------------------------------------------
+
+// bareSemverRe matches the versions release:prepare accepts: bare semver with
+// an optional pre-release suffix (0.9.0, 0.9.0-rc1, 0.10.0-dev), never a "v"
+// prefix.
+var bareSemverRe = regexp.MustCompile(`^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$`)
+
+// repoSlug derives the "owner/repo" slug from the named git remote.
+func repoSlug(remote string) (string, error) {
+	url, err := sh.Output("git", "remote", "get-url", remote)
+	if err != nil {
+		return "", fmt.Errorf("resolving remote %q: %w", remote, err)
+	}
+	return repoSlugFromURL(strings.TrimSpace(url))
+}
+
+// repoSlugFromURL extracts "owner/repo" from a git remote URL, accepting the
+// SSH (git@github.com:owner/repo.git), ssh:// and HTTPS forms, with or
+// without the .git suffix.
+func repoSlugFromURL(url string) (string, error) {
+	m := regexp.MustCompile(`[:/]([^/:]+/[^/:]+?)(\.git)?$`).FindStringSubmatch(url)
+	if m == nil {
+		return "", fmt.Errorf("could not derive owner/repo from remote URL %q", url)
+	}
+	return m[1], nil
+}
+
+// Prepare opens the version-bump pull request that must land before a release
+// can be tagged: it creates a release/vVERSION branch off the remote's main,
+// sets the internal/version constant, pushes the branch, and opens the PR
+// with `gh` — including a preview of the auto-generated release notes for
+// release versions (skipped for -dev bumps, which are the post-release step
+// returning main to a development version).
+//
+// The remote defaults to origin; set OPENVOX_CA_RELEASE_REMOTE to prepare a
+// release elsewhere (e.g. a fork rehearsal). Requires a clean working tree
+// and an authenticated `gh`.
+func (Release) Prepare(ver string) error {
+	if !bareSemverRe.MatchString(ver) {
+		return fmt.Errorf("version %q is not bare semver (expected e.g. 0.9.0, 0.9.0-rc1, or 0.10.0-dev, without a v prefix)", ver)
+	}
+	remote := os.Getenv("OPENVOX_CA_RELEASE_REMOTE")
+	if remote == "" {
+		remote = "origin"
+	}
+	slug, err := repoSlug(remote)
+	if err != nil {
+		return err
+	}
+
+	if out, err := sh.Output("git", "status", "--porcelain"); err != nil {
+		return err
+	} else if strings.TrimSpace(out) != "" {
+		return fmt.Errorf("working tree is not clean; commit or stash first")
+	}
+
+	if err := sh.RunV("git", "fetch", remote); err != nil {
+		return err
+	}
+	branch := "release/v" + ver
+	if err := sh.RunV("git", "switch", "-c", branch, remote+"/main"); err != nil {
+		return fmt.Errorf("creating %s from %s/main (does the branch already exist?): %w", branch, remote, err)
+	}
+
+	verFile := filepath.Join("internal", "version", "version.go")
+	src, err := os.ReadFile(verFile)
+	if err != nil {
+		return err
+	}
+	re := regexp.MustCompile(`(?m)^const Version = "[^"]+"$`)
+	if !re.Match(src) {
+		return fmt.Errorf("could not find the Version constant in %s", verFile)
+	}
+	if err := os.WriteFile(verFile, re.ReplaceAll(src, fmt.Appendf(nil, "const Version = %q", ver)), 0644); err != nil {
+		return err
+	}
+
+	isDev := strings.HasSuffix(ver, "-dev")
+	title := "Release v" + ver
+	body := fmt.Sprintf(`Sets the release version to %s. Once this merges, cut the release by pushing the tag (see docs/development/releasing.md):
+
+    git fetch %s
+    git tag -a v%s %s/main -m "OpenVox CA %s"
+    git push %s v%s
+`, ver, remote, ver, remote, ver, remote, ver)
+	if isDev {
+		title = "Bump version to " + ver
+		body = fmt.Sprintf("Post-release bump so builds from main identify as %s rather than as the release.\n", ver)
+	}
+
+	if err := sh.RunV("git", "add", verFile); err != nil {
+		return err
+	}
+	if err := sh.RunV("git", "commit", "-m", title); err != nil {
+		return err
+	}
+	if err := sh.RunV("git", "push", "-u", remote, branch); err != nil {
+		return err
+	}
+
+	if !isDev {
+		// Preview what --generate-notes will produce so the release PR shows
+		// reviewers the notes before the tag exists. Read-only and
+		// best-effort: the release itself regenerates the real thing.
+		notes, err := sh.Output("gh", "api", "repos/"+slug+"/releases/generate-notes",
+			"-f", "tag_name=v"+ver, "-f", "target_commitish=main", "--jq", ".body")
+		if err != nil {
+			fmt.Println("WARNING: could not generate a release-notes preview:", err)
+		} else if notes != "" {
+			body += "\n<details><summary>Auto-generated release-notes preview</summary>\n\n" + notes + "\n\n</details>\n"
+		}
+	}
+
+	return sh.RunV("gh", "pr", "create", "--repo", slug, "--base", "main",
+		"--head", branch, "--title", title, "--body", body)
 }
 
 // -- test:* --------------------------------------------------------------------
@@ -287,6 +635,14 @@ func unitTestPackages() ([]string, error) {
 		return nil, fmt.Errorf("go list ./... returned no testable packages")
 	}
 	return pkgs, nil
+}
+
+// Magefile runs the magefile's own Ginkgo suite. The suite is build-tagged
+// like the magefile itself, so ordinary `go test ./...` and the go-list-based
+// test:unit discovery cannot see it; this target is the canonical way to run
+// it, used by CI's check job and the pre-push hook.
+func (Test) Magefile() error {
+	return sh.RunV("go", "test", "-tags", "mage", ".")
 }
 
 // Unit runs the unit test suite with coverage, piping output through tparse
@@ -757,6 +1113,10 @@ func (Dev) Check() error {
 		return fmt.Errorf("go.mod/go.sum are not tidy (%s); run 'mage dev:tidy' and commit", strings.TrimSpace(changed))
 	}
 	if err := sh.Run("go", "vet", "./..."); err != nil {
+		return err
+	}
+	fmt.Println("Checking release variant lists...")
+	if err := verifyDistVariants(); err != nil {
 		return err
 	}
 	return Dev{}.Lint()
