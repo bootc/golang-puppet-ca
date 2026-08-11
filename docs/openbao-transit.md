@@ -355,10 +355,14 @@ spec:
           # logfile does not apply here: these subcommands write their progress
           # messages to stderr unconditionally, so extract the block rather than
           # relying on a quiet stream.
-          # Drop --create-key when the Transit key was provisioned out of band,
-          # which is the recommended path. Without it, a run against an empty
-          # key slot fails rather than creating one.
-          args: ["csr", "--create-key"]
+          # No --create-key: this assumes the Transit key was provisioned out
+          # of band, the recommended path, and the Job runs under the
+          # Deployment's own ServiceAccount, whose policy deliberately excludes
+          # create on transit/keys. Add the flag only if you must create the
+          # key here, and grant create for the duration of the Job alone --
+          # leaving it on the steady-state policy widens the running CA's
+          # credential to key creation for good.
+          args: ["csr"]
           volumeMounts:
             - { name: config, mountPath: /etc/puppet-ca }
             # Only needed on the filesystem backend, where --create-key writes

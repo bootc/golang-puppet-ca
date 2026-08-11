@@ -210,6 +210,23 @@ func (c *CA) seedSupportingState(ctx context.Context) error {
 	ctx, cancel := context.WithTimeout(ctx, LockTimeout)
 	defer cancel()
 	return c.Storage.WithLock(ctx, lockNameBootstrap, func() error {
+		// The public key first, and before the CRL short-circuit below, because
+		// this is the one blob nothing else ever rewrites: bootstrapCA writes it
+		// before the CRL, so a bootstrap that failed on it leaves a CA whose key
+		// and certificate load cleanly forever after while ca_pub.pem stays
+		// missing. Taken from the certificate rather than the key because it is
+		// the public component every consumer already trusts, and because it is
+		// available whether the key is local or at a provider. Idempotent, so a
+		// replica that lost the race simply rewrites identical bytes.
+		pubKeyBytes, err := x509.MarshalPKIXPublicKey(c.CACert.PublicKey)
+		if err != nil {
+			return fmt.Errorf("marshalling CA public key: %w", err)
+		}
+		pubKeyPEM := pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: pubKeyBytes})
+		if err := c.Storage.SaveCAPubKey(ctx, pubKeyPEM); err != nil {
+			return fmt.Errorf("writing CA public key: %w", err)
+		}
+
 		// Another replica may have seeded between our initial check and the
 		// lock acquisition.
 		if _, err := c.Storage.GetCRL(ctx); err == nil {
@@ -460,7 +477,8 @@ func (c *CA) bootstrapCA(ctx context.Context) error {
 	}
 	pubKeyPEM := pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: pubKeyBytes})
 	if err := c.Storage.SaveCAPubKey(ctx, pubKeyPEM); err != nil {
-		return fmt.Errorf("failed to write CA public key: %w", err)
+		return fmt.Errorf("failed to write CA public key (the CA key and certificate are "+
+			"already written; the next start will complete the remaining state): %w", err)
 	}
 
 	// Generate empty CRL.

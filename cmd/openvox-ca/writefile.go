@@ -27,9 +27,10 @@ import (
 // Mode 0644 because everything written this way — a certificate signing request,
 // a validated CA bundle — is public by construction and is about to be handed to
 // a third party or loaded into a Kubernetes Secret served to every agent.
-// Restricting it would imply a confidentiality it does not have. The explicit
-// Chmod is needed because os.WriteFile applies the umask, so the mode would
-// otherwise be whatever the invoking shell happened to have set.
+// Restricting it would imply a confidentiality it does not have. Passing the
+// mode explicitly is what makes it so: os.WriteFile would apply the umask
+// instead, leaving whatever the invoking shell happened to have set, and the
+// helper below applies the mode to the descriptor before the rename.
 //
 // Temp file plus rename because a truncating write that fails part-way — ENOSPC,
 // an interrupted process — leaves a partial chain at a path an automation step

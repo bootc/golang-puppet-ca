@@ -213,8 +213,38 @@ var _ = Describe("openvox-ca csr", func() {
 		Expect(err).NotTo(HaveOccurred())
 
 		err = runCSRWithProvider(provider, "--cadir", caDir, "--hostname", "puppet.example.com")
-		Expect(err).To(HaveOccurred())
+		// The signing failure is asserted first: without it any earlier
+		// failure -- a config change, a rejected argument -- would satisfy
+		// "no orphaned-key advice" vacuously, having never reached the gate.
+		Expect(err).To(MatchError(ContainSubstring("permission denied: transit/sign")))
 		Expect(err.Error()).NotTo(ContainSubstring("A CA key now exists"))
+	})
+
+	It("reaches the configured key provider rather than a local key", func() {
+		// newCSRCmd's own resolver, not the injected one: its `true` is the
+		// only thing that gives csr a key provider at all. Inverted, every
+		// spec here still passes -- they all run on the default file
+		// provider -- while `csr --create-key` under Transit would mint a
+		// local key and bind the request to one the server will never use.
+		//
+		// The address is unreachable on purpose: reaching it is not the
+		// point, trying to is.
+		tokenFile := filepath.Join(GinkgoT().TempDir(), "token")
+		Expect(os.WriteFile(tokenFile, []byte("s.notatoken\n"), 0o600)).To(Succeed())
+		cfgFile := filepath.Join(GinkgoT().TempDir(), "openbao.yaml")
+		Expect(os.WriteFile(cfgFile, []byte(
+			"ca_key_provider: openbao\n"+
+				"openbao:\n"+
+				"  addr: http://127.0.0.1:1\n"+
+				"  key_name: openvox-ca\n"+
+				"  auth_method: token\n"+
+				"  token_file: "+tokenFile+"\n"), 0o644)).To(Succeed())
+		setEnv("PUPPET_CA_CONFIG", cfgFile)
+
+		_, err := runCSR("--cadir", caDir, "--hostname", "puppet.example.com", "--create-key")
+		Expect(err).To(MatchError(ContainSubstring("OpenBao")))
+		Expect(err.Error()).NotTo(ContainSubstring("--create-key"),
+			"a nil provider would fall back to local storage and ask for the flag that was already passed")
 	})
 
 	It("does not warn about startup when a certificate already exists", func() {

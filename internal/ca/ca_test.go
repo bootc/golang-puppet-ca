@@ -1808,28 +1808,61 @@ var _ = Describe("CA Clean when part of it fails", func() {
 // alone. It reproduces the one storage failure bootstrap used to discard.
 type pubKeyPutFailBackend struct {
 	storage.Backend
+	fail bool
 }
 
 func (b *pubKeyPutFailBackend) Put(ctx context.Context, key string, data []byte, kind storage.BlobKind) error {
-	if key == storage.KeyCAPubKey {
+	if b.fail && key == storage.KeyCAPubKey {
 		return errors.New("simulated backend failure writing the CA public key")
 	}
 	return b.Backend.Put(ctx, key, data, kind)
 }
 
 var _ = Describe("Bootstrap public key write", func() {
-	// Nothing recreates ca_pub.pem after bootstrap: a second start finds a key
-	// and a certificate and goes to loadCA instead. A failure discarded here is
-	// therefore permanent, and leaves the layout docs/storage-backends.md
-	// documents incomplete with no operator-visible signal at all.
-	It("fails the bootstrap rather than silently omitting ca_pub.pem", func() {
-		dir := GinkgoT().TempDir()
-		store := storage.NewWithBackend(&pubKeyPutFailBackend{Backend: storage.NewFilesystemBackend(dir)}, dir)
+	var (
+		dir     string
+		backend *pubKeyPutFailBackend
+		store   *storage.StorageService
+	)
 
+	newCA := func() *ca.CA {
 		myCA := ca.New(store, ca.AutosignConfig{Mode: "off"}, "puppet.example.com")
 		myCA.CAKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
+		return myCA
+	}
 
-		err := myCA.Init(context.Background())
-		Expect(err).To(MatchError(ContainSubstring("CA public key")))
+	BeforeEach(func() {
+		dir = GinkgoT().TempDir()
+		backend = &pubKeyPutFailBackend{Backend: storage.NewFilesystemBackend(dir), fail: true}
+		store = storage.NewWithBackend(backend, dir)
+	})
+
+	It("fails the bootstrap rather than silently omitting ca_pub.pem", func() {
+		// Discarding it left the layout docs/storage-backends.md documents
+		// incomplete with no operator-visible signal at all.
+		err := newCA().Init(context.Background())
+		// The write path specifically, not the marshalling branch beside it,
+		// and the injected cause has to survive: both halves distinguish the
+		// failure that was arranged from any other route to the same prefix.
+		Expect(err).To(MatchError(ContainSubstring("failed to write CA public key")))
+		Expect(err).To(MatchError(ContainSubstring("simulated backend failure")))
+	})
+
+	It("writes the missing ca_pub.pem on the next start", func() {
+		// The half-state the failure above leaves behind: a key and a
+		// certificate that load cleanly forever after. Without the backfill in
+		// seedSupportingState the blob would never be written again, so the
+		// hard failure would only defer the silent omission by one restart.
+		Expect(newCA().Init(context.Background())).NotTo(Succeed())
+		Expect(store.HasCACert(context.Background())).To(BeTrue())
+
+		backend.fail = false
+		Expect(newCA().Init(context.Background())).To(Succeed())
+
+		pubPEM, err := store.Backend().Get(context.Background(), storage.KeyCAPubKey)
+		Expect(err).NotTo(HaveOccurred())
+		block, _ := pem.Decode(pubPEM)
+		Expect(block).NotTo(BeNil())
+		Expect(block.Type).To(Equal("PUBLIC KEY"))
 	})
 })

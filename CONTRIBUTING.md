@@ -20,6 +20,10 @@ guide is the human-friendly entry point; where the two overlap, AGENTS.md wins.
   slim container image may not have one. The product build is unaffected — it
   is still `CGO_ENABLED=0`.
 - Docker or Podman with the Compose plugin, for the integration and stack tests
+- A C compiler (gcc or clang; `build-essential` on Debian/Ubuntu, the Xcode
+  Command Line Tools on macOS). `mage test:unit` runs under the race detector,
+  which needs cgo — see [Testing](docs/development/testing.md). The binaries
+  themselves still build with `CGO_ENABLED=0`.
 
 ## Building
 

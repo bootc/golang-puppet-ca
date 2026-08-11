@@ -673,7 +673,7 @@ func (Test) Magefile() error {
 }
 
 // Unit runs the unit test suite with coverage and the race detector, piping
-// output through tparse for a colorful per-package summary table. The package
+// output through tparse for a colourful per-package summary table. The package
 // set is discovered dynamically (see unitTestPackages); only unitTestExcludes
 // is omitted.
 func (Test) Unit() error {
