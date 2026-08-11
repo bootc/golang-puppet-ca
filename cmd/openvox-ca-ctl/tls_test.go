@@ -22,6 +22,8 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
+	"errors"
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -31,6 +33,12 @@ import (
 
 	"github.com/voxpupuli/openvox-ca/internal/testutil"
 )
+
+// errWriter is a notices writer that always fails, standing in for a closed or
+// full stderr.
+type errWriter struct{}
+
+func (errWriter) Write([]byte) (int, error) { return 0, errors.New("write failed") }
 
 // writeTempPEM writes content to a file of the given name in a fresh temp dir
 // and returns its path.
@@ -68,10 +76,12 @@ var _ = Describe("newTLSConfig", func() {
 		notices = &bytes.Buffer{}
 	})
 
-	// trusts reports whether the CA certificate verifies against the pool the
-	// config was built with — a stronger check than "RootCAs is non-nil".
-	trusts := func(pool *x509.CertPool) bool {
-		block, _ := pem.Decode(caCertPEM)
+	// verifies reports whether certPEM chains to the pool the config was built
+	// with — a stronger check than "RootCAs is non-nil", and one that has to
+	// answer both ways: a pool that trusts everything would pass every
+	// positive assertion in this file.
+	verifies := func(pool *x509.CertPool, certPEM []byte) bool {
+		block, _ := pem.Decode(certPEM)
 		Expect(block).NotTo(BeNil())
 		cert, err := x509.ParseCertificate(block.Bytes)
 		Expect(err).NotTo(HaveOccurred())
@@ -81,6 +91,9 @@ var _ = Describe("newTLSConfig", func() {
 		})
 		return err == nil
 	}
+
+	// trusts is the common case: does the --ca-cert CA itself verify?
+	trusts := func(pool *x509.CertPool) bool { return verifies(pool, caCertPEM) }
 
 	Context("with --ca-cert", func() {
 		BeforeEach(func() { globalCACert = caCertPath })
@@ -134,7 +147,7 @@ var _ = Describe("newTLSConfig", func() {
 			globalCACert = writeTempPEM("raw.der", []byte("not pem at all"))
 
 			_, err := newTLSConfig(notices)
-			Expect(err).To(MatchError(ContainSubstring("no PEM certificate found")))
+			Expect(err).To(MatchError(ContainSubstring("contains no usable certificates")))
 		})
 
 		// A CA bundle (root plus intermediates) must be trusted in full, not
@@ -148,6 +161,22 @@ var _ = Describe("newTLSConfig", func() {
 			Expect(err).NotTo(HaveOccurred())
 			Expect(trusts(cfg.RootCAs)).To(BeTrue(),
 				"the second certificate in the bundle does not verify against the resulting RootCAs pool")
+			Expect(verifies(cfg.RootCAs, otherCertPEM)).To(BeTrue(),
+				"the first certificate in the bundle does not verify against the resulting RootCAs pool")
+		})
+
+		// The documented contract is that --ca-cert *replaces* the system trust
+		// store. Seeding the pool from x509.SystemCertPool() instead would keep
+		// every positive assertion above green while silently widening trust,
+		// so pin the negative direction too.
+		It("does not trust a CA outside the supplied file", func() {
+			_, foreignCertPEM, _, err := testutil.GenerateTestCAECDSA()
+			Expect(err).NotTo(HaveOccurred())
+
+			cfg, err := newTLSConfig(notices)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(verifies(cfg.RootCAs, foreignCertPEM)).To(BeFalse(),
+				"a CA absent from --ca-cert verifies against the resulting RootCAs pool; the pool is wider than the file")
 		})
 	})
 
@@ -163,6 +192,28 @@ var _ = Describe("newTLSConfig", func() {
 			Expect(notices.String()).To(ContainSubstring("WARNING"))
 			Expect(notices.String()).To(ContainSubstring("MITM"),
 				"notices = %q; want the MITM warning documented in docs/operator-cli.md", notices.String())
+		})
+
+		// The stderr write is deliberately unchecked because the log record is
+		// the durable second channel, so pin the record itself.
+		It("logs the disabled verification", func() {
+			var logged bytes.Buffer
+			orig := slog.Default()
+			slog.SetDefault(slog.New(slog.NewTextHandler(&logged, nil)))
+			DeferCleanup(func() { slog.SetDefault(orig) })
+
+			_, err := newTLSConfig(notices)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(logged.String()).To(ContainSubstring("TLS server verification disabled"),
+				"log = %q; want the warning the unchecked stderr write relies on", logged.String())
+		})
+
+		// The other half of that reasoning: a notices writer that fails must
+		// not stop the command.
+		It("still builds a config when the notices writer fails", func() {
+			cfg, err := newTLSConfig(errWriter{})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(cfg.InsecureSkipVerify).To(BeTrue())
 		})
 	})
 

@@ -157,6 +157,34 @@ var _ = Describe("Global flag precedence", func() {
 			"CACert = %q; want the env var to win when --ca-cert is unset", globalCACert)
 	})
 
+	// The remaining four pf.Changed overlays. --client-cert/--client-key are
+	// the ones that matter: newTLSConfig rejects a half-resolved pair outright,
+	// so an overlay guarding one on the other's Changed flag would break every
+	// subcommand rather than quietly dropping mTLS.
+	It("prefers the other explicit flags over the env var and config file", func() {
+		cfgFile := writeTempCtlConfig(
+			"server_url: https://from-file:8140\nclient_cert: /from/file.pem\nclient_key: /from/file-key.pem\nverbose: true\n")
+		setCtlEnv("PUPPET_CA_CTL_SERVER_URL", "https://from-env:8140")
+		setCtlEnv("PUPPET_CA_CTL_CLIENT_CERT", "/from/env.pem")
+		setCtlEnv("PUPPET_CA_CTL_CLIENT_KEY", "/from/env-key.pem")
+		setCtlEnv("PUPPET_CA_CTL_VERBOSE", "true")
+
+		runProbe(cfgFile,
+			"--server-url", "https://from-cli:8140",
+			"--client-cert", "/from/cli.pem",
+			"--client-key", "/from/cli-key.pem",
+			"--verbose=false")
+
+		Expect(globalServerURL).To(Equal("https://from-cli:8140"),
+			"ServerURL = %q; want the explicit --server-url", globalServerURL)
+		Expect(globalClientCert).To(Equal("/from/cli.pem"),
+			"ClientCert = %q; want the explicit --client-cert", globalClientCert)
+		Expect(globalClientKey).To(Equal("/from/cli-key.pem"),
+			"ClientKey = %q; want the explicit --client-key", globalClientKey)
+		Expect(globalVerbose).To(BeFalse(),
+			"Verbose = true; want the explicit --verbose=false")
+	})
+
 	// The direction that matters most for security: an operator re-enabling
 	// verification from the environment must beat a config file that disabled
 	// it. applyCtlEnv assigns the parsed bool either way, and only this spec

@@ -17,14 +17,23 @@
 Global flags may be placed before or after the subcommand name.
 
 `--ca-cert` takes precedence over `--insecure`: if both are given, the server
-certificate is still verified, against the supplied CA certificate. The file
-*replaces* the system trust store rather than adding to it, so a server whose
-certificate chains to a public CA stops verifying once `--ca-cert` is given. It
-may hold a bundle: every certificate in the file is trusted, so a root plus its
-intermediates can be passed as one file.
+certificate is still verified, against the supplied CA certificate. To override a
+`ca_cert` set in the config file or environment and reach `--insecure`, pass an
+empty `--ca-cert=""` alongside it.
+
+The file *replaces* the system trust store rather than adding to it, so a server
+whose certificate chains to a public CA stops verifying once `--ca-cert` is
+given. It may hold a bundle: every certificate in it that parses is loaded, so a
+root plus its intermediates can be passed as one file. A file holding no usable
+certificate (a DER export, a truncated download, the wrong file) is rejected on
+startup rather than failing later in the handshake.
 
 `--client-cert` and `--client-key` must be supplied together; giving only one is
 an error.
+
+Two advisory lines go to **stderr**, not stdout: a `NOTE:` on every invocation
+that supplies no trust anchor, and a `WARNING:` about MITM exposure whenever
+`--insecure` is in effect. Both are expected output, not failures.
 
 `openvox-ca-ctl --version` prints the version (including commit metadata when
 built from a git checkout) and exits. Unlike the global flags above,

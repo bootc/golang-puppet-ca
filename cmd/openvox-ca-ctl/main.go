@@ -80,11 +80,14 @@ func newTLSConfig(notices io.Writer) (*tls.Config, error) {
 		// is trusted in full, and it reports whether anything was loaded at
 		// all. Decoding only the first block instead would silently produce an
 		// empty or partial trust anchor whose only symptom is an opaque
-		// handshake failure much later.
+		// handshake failure much later. It returns false for two causes — no
+		// PEM certificate block, and none that parses — so the message names
+		// both rather than sending the operator after the wrong one.
 		// NIST 800-53: SC-8 (Transmission Confidentiality and Integrity)
 		pool := x509.NewCertPool()
 		if !pool.AppendCertsFromPEM(caCertPEM) {
-			return nil, fmt.Errorf("parsing --ca-cert %s: no PEM certificate found", globalCACert)
+			return nil, fmt.Errorf("parsing --ca-cert %s: contains no usable certificates "+
+				"(no PEM certificate block, or none that parses)", globalCACert)
 		}
 		tlsCfg.RootCAs = pool
 	} else if globalInsecure {
