@@ -253,12 +253,15 @@ func classify(rec *httptest.ResponseRecorder) denialKind {
 }
 
 // This is the repo's only Ordered/BeforeAll container, against the BeforeEach
-// convention in AGENTS.md, and deliberate on both counts: the shared CA and RSA
-// key pool are built once in BeforeAll because rebuilding them per spec costs
-// minutes, and ContinueOnFailure (which requires Ordered) is what makes a change
-// that moves several cells report all of them rather than the first. Specs stay
-// independent regardless — every certificate is re-minted per route, for the
-// reason set out above the key pool.
+// convention in AGENTS.md, and deliberate on both counts: the RSA key pool is
+// built once in BeforeAll because rebuilding it per spec costs minutes, and
+// ContinueOnFailure (which requires Ordered) is what makes a change that moves
+// several cells report all of them rather than the first. The CA beside it is
+// only cached PEMs replayed into a store — affordable per spec, as the
+// configuration-axes block below does it — and rides along in BeforeAll because
+// the container is Ordered for the pool anyway. Specs stay independent
+// regardless: every certificate is re-minted per route, for the reason set out
+// above the key pool.
 var _ = Describe("Authorisation baseline", Ordered, ContinueOnFailure, func() {
 	var (
 		ctx        context.Context

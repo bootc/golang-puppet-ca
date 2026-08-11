@@ -239,10 +239,12 @@ certificate goes away:
   existed, not that it was revoked or removed. Since admission reads the CRL
   rather than storage, the dangerous combination is a delete whose revocation
   failed: the file is gone and the certificate still works. Confirm the serial
-  in `GET /certificate_revocation_list/ca`, and treat the server's
-  `Clean: revoke failed` / `Clean: delete cert failed` warnings as the signal —
-  `puppetca_crl_update_failures_total` does not cover a revocation that failed
-  before the CRL was written.
+  in `GET /certificate_revocation_list/ca`. The server's `Clean: revoke failed`
+  and `Clean: delete cert failed` warnings are the complete signal;
+  `puppetca_crl_update_failures_total` covers most of the first — a CRL that
+  could not be read, signed or written all count — but not a revocation that
+  never reached the CRL (a lock it could not take, or a subject whose serial the
+  inventory could not resolve), and not a failed delete at all.
 
 Otherwise the next CSR is accepted: with autosign enabled it is signed at once
 and the agent is back with a fresh, unrevoked certificate; with autosign off it
@@ -260,7 +262,11 @@ When containing a compromised agent, apply the levers that hold, in this order:
    certificate from a stale cache. Each call refreshes only the replica that
    serves it, so address the replicas individually: sent through a load
    balancer it refreshes whichever one the VIP picked, and the rest stay stale
-   while the call reports success.
+   while the call reports success. To check one landed, ask that replica's
+   `/ocsp` about the serial — OCSP answers from the same in-process CRL the
+   admission check reads. `puppetca_crl_number` and
+   `puppetca_crl_revoked_certificates` cannot tell you: they are gathered from
+   shared storage, so a stale replica reports the same numbers as a fresh one.
 
 The order matters. Step 3 is also what makes a stale replica willing to evict
 the revoked certificate and issue a replacement, so running it while autosign

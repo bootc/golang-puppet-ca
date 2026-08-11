@@ -1639,42 +1639,61 @@ var _ = Describe("Concurrent SaveRequest", func() {
 	})
 })
 
-// crlPutFailBackend wraps a real filesystem backend and can be armed to fail
-// the CRL write alone, which is what a revocation failing part-way through
-// Clean looks like from storage.
-type crlPutFailBackend struct {
+// cleanFailBackend wraps a real filesystem backend and can be armed to fail one
+// key's write or delete, which is what either half of Clean failing part-way
+// looks like from storage.
+type cleanFailBackend struct {
 	storage.Backend
-	fail bool
+	failPut    string
+	failDelete string
 }
 
-func (b *crlPutFailBackend) Put(ctx context.Context, key string, data []byte, kind storage.BlobKind) error {
-	if b.fail && key == storage.KeyCRL {
-		return errors.New("simulated backend failure writing the CRL")
+func (b *cleanFailBackend) Put(ctx context.Context, key string, data []byte, kind storage.BlobKind) error {
+	if b.failPut != "" && key == b.failPut {
+		return errors.New("simulated backend failure writing " + key)
 	}
 	return b.Backend.Put(ctx, key, data, kind)
 }
 
-var _ = Describe("CA Clean when the revocation fails", func() {
-	// docs/api.md publishes this outcome as the contract operators have to
-	// guard against: DELETE /certificate_status answers 204, the stored
-	// certificate is gone, and the serial never reached the CRL — so the
-	// certificate still authenticates, because admission reads the CRL and not
-	// storage. Nothing else pins it; every other Clean spec runs the path where
-	// the revocation succeeds, so a change that turned the warning into an
-	// early return, or reordered revoke and delete, would move no assertion
-	// while making the published guidance wrong.
+func (b *cleanFailBackend) Delete(ctx context.Context, key string) error {
+	if b.failDelete != "" && key == b.failDelete {
+		return errors.New("simulated backend failure deleting " + key)
+	}
+	return b.Backend.Delete(ctx, key)
+}
+
+var _ = Describe("CA Clean when a half of it fails", func() {
+	// docs/api.md publishes this as the contract operators have to guard
+	// against: DELETE /certificate_status answers 204 whichever half failed, so
+	// a 204 records that the subject existed and nothing more. Nothing else
+	// pins it — every other Clean spec runs the path where both halves succeed,
+	// so a change that turned either warning into an early return would move no
+	// assertion while making the published guidance wrong.
 	//
 	// Recorded, not endorsed — the same contract as the authorisation baseline
-	// this branch adds. A change that makes Clean surface the failure is an
-	// improvement, and rewrites this spec and the paragraph in docs/api.md
+	// this branch adds. A change that makes Clean surface these failures is an
+	// improvement, and rewrites these specs and the paragraph in docs/api.md
 	// together.
-	It("deletes the certificate, reports success, and leaves the serial unrevoked", func() {
-		ctx := context.Background()
-		dir := GinkgoT().TempDir()
-		backend := &crlPutFailBackend{Backend: storage.NewFilesystemBackend(dir)}
-		store := storage.NewWithBackend(backend, dir)
+	//
+	// What these do not pin is the documented ordering (revoke, then delete):
+	// the serial is resolved from the inventory rather than from the stored
+	// certificate, so the revoke half succeeds or fails identically whichever
+	// order the two run in.
+	var (
+		ctx     context.Context
+		backend *cleanFailBackend
+		store   *storage.StorageService
+		myCA    *ca.CA
+		cert    *x509.Certificate
+	)
 
-		myCA := ca.New(store, ca.AutosignConfig{Mode: "off"}, "puppet.test")
+	BeforeEach(func() {
+		ctx = context.Background()
+		dir := GinkgoT().TempDir()
+		backend = &cleanFailBackend{Backend: storage.NewFilesystemBackend(dir)}
+		store = storage.NewWithBackend(backend, dir)
+
+		myCA = ca.New(store, ca.AutosignConfig{Mode: "off"}, "puppet.test")
 		Expect(store.EnsureDirs(ctx)).To(Succeed())
 		Expect(store.SaveCAKey(ctx, cachedKeyPEM)).To(Succeed())
 		Expect(store.SaveCACert(ctx, cachedCrtPEM)).To(Succeed())
@@ -1691,19 +1710,53 @@ var _ = Describe("CA Clean when the revocation fails", func() {
 		Expect(err).NotTo(HaveOccurred())
 		block, _ := pem.Decode(certPEM)
 		Expect(block).NotTo(BeNil())
-		cert, err := x509.ParseCertificate(block.Bytes)
+		cert, err = x509.ParseCertificate(block.Bytes)
 		Expect(err).NotTo(HaveOccurred())
+	})
 
-		backend.fail = true
+	It("deletes the certificate, reports success, and leaves the serial unrevoked", func() {
+		backend.failPut = storage.KeyCRL
+
 		Expect(myCA.Clean(ctx, "doomed-node")).To(Succeed(),
 			"Clean swallows the revoke failure; the handler turns this into 204")
 		Expect(store.HasCert(ctx, "doomed-node")).To(BeFalse(),
 			"the delete proceeds regardless of the failed revocation")
 
-		backend.fail = false
+		// Both views operators are pointed at: the in-process CRL admission
+		// reads, and the published CRL the guidance says to confirm the serial
+		// in. They agree only because the cache is refreshed after a successful
+		// write, which is the thing that did not happen here.
 		revoked, err := myCA.IsRevokedSerial(ctx, cert.SerialNumber)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(revoked).To(BeFalse(),
 			"the serial never reached the CRL, so the deleted certificate still authenticates")
+
+		backend.failPut = ""
+		crlPEM, err := store.GetCRL(ctx)
+		Expect(err).NotTo(HaveOccurred())
+		crlBlock, _ := pem.Decode(crlPEM)
+		Expect(crlBlock).NotTo(BeNil())
+		storedCRL, err := x509.ParseRevocationList(crlBlock.Bytes)
+		Expect(err).NotTo(HaveOccurred())
+		for _, entry := range storedCRL.RevokedCertificateEntries {
+			Expect(entry.SerialNumber.Cmp(cert.SerialNumber)).NotTo(Equal(0),
+				"the published CRL must not carry a serial the revocation failed to add")
+		}
+	})
+
+	It("revokes, reports success, and leaves the certificate in storage", func() {
+		// The other half, published in the same paragraph: a failed delete is
+		// logged and swallowed too, so 204 does not mean the record is gone.
+		backend.failDelete = "cert/doomed-node"
+
+		Expect(myCA.Clean(ctx, "doomed-node")).To(Succeed(),
+			"Clean swallows the delete failure; the handler turns this into 204")
+		Expect(store.HasCert(ctx, "doomed-node")).To(BeTrue(),
+			"the certificate is still in storage despite the 204")
+
+		revoked, err := myCA.IsRevokedSerial(ctx, cert.SerialNumber)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(revoked).To(BeTrue(),
+			"the revoke half ran first and succeeded")
 	})
 })
