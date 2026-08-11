@@ -242,12 +242,14 @@ func importCAMaterial(ctx context.Context, store *storage.StorageService, certBu
 	}
 
 	// --- Write CA public key ---
-	pubKeyBytes, err := x509.MarshalPKIXPublicKey(signer.Public())
-	if err != nil {
-		return fmt.Errorf("failed to marshal signing key's public component: %w", err)
-	}
-	pubKeyPEM := pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: pubKeyBytes})
-	if err := store.SaveCAPubKey(ctx, pubKeyPEM); err != nil {
+	// The two failures are not the same import: a marshalling failure has
+	// written nothing, while a failed write leaves the certificate installed
+	// without its companion blob, which is the inconsistency the retry advice
+	// exists to describe.
+	if err := savePubKeyPEM(ctx, store, signer.Public()); err != nil {
+		if errors.Is(err, errPubKeyMarshal) {
+			return fmt.Errorf("failed to marshal signing key's public component: %w", err)
+		}
 		return incompleteImportError(fmt.Errorf("failed to write CA public key: %w", err), retry)
 	}
 

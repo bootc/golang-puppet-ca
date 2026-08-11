@@ -1864,5 +1864,18 @@ var _ = Describe("Bootstrap public key write", func() {
 		block, _ := pem.Decode(pubPEM)
 		Expect(block).NotTo(BeNil())
 		Expect(block.Type).To(Equal("PUBLIC KEY"))
+
+		// This CA's public key, not merely a well-formed block: the blob is
+		// the companion to the certificate, so a backfill that marshalled some
+		// other public component would satisfy every check above.
+		certPEM, err := store.GetCACert(context.Background())
+		Expect(err).NotTo(HaveOccurred())
+		certBlock, _ := pem.Decode(certPEM)
+		Expect(certBlock).NotTo(BeNil())
+		cert, err := x509.ParseCertificate(certBlock.Bytes)
+		Expect(err).NotTo(HaveOccurred())
+		wantDER, err := x509.MarshalPKIXPublicKey(cert.PublicKey)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(block.Bytes).To(Equal(wantDER))
 	})
 })

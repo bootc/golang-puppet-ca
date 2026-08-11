@@ -202,10 +202,14 @@ func (c *CA) finishLoadExisting(ctx context.Context) error {
 	return nil
 }
 
-// seedSupportingState writes the CRL, inventory, and serial counter that
-// bootstrapCA would normally create, for the case where the cert+key already
-// exist (e.g. mounted via an overlay against an empty backend). Runs under
-// the bootstrap lock so concurrent replicas don't race to seed.
+// seedSupportingState writes the public key, CRL, inventory, and serial counter
+// that bootstrapCA would normally create, for the case where the cert+key
+// already exist (e.g. mounted via an overlay against an empty backend). Runs
+// under the bootstrap lock so concurrent replicas don't race to seed.
+//
+// The public key is also a backfill: a bootstrap that failed on that blob
+// leaves a cert and key that load cleanly forever after, so this is the only
+// path that would ever write it again.
 func (c *CA) seedSupportingState(ctx context.Context) error {
 	ctx, cancel := context.WithTimeout(ctx, LockTimeout)
 	defer cancel()
@@ -218,12 +222,7 @@ func (c *CA) seedSupportingState(ctx context.Context) error {
 		// the public component every consumer already trusts, and because it is
 		// available whether the key is local or at a provider. Idempotent, so a
 		// replica that lost the race simply rewrites identical bytes.
-		pubKeyBytes, err := x509.MarshalPKIXPublicKey(c.CACert.PublicKey)
-		if err != nil {
-			return fmt.Errorf("marshalling CA public key: %w", err)
-		}
-		pubKeyPEM := pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: pubKeyBytes})
-		if err := c.Storage.SaveCAPubKey(ctx, pubKeyPEM); err != nil {
+		if err := savePubKeyPEM(ctx, c.Storage, c.CACert.PublicKey); err != nil {
 			return fmt.Errorf("writing CA public key: %w", err)
 		}
 
@@ -471,12 +470,7 @@ func (c *CA) bootstrapCA(ctx context.Context) error {
 	// certificate and goes to loadCA. A failure swallowed here is therefore
 	// permanent, and leaves the storage layout documented in
 	// docs/storage-backends.md incomplete with no operator-visible signal.
-	pubKeyBytes, err := x509.MarshalPKIXPublicKey(key.Public())
-	if err != nil {
-		return fmt.Errorf("failed to marshal CA public key: %w", err)
-	}
-	pubKeyPEM := pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: pubKeyBytes})
-	if err := c.Storage.SaveCAPubKey(ctx, pubKeyPEM); err != nil {
+	if err := savePubKeyPEM(ctx, c.Storage, key.Public()); err != nil {
 		return fmt.Errorf("failed to write CA public key (the CA key and certificate are "+
 			"already written; the next start will complete the remaining state): %w", err)
 	}

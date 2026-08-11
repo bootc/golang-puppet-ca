@@ -243,8 +243,13 @@ var _ = Describe("openvox-ca csr", func() {
 
 		_, err := runCSR("--cadir", caDir, "--hostname", "puppet.example.com", "--create-key")
 		Expect(err).To(MatchError(ContainSubstring("OpenBao")))
-		Expect(err.Error()).NotTo(ContainSubstring("--create-key"),
-			"a nil provider would fall back to local storage and ask for the flag that was already passed")
+
+		// The consequence, not just the message. A nil provider sends
+		// --create-key down the local path, where it mints a key in the cadir
+		// and the run succeeds -- so the absence of that key is what says the
+		// request was never bound to one the server will not use.
+		Expect(storage.New(caDir).HasCAKey(context.Background())).To(BeFalse(),
+			"no local CA key may be created when the key belongs to a provider")
 	})
 
 	It("does not warn about startup when a certificate already exists", func() {
