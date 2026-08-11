@@ -129,9 +129,19 @@ Conventions:
   affordable per spec, as the configuration-axes block below it and
   `auth_test.go` both show.
 - Mutating process state: prefer hermetic alternatives. When a test must set an
-  environment variable, save and restore it in `BeforeEach`/`DeferCleanup` so it
-  never leaks into sibling specs (Go's `t.Setenv` is unavailable inside Ginkgo
-  nodes). Do not rely on tests running serially.
+  environment variable, use `GinkgoT().Setenv`, or save and restore it in
+  `BeforeEach`/`DeferCleanup` so it never leaks into sibling specs (Go's bare
+  `t.Setenv` needs a `*testing.T`, which Ginkgo nodes do not have; `GinkgoT()`
+  supplies the same save-and-restore semantics). Do not rely on tests running
+  serially.
+- A spec that shells out to `git` must build its environment by *stripping*
+  `GIT_*` from `os.Environ()`, never by appending to it. git exports `GIT_DIR`,
+  `GIT_WORK_TREE`, `GIT_INDEX_FILE` and `GIT_OBJECT_DIRECTORY` to the hooks it
+  runs, and they outrank `cmd.Dir` — so under the pre-push hook an inherited
+  environment makes the fixture operate on the real repository. This has already
+  cost one branch: see `fixtureEnv` in [`magefile_chart_test.go`](magefile_chart_test.go).
+  Neither `mage test:magefile` nor CI can reproduce it, because neither runs
+  inside a hook.
 - Prefer `Eventually(...).Should(...)` over `time.Sleep` for asynchronous
   conditions; sleeps make the suite flaky on loaded CI runners.
 - Keep negative and edge cases first-class: every security-relevant branch

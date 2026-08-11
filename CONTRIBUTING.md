@@ -12,6 +12,9 @@ guide is the human-friendly entry point; where the two overlap, AGENTS.md wins.
 ## Prerequisites
 
 - Go 1.25+ (see [`go.mod`](go.mod) for the exact version)
+- git 2.32+ — the magefile suite's git fixtures isolate themselves with
+  `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM`, which older git ignores silently,
+  letting your own global config reach the fixtures
 - [Mage](https://magefile.org/), the build tool this repo uses instead of Make:
   `go install github.com/magefile/mage@latest` (or run targets with
   `go run mage.go <Target>`)
