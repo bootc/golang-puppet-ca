@@ -258,4 +258,8 @@ var _ = Describe("Postgres schema migrations", func() {
 	It("survives two backends migrating the same database at once", func() {
 		sqlMigrationsConcurrentRunners(newPostgresBackend)
 	})
+
+	It("rolls back or resumes a migration failing mid-sequence, per the dialect's contract", func() {
+		migrationDDLFaultInjection(newPostgresBackend())
+	})
 })
