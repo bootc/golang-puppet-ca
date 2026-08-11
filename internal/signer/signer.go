@@ -153,15 +153,29 @@ func awaitShutdown(conn io.Closer, sigCh <-chan os.Signal, done <-chan struct{})
 
 // connFromFD wraps a raw file descriptor as a net.Conn.
 func connFromFD(fd int) (net.Conn, error) {
+	// The same provenance check fd 4 gets, for the same reason and with the same
+	// wording. Without it fd 3 was wrapped, converted and closed unexamined --
+	// so a role process started by hand under a wrapper that leaks a descriptor
+	// there, or one whose own log file took fd 3 by the lowest-available-fd rule,
+	// had that descriptor closed out from under it by the f.Close() below, and got
+	// a getsockopt error naming neither the launcher nor the contract.
+	if err := checkSocketFD(fd); err != nil {
+		return nil, err
+	}
+
 	f := os.NewFile(uintptr(fd), "signer-socketpair")
 	if f == nil {
 		return nil, fmt.Errorf("fd %d is not valid", fd)
 	}
 	conn, err := net.FileConn(f)
-	f.Close() // FileConn dups the fd; close the original
 	if err != nil {
+		// Closed only after the conversion is known to have succeeded. Closing
+		// first meant a descriptor whose provenance had not been established was
+		// closed anyway -- FileConn does not close f on failure.
+		f.Close()
 		return nil, fmt.Errorf("converting fd %d to net.Conn: %w", fd, err)
 	}
+	f.Close() // FileConn dups the fd; close the original
 	return conn, nil
 }
 
@@ -286,6 +300,21 @@ func checkPSKFD(fd int) error {
 	}
 	if st.Mode&syscall.S_IFMT != syscall.S_IFIFO {
 		return fmt.Errorf("fd %d is not a pipe (process not spawned by the launcher?)", fd)
+	}
+	return nil
+}
+
+// checkSocketFD verifies that fd is a socket before anything wraps it in an
+// os.File, so an inherited descriptor of the wrong kind is refused rather than
+// consumed and closed. The sibling of checkPSKFD, and deliberately worded the
+// same: an operator who reaches either message has made the same mistake.
+func checkSocketFD(fd int) error {
+	var st syscall.Stat_t
+	if err := syscall.Fstat(fd, &st); err != nil {
+		return fmt.Errorf("socketpair fd %d unavailable (process not spawned by the launcher?): %w", fd, err)
+	}
+	if st.Mode&syscall.S_IFMT != syscall.S_IFSOCK {
+		return fmt.Errorf("fd %d is not a socket (process not spawned by the launcher?)", fd)
 	}
 	return nil
 }

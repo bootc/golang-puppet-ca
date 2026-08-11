@@ -18,6 +18,7 @@
 package signer
 
 import (
+	"bytes"
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -206,6 +207,12 @@ var _ = Describe("PSK handshake", func() {
 		// Impostor signer: follows the message flow but forges the proof.
 		go func() {
 			defer GinkgoRecover()
+			// Closed on the way out: without it, a failing Expect in here unwinds
+			// this goroutine and leaves the spec body blocked for ever in
+			// clientHandshake's ReadFull, so the suite wedges to Ginkgo's default
+			// timeout instead of reporting. The mismatched-PSK spec above already
+			// does this.
+			defer serverConn.Close()
 			nonce := make([]byte, 32)
 			rand.Read(nonce)
 			_, err := serverConn.Write(nonce)
@@ -246,6 +253,7 @@ var _ = Describe("PSK handshake", func() {
 
 		go func() {
 			defer GinkgoRecover()
+			defer serverConn.Close()
 			nonce := make([]byte, nonceLen)
 			_, err := rand.Read(nonce)
 			Expect(err).NotTo(HaveOccurred())
@@ -446,14 +454,46 @@ var _ = Describe("awaitShutdown", func() {
 	})
 })
 
+var _ = DescribeTable("every handshake proof input is bound into the MAC",
+	// The labels were unpinned until a reflection spec caught them; the nonces are
+	// in the same position. Dropping either mac.Write leaves every handshake spec
+	// green -- both sides compute proofs the same way, so success and mismatch are
+	// unaffected, and the reflection spec still passes because the *labels* still
+	// differ. The comment claims each proof is unique to its run; this holds it.
+	func(mutate func(label, serverNonce, clientNonce []byte) ([]byte, []byte, []byte)) {
+		psk := make([]byte, pskLen)
+		_, err := rand.Read(psk)
+		Expect(err).NotTo(HaveOccurred())
+		serverNonce := bytes.Repeat([]byte{0xA1}, nonceLen)
+		clientNonce := bytes.Repeat([]byte{0xB2}, nonceLen)
+
+		base := handshakeProof(psk, signerProofLabel, serverNonce, clientNonce)
+		label, sn, cn := mutate(signerProofLabel, serverNonce, clientNonce)
+		Expect(handshakeProof(psk, label, sn, cn)).NotTo(Equal(base))
+	},
+	Entry("the label", func(l, sn, cn []byte) ([]byte, []byte, []byte) {
+		return frontendProofLabel, sn, cn
+	}),
+	Entry("the server nonce", func(l, sn, cn []byte) ([]byte, []byte, []byte) {
+		return l, bytes.Repeat([]byte{0xC3}, nonceLen), cn
+	}),
+	Entry("the client nonce", func(l, sn, cn []byte) ([]byte, []byte, []byte) {
+		return l, sn, bytes.Repeat([]byte{0xD4}, nonceLen)
+	}),
+)
+
 var _ = Describe("PSK read timeout", func() {
-	// blockingPipe returns a pipe whose read end has the provenance an inherited
-	// fd 4 has: blocking, and so unpollable. os.Pipe hands back a non-blocking
-	// read end, and it is Fd() -- which exec.Cmd.Start calls on every ExtraFiles
-	// entry -- that clears the flag on the open file description the child shares.
-	// Calling it here reproduces that exactly, which the first version of this
-	// spec did not: it used the non-blocking pipe, where a read deadline works
-	// and nowhere else does.
+	// blockingPipe returns a pipe whose read end is blocking, as an inherited fd 4
+	// is: os.Pipe hands back a non-blocking read end, and Fd() -- which
+	// exec.Cmd.Start calls on every ExtraFiles entry -- clears the flag on the open
+	// file description the child shares.
+	//
+	// It is not a complete stand-in. This file stays registered with the runtime
+	// poller (os.Pipe built it as a pipe, and Fd only clears the flag), whereas the
+	// child's os.NewFile on an already-blocking descriptor is not pollable at all.
+	// That difference is exactly what made a read deadline appear to work here and
+	// fail in production -- which is why the bound is a timer now, and why this
+	// spec no longer depends on the distinction.
 	blockingPipe := func() (*os.File, *os.File) {
 		GinkgoHelper()
 		r, w, err := os.Pipe()
@@ -500,6 +540,51 @@ var _ = Describe("PSK read timeout", func() {
 		got, err := readPSK(r, 10*time.Second)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(got).To(Equal(psk))
+	})
+})
+
+var _ = Describe("socketpair descriptor check", func() {
+	// The sibling of the fd 4 check. Without it fd 3 was wrapped, converted and
+	// closed unexamined, so a role process started by hand -- with a wrapper's
+	// descriptor or its own log file at fd 3, which the lowest-available-fd rule
+	// makes likely -- had that descriptor closed out from under it, and reported a
+	// getsockopt error naming neither the launcher nor the contract.
+	It("refuses a descriptor that is not a socket", func() {
+		f, err := os.Open(os.DevNull)
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(func() { _ = f.Close() })
+
+		err = checkSocketFD(int(f.Fd()))
+		Expect(err).To(MatchError(ContainSubstring("is not a socket")))
+		Expect(err).To(MatchError(ContainSubstring("not spawned by the launcher")))
+	})
+
+	It("refuses a descriptor that was never open", func() {
+		err := checkSocketFD(900)
+		Expect(err).To(MatchError(ContainSubstring("unavailable")))
+		Expect(err).To(MatchError(ContainSubstring("not spawned by the launcher")))
+	})
+
+	It("accepts a socketpair end", func() {
+		a, b, err := Socketpair()
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(func() { _ = a.Close(); _ = b.Close() })
+
+		Expect(checkSocketFD(int(a.Fd()))).To(Succeed())
+	})
+
+	It("leaves a descriptor it refuses open", func() {
+		// The point of checking before wrapping: a descriptor whose provenance was
+		// not established must not be consumed. connFromFD closes only after
+		// net.FileConn has succeeded.
+		f, err := os.Open(os.DevNull)
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(func() { _ = f.Close() })
+
+		_, err = connFromFD(int(f.Fd()))
+		Expect(err).To(HaveOccurred())
+		Expect(f.Close()).To(Succeed(),
+			"the descriptor must still be open for us to close")
 	})
 })
 

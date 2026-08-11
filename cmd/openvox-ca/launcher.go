@@ -191,9 +191,20 @@ func runLauncher(drain time.Duration) error {
 // testable: the parent's copies of both descriptors must be dropped as soon as
 // the child holds them, and a PSK pipe created for a child that never starts
 // must not be leaked. Both rules were open-coded twice.
+// pskPipeFn is the pipe constructor spawnChild uses. A variable so a spec can
+// capture the descriptor the helper creates and assert directly that it was
+// closed -- the fd-slot arithmetic that stood in for that could not distinguish a
+// leaked pipe from a closed socket, so it passed either way.
+var pskPipeFn = pskPipe
+
 func spawnChild(exe string, baseEnv []string, role string, sock *os.File, pskHex string) (*exec.Cmd, error) {
-	pskRead, err := pskPipe(pskHex)
+	pskRead, err := pskPipeFn(pskHex)
 	if err != nil {
+		// Including here, the earliest exit: os.Pipe fails under descriptor
+		// exhaustion, which is exactly the crash-looping launcher this helper's
+		// other failure path reasons about. Leaving fd 3 to the caller's defer on
+		// one exit and owning it on the other is the split the extraction removed.
+		sock.Close()
 		return nil, err
 	}
 

@@ -193,19 +193,27 @@ var _ = Describe("launcher fd contract", func() {
 	})
 })
 
-// lowestFreeFD returns the descriptor number a fresh pipe is given, which by the
-// POSIX lowest-available-fd rule is the lowest free slot. Comparing it before and
-// after an operation detects a descriptor the operation left open, without
-// reading /dev/fd -- which is a magic directory that cannot be listed portably
-// (on Darwin the listing's own descriptor invalidates the read).
-func lowestFreeFD() int {
+// capturePSKPipe replaces spawnChild's pipe constructor for the current spec and
+// returns a handle on whatever it hands back, so a spec can assert the helper
+// closed it. Restored by DeferCleanup.
+//
+// This replaced an fd-slot comparison. That could only ever say "the lowest free
+// descriptor did not move up", which the socketpair close satisfies on its own --
+// so it passed with the PSK pipe leaked, the single thing it was written to
+// catch.
+func capturePSKPipe() func() *os.File {
 	GinkgoHelper()
-	r, w, err := os.Pipe()
-	Expect(err).NotTo(HaveOccurred())
-	fd := int(r.Fd())
-	Expect(r.Close()).To(Succeed())
-	Expect(w.Close()).To(Succeed())
-	return fd
+	orig := pskPipeFn
+	DeferCleanup(func() { pskPipeFn = orig })
+
+	var captured *os.File
+	pskPipeFn = func(pskHex string) (*os.File, error) {
+		f, err := orig(pskHex)
+		captured = f
+		return f, err
+	}
+	// A getter, because the pipe does not exist until spawnChild runs.
+	return func() *os.File { return captured }
 }
 
 var _ = DescribeTable("filterEnv strips exactly the named keys",
@@ -280,17 +288,68 @@ var _ = Describe("spawnChild and its cleanup", func() {
 		exe, err := exec.LookPath("true")
 		Expect(err).NotTo(HaveOccurred())
 
-		before := lowestFreeFD()
+		// Capture the pipe the helper creates, so its close is asserted directly.
+		// The fd-slot arithmetic this replaces could not tell a leaked pipe from a
+		// closed socket -- the socket close alone satisfied it -- so it passed with
+		// the pipe leaked, which is the one thing it was named for.
+		pipe := capturePSKPipe()
+
 		cmd, err := spawnChild(exe, os.Environ(), "signer", sock, hex.EncodeToString(psk))
 		Expect(err).NotTo(HaveOccurred())
 		DeferCleanup(func() { killAndReap(cmd) })
 
-		// Two descriptors handed over, two closed: the lowest free slot must not
-		// have moved up, and both of the parent's copies are gone.
-		Expect(lowestFreeFD()).To(BeNumerically("<=", before),
-			"the parent must not still hold the socketpair end or the PSK pipe")
+		// Two descriptors handed over, two closed. A second Close on an *os.File
+		// returns ErrClosed rather than closing a recycled fd, so this is a safe
+		// probe -- and it returns nil if the helper skipped the close.
 		Expect(sock.Close()).To(MatchError(os.ErrClosed),
 			"the socketpair end must already be closed by the helper")
+		Expect(pipe().Close()).To(MatchError(os.ErrClosed),
+			"and so must the PSK pipe's read end")
+
+		// The role and daemon markers the children depend on. Dropping
+		// PUPPET_CA_DAEMON=1 makes each child re-daemonise under --daemon (the
+		// launcher strips the variable from baseEnv but forwards the operator's
+		// own --daemon flag), print "started in background", and exit 0 -- so the
+		// CA never starts, and no other spec notices.
+		Expect(cmd.Env).To(ContainElement("PUPPET_CA_ROLE=signer"))
+		Expect(cmd.Env).To(ContainElement("PUPPET_CA_DAEMON=1"))
+	})
+
+	It("does not let one child's role overwrite the other's", func() {
+		// The anti-aliasing clip. filterEnv returns spare capacity whenever it
+		// stripped anything, so two appends onto an unclipped slice share a
+		// backing array and the second child's role lands in the first child's
+		// env -- leaving this process tree with no signer, or two. Every other
+		// spec passes os.Environ(), which has len == cap, so the clip is a no-op
+		// there and could be deleted unnoticed.
+		psk := make([]byte, 32)
+		_, err := rand.Read(psk)
+		Expect(err).NotTo(HaveOccurred())
+		exe, err := exec.LookPath("true")
+		Expect(err).NotTo(HaveOccurred())
+
+		// Room for exactly the two variables spawnChild appends: with less, the
+		// append reallocates and the two children cannot share an array, so the
+		// fixture would prove nothing.
+		shared := filterEnv(
+			[]string{"A=1", "B=2", "PUPPET_CA_ROLE=stale", "PUPPET_CA_DAEMON=stale"},
+			"PUPPET_CA_ROLE", "PUPPET_CA_DAEMON")
+		Expect(cap(shared)-len(shared)).To(Equal(2), "the fixture needs room for both appends")
+
+		first, second, err := signer.Socketpair()
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(func() { _ = first.Close(); _ = second.Close() })
+
+		signerCmd, err := spawnChild(exe, shared, "signer", first, hex.EncodeToString(psk))
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(func() { killAndReap(signerCmd) })
+		frontendCmd, err := spawnChild(exe, shared, "frontend", second, hex.EncodeToString(psk))
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(func() { killAndReap(frontendCmd) })
+
+		Expect(signerCmd.Env).To(ContainElement("PUPPET_CA_ROLE=signer"),
+			"the second spawn must not have rewritten the first child's role")
+		Expect(frontendCmd.Env).To(ContainElement("PUPPET_CA_ROLE=frontend"))
 	})
 
 	It("is safe on a child that was never started", func() {
@@ -315,16 +374,15 @@ var _ = Describe("spawnChild and its cleanup", func() {
 		// Close on an os.File is a no-op rather than a close of a reused fd.
 		DeferCleanup(func() { _ = otherEnd.Close(); _ = sock.Close() })
 
-		before := lowestFreeFD()
+		pipe := capturePSKPipe()
 		cmd, err := spawnChild(filepath.Join(GinkgoT().TempDir(), "does-not-exist"),
 			os.Environ(), "signer", sock, hex.EncodeToString(psk))
 		Expect(err).To(HaveOccurred(), "a missing executable must not start")
 		Expect(cmd).To(BeNil())
-		// Not equality: the helper also closes the socket end it was handed, so
-		// the lowest free slot legitimately moves *down*. What must not happen is
-		// it moving up, which is what a descriptor left open would do.
-		Expect(lowestFreeFD()).To(BeNumerically("<=", before),
-			"a pipe left open would occupy this slot, pushing the next one higher")
+		Expect(pipe().Close()).To(MatchError(os.ErrClosed),
+			"a pipe created for a child that never started must not be leaked")
+		Expect(sock.Close()).To(MatchError(os.ErrClosed),
+			"and the helper owns the socketpair end on this path too")
 	})
 })
 
