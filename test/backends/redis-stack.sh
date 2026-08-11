@@ -75,16 +75,37 @@ dump_logs() {  # service-name  [tail-lines]
     "${_COMPOSE[@]}" logs --tail "$_tail" "$_svc" >&2 || true
 }
 
+# -- Every container worth hearing from when the run fails -----------------
+# The CA replicas and Redis for the backend assertions; the master and
+# OpenVoxDB for the Phase 1 catalog run; postgres because OpenVoxDB will not
+# start until it is healthy, so a postgres fault shows up as an empty
+# OpenVoxDB log. puppet-client is deliberately absent: the agent output that
+# matters is captured inline and echoed by fail().
+FAILURE_LOG_SERVICES=(openvox-ca openvox-ca-2 redis puppet-master openvoxdb postgres)
+
+dump_failure_logs() {  # tail-lines  [service-already-dumped]
+    local _tail="$1" _skip="${2:-}" _svc
+    for _svc in "${FAILURE_LOG_SERVICES[@]}"; do
+        [ "$_svc" = "$_skip" ] && continue
+        dump_logs "$_svc" "$_tail"
+    done
+}
+
 # -- Helper: abort a readiness wait loudly, dumping the culprit's logs ------
 # The wait loops below used to print " OK" whether or not the endpoint ever
 # answered, so a replica that never came up surfaced only as a downstream
 # cascade of HTTP-000 test failures. Calling this on timeout instead turns
 # that into a single actionable failure plus the container logs that explain
 # why (e.g. a Phase 1 bootstrap abort on the losing replica).
+#
+# The culprit's own logs are dumped here, unconditionally and first, because
+# they are what the operator wants to read; cleanup() adds the rest of the
+# stack below when it is about to destroy it.
 abort_not_ready() {  # human-description  service-name
     printf ' TIMEOUT\n'
     printf 'FATAL: %s did not become ready in time\n' "$1" >&2
     dump_logs "$2"
+    _ABORTED_SERVICE="$2"  # so cleanup() does not replay these lines again
     exit 1
 }
 
@@ -92,7 +113,24 @@ abort_not_ready() {  # human-description  service-name
 WORK_DIR=$(mktemp -d /tmp/redis-stack-integ.XXXXXX)
 
 cleanup() {
+    # First statement: $? here is the status the script is exiting with.
+    local _rc=$?
     rm -rf "$WORK_DIR"
+
+    # Any non-zero exit means something went wrong and the containers are
+    # about to be destroyed, taking their account of it with them: a failed
+    # assertion (which used to print its TAP line and nothing else), a
+    # readiness abort, or a shell error. Dumping from the trap rather than
+    # from each failure site is what makes that true of *every* exit path,
+    # including ones added later. Ordered before the teardown below so the
+    # containers still exist. On a --keep run (or a run against a stack this
+    # script did not start) nothing is destroyed, so the logs stay available
+    # to `compose logs` and are left there.
+    if [ "$_rc" -ne 0 ] && $DO_UP && ! $DO_KEEP; then
+        printf '\n# Run failed (exit %d) -- dumping container logs before teardown\n' "$_rc" >&2
+        dump_failure_logs 200 "${_ABORTED_SERVICE:-}"
+    fi
+
     if $DO_UP && ! $DO_KEEP; then
         printf '\n# Tearing down compose stack...\n'
         "${_COMPOSE[@]}" down --volumes --timeout 10 2>/dev/null || true
@@ -1160,33 +1198,10 @@ printf '\n# Phase 2 results: %d/%d passed, %d failed\n' \
 if [ "$FAILURES" -ne 0 ] || [ "$PHASE1_RC" -ne 0 ]; then
     printf '# Overall: FAIL  (phase1_rc=%d phase2_failures=%d)\n' \
         "$PHASE1_RC" "$FAILURES"
-    # A failed assertion used to print its TAP line and nothing else: the CA's
-    # own account of *why* -- say, the error behind a 409 on every revocation in
-    # the Race E storm -- lived in the container logs, which the EXIT trap then
-    # tore down unread. On a flake that cannot be reproduced locally that is the
-    # difference between a diagnosis and a re-run. Readiness timeouts already
-    # dump via abort_not_ready; this covers everything after that point.
-    #
-    # Gated on the same condition cleanup() tears the stack down under, because
-    # that is what makes the logs unrecoverable. A --keep run (or a run against
-    # an already-started stack) leaves them available to `compose logs`, and
-    # phase 1 runs the puppet wrapper with the stack already up, so gating also
-    # keeps a phase 1 failure from dumping the same containers twice.
-    if $DO_UP && ! $DO_KEEP; then
-        dump_logs openvox-ca 200
-        dump_logs openvox-ca-2 200
-        # Redis is the backend under test in every phase and has no readiness
-        # wait, so this is its only dump path. The CA log carries the wrapped
-        # Redis error; this is Redis's own side of it (eviction, OOM, config).
-        dump_logs redis 200
-        # Phase 1 is the puppet-stack suite, so a failure there usually needs
-        # the master's side of the conversation -- and OpenVoxDB's, since an
-        # unhealthy one fails the catalog run (see the readiness wait above).
-        if [ "$PHASE1_RC" -ne 0 ]; then
-            dump_logs puppet-master 200
-            dump_logs openvoxdb 200
-        fi
-    fi
+    # cleanup() dumps every container's logs on the way out, so the failing
+    # assertion above is followed by the CA's own account of why -- e.g. the
+    # error behind a 409 on every revocation in the Race E storm, which this
+    # script used to discard at teardown.
     exit 1
 fi
 printf '# Overall: PASS\n'
