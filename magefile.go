@@ -34,6 +34,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -41,6 +42,7 @@ import (
 
 	"github.com/magefile/mage/mg"
 	"github.com/magefile/mage/sh"
+	"gopkg.in/yaml.v3"
 
 	"github.com/caarlos0/env/v11"
 	openbao "github.com/openbao/openbao/api/v2"
@@ -214,6 +216,101 @@ func fipsCrossCC(goarch string) string {
 	return ""
 }
 
+// workflowMatrixVariants extracts the `variant:` values from the
+// strategy.matrix.include list of the named job in a workflow YAML document.
+func workflowMatrixVariants(src []byte, job string) ([]string, error) {
+	var doc struct {
+		Jobs map[string]struct {
+			Strategy struct {
+				Matrix struct {
+					Include []map[string]any `yaml:"include"`
+				} `yaml:"matrix"`
+			} `yaml:"strategy"`
+		} `yaml:"jobs"`
+	}
+	if err := yaml.Unmarshal(src, &doc); err != nil {
+		return nil, err
+	}
+	j, ok := doc.Jobs[job]
+	if !ok {
+		return nil, fmt.Errorf("job %q not found", job)
+	}
+	var names []string
+	for _, inc := range j.Strategy.Matrix.Include {
+		if v, ok := inc["variant"].(string); ok {
+			names = append(names, v)
+		}
+	}
+	if len(names) == 0 {
+		return nil, fmt.Errorf("job %q has no matrix include entries with a variant key", job)
+	}
+	return names, nil
+}
+
+// shellVariantList extracts the variant names iterated by the
+// `for variant in ...; do` loop in the release workflow's checksum step.
+func shellVariantList(src []byte) ([]string, error) {
+	m := regexp.MustCompile(`for variant in ([a-z0-9_ ]+); do`).FindSubmatch(src)
+	if m == nil {
+		return nil, fmt.Errorf("no 'for variant in ...; do' loop found")
+	}
+	return strings.Fields(string(m[1])), nil
+}
+
+// verifyDistVariants asserts that every hand-maintained copy of the release
+// variant list in the workflows agrees with distVariants(), the single source
+// of truth. Wired into dev:check so a variant added or renamed in one place
+// but not the others fails CI loudly instead of silently shipping an
+// incomplete release. The checked copies: ci.yml's dist job matrix,
+// release.yml's build job matrix, and release.yml's checksum-step shell loop
+// and tarball-count literal.
+func verifyDistVariants() error {
+	want := make([]string, 0, len(distVariants()))
+	for _, v := range distVariants() {
+		want = append(want, v.name)
+	}
+	sortedWant := slices.Sorted(slices.Values(want))
+
+	ciSrc, err := os.ReadFile(filepath.Join(".github", "workflows", "ci.yml"))
+	if err != nil {
+		return err
+	}
+	relSrc, err := os.ReadFile(filepath.Join(".github", "workflows", "release.yml"))
+	if err != nil {
+		return err
+	}
+
+	checks := []struct {
+		where string
+		got   func() ([]string, error)
+	}{
+		{"ci.yml dist job matrix", func() ([]string, error) { return workflowMatrixVariants(ciSrc, "dist") }},
+		{"release.yml build job matrix", func() ([]string, error) { return workflowMatrixVariants(relSrc, "build") }},
+		{"release.yml checksum-step shell loop", func() ([]string, error) { return shellVariantList(relSrc) }},
+	}
+	for _, c := range checks {
+		got, err := c.got()
+		if err != nil {
+			return fmt.Errorf("%s: %w", c.where, err)
+		}
+		if !slices.Equal(slices.Sorted(slices.Values(got)), sortedWant) {
+			return fmt.Errorf("%s lists variants %v, but distVariants() in magefile.go defines %v; update them together",
+				c.where, got, want)
+		}
+	}
+
+	// The checksum step also asserts an exact tarball count.
+	m := regexp.MustCompile(`"\$tarballs" -ne (\d+)`).FindSubmatch(relSrc)
+	if m == nil {
+		return fmt.Errorf("release.yml: tarball-count check not found")
+	}
+	if count, _ := strconv.Atoi(string(m[1])); count != len(want) {
+		return fmt.Errorf("release.yml expects %s tarballs, but distVariants() defines %d; update them together",
+			m[1], len(want))
+	}
+	return nil
+}
+
 // distVariantSpec describes one release artefact: its short name (the
 // artefact-name suffix, e.g. "linux_arm64_fips") and the build environment
 // that produces it.
@@ -385,16 +482,22 @@ func (Build) DistVariant(name string) error {
 // prefix.
 var bareSemverRe = regexp.MustCompile(`^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$`)
 
-// repoSlug derives the "owner/repo" slug from a git remote URL, accepting the
-// SSH (git@github.com:owner/repo.git) and HTTPS forms.
+// repoSlug derives the "owner/repo" slug from the named git remote.
 func repoSlug(remote string) (string, error) {
 	url, err := sh.Output("git", "remote", "get-url", remote)
 	if err != nil {
 		return "", fmt.Errorf("resolving remote %q: %w", remote, err)
 	}
-	m := regexp.MustCompile(`[:/]([^/:]+/[^/:]+?)(\.git)?$`).FindStringSubmatch(strings.TrimSpace(url))
+	return repoSlugFromURL(strings.TrimSpace(url))
+}
+
+// repoSlugFromURL extracts "owner/repo" from a git remote URL, accepting the
+// SSH (git@github.com:owner/repo.git), ssh:// and HTTPS forms, with or
+// without the .git suffix.
+func repoSlugFromURL(url string) (string, error) {
+	m := regexp.MustCompile(`[:/]([^/:]+/[^/:]+?)(\.git)?$`).FindStringSubmatch(url)
 	if m == nil {
-		return "", fmt.Errorf("could not derive owner/repo from remote URL %q", strings.TrimSpace(url))
+		return "", fmt.Errorf("could not derive owner/repo from remote URL %q", url)
 	}
 	return m[1], nil
 }
@@ -996,6 +1099,10 @@ func (Dev) Check() error {
 		return fmt.Errorf("go.mod/go.sum are not tidy (%s); run 'mage dev:tidy' and commit", strings.TrimSpace(changed))
 	}
 	if err := sh.Run("go", "vet", "./..."); err != nil {
+		return err
+	}
+	fmt.Println("Checking release variant lists...")
+	if err := verifyDistVariants(); err != nil {
 		return err
 	}
 	return Dev{}.Lint()

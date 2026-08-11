@@ -94,8 +94,9 @@ jobs:
           ls -l
           # Refuse to publish an incomplete release: every variant in the
           # build matrix must have produced exactly one tarball, and nothing
-          # unexpected may sneak in. Keep this list in sync with the matrix
-          # above and distVariants() in magefile.go.
+          # unexpected may sneak in. This list, the matrix above, ci.yml's
+          # dist matrix, and distVariants() in magefile.go are checked for
+          # agreement by `mage dev:check` (verifyDistVariants).
           for variant in linux_amd64 linux_arm64 linux_amd64_fips linux_arm64_fips; do
             ls -- openvox-ca_*_"$variant".tar.gz > /dev/null
           done

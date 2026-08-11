@@ -38,10 +38,11 @@ repository. Until then, release/manual builds will fail at the push step and PR
 validation builds will still work (they don't push).
 
 1. **Allow Actions to publish packages.**
-   Settings → Actions → General → *Workflow permissions*. The workflow already
-   requests `packages: write`, but if an organization policy overrides this,
-   select **Read and write permissions** (or explicitly allow the
-   `GITHUB_TOKEN` to write packages for this repository).
+   Settings → Actions → General → *Workflow permissions*. The build and merge
+   jobs already request `packages: write` (the grant is per-job, not
+   workflow-wide), but if an organization policy overrides this, select
+   **Read and write permissions** (or explicitly allow the `GITHUB_TOKEN` to
+   write packages for this repository).
 
 2. **Publish a release to create the package, then set its visibility.**
    The GHCR package is created on the first successful push and is **private**
