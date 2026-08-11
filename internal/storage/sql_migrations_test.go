@@ -19,7 +19,9 @@ package storage
 
 import (
 	"context"
+	"path/filepath"
 	"sync"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -255,3 +257,31 @@ func expectOneRowPerMigration(ctx context.Context, b *SQLBackend) {
 		Expect(count).To(Equal(1), "migration %s recorded %d times", name, count)
 	}
 }
+
+// The migration budget is the one operator knob that decides whether a schema
+// change completes, and it reaches the backend through four hops: YAML, SQLSpec,
+// SQLConfig, and the field EnsureReady reads. The two ends are pinned here; the
+// middle two in internal/config and cmd/openvox-ca.
+var _ = Describe("SQLConfig migration budget", func() {
+	It("defaults to ten minutes", func() {
+		cfg := SQLConfig{Dialect: SQLitePure, DSN: "file::memory:"}
+		cfg.applyDefaults()
+		Expect(cfg.MigrationTimeout).To(Equal(10 * time.Minute))
+	})
+
+	It("honours an operator's value all the way to the backend", func() {
+		dir := GinkgoT().TempDir()
+		b, err := NewSQLBackend(SQLConfig{
+			Dialect:          SQLitePure,
+			DSN:              "file:" + filepath.Join(dir, "ca.db"),
+			MigrationTimeout: 45 * time.Second,
+		})
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(func() { _ = b.Close() })
+
+		// White-box on purpose: the value's only observable effect is the deadline
+		// EnsureReady installs, and asserting that through a real timeout would
+		// mean contriving a migration slow enough to exceed it.
+		Expect(b.migrationTimeout).To(Equal(45 * time.Second))
+	})
+})

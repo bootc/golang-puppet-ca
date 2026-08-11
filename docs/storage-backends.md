@@ -383,6 +383,7 @@ The SQL backends share one set of config keys and environment variables:
 | `sql_request_timeout_sec` | `PUPPET_CA_SQL_REQUEST_TIMEOUT_SEC` |
 | `sql_max_open_conns` | `PUPPET_CA_SQL_MAX_OPEN_CONNS` |
 | `sql_max_idle_conns` | `PUPPET_CA_SQL_MAX_IDLE_CONNS` |
+| `sql_migration_timeout_sec` | `PUPPET_CA_SQL_MIGRATION_TIMEOUT_SEC` |
 | `sql_tls_ca_file` | `PUPPET_CA_SQL_TLS_CA_FILE` |
 | `sql_tls_cert_file` | `PUPPET_CA_SQL_TLS_CERT_FILE` |
 | `sql_tls_key_file` | `PUPPET_CA_SQL_TLS_KEY_FILE` |

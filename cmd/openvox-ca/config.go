@@ -505,6 +505,11 @@ func applyServerEnv(cfg *serverConfig) {
 			cfg.SQLRequestTimeoutSec = n
 		}
 	}
+	if v := os.Getenv("PUPPET_CA_SQL_MIGRATION_TIMEOUT_SEC"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cfg.SQLMigrationTimeoutSec = n
+		}
+	}
 	if v := os.Getenv("PUPPET_CA_SQL_MAX_OPEN_CONNS"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			cfg.SQLMaxOpenConns = n

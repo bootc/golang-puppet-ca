@@ -213,20 +213,9 @@ func NewSQLBackend(cfg SQLConfig) (*SQLBackend, error) {
 	return newSQLBackend(bun.NewDB(sqldb, bunDialect), true, cfg.RequestTimeout, cfg.MigrationTimeout), nil
 }
 
-// NewSQLBackendFromDB wraps an existing *bun.DB. The backend does not take
-// ownership and Close leaves the handle open. Used by tests that want to share
-// a single database across backends to simulate multiple replicas.
-func NewSQLBackendFromDB(db *bun.DB, requestTimeout time.Duration) *SQLBackend {
-	if requestTimeout == 0 {
-		requestTimeout = sqlDefaultTimeout
-	}
-	return newSQLBackend(db, false, requestTimeout, sqlMigrationTimeout)
-}
-
+// newSQLBackend takes both budgets already defaulted: applyDefaults is the single
+// place that decides them, so there is no second guard here to drift from it.
 func newSQLBackend(db *bun.DB, owned bool, timeout, migrationTimeout time.Duration) *SQLBackend {
-	if migrationTimeout == 0 {
-		migrationTimeout = sqlMigrationTimeout
-	}
 	return &SQLBackend{db: db, owned: owned, timeout: timeout, migrationTimeout: migrationTimeout}
 }
 
@@ -334,6 +323,12 @@ func (b *SQLBackend) EnsureReady(ctx context.Context) error {
 	// loser then fails on work the winner already did, and with bun's default of
 	// recording a migration before running it, the version stays recorded and is
 	// never retried. That is how a schema ends up permanently half-migrated.
+	// Announced before the lock, not after it. A replica queued behind a peer
+	// blocks here for up to the whole budget, and that wait was the silence this
+	// line exists to break -- logging after the lock only ever described the part
+	// that was already visible from the completion line.
+	slog.Info("Checking the SQL schema, waiting for the migration lock if another replica holds it",
+		"timeout", b.migrationTimeout)
 	unlock, lockErr := b.AcquireLock(ctx, lockNameSQLMigrate)
 	switch {
 	case lockErr == nil:
@@ -356,7 +351,8 @@ func (b *SQLBackend) EnsureReady(ctx context.Context) error {
 		local.Lock()
 		defer local.Unlock()
 	default:
-		return fmt.Errorf("acquiring migration lock: %w", lockErr)
+		return fmt.Errorf("acquiring migration lock (raise sql_migration_timeout_sec if a peer's "+
+			"migration legitimately takes longer): %w", lockErr)
 	}
 
 	// WithMarkAppliedOnSuccess reverses bun's default of recording a migration
@@ -371,10 +367,10 @@ func (b *SQLBackend) EnsureReady(ctx context.Context) error {
 	// nothing to distinguish that from a start that has wedged. The lock wait
 	// above is inside the same window, so a replica queued behind a peer looks
 	// identical without these.
-	slog.Info("Running SQL schema migrations", "timeout", b.migrationTimeout)
 	group, err := migrator.Migrate(ctx)
 	if err != nil {
-		return fmt.Errorf("running migrations: %w", err)
+		return fmt.Errorf("running migrations (raise sql_migration_timeout_sec if this is a large "+
+			"inventory): %w", err)
 	}
 	if group.IsZero() {
 		slog.Info("SQL schema is already up to date")

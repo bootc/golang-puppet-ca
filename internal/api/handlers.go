@@ -697,6 +697,36 @@ func certStatusFromCert(subject string, certPEM []byte, state string, timeFmt st
 // stand alone — its display projection was never populated (legacy inventory
 // import) or a canonical field does not parse — and the caller should fall
 // back to the PEM path for that subject.
+// normaliseSerial renders an inventory serial the way the CA's revoked-serial map
+// keys it, so a legacy zero-padded form still matches. Reports false when the
+// serial is not hex at all, which certStatusFromRecord also rejects.
+func normaliseSerial(serial string) (string, bool) {
+	n := new(big.Int)
+	if _, ok := n.SetString(serial, 16); !ok {
+		return "", false
+	}
+	return fmt.Sprintf("%X", n), true
+}
+
+// certMatchesSerial reports whether certPEM is the certificate the given
+// inventory serial names. Serials are compared through big.Int so a legacy
+// zero-padded form still matches, exactly as the index repair compares them.
+func certMatchesSerial(certPEM []byte, serial string) bool {
+	block, _ := pem.Decode(certPEM)
+	if block == nil {
+		return false
+	}
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return false
+	}
+	want := new(big.Int)
+	if _, ok := want.SetString(serial, 16); !ok {
+		return false
+	}
+	return want.Cmp(cert.SerialNumber) == 0
+}
+
 func certStatusFromRecord(rec storage.CertRecord, timeFmt string) (CertStatusResponse, bool) {
 	if rec.Fingerprint == "" {
 		return CertStatusResponse{}, false
@@ -817,25 +847,92 @@ func (s *Server) handleGetStatuses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if indexed {
+		// State comes from the signed CRL, not from the index row. The row is a
+		// projection, and the write that maintains it is best-effort -- a
+		// swallowed SetRevoked leaves the CRL correct and the row saying signed,
+		// and the repair pass that reconciles them runs only at startup. Every
+		// other status path in this file derives state from the CRL; deriving it
+		// from the row here made the list view disagree with the single-subject
+		// view for as long as the process ran. One pass over the CRL plus a map
+		// lookup per record keeps the O(N) PEM scan the index removed.
+		revoked := s.CA.RevokedSerials()
 		for _, rec := range records {
 			seen[rec.Subject] = true
-			if stateFilter != "" && rec.State != stateFilter {
+			state := storage.CertStateSigned
+			if normalised, ok := normaliseSerial(rec.Serial); ok {
+				if _, inCRL := revoked[normalised]; inCRL {
+					state = storage.CertStateRevoked
+				}
+			}
+			if stateFilter != "" && state != stateFilter {
 				continue
 			}
 			resp, ok := certStatusFromRecord(rec, s.timeFormat())
 			if !ok {
-				// Projection not (yet) populated for this record — fall back
-				// to the stored PEM for this one subject, keeping the record's
-				// state so the response matches the filter just applied.
+				// Projection not (yet) populated for this record — fall back to
+				// the stored PEM for this one subject.
 				certPEM, err := s.CA.Storage.GetCert(r.Context(), rec.Subject)
 				if err != nil {
 					slog.Warn("statuses: reading stored certificate failed, omitting subject",
 						"subject", rec.Subject, "error", err)
 					continue
 				}
-				resp = certStatusFromCert(rec.Subject, certPEM, rec.State, s.timeFormat())
+				// Warned but still served, and the distinction matters. The index
+				// repair refuses this same pairing because it would *write* the
+				// PEM's fields onto the row, making the row assert something about
+				// a certificate it does not describe. Here nothing of the row is
+				// used: every display field comes from the authoritative PEM and
+				// the state from the signed CRL, so the response describes the
+				// stored certificate accurately. Omitting instead would drop a
+				// real certificate from the listing, which is the divergence from
+				// the scan path this branch exists to avoid.
+				if !certMatchesSerial(certPEM, rec.Serial) {
+					slog.Warn("statuses: stored certificate does not match the index record's serial; "+
+						"answering from the stored certificate",
+						"subject", rec.Subject, "index_serial", rec.Serial)
+				}
+				resp = certStatusFromCert(rec.Subject, certPEM, state, s.timeFormat())
+			} else {
+				resp.State = state
 			}
 			statuses = append(statuses, resp)
+		}
+
+		// The index reports the *intersection* of stored certificates and
+		// inventory rows, so a subject whose certificate was written and whose row
+		// was not -- the crash window between those two writes, which
+		// backfillCertProjection's own doc names -- is missing from it entirely.
+		// The scan branch lists that subject from the blobs, so without this the
+		// same endpoint answers differently by backend: the certificate vanishes,
+		// it never lands in seen, and the pending CSR is then reported as
+		// "requested" for a host that already holds a certificate the CA serves.
+		certs, err := s.CA.Storage.ListCerts(r.Context())
+		if err != nil {
+			slog.Error("list certs failed", "error", err)
+			http.Error(w, "internal server error", http.StatusInternalServerError)
+			return
+		}
+		for _, subject := range certs {
+			if seen[subject] {
+				continue
+			}
+			seen[subject] = true
+			certPEM, err := s.CA.Storage.GetCert(r.Context(), subject)
+			if err != nil {
+				slog.Warn("statuses: reading stored certificate failed, omitting subject",
+					"subject", subject, "error", err)
+				continue
+			}
+			state := storage.CertStateSigned
+			if s.CA.IsRevoked(r.Context(), subject) {
+				state = storage.CertStateRevoked
+			}
+			slog.Warn("statuses: stored certificate has no index row; reporting it from the stored PEM",
+				"subject", subject)
+			if stateFilter != "" && state != stateFilter {
+				continue
+			}
+			statuses = append(statuses, certStatusFromCert(subject, certPEM, state, s.timeFormat()))
 		}
 	} else {
 		certs, err := s.CA.Storage.ListCerts(r.Context())

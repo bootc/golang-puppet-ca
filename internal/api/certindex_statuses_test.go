@@ -186,6 +186,53 @@ var _ = Describe("Certificate statuses via the certificate index", func() {
 		Expect(requested[0].Name).To(Equal("idx-pending"))
 	})
 
+	It("reports a revocation the index row has not caught up with", func() {
+		// State comes from the signed CRL, not from the index row. The write that
+		// maintains the row is best-effort -- markCertRevokedIndex logs and carries
+		// on -- and the repair pass that reconciles it runs only at startup, so a
+		// swallowed write used to make this listing disagree with
+		// GET /certificate_status/<subject> for as long as the process ran.
+		submitAndSign("idx-lagging", generateCSRWithSANs("idx-lagging", []string{"idx-lagging"}))
+		Expect(myCA.Revoke(ctx, "idx-lagging")).To(Succeed())
+
+		// Undo the projection, leaving the CRL as the only record of the fact.
+		recs, _, err := store.CertStatuses(ctx, "")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(recs).To(HaveLen(1))
+		Expect(store.ClearCertRevoked(ctx, recs[0].Serial)).To(Succeed())
+
+		statuses := getStatuses("")
+		Expect(statuses).To(HaveLen(1))
+		Expect(statuses[0].State).To(Equal("revoked"),
+			"the CRL is the signed fact; the row is a projection that can lag it")
+
+		// And the filter agrees with the body, rather than filtering on the row.
+		Expect(getStatuses("?state=revoked")).To(HaveLen(1))
+		Expect(getStatuses("?state=signed")).To(BeEmpty())
+	})
+
+	It("lists a certificate that has no index row at all", func() {
+		// Statuses reports the intersection of stored certificates and inventory
+		// rows, so the crash window between those two writes leaves a subject the
+		// index cannot see. The scan path lists it from the blobs, and without the
+		// same treatment here the certificate vanished on SQL backends -- and its
+		// pending CSR was then reported as "requested" for a host that already
+		// holds a certificate this CA serves.
+		submitAndSign("idx-rowless", generateCSRWithSANs("idx-rowless", []string{"idx-rowless"}))
+
+		// Drop the inventory rows, keeping the certificate blob -- the state the
+		// crash window leaves, reached here by pruning everything.
+		_, err := store.PruneInventory(ctx, func(storage.InventoryEntry) bool { return false })
+		Expect(err).NotTo(HaveOccurred())
+
+		statuses := getStatuses("")
+		Expect(statuses).To(HaveLen(1))
+		Expect(statuses[0].Name).To(Equal("idx-rowless"))
+		Expect(statuses[0].State).To(Equal("signed"))
+		Expect(statuses[0].Fingerprint).NotTo(BeEmpty(),
+			"the display fields must come from the stored PEM")
+	})
+
 	It("falls back to the stored PEM for a projection-less record, keeping the record's state", func() {
 		submitAndSign("idx-legacy", generateCSRWithSANs("idx-legacy", []string{"idx-legacy"}))
 

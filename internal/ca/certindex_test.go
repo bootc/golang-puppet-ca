@@ -228,6 +228,12 @@ var _ = Describe("CA certificate index", func() {
 
 			recs, _, err := store.CertStatuses(ctx, "")
 			Expect(err).NotTo(HaveOccurred())
+			// The claim is that the record *after* the malformed one is still
+			// reconciled, and that only holds because Statuses orders by subject
+			// and "broken-node" sorts first. Asserted, so a rename cannot quietly
+			// turn this into a spec that passes whatever the loop does.
+			Expect(recs[0].Subject).To(Equal("broken-node"),
+				"the malformed row must be reconciled first for this spec to mean anything")
 			bySubject := map[string]storage.CertRecord{}
 			for _, r := range recs {
 				bySubject[r.Subject] = r
@@ -280,7 +286,11 @@ var _ = Describe("CA certificate index", func() {
 
 			data, err := blobStore.ReadInventory(ctx)
 			Expect(err).NotTo(HaveOccurred())
-			Expect(string(data)).To(ContainSubstring("/node1"))
+			// Equality, not a substring: the inventory line is a byte-compatibility
+			// contract with Puppet's inventory.txt, so "the projection is ignored"
+			// must mean nothing extra was written -- a substring would pass just as
+			// happily if a fingerprint were appended.
+			Expect(string(data)).To(Equal(line + "\n"))
 
 			_, ok, err := blobStore.CertStatuses(ctx, "")
 			Expect(err).NotTo(HaveOccurred())

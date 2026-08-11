@@ -220,26 +220,28 @@ var _ = Describe("StorageConfig.ToBackendSpec", func() {
 		DescribeTable("propagate the DSN and TLS paths for each SQL dialect",
 			func(configured string, expectedKind storage.BackendKind) {
 				cfg := config.StorageConfig{
-					StorageBackend:       configured,
-					SQLDSN:               "user:dsn-s3cr3t@tcp(db:3306)/puppetca",
-					SQLRequestTimeoutSec: 9,
-					SQLMaxOpenConns:      20,
-					SQLMaxIdleConns:      5,
-					SQLTLSCAFile:         "/tls/sql-ca.pem",
-					SQLTLSCertFile:       "/tls/sql-client.pem",
-					SQLTLSKeyFile:        "/tls/sql-client.key",
+					StorageBackend:         configured,
+					SQLDSN:                 "user:dsn-s3cr3t@tcp(db:3306)/puppetca",
+					SQLRequestTimeoutSec:   9,
+					SQLMigrationTimeoutSec: 1800,
+					SQLMaxOpenConns:        20,
+					SQLMaxIdleConns:        5,
+					SQLTLSCAFile:           "/tls/sql-ca.pem",
+					SQLTLSCertFile:         "/tls/sql-client.pem",
+					SQLTLSKeyFile:          "/tls/sql-client.key",
 				}
 				spec, err := cfg.ToBackendSpec(localDir)
 				Expect(err).NotTo(HaveOccurred())
 				Expect(spec.Kind).To(Equal(expectedKind))
 				Expect(spec.SQL).To(Equal(storage.SQLSpec{
-					DSN:               "user:dsn-s3cr3t@tcp(db:3306)/puppetca",
-					RequestTimeoutSec: 9,
-					MaxOpenConns:      20,
-					MaxIdleConns:      5,
-					TLSCAFile:         "/tls/sql-ca.pem",
-					TLSCertFile:       "/tls/sql-client.pem",
-					TLSKeyFile:        "/tls/sql-client.key",
+					DSN:                 "user:dsn-s3cr3t@tcp(db:3306)/puppetca",
+					RequestTimeoutSec:   9,
+					MigrationTimeoutSec: 1800,
+					MaxOpenConns:        20,
+					MaxIdleConns:        5,
+					TLSCAFile:           "/tls/sql-ca.pem",
+					TLSCertFile:         "/tls/sql-client.pem",
+					TLSKeyFile:          "/tls/sql-client.key",
 				}))
 				Expect(spec.Etcd).To(Equal(storage.EtcdSpec{}))
 				Expect(spec.Redis).To(Equal(storage.RedisSpec{}))

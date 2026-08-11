@@ -87,13 +87,7 @@ func (c *CA) rebuildCertIndex(ctx context.Context) {
 		return
 	}
 
-	// Normalised serial → revocation time, from the signed CRL.
-	revoked := make(map[string]time.Time)
-	if c.cachedCRL != nil {
-		for _, entry := range c.cachedCRL.RevokedCertificateEntries {
-			revoked[serialHexStr(entry.SerialNumber)] = entry.RevocationTime
-		}
-	}
+	revoked := c.revokedSerialsLocked()
 
 	// The backfill reads and parses one stored PEM per projection-less record,
 	// so the first start after a blob→SQL migration legitimately takes a while
@@ -113,7 +107,21 @@ func (c *CA) rebuildCertIndex(ctx context.Context) {
 
 	const progressEvery = 1000
 	var projected, restated int
-	for _, rec := range records {
+	for i, rec := range records {
+		// The backfill is one stored-PEM read and one row write per record, so on
+		// a large fleet this pass runs for minutes -- and it inherits whatever
+		// budget Init had, which on the lost-bootstrap-race path is the 60-second
+		// bootstrap-lock timeout. Without this check a cancelled context produced
+		// one warning per remaining record, burying the cause under thousands of
+		// lines, and then reported "Certificate index repaired" for a pass that
+		// had done a quarter of the work.
+		if err := ctx.Err(); err != nil {
+			slog.Warn("Certificate index repair interrupted; the next start resumes it",
+				"records_done", i, "records_total", len(records),
+				"projections_backfilled", projected, "states_corrected", restated,
+				"error", err)
+			return
+		}
 		if rec.Fingerprint == "" && c.backfillCertProjection(ctx, rec) {
 			projected++
 			if projected%progressEvery == 0 {
@@ -153,6 +161,34 @@ func (c *CA) rebuildCertIndex(ctx context.Context) {
 		slog.Info("Certificate index repaired",
 			"projections_backfilled", projected, "states_corrected", restated)
 	}
+}
+
+// RevokedSerials returns the CRL's revocations as normalised serial → revocation
+// time, built once from the cached CRL.
+//
+// Exported because the certificate-index read path needs the same answer the
+// repair pass needs, and needs it for a whole page of records: one pass over the
+// CRL plus a map lookup per record, rather than a linear scan of the CRL per
+// record. Taking the state from the index row instead would be cheaper still and
+// is what the handler used to do -- but the row is a projection that a swallowed
+// write can leave behind, and the CRL is the signed fact.
+func (c *CA) RevokedSerials() map[string]time.Time {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.revokedSerialsLocked()
+}
+
+// revokedSerialsLocked is RevokedSerials for a caller that already holds c.mu.
+// Init does, for the whole of itself, and the repair pass runs inside it -- so
+// taking the read lock there would deadlock, sync.RWMutex being non-reentrant.
+func (c *CA) revokedSerialsLocked() map[string]time.Time {
+	revoked := make(map[string]time.Time)
+	if c.cachedCRL != nil {
+		for _, entry := range c.cachedCRL.RevokedCertificateEntries {
+			revoked[serialHexStr(entry.SerialNumber)] = entry.RevocationTime
+		}
+	}
+	return revoked
 }
 
 // backfillCertProjection fills rec's missing display projection from the
