@@ -234,34 +234,70 @@ type tagGateRepo struct {
 // fixture built from os.Environ() inside a pre-push hook commits into the
 // *real* repository and moves its branch. The pre-push hook runs this suite via
 // its `go test -tags mage .` invocation, and that is exactly what happened: six
-// fixture commits landed on the branch being pushed. Neither `mage
-// test:magefile` nor CI can reproduce it — there is no hook in the picture, so
-// there is no GIT_DIR to inherit — which is why it survived five green rounds
-// of review.
+// fixture commits landed on the branch being pushed.
+//
+// A hook is the only thing that leaks that environment naturally, which is why
+// nothing reproduced it and it survived five green rounds of review. A spec has
+// to plant it deliberately — the decoy repository below does, so the class is
+// visible to `mage test:magefile` and CI now.
+// HOME and XDG_CONFIG_HOME are redirected too, and they are the subtle half:
+// neither carries the GIT_ prefix, and git finds its default ignore and
+// attributes files under them ($XDG_CONFIG_HOME/git/ignore, else
+// $HOME/.config/git/ignore) regardless of GIT_CONFIG_GLOBAL. A maintainer whose
+// user-level ignore file covers *.txt would otherwise turn the decoy's
+// `status --porcelain` assertion empty — failing a clean tree, and worse,
+// blinding that assertion to a real index write. Redirecting them also makes the
+// isolation independent of git's version, since GIT_CONFIG_GLOBAL/SYSTEM are
+// silently ignored before git 2.32.
+// fixtureHome is suite-scoped rather than per-spec because fixtureEnv is called
+// from DeferCleanup too, and GinkgoT().TempDir() registers a cleanup of its own —
+// which Ginkgo refuses from inside one. It stays empty: nothing writes to it, it
+// exists only so git finds no user-level config, ignore or attributes file.
+var fixtureHome string
+
+var _ = BeforeSuite(func() {
+	dir, err := os.MkdirTemp("", "openvox-ca-fixture-home-")
+	Expect(err).NotTo(HaveOccurred())
+	fixtureHome = dir
+	DeferCleanup(func() {
+		Expect(os.RemoveAll(dir)).To(Succeed())
+	})
+})
+
 func fixtureEnv() []string {
-	env := make([]string, 0, len(os.Environ())+6)
+	GinkgoHelper()
+	Expect(fixtureHome).NotTo(BeEmpty(), "fixtureHome is unset; BeforeSuite did not run")
+	env := make([]string, 0, len(os.Environ())+8)
 	for _, kv := range os.Environ() {
-		if strings.HasPrefix(kv, "GIT_") {
+		if strings.HasPrefix(kv, "GIT_") ||
+			strings.HasPrefix(kv, "HOME=") || strings.HasPrefix(kv, "XDG_CONFIG_HOME=") {
 			continue
 		}
 		env = append(env, kv)
 	}
-	// No signing, no hooks, no ambient identity: the fixture must build
-	// identically on a maintainer's machine and on a CI runner.
+	// No signing, no hooks, no ambient identity, no user-level ignore or
+	// attributes: the fixture must build identically on a maintainer's machine
+	// and on a CI runner.
 	return append(env,
+		"HOME="+fixtureHome,
+		"XDG_CONFIG_HOME="+filepath.Join(fixtureHome, ".config"),
 		"GIT_CONFIG_GLOBAL=/dev/null",
 		"GIT_CONFIG_SYSTEM=/dev/null",
+		"GIT_CONFIG_NOSYSTEM=1",
+		"GIT_ATTR_NOSYSTEM=1",
 		"GIT_AUTHOR_NAME=test", "GIT_AUTHOR_EMAIL=test@example.com",
 		"GIT_COMMITTER_NAME=test", "GIT_COMMITTER_EMAIL=test@example.com",
 	)
 }
 
 // gitIn runs one git command in dir with the fixture environment, and is the
-// only place in this file that builds a git exec.Command. Everything else goes
-// through it — including the decoy repository's own setup and inspection —
-// because forgetting cmd.Env at a single site is exactly how these fixtures came
-// to operate on the real repository. Output is folded into the failure message
-// so a fixture that cannot build says why.
+// only site that execs git directly — the decoy repository's setup and
+// inspection included. The single choke point for the environment itself is
+// fixtureEnv, not this function: pushWithEnv execs the gate script rather than
+// git, so it cannot route through here and has to set cmd.Env for itself, which
+// leaves it the one place where forgetting is still possible. That is how these
+// fixtures came to operate on the real repository, twice. Output is folded into
+// the failure message so a fixture that cannot build says why.
 func gitIn(dir string, args ...string) string {
 	GinkgoHelper()
 	cmd := exec.Command("git", args...)
@@ -273,9 +309,13 @@ func gitIn(dir string, args ...string) string {
 }
 
 func newTagGateRepo(constVersion, chartVersion, chartAppVersion string) *tagGateRepo {
+	GinkgoHelper()
 	dir := GinkgoT().TempDir()
 
-	git := func(args ...string) string { return gitIn(dir, args...) }
+	git := func(args ...string) string {
+		GinkgoHelper()
+		return gitIn(dir, args...)
+	}
 
 	git("init", "--quiet")
 
@@ -298,7 +338,13 @@ func newTagGateRepo(constVersion, chartVersion, chartAppVersion string) *tagGate
 	git("add", "-A")
 	git("commit", "--quiet", "--no-gpg-sign", "-m", "fixture")
 
-	return &tagGateRepo{dir: dir, sha: git("rev-parse", "HEAD")}
+	// Validated, because gitIn returns CombinedOutput: one stray byte on stderr
+	// makes this not a sha, the gate cannot resolve it, and the gate skips —
+	// which every allow-path spec would read as success.
+	sha := git("rev-parse", "HEAD")
+	Expect(sha).To(MatchRegexp("^[0-9a-f]{40}$"), "the fixture did not yield a commit sha")
+
+	return &tagGateRepo{dir: dir, sha: sha}
 }
 
 // git runs a git command inside the fixture. A read is as dangerous as a write
@@ -310,19 +356,44 @@ func (r *tagGateRepo) git(args ...string) string {
 	return gitIn(r.dir, args...)
 }
 
-// push runs the hook the way git does: the pushed refs arrive on stdin as
-// "<local-ref> <local-sha> <remote-ref> <remote-sha>".
+// push runs the script with the pushed refs on stdin, as git delivers them:
+// "<local-ref> <local-sha> <remote-ref> <remote-sha>". The script finds its
+// repository by cwd here.
 func (r *tagGateRepo) push(remoteRef, localSHA string) (string, error) {
+	GinkgoHelper()
+	return r.pushWithEnv(remoteRef, localSHA, fixtureEnv())
+}
+
+// pushAsHook runs it the way git actually does under a real pre-push hook, with
+// GIT_DIR and GIT_WORK_TREE naming the repository being pushed — which is the
+// fixture itself, since that is the repository whose tag is under test.
+//
+// Production always has those set and cwd discovery never happens there, so
+// without this the script's only coverage is a configuration that never occurs.
+// The two are different paths inside git, and the difference is not academic:
+// stripping GIT_* is now the house rule for anything shelling out to git, and
+// applying it inside the script would change its behaviour under a real push
+// while leaving every cwd-discovered spec green.
+func (r *tagGateRepo) pushAsHook(remoteRef, localSHA string) (string, error) {
+	GinkgoHelper()
+	return r.pushWithEnv(remoteRef, localSHA, append(fixtureEnv(),
+		"GIT_DIR="+filepath.Join(r.dir, ".git"),
+		"GIT_WORK_TREE="+r.dir,
+	))
+}
+
+func (r *tagGateRepo) pushWithEnv(remoteRef, localSHA string, env []string) (string, error) {
+	GinkgoHelper()
 	script, err := filepath.Abs(filepath.Join(".lefthook", "pre-push", "verify-tags.sh"))
 	Expect(err).NotTo(HaveOccurred())
 
 	cmd := exec.Command("sh", script)
 	cmd.Dir = r.dir
-	// The script's own `git show` must read the fixture, not whatever repo the
-	// ambient GIT_DIR names — under a real pre-push hook that is the repo being
-	// pushed, so an inherited environment made every one of these specs assert
-	// against the wrong commit.
-	cmd.Env = fixtureEnv()
+	// The caller chooses, but every caller passes an environment built from
+	// fixtureEnv: the script's own `git show` must read the fixture, not whatever
+	// repository an inherited GIT_DIR names, which is what made these specs
+	// assert against the wrong commit.
+	cmd.Env = env
 	cmd.Stdin = strings.NewReader(fmt.Sprintf("%s %s %s %s\n", remoteRef, localSHA, remoteRef, strings.Repeat("0", 40)))
 	out, err := cmd.CombinedOutput()
 	return string(out), err
@@ -336,24 +407,51 @@ var _ = Describe("fixtureEnv", func() {
 	It("removes every ambient GIT_ variable", func() {
 		for _, k := range []string{
 			"GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
-			"GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_QUARANTINE_PATH", "GIT_PREFIX",
+			"GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_COMMON_DIR", "GIT_CONFIG",
+			"GIT_CONFIG_PARAMETERS", "GIT_QUARANTINE_PATH", "GIT_PREFIX",
 		} {
 			GinkgoT().Setenv(k, "/should/not/survive")
 		}
 
-		kept := map[string]bool{
-			"GIT_CONFIG_GLOBAL=/dev/null":          true,
-			"GIT_CONFIG_SYSTEM=/dev/null":          true,
-			"GIT_AUTHOR_NAME=test":                 true,
-			"GIT_AUTHOR_EMAIL=test@example.com":    true,
-			"GIT_COMMITTER_NAME=test":              true,
-			"GIT_COMMITTER_EMAIL=test@example.com": true,
-		}
+		// Asserted as a set, in both directions at once. A one-sided check for
+		// survivors passes when fixtureEnv stops appending at all — which would
+		// quietly let a maintainer's global config and identity back in — and
+		// reports a legitimate value change as "a leak survived", sending the
+		// reader after a fault that is not there.
+		var gitVars []string
 		for _, kv := range fixtureEnv() {
 			if strings.HasPrefix(kv, "GIT_") {
-				Expect(kept).To(HaveKey(kv), "an ambient GIT_ variable survived the strip")
+				gitVars = append(gitVars, kv)
 			}
 		}
+		Expect(gitVars).To(ConsistOf(
+			"GIT_CONFIG_GLOBAL=/dev/null",
+			"GIT_CONFIG_SYSTEM=/dev/null",
+			"GIT_CONFIG_NOSYSTEM=1",
+			"GIT_ATTR_NOSYSTEM=1",
+			"GIT_AUTHOR_NAME=test", "GIT_AUTHOR_EMAIL=test@example.com",
+			"GIT_COMMITTER_NAME=test", "GIT_COMMITTER_EMAIL=test@example.com",
+		))
+	})
+
+	// HOME and XDG_CONFIG_HOME are where git looks for its default ignore and
+	// attributes files, so leaving the ambient ones in place would let a
+	// maintainer's own config reach the fixtures.
+	It("redirects HOME and XDG_CONFIG_HOME away from the ambient ones", func() {
+		GinkgoT().Setenv("HOME", "/should/not/survive")
+		GinkgoT().Setenv("XDG_CONFIG_HOME", "/should/not/survive/config")
+
+		env := fixtureEnv()
+		Expect(env).NotTo(ContainElement("HOME=/should/not/survive"))
+		Expect(env).NotTo(ContainElement("XDG_CONFIG_HOME=/should/not/survive/config"))
+
+		var homes int
+		for _, kv := range env {
+			if strings.HasPrefix(kv, "HOME=") {
+				homes++
+			}
+		}
+		Expect(homes).To(Equal(1), "HOME must be replaced, not duplicated")
 	})
 })
 
@@ -367,6 +465,31 @@ var _ = Describe("the pre-push tag gate", func() {
 		out, err := repo.push("refs/tags/v"+version, repo.sha)
 		Expect(err).NotTo(HaveOccurred(), out)
 		Expect(out).To(BeEmpty())
+
+		// Silence is also what a gate that skipped everything prints, so prove it
+		// read this fixture: the same commit under a tag it does not match must be
+		// refused, and the refusal has to name the version the fixture holds.
+		out, err = repo.push("refs/tags/v0.7.0", repo.sha)
+		Expect(err).To(HaveOccurred(), "the gate skipped the tag instead of reading it")
+		Expect(out).To(ContainSubstring(`says "` + version + `", not "0.7.0"`))
+	})
+
+	// The environment git actually supplies to a pre-push hook: GIT_DIR naming the
+	// repository being pushed, which is this fixture. Every other spec here lets
+	// the script discover its repository from cwd, a configuration production
+	// never presents.
+	It("reads the tagged commit when git names the repository, as a real hook does", func() {
+		repo := newTagGateRepo(version, version, version)
+		out, err := repo.pushAsHook("refs/tags/v"+version, repo.sha)
+		Expect(err).NotTo(HaveOccurred(), out)
+		Expect(out).To(BeEmpty())
+	})
+
+	It("refuses a mismatching tag when git names the repository too", func() {
+		repo := newTagGateRepo("0.8.0", version, version)
+		out, err := repo.pushAsHook("refs/tags/v"+version, repo.sha)
+		Expect(err).To(HaveOccurred())
+		Expect(out).To(ContainSubstring(`internal/version at the tagged commit says "0.8.0"`))
 	})
 
 	// The regression that made this suite dangerous rather than merely wrong.
@@ -381,7 +504,7 @@ var _ = Describe("the pre-push tag gate", func() {
 	// the fixture's own .git, so the fixture builds and the decoy stays empty,
 	// but the staged entries are written into the other repository's index —
 	// destroying whatever the developer had staged when they ran git push.
-	decoyLeak := func() string {
+	decoyLeak := func() {
 		decoy := GinkgoT().TempDir()
 		gitIn(decoy, "init", "--quiet")
 		// A file to stage, so a leak lands a real commit here — the harm as it
@@ -402,7 +525,6 @@ var _ = Describe("the pre-push tag gate", func() {
 			Expect(gitIn(decoy, "status", "--porcelain")).To(Equal("?? tracked.txt"),
 				"the decoy's index or work tree was written to")
 		})
-		return decoy
 	}
 
 	It("builds and verifies its fixture in its own repository under a leaked environment", func() {

@@ -12,9 +12,9 @@ guide is the human-friendly entry point; where the two overlap, AGENTS.md wins.
 ## Prerequisites
 
 - Go 1.25+ (see [`go.mod`](go.mod) for the exact version)
-- git 2.32+ — the magefile suite's git fixtures isolate themselves with
-  `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM`, which older git ignores silently,
-  letting your own global config reach the fixtures
+- git (any supported version — the magefile suite's fixtures isolate themselves
+  from your own git config by redirecting `HOME` as well as setting
+  `GIT_CONFIG_GLOBAL`, so they do not depend on the 2.32+ variables alone)
 - [Mage](https://magefile.org/), the build tool this repo uses instead of Make:
   `go install github.com/magefile/mage@latest` (or run targets with
   `go run mage.go <Target>`)
@@ -96,6 +96,14 @@ See [`AGENTS.md`](AGENTS.md) for the details. The essentials:
   committing.
 - Make sure `mage dev:check`, `mage test:unit`, `mage test:magefile`, and
   `markdownlint-cli2` pass.
+- `lefthook install` wires these up as git hooks: pre-commit runs gofmt and
+  golangci-lint, and pre-push runs both test invocations (`go test ./...` plus
+  the build-tagged `go test -tags mage .`) and refuses a `v*` tag whose version
+  does not match the tree. Each check prints a SKIP and stands aside rather than
+  blocking when its tool is missing. Worth knowing that the pre-push run is a
+  *different environment* from a bare `mage test:magefile` — git exports
+  `GIT_DIR` and friends to its hooks — which is a hazard for any test that
+  shells out to git; see the testing conventions in [AGENTS.md](AGENTS.md).
 - Changed the Helm chart? `mage chart:validate` and `mage chart:test` are
   required checks too. A new template branch needs a fixture under
   `charts/openvox-ca/ci/`, and anything a reader has to trust needs a case in

@@ -134,14 +134,18 @@ Conventions:
   `t.Setenv` needs a `*testing.T`, which Ginkgo nodes do not have; `GinkgoT()`
   supplies the same save-and-restore semantics). Do not rely on tests running
   serially.
-- A spec that shells out to `git` must build its environment by *stripping*
+- A spec that shells out to `git` — or to anything that may itself run `git`, a
+  hook script included, which is where this was missed twice — must build its
+  environment by *stripping*
   `GIT_*` from `os.Environ()`, never by appending to it. git exports `GIT_DIR`,
   `GIT_WORK_TREE`, `GIT_INDEX_FILE` and `GIT_OBJECT_DIRECTORY` to the hooks it
   runs, and they outrank `cmd.Dir` — so under the pre-push hook an inherited
   environment makes the fixture operate on the real repository. This has already
   cost one branch: see `fixtureEnv` in [`magefile_chart_test.go`](magefile_chart_test.go).
-  Neither `mage test:magefile` nor CI can reproduce it, because neither runs
-  inside a hook.
+  A hook is the only thing that leaks that environment naturally, so a spec has
+  to plant it deliberately to be covered — see the decoy repository in the same
+  file, which is what makes this class visible to `mage test:magefile` and CI at
+  all. Without one, neither can reproduce it.
 - Prefer `Eventually(...).Should(...)` over `time.Sleep` for asynchronous
   conditions; sleeps make the suite flaky on loaded CI runners.
 - Keep negative and edge cases first-class: every security-relevant branch

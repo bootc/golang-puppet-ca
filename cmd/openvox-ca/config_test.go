@@ -28,9 +28,9 @@ import (
 )
 
 // setEnv sets an environment variable for the duration of the current spec,
-// saving the prior value and restoring it via DeferCleanup. Go's t.Setenv is
-// unavailable inside Ginkgo nodes, so this preserves the same save/restore
-// semantics without leaking into sibling specs.
+// saving the prior value and restoring it via DeferCleanup. Equivalent to
+// GinkgoT().Setenv, which is the other sanctioned form (see AGENTS.md); a bare
+// t.Setenv needs a *testing.T, which Ginkgo nodes do not have.
 func setEnv(key, value string) {
 	GinkgoHelper()
 	prior, had := os.LookupEnv(key)
