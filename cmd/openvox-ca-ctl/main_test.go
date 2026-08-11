@@ -44,6 +44,10 @@ func saveCtlGlobals() {
 }
 
 var _ = Describe("Root command", func() {
+	// Every spec here builds a root command, and newRootCmd() re-registers the
+	// persistent flags against the package globals, resetting them all.
+	BeforeEach(saveCtlGlobals)
+
 	It("prints the release version for --version", func() {
 		var out bytes.Buffer
 		cmd := newRootCmd()
@@ -71,7 +75,6 @@ var _ = Describe("Root command", func() {
 	// --version may not). --help returns before PersistentPreRunE, keeping
 	// the spec hermetic — no config loading or network.
 	It("accepts a persistent flag after the subcommand", func() {
-		DeferCleanup(func(orig bool) { globalVerbose = orig }, globalVerbose)
 		cmd := newRootCmd()
 		cmd.SetArgs([]string{"list", "-v", "--help"})
 		cmd.SetOut(io.Discard)
@@ -152,6 +155,20 @@ var _ = Describe("Global flag precedence", func() {
 			"Insecure = false; want the env var to win when --insecure is unset")
 		Expect(globalCACert).To(Equal("/from/env.pem"),
 			"CACert = %q; want the env var to win when --ca-cert is unset", globalCACert)
+	})
+
+	// The direction that matters most for security: an operator re-enabling
+	// verification from the environment must beat a config file that disabled
+	// it. applyCtlEnv assigns the parsed bool either way, and only this spec
+	// covers the false direction end to end.
+	It("lets the env var switch insecure back off over the config file", func() {
+		cfgFile := writeTempCtlConfig("insecure: true\n")
+		setCtlEnv("PUPPET_CA_CTL_INSECURE", "false")
+
+		runProbe(cfgFile)
+
+		Expect(globalInsecure).To(BeFalse(),
+			"Insecure = true; want PUPPET_CA_CTL_INSECURE=false to beat the config file")
 	})
 
 	It("falls back to the config file when neither the flag nor the env var is set", func() {

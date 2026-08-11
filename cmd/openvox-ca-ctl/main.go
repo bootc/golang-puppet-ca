@@ -27,7 +27,6 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
-	"encoding/pem"
 	"fmt"
 	"io"
 	"log/slog"
@@ -76,14 +75,16 @@ func newTLSConfig(notices io.Writer) (*tls.Config, error) {
 		if err != nil {
 			return nil, fmt.Errorf("reading --ca-cert %s: %w", globalCACert, err)
 		}
+		// SECURITY: AppendCertsFromPEM loads every certificate in the file, so
+		// a bundle (root plus intermediates, as Puppet's ca_crt.pem often is)
+		// is trusted in full, and it reports whether anything was loaded at
+		// all. Decoding only the first block instead would silently produce an
+		// empty or partial trust anchor whose only symptom is an opaque
+		// handshake failure much later.
+		// NIST 800-53: SC-8 (Transmission Confidentiality and Integrity)
 		pool := x509.NewCertPool()
-		block, _ := pem.Decode(caCertPEM)
-		if block != nil {
-			cert, err := x509.ParseCertificate(block.Bytes)
-			if err != nil {
-				return nil, fmt.Errorf("parsing --ca-cert: %w", err)
-			}
-			pool.AddCert(cert)
+		if !pool.AppendCertsFromPEM(caCertPEM) {
+			return nil, fmt.Errorf("parsing --ca-cert %s: no PEM certificate found", globalCACert)
 		}
 		tlsCfg.RootCAs = pool
 	} else if globalInsecure {
@@ -109,12 +110,18 @@ func newTLSConfig(notices io.Writer) (*tls.Config, error) {
 	// NIST 800-53: SC-8 (Transmission Confidentiality and Integrity)
 	tlsCfg.MinVersion = tls.VersionTLS13
 
-	if globalClientCert != "" && globalClientKey != "" {
+	switch {
+	case globalClientCert != "" && globalClientKey != "":
 		cert, err := tls.LoadX509KeyPair(globalClientCert, globalClientKey)
 		if err != nil {
 			return nil, fmt.Errorf("loading --client-cert/--client-key: %w", err)
 		}
 		tlsCfg.Certificates = []tls.Certificate{cert}
+	case globalClientCert != "" || globalClientKey != "":
+		// SECURITY: Half a key pair cannot authenticate. Say so now rather
+		// than presenting no client certificate and leaving the operator to
+		// diagnose a server-side mTLS rejection.
+		return nil, fmt.Errorf("--client-cert and --client-key must be supplied together")
 	}
 
 	return tlsCfg, nil

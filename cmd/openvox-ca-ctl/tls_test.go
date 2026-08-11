@@ -126,6 +126,29 @@ var _ = Describe("newTLSConfig", func() {
 			_, err := newTLSConfig(notices)
 			Expect(err).To(MatchError(ContainSubstring("parsing --ca-cert")))
 		})
+
+		// A readable file with no PEM in it at all (a DER export, a truncated
+		// download, the wrong file) must fail here and not as an opaque
+		// handshake error against an empty trust pool.
+		It("returns an error when the file holds no PEM certificate", func() {
+			globalCACert = writeTempPEM("raw.der", []byte("not pem at all"))
+
+			_, err := newTLSConfig(notices)
+			Expect(err).To(MatchError(ContainSubstring("no PEM certificate found")))
+		})
+
+		// A CA bundle (root plus intermediates) must be trusted in full, not
+		// truncated to whichever certificate happens to come first.
+		It("trusts every certificate in a bundle", func() {
+			_, otherCertPEM, _, err := testutil.GenerateTestCAECDSA()
+			Expect(err).NotTo(HaveOccurred())
+			globalCACert = writeTempPEM("bundle.pem", append(append([]byte{}, otherCertPEM...), caCertPEM...))
+
+			cfg, err := newTLSConfig(notices)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(trusts(cfg.RootCAs)).To(BeTrue(),
+				"the second certificate in the bundle does not verify against the resulting RootCAs pool")
+		})
 	})
 
 	Context("with --insecure and no --ca-cert", func() {
@@ -179,7 +202,29 @@ var _ = Describe("newTLSConfig", func() {
 			Expect(err).NotTo(HaveOccurred())
 			Expect(cfg.Certificates).To(HaveLen(1),
 				"Certificates = %d; want the --client-cert/--client-key pair", len(cfg.Certificates))
+			// Pin which pair loaded, not merely that one did.
+			block, _ := pem.Decode(caCertPEM)
+			Expect(block).NotTo(BeNil())
+			Expect(cfg.Certificates[0].Certificate[0]).To(Equal(block.Bytes),
+				"the loaded leaf is not the certificate named by --client-cert")
 		})
+
+		// Half a key pair cannot authenticate, so it must be rejected here
+		// rather than surfacing as a server-side mTLS refusal.
+		DescribeTable("rejects a half-supplied pair",
+			func(prepare func()) {
+				prepare()
+
+				_, err := newTLSConfig(notices)
+				Expect(err).To(MatchError(ContainSubstring("must be supplied together")))
+			},
+			Entry("only --client-cert", func() {
+				globalClientCert = writeTempPEM("client.pem", caCertPEM)
+			}),
+			Entry("only --client-key", func() {
+				globalClientKey = writeTempPEM("client-key.pem", caKeyPEM)
+			}),
+		)
 
 		It("returns an error when the key does not match the certificate", func() {
 			otherKeyPEM, _, _, err := testutil.GenerateTestCAECDSA()
