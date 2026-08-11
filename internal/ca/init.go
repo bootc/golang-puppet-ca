@@ -470,6 +470,10 @@ func (c *CA) bootstrapCA(ctx context.Context) error {
 	// certificate and goes to loadCA. A failure swallowed here is therefore
 	// permanent, and leaves the storage layout documented in
 	// docs/storage-backends.md incomplete with no operator-visible signal.
+	// Named as a write failure because that is the only half reachable here:
+	// x509.CreateCertificate above has already marshalled this same public key
+	// into the certificate, so a key savePubKeyPEM could not encode would have
+	// failed the bootstrap long before this line.
 	if err := savePubKeyPEM(ctx, c.Storage, key.Public()); err != nil {
 		return fmt.Errorf("failed to write CA public key (the CA key and certificate are "+
 			"already written; the next start will complete the remaining state): %w", err)

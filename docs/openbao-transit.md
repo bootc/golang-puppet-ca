@@ -365,12 +365,13 @@ spec:
           args: ["csr"]
           volumeMounts:
             - { name: config, mountPath: /etc/puppet-ca }
-            # Only needed on the filesystem backend, which keeps the CA key and
-            # certificate in the cadir: csr reads them from there, and
-            # --create-key would write the key there too. It must be the same
-            # volume the Deployment uses, or the Job reads an empty ephemeral
-            # layer instead of the CA -- and any key it created there is lost
-            # with the pod.
+            # Only needed on the filesystem backend, which keeps the CA
+            # certificate in the cadir: csr reads it from there to reproduce an
+            # established subject. It must be the same volume the Deployment
+            # uses, or the Job reads an empty ephemeral layer instead of the CA.
+            # The key is not in play here -- under ca_key_provider: openbao it
+            # lives in Transit, and only the default file provider would put it
+            # in the cadir.
             - { name: cadir, mountPath: /etc/puppetlabs/puppet/ssl/ca }
       volumes:
         - { name: config, configMap: { name: openvox-ca-config } }   # key: config.yaml

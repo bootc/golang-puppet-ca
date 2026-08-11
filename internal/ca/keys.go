@@ -241,15 +241,9 @@ func parsePrivateKeyDER(blockType string, der []byte) (crypto.Signer, error) {
 	}
 }
 
-// errPubKeyMarshal marks the half of savePubKeyPEM that fails before anything
-// is written. The import path has to tell the two apart: a marshalling failure
-// leaves storage untouched, while a failed write leaves a certificate installed
-// without its companion, which is what incompleteImportError exists to say.
-var errPubKeyMarshal = errors.New("marshalling public key")
-
 // savePubKeyPEM writes pub to storage as the CA public key blob, in the PEM
-// encoding docs/development/storage-internals.md and docs/storage-backends.md
-// describe (`ca_pub.pem`, block type "PUBLIC KEY").
+// encoding docs/development/storage-internals.md describes (`ca_pub.pem`, block
+// type "PUBLIC KEY").
 //
 // One encoder for the three paths that write it — bootstrap, import, and the
 // backfill in seedSupportingState — because the encoding is a stored-format
@@ -258,10 +252,16 @@ var errPubKeyMarshal = errors.New("marshalling public key")
 // itself differs per caller by design (a freshly generated key, the signer that
 // proved custody at import, the established certificate's own key), so it is a
 // parameter; so is the error context, which each caller wraps for itself.
+//
+// The marshalling half is defence in depth rather than a case any caller can
+// reach: each one has already had the same public component marshalled by
+// x509.CreateCertificate, AssertSignerMatchesCert, or x509.ParseCertificate
+// before it gets here. Callers therefore report a failure as a write failure,
+// which is the only half that can actually occur.
 func savePubKeyPEM(ctx context.Context, store *storage.StorageService, pub crypto.PublicKey) error {
 	der, err := x509.MarshalPKIXPublicKey(pub)
 	if err != nil {
-		return fmt.Errorf("%w: %w", errPubKeyMarshal, err)
+		return fmt.Errorf("marshalling the public key: %w", err)
 	}
 	return store.SaveCAPubKey(ctx, pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: der}))
 }

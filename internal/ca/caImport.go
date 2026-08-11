@@ -242,14 +242,13 @@ func importCAMaterial(ctx context.Context, store *storage.StorageService, certBu
 	}
 
 	// --- Write CA public key ---
-	// The two failures are not the same import: a marshalling failure has
-	// written nothing, while a failed write leaves the certificate installed
-	// without its companion blob, which is the inconsistency the retry advice
-	// exists to describe.
+	// Past the point of no return: SaveCACert above has already replaced the
+	// certificate, so any failure here leaves storage inconsistent and takes
+	// the incompleteImportError annotation. That covers savePubKeyPEM's
+	// marshalling half too, which AssertSignerMatchesCert has already ruled out
+	// by marshalling this same public component to compare it with the
+	// certificate.
 	if err := savePubKeyPEM(ctx, store, signer.Public()); err != nil {
-		if errors.Is(err, errPubKeyMarshal) {
-			return fmt.Errorf("failed to marshal signing key's public component: %w", err)
-		}
 		return incompleteImportError(fmt.Errorf("failed to write CA public key: %w", err), retry)
 	}
 

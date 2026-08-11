@@ -1878,4 +1878,16 @@ var _ = Describe("Bootstrap public key write", func() {
 		Expect(err).NotTo(HaveOccurred())
 		Expect(block.Bytes).To(Equal(wantDER))
 	})
+
+	It("refuses to start when the backfill cannot write it either", func() {
+		// The backfill is held to the same contract as bootstrap. Swallowing
+		// this error would restore the silent omission by the back door: the
+		// start would succeed, and this is the only path that would ever write
+		// the blob again.
+		Expect(newCA().Init(context.Background())).NotTo(Succeed())
+
+		err := newCA().Init(context.Background())
+		Expect(err).To(MatchError(ContainSubstring("writing CA public key")))
+		Expect(err).To(MatchError(ContainSubstring("simulated backend failure")))
+	})
 })
