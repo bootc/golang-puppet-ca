@@ -151,6 +151,36 @@ var _ = Describe("CA CleanupExpiredCerts", func() {
 		Expect(store.HasCert(ctx, "live-node")).To(BeTrue())
 	})
 
+	It("preserves an imported CRL chain when it re-signs", func() {
+		// The fourth re-sign path, and the one no spec covered. Chain preservation
+		// used to be structural -- the chain assembly fetched the stored blob
+		// itself, so no call site could get it wrong -- and is now an argument
+		// each of the four callers passes. Every spec in this file runs against a
+		// single-block store, so a caller that passed nothing would drop every
+		// ancestor and reset the CRL number with the suite green.
+		upstream, upsCRL := upstreamCA("Upstream Root CA")
+		seedCert("expired-node", big.NewInt(0xABCE), time.Now().Add(-3*365*24*time.Hour))
+
+		ours, err := store.GetCRL(ctx)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(store.UpdateCRL(ctx, append(append([]byte{}, ours...), upsCRL...))).To(Succeed())
+		before := crlBlocks(mustGetCRL(ctx, store))
+		Expect(before).To(HaveLen(2))
+		Expect(before[0].RevokedCertificateEntries).To(HaveLen(1))
+
+		removed, err := myCA.CleanupExpiredCerts(ctx, time.Hour)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(removed).To(Equal(1), "the expired entry is what forces the re-sign")
+
+		after := crlBlocks(mustGetCRL(ctx, store))
+		Expect(after).To(HaveLen(2), "the ancestor must survive a cleanup re-sign")
+		Expect(after[1].Raw).To(Equal(before[1].Raw))
+		Expect(after[1].AuthorityKeyId).To(Equal(upstream.SubjectKeyId))
+		Expect(after[0].RevokedCertificateEntries).To(BeEmpty())
+		Expect(after[0].Number.Cmp(before[0].Number)).To(Equal(1),
+			"and our own number must advance rather than reset")
+	})
+
 	It("does not remove certs that are still within the retention grace period", func() {
 		// Expired only 1 hour ago, but retention is 30 days: must be kept.
 		seedCert("recent-node", big.NewInt(0x1234), time.Now().Add(-time.Hour))

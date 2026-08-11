@@ -243,6 +243,17 @@ Some limits worth knowing before you rely on re-import as a refresh mechanism.
 > before its own `nextUpdate` lapses. Nothing alerts on this — see
 > [the metrics reference](metrics.md#crl) — so track those deadlines out of band.
 >
+> `import` is the one place it is detectable, so read its output. It warns when a
+> supplied ancestor is already past its `nextUpdate`, and when the chain carries
+> more than one CRL for the same ancestor:
+>
+> ```text
+> level=WARN msg="Imported ancestor CRL has already expired; agents doing full-chain revocation checking will reject the published chain" issuer="CN=Root CA" next_update=2026-01-01T00:00:00Z
+> ```
+>
+> Running `import` with no `--crl-chain` writes nothing and still performs both
+> checks, so it is a safe way to ask whether the chain you are serving is sound.
+>
 > **`import` writes to a local filesystem directory only.** It takes `--cadir` and
 > constructs filesystem storage directly; unlike `migrate` it has no
 > `--source-config`/`--dest-config`. If your CA runs on **sqlite, postgres, mysql,
@@ -285,7 +296,13 @@ openvox-ca-ctl import --cadir "$SCRATCH" \
   --crl-chain refreshed-chain.pem
 
 # Back up the live backend before the return leg: --force overwrites a CA that
-# is already there, and migrate is not transactional.
+# is already there, and migrate is not transactional. backup.yaml must describe
+# a filesystem backend whose cadir is a fresh, empty directory, for the same
+# reason scratch.yaml must -- migrate refuses a destination that already holds a
+# CA certificate, so a reused backup directory fails this leg *after* the import
+# above has run, and reusing it with --force would overwrite the previous backup
+# with the state you are about to replace.
+BACKUP=$(mktemp -d)   # write this path into backup.yaml as cadir:
 openvox-ca-ctl migrate --source-config live.yaml --dest-config backup.yaml
 
 openvox-ca-ctl migrate --source-config scratch.yaml --dest-config live.yaml --force

@@ -97,7 +97,7 @@ func ImportCA(ctx context.Context, store *storage.StorageService, certBundlePEM,
 	// the authoritative decision is taken again under the CRL lock below, so
 	// that the read it depends on and the write that follows are atomic with
 	// respect to a concurrent revocation.
-	if _, err := planCRLImport(ctx, store, crlPEM, caCert, caKey); err != nil {
+	if _, _, err := planCRLImport(ctx, store, crlPEM, caCert, caKey); err != nil {
 		return err
 	}
 
@@ -138,17 +138,20 @@ func ImportCA(ctx context.Context, store *storage.StorageService, certBundlePEM,
 	lockCtx, cancel := context.WithTimeout(ctx, lockTimeout)
 	defer cancel()
 	if err := store.WithLock(lockCtx, lockNameCRL, func() error {
-		plan, err := planCRLImport(ctx, store, crlPEM, caCert, caKey)
+		plan, changed, err := planCRLImport(ctx, store, crlPEM, caCert, caKey)
 		if err != nil {
 			return err
 		}
-		if plan == nil {
-			return nil
-		}
-		// Warned here rather than inside orderCRLChain, so the checks run on
-		// every import shape including the ancestors-only one.
+		// Checked before the early return, so every import shape gets it --
+		// including the two that write nothing. These are pure reads of the chain
+		// about to be published, and an import that changes nothing still leaves
+		// a lapsed ancestor being served to every agent. This warning is the only
+		// detector of that: no series and no alert covers ancestor expiry.
 		if len(plan) > 1 {
 			warnAboutAncestors(plan[1:])
+		}
+		if !changed {
+			return nil
 		}
 		return writeCRLChain(ctx, store, plan)
 	}); err != nil {
@@ -176,7 +179,10 @@ func ImportCA(ctx context.Context, store *storage.StorageService, certBundlePEM,
 
 // planCRLImport decides what the stored CRL chain should become, without
 // writing anything, so a refusal cannot leave the cert and key already replaced.
-// A nil result means the stored chain is already correct and must be left alone.
+// It returns the chain that will be published and whether writing it would change
+// anything: false means the stored chain is already correct and must be left
+// alone. The chain is returned either way, because the caller's ancestor checks
+// have to run on what is being served, not only on what is being written.
 //
 // crlPEM may be nil, meaning the operator supplied no --crl-chain. That is not
 // an instruction to discard the stored CRL: it used to generate a fresh empty
@@ -186,10 +192,10 @@ func ImportCA(ctx context.Context, store *storage.StorageService, certBundlePEM,
 // block 0 was legitimately ours. Nothing supplied means nothing to change.
 func planCRLImport(ctx context.Context, store *storage.StorageService, crlPEM []byte,
 	caCert *x509.Certificate, caKey crypto.Signer,
-) ([]*x509.RevocationList, error) {
+) ([]*x509.RevocationList, bool, error) {
 	stored, err := storedCRLChain(ctx, store)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
 	if crlPEM == nil {
@@ -199,7 +205,7 @@ func planCRLImport(ctx context.Context, store *storage.StorageService, crlPEM []
 			// from the wrong list.
 			ordered, foundOurs := orderCRLChain(stored, caCert)
 			if !foundOurs {
-				return nil, fmt.Errorf("the stored CRL chain contains no CRL signed by the CA certificate "+
+				return nil, false, fmt.Errorf("the stored CRL chain contains no CRL signed by the CA certificate "+
 					"being imported, and no --crl-chain was supplied to replace it: pass --crl-chain "+
 					"with this CA's own CRL, or remove the stored CRL to have a fresh empty one generated "+
 					"(%d block(s) currently stored)", len(stored))
@@ -207,15 +213,15 @@ func planCRLImport(ctx context.Context, store *storage.StorageService, crlPEM []
 			if sameCRLOrder(stored, ordered) {
 				// Already exactly right: writing identical bytes would bump the
 				// stored modification time and make every agent re-download.
-				return nil, nil
+				return ordered, false, nil
 			}
-			return ordered, nil
+			return ordered, true, nil
 		}
 		generated, err := newEmptyCRL(caCert, caKey, CRLValidity)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
-		return []*x509.RevocationList{generated}, nil
+		return []*x509.RevocationList{generated}, true, nil
 	}
 
 	// Every CRL block must parse. The blob is served verbatim to every agent,
@@ -224,10 +230,10 @@ func planCRLImport(ctx context.Context, store *storage.StorageService, crlPEM []
 	// CRL across the fleet rather than as an import error here.
 	incoming, err := decodeCRLChain(crlPEM)
 	if err != nil {
-		return nil, fmt.Errorf("crl-chain: %w", err)
+		return nil, false, fmt.Errorf("crl-chain: %w", err)
 	}
 	if len(incoming) == 0 {
-		return nil, fmt.Errorf("crl-chain does not contain a valid X509 CRL PEM block")
+		return nil, false, fmt.Errorf("crl-chain does not contain a valid X509 CRL PEM block")
 	}
 
 	// Every reader takes block 0 as this CA's own CRL, so put it there. An
@@ -249,12 +255,15 @@ func planCRLImport(ctx context.Context, store *storage.StorageService, crlPEM []
 		if ourCRL == nil {
 			ourCRL, err = newEmptyCRL(caCert, caKey, CRLValidity)
 			if err != nil {
-				return nil, err
+				return nil, false, err
 			}
 		}
 		ordered = append([]*x509.RevocationList{ourCRL}, ordered...)
 	}
-	return ordered, nil
+	// A supplied chain is authoritative, so it is always written -- even when it
+	// happens to match, since the operator asked for it and the re-encode is
+	// byte-identical anyway.
+	return ordered, true, nil
 }
 
 // writeCRLChain persists a chain, re-encoded from the parsed blocks rather than
@@ -310,12 +319,28 @@ func sameCRLOrder(a, b []*x509.RevocationList) bool {
 	return true
 }
 
-// ownCRLIn returns the CRL in chain that cert signed, or nil when there is none.
+// ownCRLIn returns the newest CRL in chain that cert signed, or nil when there is
+// none.
+//
+// Newest, not first, and by the same newerCRL comparison orderCRLChain applies to
+// an incoming bundle -- the two answer the same question about different inputs,
+// and a stored blob can hold more than one block of ours. The released build's
+// import validated block 0 and then wrote the operator's bundle verbatim, so
+// `--crl-chain stale.pem current.pem root.pem` is a stored shape this code has to
+// read after an upgrade.
+//
+// Taking the first match there resolved to the stale copy, and an ancestors-only
+// refresh -- the documented way to refresh ancestors -- then promoted it to block
+// 0. The CRL number regresses and every revocation recorded after the stale
+// export stops being published, silently: the import path emits no chain-length
+// warning, and orderCRLChain's superseded warning only ever sees the incoming
+// bundle, which holds none of ours on that path.
 func ownCRLIn(chain []*x509.RevocationList, cert *x509.Certificate) *x509.RevocationList {
+	var ours *x509.RevocationList
 	for _, crl := range chain {
-		if crlSignedBy(cert, crl) {
-			return crl
+		if crlSignedBy(cert, crl) && (ours == nil || newerCRL(crl, ours)) {
+			ours = crl
 		}
 	}
-	return nil
+	return ours
 }

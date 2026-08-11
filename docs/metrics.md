@@ -90,8 +90,12 @@ the Unix epoch, the Prometheus convention for `*_timestamp_seconds` gauges.
 | `puppetca_crl_revoked_certificates` | Number of certificates currently listed in the CRL. |
 | `puppetca_crl_update_failures_total` | Counter of failures to amend the CRL — a revocation that could not be recorded, or a CRL that could not be re-signed or written (across the revoke, cleanup, reissue and refresh paths). A rising value means the CRL is not being maintained; for revocations it means a superseded certificate may still be a valid credential. Resets to `0` on process restart. |
 
-The four CRL gauges above describe **this CA's own CRL**, the first block of the
-stored blob. When a CRL chain has been imported, the ancestor CRLs that follow it
+The four CRL gauges above describe the **first block of the stored blob**, which
+is normally this CA's own CRL and not always: a hand-assembled blob can lead with
+an ancestor's, and the CA then answers revocation from its own block found later
+in the chain (see [storage internals](development/storage-internals.md)) while
+these series still describe block 0. Startup warns loudly in that state, and every
+write path refuses it, so it is a condition to fix rather than to monitor. When a CRL chain has been imported, the ancestor CRLs that follow it
 are not covered: this CA cannot re-sign them, so their expiry is not something a
 refresh can fix and not something these series track.
 

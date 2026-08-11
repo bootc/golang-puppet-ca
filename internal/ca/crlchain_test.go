@@ -376,7 +376,6 @@ var _ = Describe("CRL chain read failures", func() {
 		// Unrevoked, and specifically so: the stored CRL is untouched, which is
 		// what makes the deleted certificate still valid.
 		Expect(mustGetCRL(ctx, store)).To(Equal(before))
-		Expect(crlBlocks(mustGetCRL(ctx, store))[0].RevokedCertificateEntries).To(BeEmpty())
 		Expect(buf.String()).To(ContainSubstring("stays a valid credential until it expires"))
 	})
 
@@ -848,6 +847,30 @@ var _ = Describe("CRL chain ordering at import", func() {
 		Expect(buf.String()).To(ContainSubstring("copies=3"))
 	})
 
+	It("warns once per duplicated ancestor, not once per chain", func() {
+		// The latch is per issuer, and one duplicated ancestor cannot show that:
+		// a single global flag would satisfy the spec above exactly. Two matter
+		// because the topology this exists for is root -> intermediate -> us, so
+		// two ancestors is the ordinary case, and a backup directory that
+		// duplicates one duplicates both.
+		_, rootCRL := upstreamCA("Shared Root CA")
+		bundle := append([]byte{}, ourCRL...)
+		for _, block := range [][]byte{upsCRL, upsCRL, rootCRL, rootCRL} {
+			bundle = append(bundle, block...)
+		}
+
+		var buf bytes.Buffer
+		orig := slog.Default()
+		slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+		defer slog.SetDefault(orig)
+
+		Expect(ca.ImportCA(ctx, store, certPEM, keyPEM, bundle)).To(Succeed())
+		Expect(strings.Count(buf.String(), "more than one CRL for the same ancestor")).To(Equal(2),
+			"each duplicated ancestor is its own problem to fix")
+		Expect(buf.String()).To(ContainSubstring("Upstream Root CA"))
+		Expect(buf.String()).To(ContainSubstring("Shared Root CA"))
+	})
+
 	It("keeps the highest-numbered copy when the bundle carries two of ours", func() {
 		// A bundle assembled from a backup directory easily contains a stale
 		// export alongside the current one. Taking whichever came first made
@@ -981,6 +1004,74 @@ var _ = Describe("CRL chain ordering at import", func() {
 		Expect(chain[0].RevokedCertificateEntries[0].SerialNumber).
 			To(Equal(revoked.RevokedCertificateEntries[0].SerialNumber))
 		Expect(chain[1].AuthorityKeyId).To(Equal(upstream.SubjectKeyId))
+	})
+
+	It("keeps the newest of our blocks when the stored blob holds two, not the first", func() {
+		// The shape the released build's import could store: it validated block 0
+		// and then wrote the operator's bundle verbatim, so
+		// `--crl-chain stale.pem current.pem root.pem` is a stored blob this code
+		// has to read after an upgrade.
+		//
+		// orderCRLChain already resolves this for an *incoming* bundle, by CRL
+		// number. ownCRLIn read the stored one and took the first match, so an
+		// ancestors-only refresh -- the documented way to refresh ancestors --
+		// promoted the stale copy to block 0. The number regresses and every
+		// revocation recorded after the stale export stops being published, with
+		// no warning anywhere: the import path emits no chain-length line, and
+		// orderCRLChain's superseded warning only ever sees the incoming bundle.
+		Expect(ca.ImportCA(ctx, store, certPEM, keyPEM, ourCRL)).To(Succeed())
+
+		myCA := ca.New(store, ca.AutosignConfig{Mode: "off"}, "puppet.test")
+		myCA.LeafKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
+		Expect(myCA.Init(ctx)).To(Succeed())
+		_, err := myCA.Generate(ctx, "node1.test", nil)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(myCA.Revoke(ctx, "node1.test")).To(Succeed())
+
+		current := crlBlocks(mustGetCRL(ctx, store))[0]
+		Expect(current.RevokedCertificateEntries).To(HaveLen(1))
+		serial := current.RevokedCertificateEntries[0].SerialNumber
+
+		// Stale copy first, current second: the concatenation order an operator
+		// gets from a backup directory.
+		stale := ourCRL
+		Expect(store.UpdateCRL(ctx, append(append([]byte{}, stale...),
+			pem.EncodeToMemory(&pem.Block{Type: "X509 CRL", Bytes: current.Raw})...))).To(Succeed())
+
+		// Refresh the ancestors only, which is when ownCRLIn is consulted.
+		Expect(ca.ImportCA(ctx, store, certPEM, keyPEM, upsCRL)).To(Succeed())
+
+		chain := crlBlocks(mustGetCRL(ctx, store))
+		Expect(chain).To(HaveLen(2))
+		Expect(chain[0].Number.Cmp(current.Number)).To(Equal(0),
+			"the newest of our blocks must lead, so the CRL number cannot regress")
+		Expect(chain[0].RevokedCertificateEntries).To(HaveLen(1),
+			"and the revocations recorded after the stale export must survive")
+		Expect(chain[0].RevokedCertificateEntries[0].SerialNumber).To(Equal(serial))
+	})
+
+	It("warns about a lapsed ancestor even when the import writes nothing", func() {
+		// The two no-op shapes -- nothing supplied and already in order -- return
+		// before the write. The expiry check is a pure read of what is being
+		// served, and an import that changes nothing still republishes a lapsed
+		// ancestor to every agent. Since no series and no alert covers ancestor
+		// expiry, skipping the check here left the only detector unreachable on
+		// the shape an operator uses to *check* their chain.
+		expired := expiringUpstreamCA("Lapsed Root CA", -time.Hour)
+		Expect(ca.ImportCA(ctx, store, certPEM, keyPEM,
+			append(append([]byte{}, ourCRL...), expired...))).To(Succeed())
+		before := mustGetCRL(ctx, store)
+
+		var buf bytes.Buffer
+		orig := slog.Default()
+		slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+		defer slog.SetDefault(orig)
+
+		// No --crl-chain: nothing to change, nothing written.
+		Expect(ca.ImportCA(ctx, store, certPEM, keyPEM, nil)).To(Succeed())
+		Expect(mustGetCRL(ctx, store)).To(Equal(before), "this shape must not write")
+		Expect(buf.String()).To(ContainSubstring("has already expired"),
+			"the only detector of ancestor expiry must run on the shape that writes nothing")
 	})
 
 	It("rejects a chain whose ancestor block is corrupt", func() {

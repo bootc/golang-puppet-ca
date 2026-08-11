@@ -64,7 +64,10 @@ openvox-ca-ctl sign --all
 # Revoke a certificate
 openvox-ca-ctl revoke --certname agent.example.com
 
-# Revoke + delete cert and CSR
+# Revoke + delete cert and CSR. The delete happens even if the revocation
+# fails, so check the server log: a certificate that could not be revoked
+# stays a valid credential until it expires, and it is no longer in storage
+# to clean again. See docs/api.md for the state that causes it.
 openvox-ca-ctl clean --certname agent.example.com
 
 # Re-sign the CRL with a fresh validity window (preserves all revocations)

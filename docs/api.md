@@ -11,7 +11,7 @@ All endpoints are served under both the bare path and `/puppet-ca/v1/<path>`, so
 | --- | --- | --- |
 | `GET` | `/certificate_status/{subject}` | Get status: `signed`, `requested`, or `revoked` |
 | `PUT` | `/certificate_status/{subject}` | Change state (`signed` or `revoked`); supports `cert_ttl` (seconds). `revoked` returns `409 Conflict` when the stored CRL was not signed by the CA certificate this process loaded — see the note below |
-| `DELETE` | `/certificate_status/{subject}` | Revoke + delete cert and CSR (`puppet cert clean`) |
+| `DELETE` | `/certificate_status/{subject}` | Revoke + delete cert and CSR (`puppet cert clean`). The delete happens even if the revocation fails — see the note below |
 
 `PUT` body:
 
@@ -26,6 +26,18 @@ All endpoints are served under both the bare path and `/puppet-ca/v1/<path>`, so
 > startup; the response body names the cause and the remedy, which is to restart
 > the replica holding the stale certificate. `PUT /certificate_revocation_list/ca`
 > refuses the same state for the same reason.
+>
+> **`clean` is not symmetric with `revoke` here.** Clean's job is to remove the
+> certificate, so a revocation that fails does not stop it: `DELETE
+> /certificate_status/{subject}` and `PUT /clean` return success, delete the
+> certificate, and leave it unrevoked and usable as a credential until it expires.
+> In the `409` state above that means the whole revoke family does *not* fail
+> closed — the `PUT` refuses, the `DELETE` succeeds. The revoke failure is logged
+> at `WARN` ("stays a valid credential until it expires") and counted in
+> `puppetca_crl_update_failures_total`, so
+> [`PuppetCACRLUpdateFailing`](metrics.md#crl) fires. Recovering needs both a
+> restart of the stale replica *and* the serial revoked by hand, because the
+> certificate is no longer in storage to clean again.
 
 `GET` response:
 
