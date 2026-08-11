@@ -25,15 +25,17 @@ The file *replaces* the system trust store rather than adding to it, so a server
 whose certificate chains to a public CA stops verifying once `--ca-cert` is
 given. It may hold a bundle: every certificate in it that parses is loaded, so a
 root plus its intermediates can be passed as one file. A file holding no usable
-certificate (a DER export, a truncated download, the wrong file) is rejected on
-startup rather than failing later in the handshake.
+certificate (a DER export, a truncated download, the wrong file) is rejected
+before the connection is attempted rather than failing later in the handshake.
 
 `--client-cert` and `--client-key` must be supplied together; giving only one is
 an error.
 
-Two advisory lines go to **stderr**, not stdout: a `NOTE:` on every invocation
-that supplies no trust anchor, and a `WARNING:` about MITM exposure whenever
-`--insecure` is in effect. Both are expected output, not failures.
+Subcommands that contact the server write one advisory line to **stderr**, not
+stdout: a `WARNING:` about MITM exposure when `--insecure` is in effect,
+otherwise a `NOTE:` when no `--ca-cert` is supplied, and nothing at all when
+`--ca-cert` is. Both are expected output, not failures. `setup`, `import` and
+`migrate` build no client, so they write neither line and never check `--ca-cert`.
 
 `openvox-ca-ctl --version` prints the version (including commit metadata when
 built from a git checkout) and exits. Unlike the global flags above,

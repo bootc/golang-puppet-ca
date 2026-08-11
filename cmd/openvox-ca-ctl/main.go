@@ -90,6 +90,13 @@ func newTLSConfig(notices io.Writer) (*tls.Config, error) {
 				"(no PEM certificate block, or none that parses)", globalCACert)
 		}
 		tlsCfg.RootCAs = pool
+		if globalInsecure {
+			// The operator asked for both. Say which one won, since the
+			// losing flag was typed deliberately and its absence of effect is
+			// otherwise invisible.
+			_, _ = fmt.Fprintln(notices, "NOTE: --ca-cert supplied; --insecure ignored and the server "+
+				`certificate will still be verified (pass --ca-cert="" to drop a configured trust anchor)`)
+		}
 	} else if globalInsecure {
 		// SECURITY: Operator explicitly opted in to skip TLS verification.
 		// NIST 800-53: SC-8 (Transmission Confidentiality and Integrity)
@@ -120,11 +127,22 @@ func newTLSConfig(notices io.Writer) (*tls.Config, error) {
 			return nil, fmt.Errorf("loading --client-cert/--client-key: %w", err)
 		}
 		tlsCfg.Certificates = []tls.Certificate{cert}
-	case globalClientCert != "" || globalClientKey != "":
+	case globalClientCert != "":
 		// SECURITY: Half a key pair cannot authenticate. Say so now rather
 		// than presenting no client certificate and leaving the operator to
-		// diagnose a server-side mTLS rejection.
-		return nil, fmt.Errorf("--client-cert and --client-key must be supplied together")
+		// diagnose a server-side mTLS rejection. Name the half that arrived
+		// and every source it could have come from: after an upgrade the
+		// operator most often typed neither flag, and the value came from
+		// ctl.yaml or the environment.
+		return nil, fmt.Errorf("--client-cert %s given without --client-key "+
+			"(also settable as client_cert/client_key in the config file, or "+
+			"PUPPET_CA_CTL_CLIENT_CERT/PUPPET_CA_CTL_CLIENT_KEY); both are required for mTLS",
+			globalClientCert)
+	case globalClientKey != "":
+		return nil, fmt.Errorf("--client-key %s given without --client-cert "+
+			"(also settable as client_cert/client_key in the config file, or "+
+			"PUPPET_CA_CTL_CLIENT_CERT/PUPPET_CA_CTL_CLIENT_KEY); both are required for mTLS",
+			globalClientKey)
 	}
 
 	return tlsCfg, nil

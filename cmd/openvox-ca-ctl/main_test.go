@@ -142,6 +142,27 @@ var _ = Describe("Global flag precedence", func() {
 			"CACert = %q; want the explicit --ca-cert to beat the env var and config file", globalCACert)
 	})
 
+	// The documented route to --insecure when a config file already sets
+	// ca_cert. It works only because an explicitly empty flag still counts as
+	// Changed, so the overlay assigns the empty value instead of skipping it.
+	It("lets an empty --ca-cert clear the config file value", func() {
+		cfgFile := writeTempCtlConfig("ca_cert: /from/file.pem\n")
+		setCtlEnv("PUPPET_CA_CTL_CA_CERT", "/from/env.pem")
+
+		runProbe(cfgFile, "--ca-cert=", "--insecure")
+
+		Expect(globalCACert).To(BeEmpty(),
+			"CACert = %q; want the empty --ca-cert to clear the config file and env values", globalCACert)
+		Expect(globalInsecure).To(BeTrue())
+
+		// Follow it through: with the trust anchor cleared, --insecure is now
+		// the branch that runs, which is the whole point of the route.
+		cfg, err := newTLSConfig(io.Discard)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(cfg.InsecureSkipVerify).To(BeTrue(),
+			"InsecureSkipVerify = false; want the documented --ca-cert=\"\" route to reach --insecure")
+	})
+
 	// The pf.Changed() gate is what makes this work: without it, every unset
 	// flag's zero value would clobber the env var and config file below.
 	It("falls back to the env var when the flag is unset", func() {

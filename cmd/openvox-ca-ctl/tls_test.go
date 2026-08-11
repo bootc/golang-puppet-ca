@@ -23,6 +23,7 @@ import (
 	"crypto/x509"
 	"encoding/pem"
 	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -166,17 +167,31 @@ var _ = Describe("newTLSConfig", func() {
 		})
 
 		// The documented contract is that --ca-cert *replaces* the system trust
-		// store. Seeding the pool from x509.SystemCertPool() instead would keep
-		// every positive assertion above green while silently widening trust,
-		// so pin the negative direction too.
-		It("does not trust a CA outside the supplied file", func() {
-			_, foreignCertPEM, _, err := testutil.GenerateTestCAECDSA()
-			Expect(err).NotTo(HaveOccurred())
+		// store. Probing with a foreign CA cannot show that: a freshly
+		// generated self-signed CA is in no system store either, so it would
+		// fail against a system-seeded pool exactly as it fails against this
+		// one. Pin the pool's membership instead — Equal fails the moment the
+		// pool holds anything the --ca-cert file did not put there.
+		It("builds a pool holding exactly the supplied file", func() {
+			want := x509.NewCertPool()
+			Expect(want.AppendCertsFromPEM(caCertPEM)).To(BeTrue())
 
 			cfg, err := newTLSConfig(notices)
 			Expect(err).NotTo(HaveOccurred())
-			Expect(verifies(cfg.RootCAs, foreignCertPEM)).To(BeFalse(),
-				"a CA absent from --ca-cert verifies against the resulting RootCAs pool; the pool is wider than the file")
+			Expect(cfg.RootCAs.Equal(want)).To(BeTrue(),
+				"RootCAs holds more than the --ca-cert file; the pool is wider than the operator asked for")
+		})
+
+		// The other flag was typed deliberately, so the operator is told which
+		// one won rather than left to infer it from a connection that still
+		// verifies.
+		It("says so when it overrides --insecure", func() {
+			globalInsecure = true
+
+			_, err := newTLSConfig(notices)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(notices.String()).To(ContainSubstring("--insecure ignored"),
+				"notices = %q; want the operator told that --ca-cert won", notices.String())
 		})
 	})
 
@@ -261,20 +276,28 @@ var _ = Describe("newTLSConfig", func() {
 		})
 
 		// Half a key pair cannot authenticate, so it must be rejected here
-		// rather than surfacing as a server-side mTLS refusal.
+		// rather than surfacing as a server-side mTLS refusal. The message has
+		// to name the half that arrived, and its path: the value most often
+		// came from ctl.yaml or the environment, not from the flag it names.
 		DescribeTable("rejects a half-supplied pair",
-			func(prepare func()) {
-				prepare()
+			func(prepare func() string, missing string) {
+				supplied := prepare()
 
 				_, err := newTLSConfig(notices)
-				Expect(err).To(MatchError(ContainSubstring("must be supplied together")))
+				Expect(err).To(MatchError(ContainSubstring(missing)))
+				Expect(err).To(MatchError(ContainSubstring(supplied)),
+					"error does not name the path that was supplied")
+				Expect(err).To(MatchError(ContainSubstring("PUPPET_CA_CTL_CLIENT_CERT")),
+					"error does not name the other sources the value could have come from")
 			},
-			Entry("only --client-cert", func() {
+			Entry("only --client-cert", func() string {
 				globalClientCert = writeTempPEM("client.pem", caCertPEM)
-			}),
-			Entry("only --client-key", func() {
+				return globalClientCert
+			}, "without --client-key"),
+			Entry("only --client-key", func() string {
 				globalClientKey = writeTempPEM("client-key.pem", caKeyPEM)
-			}),
+				return globalClientKey
+			}, "without --client-cert"),
 		)
 
 		It("returns an error when the key does not match the certificate", func() {
@@ -318,6 +341,36 @@ var _ = Describe("newClient", func() {
 			"RootCAs = nil; want the --ca-cert pool to reach the transport")
 		Expect(transport.TLSClientConfig.MinVersion).To(Equal(uint16(tls.VersionTLS13)),
 			"MinVersion = %#x; want TLS 1.3 to reach the transport", transport.TLSClientConfig.MinVersion)
+	})
+
+	// The advisory lines share a stream with command output, so the writer
+	// newClient picks is a wiring decision: on stdout they would interleave with
+	// the PEM that `generate` prints and with the `list` table.
+	It("writes its notices to stderr, not stdout", func() {
+		globalCACert = ""
+
+		outR, outW, err := os.Pipe()
+		Expect(err).NotTo(HaveOccurred())
+		errR, errW, err := os.Pipe()
+		Expect(err).NotTo(HaveOccurred())
+		origOut, origErr := os.Stdout, os.Stderr
+		os.Stdout, os.Stderr = outW, errW
+		DeferCleanup(func() { os.Stdout, os.Stderr = origOut, origErr })
+
+		_, err = newClient()
+		Expect(err).NotTo(HaveOccurred())
+		Expect(outW.Close()).To(Succeed())
+		Expect(errW.Close()).To(Succeed())
+
+		stdout, err := io.ReadAll(outR)
+		Expect(err).NotTo(HaveOccurred())
+		stderr, err := io.ReadAll(errR)
+		Expect(err).NotTo(HaveOccurred())
+
+		Expect(string(stderr)).To(ContainSubstring("NOTE:"),
+			"stderr = %q; want the advisory notice", string(stderr))
+		Expect(string(stdout)).To(BeEmpty(),
+			"stdout = %q; want notices kept off the output stream", string(stdout))
 	})
 
 	It("propagates a --ca-cert read failure", func() {
