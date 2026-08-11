@@ -226,8 +226,14 @@ certificate goes away:
   displaces it. Eviction reads the same per-process CRL cache as the admission
   check described below, so on the HA backends a peer that has not yet seen the
   revocation instead answers `200 OK` and silently discards the CSR.
-- `DELETE /certificate_status/{subject}` revokes *and* deletes it immediately,
-  on shared storage, so it does not depend on any replica's cache.
+- `DELETE /certificate_status/{subject}` deletes the stored certificate
+  immediately, on shared storage, so the removal does not depend on any
+  replica's cache. It revokes first, but only as far as it can: a revocation
+  that fails is logged and the delete proceeds anyway, and the endpoint still
+  answers `204`. Since admission reads the CRL rather than storage, a delete
+  whose revocation failed removes the file and leaves the certificate usable —
+  so confirm the serial in `GET /certificate_revocation_list/ca` before
+  treating the subject as revoked.
 
 Otherwise the next CSR is accepted: with autosign enabled it is signed at once
 and the agent is back with a fresh, unrevoked certificate; with autosign off it
@@ -240,8 +246,12 @@ When containing a compromised agent, apply the levers that hold, in this order:
 1. Close off issuance: disable autosign, or use an autosign policy that
    excludes the subject, and block the agent at the network layer.
 2. Revoke the certificate.
-3. Force a CRL re-sign on every replica, so no peer keeps admitting the old
-   certificate from a stale cache.
+3. Force a CRL re-sign on every replica — `openvox-ca-ctl reissue-crl`, or
+   `PUT /certificate_revocation_list/ca` — so no peer keeps admitting the old
+   certificate from a stale cache. Each call refreshes only the replica that
+   serves it, so address the replicas individually: sent through a load
+   balancer it refreshes whichever one the VIP picked, and the rest stay stale
+   while the call reports success.
 
 The order matters. Step 3 is also what makes a stale replica willing to evict
 the revoked certificate and issue a replacement, so running it while autosign
