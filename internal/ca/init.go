@@ -510,32 +510,43 @@ func (c *CA) loadCRLCache(ctx context.Context) error {
 	// deliberately not suggested: it reaches readStoredCRL and fails closed on
 	// this very condition, so it would send the operator to a command that
 	// returns 500 without surfacing why.
+	// The search runs unconditionally, not only when block 0 is foreign. Block 0
+	// being ours is not the same as block 0 being our *newest*: a blob holding a
+	// stale export ahead of the current one passes the ownership check, and the
+	// cache then answers "did we revoke this serial" from a list missing every
+	// serial revoked since the export -- so a certificate this CA revoked
+	// authenticates, silently, which is the exact failure the foreign-block-0
+	// search exists to prevent. Gating the search on the foreign case left the
+	// stale case uncovered, and the stale case is the one an upgrade produces:
+	// the released build's import wrote the operator's bundle verbatim.
+	newest, position, decodeErr := c.selectOwnCRL(crlPEM)
+	switch {
+	case decodeErr != nil:
+		// A chain that will not decode keeps block 0, warned about below if it is
+		// also foreign. The blob is served without parsing and the cache answers
+		// from block 0, so neither is affected by a malformed ancestor.
+		slog.Warn("Could not decode the stored CRL chain to look for this CA's own block; "+
+			"continuing with block 0", "error", decodeErr)
+	case newest == nil:
+		// Nothing in the blob is ours. There is nothing better to cache, so the
+		// foreign block stays: the same outcome as an empty CRL, and the
+		// deliberate availability trade-off described above.
+	case position > 0:
+		slog.Warn("Using this CA's own CRL found later in the stored chain",
+			"position", position, "crl_number", newest.Number)
+		crl = newest
+	case newerCRL(newest, crl):
+		// position == 0 and still newer than what block 0 parsed to cannot
+		// happen; kept as a belt-and-braces arm so the selection, not this
+		// switch, decides which block wins.
+		crl = newest
+	}
+
 	if !c.ownsCRL(crl) {
 		slog.Warn("Stored CRL does not lead with this CA's own CRL; revocation checks may be using the wrong list. "+
 			"Re-import the CRL chain with this CA's own CRL first",
 			"crl_authority_key_id", fmt.Sprintf("%x", crl.AuthorityKeyId),
 			"ca_subject_key_id", fmt.Sprintf("%x", c.CACert.SubjectKeyId))
-
-		// Search the rest of the chain for the block this CA actually signed,
-		// rather than answering revocation questions from an ancestor's list —
-		// which contains none of our serials, so every certificate we revoked
-		// would authenticate.
-		//
-		// When the chain holds no block of ours at all there is nothing better
-		// to cache, so the foreign block stays: the same outcome as an empty
-		// CRL, and the deliberate availability trade-off described above. A
-		// chain that will not decode is treated the same way — the warning
-		// stands, and startup continues.
-		if chain, decodeErr := decodeCRLChain(crlPEM); decodeErr == nil {
-			if ours := ownCRLIn(chain, c.CACert); ours != nil {
-				slog.Warn("Using this CA's own CRL found later in the stored chain",
-					"position", indexOfCRL(chain, ours))
-				crl = ours
-			}
-		} else {
-			slog.Warn("Could not decode the stored CRL chain to look for this CA's own block; "+
-				"continuing with block 0", "error", decodeErr)
-		}
 	}
 
 	c.cachedCRL = crl

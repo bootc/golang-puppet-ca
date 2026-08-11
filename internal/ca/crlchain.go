@@ -163,7 +163,11 @@ func (c *CA) crlChainLocked(ourCRL *x509.RevocationList, storedBlob []byte) ([]b
 // it, and the next re-sign would advance from its number and discard the newer
 // block. Chain length and CRL number both look healthy while revocations
 // recorded after the stale copy silently stop being seen.
-func orderCRLChain(crls []*x509.RevocationList, cert *x509.Certificate) ([]*x509.RevocationList, bool) {
+// The count of superseded copies is returned rather than logged here, so the one
+// import that runs this twice -- once to validate, once under the lock -- reports
+// the problem once. warnAboutAncestors was hoisted to the caller for the same
+// reason.
+func orderCRLChain(crls []*x509.RevocationList, cert *x509.Certificate) ([]*x509.RevocationList, int, bool) {
 	var ours *x509.RevocationList
 	superseded := 0
 	others := make([]*x509.RevocationList, 0, len(crls))
@@ -182,13 +186,9 @@ func orderCRLChain(crls []*x509.RevocationList, cert *x509.Certificate) ([]*x509
 		others = append(others, crl)
 	}
 	if ours == nil {
-		return crls, false
+		return crls, 0, false
 	}
-	if superseded > 0 {
-		slog.Warn("Discarding superseded copies of this CA's own CRL from the imported chain",
-			"discarded", superseded, "kept_crl_number", ours.Number)
-	}
-	return append([]*x509.RevocationList{ours}, others...), true
+	return append([]*x509.RevocationList{ours}, others...), superseded, true
 }
 
 // warnAboutAncestors reports ancestor blocks that will make agents reject the
@@ -212,7 +212,7 @@ func warnAboutAncestors(others []*x509.RevocationList) {
 	seen := make(map[string]int, len(others))
 	for _, crl := range others {
 		if !crl.NextUpdate.IsZero() && now.After(crl.NextUpdate) {
-			slog.Warn("Imported ancestor CRL has already expired; agents doing full-chain "+
+			slog.Warn("Ancestor CRL has already expired; agents doing full-chain "+
 				"revocation checking will reject the published chain",
 				"issuer", crl.Issuer.String(), "next_update", crl.NextUpdate.UTC().Format(time.RFC3339))
 		}
@@ -228,12 +228,55 @@ func warnAboutAncestors(others []*x509.RevocationList) {
 	}
 }
 
-// newerCRL reports whether a supersedes b, by CRL number where both carry one
-// and by ThisUpdate otherwise. RFC 5280 requires cRLNumber on a conforming CRL,
-// but a hand-rolled one may omit it and the comparison still has to terminate.
+// newerCRL reports whether a supersedes b: by CRL number where both carry one, by
+// the presence of a number where only one does, and by ThisUpdate otherwise.
+//
+// RFC 5280 requires cRLNumber on a conforming CRL, but `openssl ca -gencrl` under
+// the stock openssl.cnf emits a V1 list, which cannot carry one at all -- so a
+// numberless CRL of ours is a routine import, not a curiosity. A numbered block
+// therefore wins outright over a numberless one, whatever their timestamps say:
+// whichever block ends up at position 0 is what the next re-sign advances from,
+// and advancing from a numberless block restarts the sequence at 1. That
+// regresses a number docs/metrics.md publishes as monotonic, and an RFC 5280
+// client comparing cRLNumber may keep serving the copy it already has -- so a
+// revocation recorded afterwards is never seen.
+//
+// The comparison still has to terminate on any input, which the ThisUpdate
+// fallback gives it.
 func newerCRL(a, b *x509.RevocationList) bool {
-	if a.Number != nil && b.Number != nil {
+	switch {
+	case a.Number != nil && b.Number != nil:
 		return a.Number.Cmp(b.Number) > 0
+	case a.Number != nil:
+		return true
+	case b.Number != nil:
+		return false
 	}
 	return a.ThisUpdate.After(b.ThisUpdate)
+}
+
+// selectOwnCRL picks the block a reader should treat as this CA's own CRL: the
+// newest one we signed, wherever it sits in the blob.
+//
+// One function because three readers need the same answer and reached it three
+// different ways. Import selected the newest; the cache loader and the re-sign
+// read took block 0 unless it was *foreign*. A stale block 0 of our own passes an
+// ownership check, so on a blob holding two of ours -- which the released build's
+// import stored verbatim -- the cache answered revocation from a list missing
+// every serial revoked since, and the next re-sign advanced from the stale number
+// and destroyed the newer block.
+//
+// A blob that will not decode past block 0 returns the decode error, and each
+// caller keeps its existing policy for that case rather than having one imposed
+// here.
+func (c *CA) selectOwnCRL(blob []byte) (*x509.RevocationList, int, error) {
+	chain, err := decodeCRLChain(blob)
+	if err != nil {
+		return nil, -1, err
+	}
+	ours := ownCRLIn(chain, c.CACert)
+	if ours == nil {
+		return nil, -1, nil
+	}
+	return ours, indexOfCRL(chain, ours), nil
 }

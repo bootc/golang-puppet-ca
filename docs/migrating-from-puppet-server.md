@@ -248,7 +248,7 @@ Some limits worth knowing before you rely on re-import as a refresh mechanism.
 > more than one CRL for the same ancestor:
 >
 > ```text
-> level=WARN msg="Imported ancestor CRL has already expired; agents doing full-chain revocation checking will reject the published chain" issuer="CN=Root CA" next_update=2026-01-01T00:00:00Z
+> level=WARN msg="Ancestor CRL has already expired; agents doing full-chain revocation checking will reject the published chain" issuer="CN=Root CA" next_update=2026-01-01T00:00:00Z
 > ```
 >
 > Running `import` with no `--crl-chain` writes nothing and still performs both

@@ -22,7 +22,9 @@ import (
 	"context"
 	"crypto/x509"
 	"encoding/pem"
+	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"math/big"
 	"strings"
@@ -53,6 +55,20 @@ func (c *CA) revokeLocked(ctx context.Context, subject string) error {
 
 	serialStr, err := c.findSerialForSubject(ctx, subject)
 	if err != nil {
+		// A read failure is counted; a subject that was simply never issued is
+		// not. The metric's documented meaning is "a revocation that could not be
+		// recorded", and an inventory read that fails -- including an HMAC
+		// verification failure, which is a tamper signal -- is one. It matters
+		// because Clean swallows this error and deletes anyway, so without the
+		// increment a clean silently became delete-without-revoke with one WARN
+		// line and a flat counter, leaving the alert the mixin ships unable to
+		// fire. Not-found is excluded deliberately: a typo'd certname would
+		// otherwise page someone.
+		// Both the blob and the SQL inventory report a missing subject by
+		// wrapping fs.ErrNotExist, so one check covers every backend.
+		if !errors.Is(err, fs.ErrNotExist) {
+			c.crlUpdateFailures.Add(1)
+		}
 		return fmt.Errorf("could not find certificate for subject %s: %w", subject, err)
 	}
 

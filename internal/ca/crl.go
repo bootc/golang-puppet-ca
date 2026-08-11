@@ -25,6 +25,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math/big"
 	"time"
 )
@@ -42,13 +43,24 @@ import (
 // they run at bootstrap/import before any consumer exists, and the exporter's
 // startup reconcile covers that initial state.
 func (c *CA) signCRLLocked(ctx context.Context, prev *storedCRL, revoked []x509.RevocationListEntry) error {
+	// Refused rather than tolerated. A nil prev would leave the number at 1 and
+	// the blob empty, so the write would regress the CRL number *and* drop every
+	// ancestor -- the two failures this path exists to prevent, in one write. No
+	// caller does it: all four take their storedCRL from readStoredCRL and return
+	// on its error. The guard is here because the invariant used to be structural
+	// -- the chain assembly fetched the blob itself -- and is now a caller
+	// obligation the signature cannot express.
+	if prev == nil {
+		c.crlUpdateFailures.Add(1)
+		return fmt.Errorf("re-signing the CRL without a prior read: refusing to write a chain " +
+			"that would drop every ancestor block")
+	}
 	nextNum := big.NewInt(1)
-	var prevBlob []byte
-	if prev != nil {
-		prevBlob = prev.blob
-		if prev.own.Number != nil {
-			nextNum.Add(prev.own.Number, big.NewInt(1))
-		}
+	prevBlob := prev.blob
+	// A CRL of ours carrying no number is reachable -- openssl's V1 output cannot
+	// carry one -- and the sequence then starts from 1 as it always has.
+	if prev.own.Number != nil {
+		nextNum.Add(prev.own.Number, big.NewInt(1))
 	}
 
 	now := time.Now()
@@ -239,6 +251,24 @@ func (c *CA) parseStoredCRL(ctx context.Context) (*storedCRL, error) {
 		return nil, fmt.Errorf("%w (CRL authority key id %x, our subject key id %x): refusing to re-sign it. "+
 			"If the CA certificate was replaced, this replica needs a restart to pick it up",
 			ErrForeignStoredCRL, crl.AuthorityKeyId, c.CACert.SubjectKeyId)
+	}
+
+	// Block 0 being ours is not the same as block 0 being our *newest*. A blob
+	// holding a stale export ahead of the current one -- which the released
+	// build's import stored verbatim -- passes the check above, and re-signing
+	// from the stale block advances from its number (regressing the sequence) and
+	// carries its entry list forward, while the chain assembly drops every block
+	// of ours including the newer one. The newer revocations are then gone for
+	// good.
+	//
+	// A blob that will not decode past block 0 keeps block 0, which is this
+	// function's existing policy: the corrupt-ancestor failure belongs to the
+	// chain assembly, after the callers that only wanted the staleness check have
+	// had their answer.
+	if newest, position, err := c.selectOwnCRL(crlPEM); err == nil && newest != nil && newerCRL(newest, crl) {
+		slog.Warn("Stored CRL leads with a superseded copy of our own; re-signing from the newer block",
+			"leading_crl_number", crl.Number, "using_crl_number", newest.Number, "position", position)
+		crl = newest
 	}
 	return &storedCRL{own: crl, blob: crlPEM}, nil
 }
