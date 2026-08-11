@@ -220,8 +220,8 @@ func warnAboutAncestors(others []*x509.RevocationList) {
 	}
 	for _, crl := range others {
 		if n := seen[string(crl.RawIssuer)]; n > 1 {
-			slog.Warn("Imported chain carries more than one CRL for the same ancestor; "+
-				"all of them are published as supplied",
+			slog.Warn("The chain carries more than one CRL for the same ancestor; "+
+				"all of them are published",
 				"issuer", crl.Issuer.String(), "copies", n)
 			seen[string(crl.RawIssuer)] = 0
 		}

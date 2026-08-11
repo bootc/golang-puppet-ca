@@ -392,10 +392,19 @@ var _ = Describe("CRL chain read failures", func() {
 			pem.EncodeToMemory(&pem.Block{Type: "X509 CRL", Bytes: current.Raw})...)
 		Expect(store.UpdateCRL(ctx, append(blob, upsCRL...))).To(Succeed())
 
+		var buf bytes.Buffer
+		orig := slog.Default()
+		slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+		defer slog.SetDefault(orig)
+
 		restarted := ca.New(store, ca.AutosignConfig{Mode: "off"}, "puppet.test")
 		restarted.CAKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
 		Expect(restarted.Init(ctx)).To(Succeed())
 		Expect(restarted.ReissueCRL(ctx)).To(Succeed())
+
+		// The line that tells an operator why the number jumped past the block
+		// they were looking at.
+		Expect(buf.String()).To(ContainSubstring("leads with a superseded copy of our own"))
 
 		after := crlBlocks(mustGetCRL(ctx, store))
 		Expect(after).To(HaveLen(2), "the ancestor survives; both copies of ours collapse to one")
@@ -1032,6 +1041,34 @@ var _ = Describe("CRL chain ordering at import", func() {
 		Entry("numbered first", true),
 	)
 
+	It("picks the later of two numberless copies of ours", func() {
+		// The ThisUpdate fallback, which lost its only spec when the
+		// numbered-beats-numberless rule was added: in the table above the
+		// numberless block always loses through the new arms, so the comparison
+		// below them is never reached. An operator whose predecessor CA was
+		// managed by `openssl ca -gencrl` has only V1 exports, so a bundle
+		// assembled from a backup directory can hold two of them and nothing else
+		// decides between them.
+		certBlock, _ := pem.Decode(certPEM)
+		ourCert, err := x509.ParseCertificate(certBlock.Bytes)
+		Expect(err).NotTo(HaveOccurred())
+		keyBlock, _ := pem.Decode(keyPEM)
+		ourKey, err := x509.ParseECPrivateKey(keyBlock.Bytes)
+		Expect(err).NotTo(HaveOccurred())
+
+		base := time.Now().UTC().Truncate(time.Second)
+		older := handRolledCRLAt(ourCert, ourKey, base.Add(-24*time.Hour))
+		newer := handRolledCRLAt(ourCert, ourKey, base)
+
+		Expect(ca.ImportCA(ctx, store, certPEM, keyPEM, append(append([]byte{}, older...), newer...))).To(Succeed())
+
+		chain := crlBlocks(mustGetCRL(ctx, store))
+		Expect(chain).To(HaveLen(1))
+		Expect(chain[0].Number).To(BeNil(), "both copies are numberless")
+		Expect(chain[0].ThisUpdate.Unix()).To(Equal(base.Unix()),
+			"the later of two numberless copies must lead")
+	})
+
 	It("fails the import rather than fabricating a CRL when the stored blob will not decode", func() {
 		// The other half of the swallowed-error fix. A valid PEM envelope round
 		// corrupt DER is what a truncated paste or a hand-assembled file
@@ -1355,6 +1392,11 @@ var _ = Describe("CRL cache loading", func() {
 		_, upsCRL := upstreamCA("Upstream Root CA")
 		Expect(store.UpdateCRL(ctx, append(append([]byte{}, upsCRL...), ourCRL...))).To(Succeed())
 
+		var buf bytes.Buffer
+		orig := slog.Default()
+		slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+		defer slog.SetDefault(orig)
+
 		restarted := ca.New(store, ca.AutosignConfig{Mode: "off"}, "puppet.test")
 		restarted.CAKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
 		Expect(restarted.Init(ctx)).To(Succeed())
@@ -1362,6 +1404,14 @@ var _ = Describe("CRL cache loading", func() {
 		Expect(err).NotTo(HaveOccurred())
 		Expect(wasRevoked).To(BeTrue(),
 			"a certificate we revoked must stay revoked whatever order the blob is in")
+
+		// Both lines. Reading past a foreign block 0 keeps the CA answering
+		// correctly, but every write path still fails closed on this blob, so the
+		// remedy has to survive the repair -- and it must stay distinguishable
+		// from the stale-duplicate case, which needs no operator action.
+		Expect(buf.String()).To(ContainSubstring("does not lead with this CA's own CRL"),
+			"the remedy must be named on the shape where writes are refused")
+		Expect(buf.String()).To(ContainSubstring("found later in the stored chain"))
 	})
 
 	It("starts on a foreign block 0 whose chain will not decode, saying it could not look further", func() {

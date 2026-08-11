@@ -568,6 +568,12 @@ var _ = Describe("CA Revocation", func() {
 
 	It("returns an error when revoking a subject with no inventory entry", func() {
 		Expect(myCA.Revoke(context.Background(), "never-signed")).To(HaveOccurred())
+		// Not counted. The CRL-update counter drives the mixin's alert, and a
+		// typo'd certname is an operator mistake, not a CA fault -- so the
+		// exclusion for a never-issued subject is pinned here, beside the error
+		// that identifies it.
+		Expect(myCA.CRLUpdateFailures()).To(BeNumerically("==", 0),
+			"a subject that was never issued must not raise the CRL-failure alert")
 	})
 
 	It("counts a CRL-update failure when a revocation cannot amend the CRL", func() {

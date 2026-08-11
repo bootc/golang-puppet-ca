@@ -57,8 +57,13 @@ func (c *CA) revokeLocked(ctx context.Context, subject string) error {
 	if err != nil {
 		// A read failure is counted; a subject that was simply never issued is
 		// not. The metric's documented meaning is "a revocation that could not be
-		// recorded", and an inventory read that fails -- including an HMAC
-		// verification failure, which is a tamper signal -- is one. It matters
+		// recorded", and an inventory read that fails is one. On a blob backend
+		// that includes an HMAC verification failure -- a tamper signal -- since
+		// the read goes through ReadInventory; the SQL backends answer from an
+		// indexed SELECT, which verifies nothing, so there the counted cases are
+		// connection and query failures. An *absent* inventory on a blob backend
+		// reaches fs.ErrNotExist and is classed as never-issued, so it is not
+		// counted either. It matters
 		// because Clean swallows this error and deletes anyway, so without the
 		// increment a clean silently became delete-without-revoke with one WARN
 		// line and a flat counter, leaving the alert the mixin ships unable to

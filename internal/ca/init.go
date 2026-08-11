@@ -519,6 +519,15 @@ func (c *CA) loadCRLCache(ctx context.Context) error {
 	// search exists to prevent. Gating the search on the foreign case left the
 	// stale case uncovered, and the stale case is the one an upgrade produces:
 	// the released build's import wrote the operator's bundle verbatim.
+	// Captured before the selection replaces crl. The remedy warning below has to
+	// describe the blob as *stored*, not as repaired: on [foreign, ours] the
+	// selection makes crl ours, so testing it afterwards suppressed the one line
+	// that names the fix -- and every write path still fails closed on that blob,
+	// so the operator was left with an informational "found later in the chain"
+	// line and no remedy, indistinguishable from the benign stale-duplicate case
+	// that self-heals at the next re-sign.
+	leadIsOurs := c.ownsCRL(crl)
+
 	newest, position, decodeErr := c.selectOwnCRL(crlPEM)
 	switch {
 	case decodeErr != nil:
@@ -542,7 +551,7 @@ func (c *CA) loadCRLCache(ctx context.Context) error {
 		crl = newest
 	}
 
-	if !c.ownsCRL(crl) {
+	if !leadIsOurs {
 		slog.Warn("Stored CRL does not lead with this CA's own CRL; revocation checks may be using the wrong list. "+
 			"Re-import the CRL chain with this CA's own CRL first",
 			"crl_authority_key_id", fmt.Sprintf("%x", crl.AuthorityKeyId),
