@@ -211,6 +211,7 @@ var _ = Describe("openvox-ca import-ca-cert", func() {
 		myCA := ca.New(store, ca.AutosignConfig{Mode: "off"}, "puppet.example.com")
 		Expect(myCA.Init(context.Background())).To(Succeed())
 		block, _ := pem.Decode(after)
+		Expect(block).NotTo(BeNil())
 		crl, err := x509.ParseRevocationList(block.Bytes)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(crl.CheckSignatureFrom(myCA.CACert)).To(Succeed())

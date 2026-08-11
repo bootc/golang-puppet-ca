@@ -92,6 +92,39 @@ var _ = Describe("resolveRuntime", func() {
 	})
 })
 
+var _ = Describe("resolveRuntimeForRole", func() {
+	// The composition, not either half. resolveRuntime honouring its boolean and
+	// roleMayReachCAKey's mapping are pinned separately; what neither can catch
+	// is the two being wired together the wrong way round -- an inverted
+	// argument, or a hardcoded true -- which is what would hand the frontend an
+	// authenticated session to the key backend.
+	//
+	// The address is deliberately unreachable, so a role that *should* build a
+	// provider fails loudly here rather than passing quietly.
+	openBaoCfg := func() *serverConfig {
+		cfg := &serverConfig{CADir: GinkgoT().TempDir()}
+		cfg.CAKeyProvider = "openbao"
+		cfg.OpenBao.Addr = "http://127.0.0.1:1"
+		cfg.OpenBao.KeyName = "openvox-ca"
+		cfg.OpenBao.AuthMethod = "token"
+		return cfg
+	}
+
+	It("builds no key provider for the frontend role", func() {
+		rt, err := resolveRuntimeForRole(context.Background(), openBaoCfg(), "frontend")
+		Expect(err).NotTo(HaveOccurred())
+		defer func() { Expect(rt.Close()).To(Succeed()) }()
+		Expect(rt.KeyProvider).To(BeNil())
+	})
+
+	It("does try to build one for a role that may reach the key", func() {
+		// Without this the spec above passes just as well against a call site
+		// that never builds a provider for anyone.
+		_, err := resolveRuntimeForRole(context.Background(), openBaoCfg(), "signer")
+		Expect(err).To(MatchError(ContainSubstring("OpenBao")))
+	})
+})
+
 var _ = Describe("roleMayReachCAKey", func() {
 	// The gate itself is asserted against resolveRuntime elsewhere; this pins
 	// the mapping feeding it, which is the half a typo or an inversion breaks.

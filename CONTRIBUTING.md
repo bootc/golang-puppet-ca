@@ -47,7 +47,7 @@ mage build:fips   # → bin/openvox-ca + bin/openvox-ca-ctl  (GOEXPERIMENT=borin
 ## Testing
 
 ```bash
-# Run all unit tests (under -race; needs cgo and a C compiler)
+# Run all unit tests (with coverage, under -race; needs cgo and a C compiler)
 mage test:unit
 
 # Format, vet, tidy modules, and lint (the CI gate)

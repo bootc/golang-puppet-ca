@@ -355,7 +355,10 @@ spec:
           # logfile does not apply here: these subcommands write their progress
           # messages to stderr unconditionally, so extract the block rather than
           # relying on a quiet stream.
-          args: ["csr"]
+          # Drop --create-key when the Transit key was provisioned out of band,
+          # which is the recommended path. Without it, a run against an empty
+          # key slot fails rather than creating one.
+          args: ["csr", "--create-key"]
           volumeMounts:
             - { name: config, mountPath: /etc/puppet-ca }
             # Only needed on the filesystem backend, where --create-key writes

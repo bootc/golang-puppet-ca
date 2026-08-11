@@ -20,6 +20,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -27,6 +28,8 @@ import (
 	"crypto/x509/pkix"
 	"encoding/asn1"
 	"encoding/pem"
+	"errors"
+	"io"
 	"math/big"
 	"os"
 	"path/filepath"
@@ -60,6 +63,62 @@ func runCSRStreams(args ...string) (stdout, stderr string, err error) {
 	root.SetArgs(append([]string{"csr"}, args...))
 	err = root.Execute()
 	return out.String(), errOut.String(), err
+}
+
+// refusingSigner has a usable public key and refuses to sign with it, which is
+// what a Transit key reachable through transit/keys but not transit/sign looks
+// like from here.
+type refusingSigner struct{ pub crypto.PublicKey }
+
+func (s refusingSigner) Public() crypto.PublicKey { return s.pub }
+
+func (s refusingSigner) Sign(io.Reader, []byte, crypto.SignerOpts) ([]byte, error) {
+	return nil, errors.New("permission denied: transit/sign")
+}
+
+// createThenRefuseProvider creates a key successfully and then cannot sign with
+// it. The two are separate grants under Transit, so a policy scoped one
+// endpoint short lands exactly here: a key committed at the provider, no
+// certificate, and a server that will refuse to start until one is imported.
+//
+// A double rather than a real backend because no real provider can be made to
+// fail this way on demand, and the operator guidance this path prints is the
+// only thing between an operator and a crash-looping Deployment.
+type createThenRefuseProvider struct{ key crypto.Signer }
+
+func (p *createThenRefuseProvider) Load(context.Context) (crypto.Signer, error) {
+	if p.key == nil {
+		return nil, ca.ErrKeyProviderKeyNotFound
+	}
+	return p.key, nil
+}
+
+func (p *createThenRefuseProvider) Generate(context.Context, ca.KeyConfig) (crypto.Signer, error) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return nil, err
+	}
+	p.key = refusingSigner{pub: &key.PublicKey}
+	return p.key, nil
+}
+
+// runCSRWithProvider runs the csr subcommand against provider, returning the
+// error the command exits with.
+func runCSRWithProvider(provider ca.KeyProvider, args ...string) error {
+	GinkgoHelper()
+	cmd := newCSRCmdWith(func(ctx context.Context, cfg *serverConfig) (*caRuntime, error) {
+		rt, err := resolveRuntime(ctx, cfg, false)
+		if err != nil {
+			return nil, err
+		}
+		rt.KeyProvider = provider
+		return rt, nil
+	})
+	var out, errOut bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&errOut)
+	cmd.SetArgs(args)
+	return cmd.Execute()
 }
 
 var _ = Describe("openvox-ca csr", func() {
@@ -132,6 +191,32 @@ var _ = Describe("openvox-ca csr", func() {
 		Expect(stderr).To(ContainSubstring("import-ca-cert"))
 	})
 
+	It("names the orphaned key when the signature fails after one was created", func() {
+		// The failure the surrounding comment in csr.go calls out by name, and
+		// the state Init refuses to start from. Nothing else reaches it: every
+		// other --create-key failure gives up before a key exists.
+		err := runCSRWithProvider(&createThenRefuseProvider{},
+			"--cadir", caDir, "--hostname", "puppet.example.com", "--create-key")
+		Expect(err).To(MatchError(ContainSubstring("A CA key now exists with no certificate")))
+		Expect(err).To(MatchError(ContainSubstring("import-ca-cert")))
+		Expect(err).To(MatchError(ContainSubstring("permission denied: transit/sign")),
+			"the cause must survive the advice wrapped around it")
+	})
+
+	It("does not claim to have orphaned a key it did not create", func() {
+		// Pins the gate rather than an unconditional suffix: the same signing
+		// failure against a key that was already there is not this problem, and
+		// telling an operator to go and clean one up would send them after a key
+		// that predates the run.
+		provider := &createThenRefuseProvider{}
+		_, err := provider.Generate(context.Background(), ca.KeyConfig{})
+		Expect(err).NotTo(HaveOccurred())
+
+		err = runCSRWithProvider(provider, "--cadir", caDir, "--hostname", "puppet.example.com")
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).NotTo(ContainSubstring("A CA key now exists"))
+	})
+
 	It("does not warn about startup when a certificate already exists", func() {
 		// The ordering claim: the probe runs before BuildCSR creates anything,
 		// and an established CA is not in the refuse-to-start window.
@@ -151,6 +236,7 @@ var _ = Describe("openvox-ca csr", func() {
 		Expect(err).NotTo(HaveOccurred())
 
 		block, _ := pem.Decode([]byte(out))
+		Expect(block).NotTo(BeNil())
 		csr, err := x509.ParseCertificateRequest(block.Bytes)
 		Expect(err).NotTo(HaveOccurred())
 		pub, ok := csr.PublicKey.(*ecdsa.PublicKey)
@@ -167,7 +253,9 @@ var _ = Describe("openvox-ca csr", func() {
 		Expect(err).NotTo(HaveOccurred())
 
 		firstBlock, _ := pem.Decode([]byte(first))
+		Expect(firstBlock).NotTo(BeNil())
 		secondBlock, _ := pem.Decode([]byte(second))
+		Expect(secondBlock).NotTo(BeNil())
 		firstCSR, err := x509.ParseCertificateRequest(firstBlock.Bytes)
 		Expect(err).NotTo(HaveOccurred())
 		secondCSR, err := x509.ParseCertificateRequest(secondBlock.Bytes)
@@ -232,6 +320,7 @@ var _ = Describe("openvox-ca csr", func() {
 		Expect(err).NotTo(HaveOccurred())
 
 		block, _ := pem.Decode([]byte(out))
+		Expect(block).NotTo(BeNil())
 		csr, err := x509.ParseCertificateRequest(block.Bytes)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(csr.Subject.CommonName).To(Equal("Puppet CA: original.example.com"))
@@ -265,6 +354,7 @@ var _ = Describe("openvox-ca csr", func() {
 		out, err := runCSR("--cadir", caDir)
 		Expect(err).NotTo(HaveOccurred())
 		block, _ := pem.Decode([]byte(out))
+		Expect(block).NotTo(BeNil())
 		csr, err := x509.ParseCertificateRequest(block.Bytes)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(csr.RawSubject).To(Equal(certs[0].RawSubject))

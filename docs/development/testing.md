@@ -8,7 +8,7 @@ For build/lint conventions and the full `mage` target list, see
 ## Common targets
 
 ```bash
-# Run all unit tests (under -race; needs cgo and a C compiler)
+# Run all unit tests (with coverage, under -race; needs cgo and a C compiler)
 mage test:unit
 
 # Run the magefile's own suite (build-tagged; not covered by `go test ./...`)
@@ -29,6 +29,12 @@ mage test:puppetFIPS
 # Run k6 load tests (correctness + throughput + saturation) via compose
 mage test:bench
 ```
+
+`test:unit` runs under `-race`. Several specs exist only to prove concurrency
+guarantees — the storage lock serialising CA bootstrap and key creation, the CRL
+cache, the API's in-flight bookkeeping — and without the race detector they can
+pass over a genuine data race. It needs cgo, which the target enables
+explicitly, and costs roughly 40% more wall clock than the same run without it.
 
 ## Container / Compose topologies
 

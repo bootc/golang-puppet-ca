@@ -147,7 +147,7 @@ func (b *FilesystemBackend) Put(ctx context.Context, key string, data []byte, ki
 	if err := os.MkdirAll(filepath.Dir(p), DirPerm); err != nil {
 		return err
 	}
-	return atomicWriteFile(p, data, permFor(kind))
+	return AtomicWriteFile(p, data, permFor(kind))
 }
 
 func (b *FilesystemBackend) Delete(ctx context.Context, key string) error {
@@ -265,41 +265,53 @@ func permFor(kind BlobKind) os.FileMode {
 	return FilePermPublic
 }
 
-// atomicWriteFile writes data to a temporary file in the same directory as
-// target, then renames it into place. This prevents partial writes from
-// leaving a corrupt file on disk (e.g. during a crash or power loss).
-func atomicWriteFile(target string, data []byte, perm os.FileMode) error {
+// AtomicWriteFile writes data to a temporary file in the same directory as
+// target, sets perm on it, then renames it into place. This prevents partial
+// writes from leaving a corrupt file on disk (e.g. during a crash or power
+// loss).
+//
+// Exported because the offline subcommands write public PEM material to
+// operator-supplied paths and must do it the same way: docs/storage-backends.md
+// advertises the property for CA material, and a bundle an automation step is
+// about to deploy fleet-wide should not be weaker than the copy in storage.
+// One implementation rather than two so the two cannot drift.
+//
+// The mode is applied to the descriptor before the rename, so the file never
+// exists at the target path under the caller's umask.
+func AtomicWriteFile(target string, data []byte, perm os.FileMode) error {
 	dir := filepath.Dir(target)
 	tmp, err := os.CreateTemp(dir, ".tmp-*")
 	if err != nil {
-		return err
+		return fmt.Errorf("creating a temporary file beside %s: %w", target, err)
 	}
 	tmpName := tmp.Name()
 
 	if _, err := tmp.Write(data); err != nil {
 		_ = tmp.Close()
 		_ = os.Remove(tmpName)
-		return err
+		return fmt.Errorf("writing %s: %w", target, err)
 	}
 	if err := tmp.Chmod(perm); err != nil {
 		_ = tmp.Close()
 		_ = os.Remove(tmpName)
-		return err
+		return fmt.Errorf("setting permissions on %s: %w", target, err)
 	}
 	// Flush the data to stable storage before the rename. Without this the
 	// rename can be reordered ahead of the data on a crash, leaving a
-	// zero-length or stale file in place of a CA key, cert, or CRL.
+	// zero-length or stale file in place of a CA key, cert, or CRL. It also
+	// surfaces ENOSPC on filesystems that defer the error past close(2).
 	if err := tmp.Sync(); err != nil {
 		_ = tmp.Close()
 		_ = os.Remove(tmpName)
-		return fmt.Errorf("syncing temp file %s: %w", tmpName, err)
+		return fmt.Errorf("flushing %s: %w", target, err)
 	}
 	if err := tmp.Close(); err != nil {
 		_ = os.Remove(tmpName)
-		return err
+		return fmt.Errorf("writing %s: %w", target, err)
 	}
 	if err := os.Rename(tmpName, target); err != nil {
-		return err
+		_ = os.Remove(tmpName)
+		return fmt.Errorf("writing %s: %w", target, err)
 	}
 	// fsync the parent directory so the rename itself survives a crash. The
 	// data is already on disk and renamed, so a failure here is best-effort.

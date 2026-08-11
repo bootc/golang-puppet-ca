@@ -520,7 +520,7 @@ have the wrong name, not that the problem is solved. Do not reach for
 #### With the CA key at a provider
 
 `ca_key_provider: openbao` puts the key in a Transit engine rather than a
-storage backend, and `hasCAKey` asks the provider directly — so a populated
+storage backend, and `HasCAKey` asks the provider directly — so a populated
 Transit slot counts as present however empty the backend is. Three routes exist
 for abandoning a half-finished sub-CA, and only the first two are cheap:
 

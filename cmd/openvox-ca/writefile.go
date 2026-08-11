@@ -18,10 +18,6 @@
 package main
 
 import (
-	"fmt"
-	"os"
-	"path/filepath"
-
 	"github.com/voxpupuli/openvox-ca/internal/storage"
 )
 
@@ -39,47 +35,9 @@ import (
 // an interrupted process — leaves a partial chain at a path an automation step
 // may go on to deploy fleet-wide. The storage layer writes CA material the same
 // way, and docs/storage-backends.md advertises that property; a file destined for
-// the same place should not be weaker.
+// the same place should not be weaker. It is the storage layer's own helper
+// rather than a copy of it, so the crash-safety of a written bundle cannot drift
+// from the crash-safety of the blob in storage.
 func writePublicFile(path string, data []byte) error {
-	dir := filepath.Dir(path)
-	tmp, err := os.CreateTemp(dir, filepath.Base(path)+".tmp*")
-	if err != nil {
-		return fmt.Errorf("creating a temporary file beside %s: %w", path, err)
-	}
-	tmpName := tmp.Name()
-	defer func() {
-		// No-op once the rename has succeeded; cleans up on every failure path.
-		_ = os.Remove(tmpName)
-	}()
-
-	if _, err := tmp.Write(data); err != nil {
-		_ = tmp.Close()
-		return fmt.Errorf("writing %s: %w", path, err)
-	}
-	// Flush to stable storage before the rename. Without this the rename can be
-	// reordered ahead of the data on a crash, leaving a zero-length or stale
-	// file where the documented procedure expects a validated bundle it is about
-	// to load into a Secret served to every agent. It also surfaces ENOSPC on
-	// filesystems that defer the error past close(2).
-	if err := tmp.Sync(); err != nil {
-		_ = tmp.Close()
-		return fmt.Errorf("flushing %s: %w", path, err)
-	}
-	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("writing %s: %w", path, err)
-	}
-	if err := os.Chmod(tmpName, storage.FilePermPublic); err != nil {
-		return fmt.Errorf("setting permissions on %s: %w", path, err)
-	}
-	if err := os.Rename(tmpName, path); err != nil {
-		return fmt.Errorf("writing %s: %w", path, err)
-	}
-	// Best-effort: makes the rename itself durable. A failure here means the
-	// file is written and visible but the directory entry may not survive a
-	// crash, which is not worth failing an otherwise complete operation over.
-	if dirFile, err := os.Open(dir); err == nil {
-		_ = dirFile.Sync()
-		_ = dirFile.Close()
-	}
-	return nil
+	return storage.AtomicWriteFile(path, data, storage.FilePermPublic)
 }

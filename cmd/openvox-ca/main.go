@@ -490,7 +490,7 @@ func newRootCmd() *cobra.Command {
 			} else {
 				notifier.Status("Opening the storage backend")
 			}
-			rt, err := resolveRuntime(ctx, cfg, roleMayReachCAKey(role))
+			rt, err := resolveRuntimeForRole(ctx, cfg, role)
 			if err != nil {
 				return err
 			}

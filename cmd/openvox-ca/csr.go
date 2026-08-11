@@ -18,6 +18,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 
@@ -36,6 +37,21 @@ import (
 // schema. Driving it from the server's own config file is also what makes it
 // work identically for every ca_key_provider without special-casing.
 func newCSRCmd() *cobra.Command {
+	return newCSRCmdWith(func(ctx context.Context, cfg *serverConfig) (*caRuntime, error) {
+		return resolveRuntime(ctx, cfg, true)
+	})
+}
+
+// newCSRCmdWith is newCSRCmd with runtime resolution injected.
+//
+// The seam exists for one path a test cannot otherwise reach: a key provider
+// that creates a key and then refuses to sign with it. That is not a contrived
+// failure — under Transit the create and the signature are two separate grants,
+// so a policy scoped one endpoint short produces exactly it, and the operator
+// guidance the command prints in response ("a CA key now exists with no
+// certificate") is the only thing standing between them and a crash-looping
+// Deployment with no explanation.
+func newCSRCmdWith(resolve runtimeResolver) *cobra.Command {
 	var (
 		configFile string
 		caDir      string
@@ -73,7 +89,7 @@ identically whether the key is a local PEM file or lives in OpenBao Transit.`,
 
 			reportResolvedConfig(cmd.ErrOrStderr(), resolvedCfgFile, cfg)
 
-			rt, err := resolveRuntime(cmd.Context(), cfg, true)
+			rt, err := resolve(cmd.Context(), cfg)
 			if err != nil {
 				return err
 			}

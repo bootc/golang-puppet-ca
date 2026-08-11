@@ -448,11 +448,19 @@ func (c *CA) bootstrapCA(ctx context.Context) error {
 		return fmt.Errorf("failed to write CA cert: %w", err)
 	}
 
-	// Write a public key file alongside the cert.
+	// Write a public key file alongside the cert. Reported rather than
+	// discarded, like every other write here and like the import path: nothing
+	// recreates this blob later, because a second start finds a key and a
+	// certificate and goes to loadCA. A failure swallowed here is therefore
+	// permanent, and leaves the storage layout documented in
+	// docs/storage-backends.md incomplete with no operator-visible signal.
 	pubKeyBytes, err := x509.MarshalPKIXPublicKey(key.Public())
-	if err == nil {
-		pubKeyPEM := pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: pubKeyBytes})
-		_ = c.Storage.SaveCAPubKey(ctx, pubKeyPEM)
+	if err != nil {
+		return fmt.Errorf("failed to marshal CA public key: %w", err)
+	}
+	pubKeyPEM := pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: pubKeyBytes})
+	if err := c.Storage.SaveCAPubKey(ctx, pubKeyPEM); err != nil {
+		return fmt.Errorf("failed to write CA public key: %w", err)
 	}
 
 	// Generate empty CRL.

@@ -106,7 +106,7 @@ func (o *OverlayBackend) Put(ctx context.Context, key string, data []byte, kind 
 		if err := os.MkdirAll(filepath.Dir(p), DirPerm); err != nil {
 			return err
 		}
-		return atomicWriteFile(p, data, permFor(kind))
+		return AtomicWriteFile(p, data, permFor(kind))
 	}
 	return o.base.Put(ctx, key, data, kind)
 }

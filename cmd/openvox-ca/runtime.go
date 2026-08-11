@@ -59,6 +59,11 @@ func (r *caRuntime) Close() error {
 	return firstErr
 }
 
+// runtimeResolver resolves the storage and key provider a subcommand operates
+// on. Subcommands take one rather than calling resolveRuntime directly so a
+// test can substitute a provider that fails as only a real backend would.
+type runtimeResolver func(ctx context.Context, cfg *serverConfig) (*caRuntime, error)
+
 // resolveRuntime builds the storage service and, when one is configured, the CA
 // key provider, from an already-resolved server configuration.
 //
@@ -110,6 +115,19 @@ func resolveRuntime(ctx context.Context, cfg *serverConfig, withKeyProvider bool
 	}
 
 	return rt, nil
+}
+
+// resolveRuntimeForRole resolves the runtime a process running as role should
+// operate on, deciding key-provider access from the role itself.
+//
+// The composition lives here rather than inline at the server's single call
+// site so it can be driven directly by a test. The security property is not
+// resolveRuntime honouring its boolean, nor roleMayReachCAKey's mapping — both
+// are covered on their own — but that the two are wired together the right way
+// round. An inverted or hardcoded argument would pass every test of the parts
+// while handing the frontend an authenticated session to the key backend.
+func resolveRuntimeForRole(ctx context.Context, cfg *serverConfig, role string) (*caRuntime, error) {
+	return resolveRuntime(ctx, cfg, roleMayReachCAKey(role))
 }
 
 // roleMayReachCAKey reports whether a process running as role is permitted to

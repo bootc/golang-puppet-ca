@@ -1802,3 +1802,34 @@ var _ = Describe("CA Clean when part of it fails", func() {
 			"the request is still pending despite the 204")
 	})
 })
+
+// pubKeyPutFailBackend wraps a real filesystem backend and fails only the CA
+// public key write, leaving the key, certificate, CRL and inventory writes
+// alone. It reproduces the one storage failure bootstrap used to discard.
+type pubKeyPutFailBackend struct {
+	storage.Backend
+}
+
+func (b *pubKeyPutFailBackend) Put(ctx context.Context, key string, data []byte, kind storage.BlobKind) error {
+	if key == storage.KeyCAPubKey {
+		return errors.New("simulated backend failure writing the CA public key")
+	}
+	return b.Backend.Put(ctx, key, data, kind)
+}
+
+var _ = Describe("Bootstrap public key write", func() {
+	// Nothing recreates ca_pub.pem after bootstrap: a second start finds a key
+	// and a certificate and goes to loadCA instead. A failure discarded here is
+	// therefore permanent, and leaves the layout docs/storage-backends.md
+	// documents incomplete with no operator-visible signal at all.
+	It("fails the bootstrap rather than silently omitting ca_pub.pem", func() {
+		dir := GinkgoT().TempDir()
+		store := storage.NewWithBackend(&pubKeyPutFailBackend{Backend: storage.NewFilesystemBackend(dir)}, dir)
+
+		myCA := ca.New(store, ca.AutosignConfig{Mode: "off"}, "puppet.example.com")
+		myCA.CAKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
+
+		err := myCA.Init(context.Background())
+		Expect(err).To(MatchError(ContainSubstring("CA public key")))
+	})
+})
