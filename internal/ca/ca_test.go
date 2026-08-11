@@ -1886,7 +1886,19 @@ var _ = Describe("Bootstrap public key write", func() {
 		// the blob again.
 		Expect(newCA().Init(context.Background())).NotTo(Succeed())
 
-		err := newCA().Init(context.Background())
+		// The state this depends on, not merely that something failed: a
+		// certificate to load, and the blob still missing. Without both, a
+		// first Init that failed earlier would leave a different fixture and
+		// this spec would never reach the backfill at all.
+		Expect(store.HasCACert(context.Background())).To(BeTrue())
+		_, err := store.Backend().Get(context.Background(), storage.KeyCAPubKey)
+		Expect(err).To(HaveOccurred())
+
+		err = newCA().Init(context.Background())
+		// The backfill's own wrap, so the spec cannot be satisfied by a second
+		// bootstrap: the two are otherwise a single word apart ("write" against
+		// "writing") in messages neither is obliged to keep.
+		Expect(err).To(MatchError(ContainSubstring("seeding CA supporting state")))
 		Expect(err).To(MatchError(ContainSubstring("writing CA public key")))
 		Expect(err).To(MatchError(ContainSubstring("simulated backend failure")))
 	})

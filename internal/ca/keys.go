@@ -254,10 +254,14 @@ func parsePrivateKeyDER(blockType string, der []byte) (crypto.Signer, error) {
 // parameter; so is the error context, which each caller wraps for itself.
 //
 // The marshalling half is defence in depth rather than a case any caller can
-// reach: each one has already had the same public component marshalled by
-// x509.CreateCertificate, AssertSignerMatchesCert, or x509.ParseCertificate
-// before it gets here. Callers therefore report a failure as a write failure,
-// which is the only half that can actually occur.
+// reach: each one has already had this same public component marshalled, and
+// the failure reported, before it gets here — by x509.CreateCertificate for
+// bootstrapCA, by AssertSignerMatchesCert for the import, and by loadCA's own
+// key-matching check for the backfill in seedSupportingState. loadCA skips that
+// check under an ExternalSigner, which costs nothing here because
+// finishLoadExisting returns before it can reach the backfill in that mode.
+// Callers therefore report a failure as a write failure, which is the only half
+// that can actually occur.
 func savePubKeyPEM(ctx context.Context, store *storage.StorageService, pub crypto.PublicKey) error {
 	der, err := x509.MarshalPKIXPublicKey(pub)
 	if err != nil {
