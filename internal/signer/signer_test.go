@@ -224,6 +224,48 @@ var _ = Describe("PSK handshake", func() {
 			"client should reject a forged signer proof")
 	})
 
+	// verifies the property that makes the handshake *mutual* rather than merely
+	// two-way: the two directions are domain-separated, so a proof valid in one
+	// direction is not valid in the other.
+	//
+	// The impostor spec above cannot show this. It forges a random proof, which an
+	// HMAC comparison rejects whether or not the labels differ. Unify the two
+	// labels and every other spec in this suite still passes -- while an attacker
+	// holding a leaked socketpair descriptor and no PSK at all can impersonate the
+	// signer by *reflecting* the frontend's own proof straight back, and the
+	// frontend then hands CSR digests to it and accepts whatever comes back as a
+	// CA signature.
+	It("rejects a signer that reflects the frontend's own proof back", func() {
+		psk := make([]byte, pskLen)
+		_, err := rand.Read(psk)
+		Expect(err).NotTo(HaveOccurred())
+
+		serverConn, clientConn := net.Pipe()
+		DeferCleanup(serverConn.Close)
+		DeferCleanup(clientConn.Close)
+
+		go func() {
+			defer GinkgoRecover()
+			nonce := make([]byte, nonceLen)
+			_, err := rand.Read(nonce)
+			Expect(err).NotTo(HaveOccurred())
+			_, err = serverConn.Write(nonce)
+			Expect(err).NotTo(HaveOccurred(), "impostor sending nonce")
+
+			buf := make([]byte, nonceLen+sha256.Size)
+			_, err = io.ReadFull(serverConn, buf)
+			Expect(err).NotTo(HaveOccurred(), "impostor reading frontend flight")
+
+			// No PSK needed: echo the frontend's proof rather than forging one.
+			_, err = serverConn.Write(buf[nonceLen:])
+			Expect(err).NotTo(HaveOccurred(), "impostor reflecting the proof")
+		}()
+
+		Expect(clientHandshake(clientConn, psk)).To(
+			MatchError(ContainSubstring("signer proof mismatch")),
+			"a reflected proof must not authenticate the signer")
+	})
+
 	// verifies signing works after a successful PSK handshake.
 	It("signs after a successful PSK handshake", func() {
 		psk := make([]byte, 32)
@@ -404,17 +446,30 @@ var _ = Describe("awaitShutdown", func() {
 	})
 })
 
-var _ = Describe("PSK read deadline", func() {
-	// A foreign FIFO at fd 4 whose write end is held open satisfies loadPSK's
-	// S_IFIFO check and then never reaches EOF. io.LimitReader does not shorten a
-	// blocking read -- it only synthesises EOF once its own budget is spent -- so
-	// without a deadline the signer hangs before it has logged anything, which
-	// presents as a wedged start with no diagnosis. Exercised on readPSK directly
-	// so the spec costs milliseconds rather than the production timeout.
-	It("gives up on a pipe nobody writes to, and says why", func() {
+var _ = Describe("PSK read timeout", func() {
+	// blockingPipe returns a pipe whose read end has the provenance an inherited
+	// fd 4 has: blocking, and so unpollable. os.Pipe hands back a non-blocking
+	// read end, and it is Fd() -- which exec.Cmd.Start calls on every ExtraFiles
+	// entry -- that clears the flag on the open file description the child shares.
+	// Calling it here reproduces that exactly, which the first version of this
+	// spec did not: it used the non-blocking pipe, where a read deadline works
+	// and nowhere else does.
+	blockingPipe := func() (*os.File, *os.File) {
+		GinkgoHelper()
 		r, w, err := os.Pipe()
 		Expect(err).NotTo(HaveOccurred())
 		DeferCleanup(func() { _ = r.Close(); _ = w.Close() })
+		_ = r.Fd()
+		return r, w
+	}
+
+	It("gives up on a pipe nobody writes to, and says why", func() {
+		// A foreign FIFO at fd 4 whose write end is held open by an unrelated
+		// process satisfies checkPSKFD and then never reaches EOF, and
+		// io.LimitReader does not shorten a blocking read -- it only synthesises
+		// EOF once its own budget is spent. Unbounded, the signer hangs before it
+		// has logged anything: a wedged start with no diagnosis at all.
+		r, _ := blockingPipe()
 
 		done := make(chan error, 1)
 		go func() {
@@ -430,16 +485,14 @@ var _ = Describe("PSK read deadline", func() {
 	})
 
 	It("still reads a PSK that is already there", func() {
-		// The companion: a deadline that rejected everything would satisfy the
-		// assertion above just as well. The write end is closed before the read,
-		// exactly as the launcher does it.
+		// The companion: a bound that rejected everything would satisfy the
+		// assertion above just as well. Same blocking provenance, and the write
+		// end is closed before the read, exactly as the launcher does it.
 		psk := make([]byte, pskLen)
 		_, err := rand.Read(psk)
 		Expect(err).NotTo(HaveOccurred())
 
-		r, w, err := os.Pipe()
-		Expect(err).NotTo(HaveOccurred())
-		DeferCleanup(func() { _ = r.Close() })
+		r, w := blockingPipe()
 		_, err = w.WriteString(hex.EncodeToString(psk))
 		Expect(err).NotTo(HaveOccurred())
 		Expect(w.Close()).To(Succeed())

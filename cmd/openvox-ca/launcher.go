@@ -111,10 +111,9 @@ func runLauncher(drain time.Duration) error {
 	// Build base environment: strip role/daemon vars to prevent inheritance
 	// loops. PUPPET_CA_SIGNER_PSK is stripped defensively: the PSK travels
 	// over a pipe, and a variable by that name must never reach a child.
-	// Clip to len==cap so each append below allocates a fresh backing array,
-	// preventing the signer and frontend env slices from aliasing.
+	// spawnChild clips this before appending to it, so the two children cannot
+	// share a backing array.
 	baseEnv := filterEnv(os.Environ(), "PUPPET_CA_ROLE", "PUPPET_CA_DAEMON", "PUPPET_CA_SIGNER_PSK")
-	baseEnv = baseEnv[:len(baseEnv):len(baseEnv)]
 
 	signerCmd, err := spawnChild(exe, baseEnv, "signer", signerSock, pskHex)
 	if err != nil {
@@ -199,6 +198,13 @@ func spawnChild(exe string, baseEnv []string, role string, sock *os.File, pskHex
 	}
 
 	cmd := exec.Command(exe, os.Args[1:]...) //nolint:gosec // G204: re-execs this same binary (os.Executable) with the operator's own os.Args
+	// Clipped to len==cap here, beside the append that depends on it: filterEnv
+	// returns spare capacity whenever it stripped anything, so two spawns sharing
+	// an unclipped slice would share a backing array and the second would rewrite
+	// the first child's role -- leaving this process tree with no signer, or two.
+	// The guard used to live in the caller, one function away from the append it
+	// protects, which is how a third caller would have reintroduced it.
+	baseEnv = baseEnv[:len(baseEnv):len(baseEnv)]
 	cmd.Env = append(baseEnv,
 		"PUPPET_CA_ROLE="+role,
 		"PUPPET_CA_DAEMON=1",
@@ -208,11 +214,22 @@ func spawnChild(exe string, baseEnv []string, role string, sock *os.File, pskHex
 	cmd.Stderr = os.Stderr
 
 	if err := cmd.Start(); err != nil {
+		// Both, so the helper owns both descriptors unconditionally. Closing only
+		// the pipe left fd 3 to the caller's defers, which runLauncher does have
+		// -- but that is the split-ownership shape this extraction exists to
+		// remove, and the second caller already got it wrong.
 		pskRead.Close()
+		sock.Close()
 		return nil, fmt.Errorf("starting %s process: %w", role, err)
 	}
-	// Only the child should hold these now -- the PSK pipe especially: while the
-	// parent keeps the read end open the pipe never reaches EOF for the child.
+	// Only the child should hold these now. The socketpair end is the
+	// load-bearing one: while the launcher keeps a copy, both endpoints stay
+	// alive, which falsifies the property this whole topology rests on -- that
+	// only the two children hold endpoints -- and stops the signer seeing EOF
+	// when the frontend dies. The PSK pipe's read end is closed for hygiene
+	// rather than correctness: EOF for the child depends on the *write* end,
+	// which pskPipe already closed before returning. An earlier comment here had
+	// that backwards.
 	sock.Close()
 	pskRead.Close()
 	return cmd, nil

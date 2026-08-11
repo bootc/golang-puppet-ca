@@ -41,11 +41,15 @@ the launcher's pipe refuses to start rather than proceeding unauthenticated.
 > verbatim by crash-dump tooling such as `systemd-coredump`. A pipe is consumed
 > once and leaves no such residue.
 >
-> **Wrapper scripts must not leave a descriptor open at fd 3 or fd 4.** `exec`
-> replaces only fds 0-2 and the ones the launcher passes deliberately, so a
-> descriptor your supervisor or shell wrapper leaks at either number is inherited
-> as-is. A foreign pipe at fd 4 is refused, and a foreign one that is a pipe is
-> given ten seconds before the child gives up and says so.
+> **Do not run a role process by hand with a descriptor open at fd 3 or fd 4.**
+> The launcher replaces both numbers in the children it spawns, so a descriptor
+> your supervisor or wrapper script leaks is harmless in the default topology. It
+> matters when you set `PUPPET_CA_ROLE` yourself: `execve` preserves every
+> descriptor not marked close-on-exec, so whatever your shell left at fd 4 is what
+> the process finds there. A descriptor that is not a pipe is refused immediately.
+> A *pipe* cannot be told from the launcher's by inspection, so it gets ten
+> seconds to produce a valid pre-shared key before the process gives up and says
+> so — and fails at once if it is already at end-of-file or carries anything else.
 
 ## CA key encryption at rest
 

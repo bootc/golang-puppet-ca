@@ -171,7 +171,10 @@ var _ = Describe("launcher fd contract", func() {
 	It("fails closed when fd 4 is not the launcher's PSK pipe", func() {
 		signerSock, frontendSock, err := signer.Socketpair()
 		Expect(err).NotTo(HaveOccurred(), "creating socketpair")
-		DeferCleanup(func() { _ = signerSock.Close() })
+		// Both ends, registered before anything else can fail: the sibling spec
+		// above makes exactly this argument about itself, and this one relied on
+		// straight-line execution reaching its own Close for the other end.
+		DeferCleanup(func() { _ = signerSock.Close(); _ = frontendSock.Close() })
 
 		notAPipe, err := os.Open(os.DevNull)
 		Expect(err).NotTo(HaveOccurred(), "opening %s", os.DevNull)
@@ -183,7 +186,6 @@ var _ = Describe("launcher fd contract", func() {
 		var out bytes.Buffer
 		cmd := pskChildCmd(ctx, "frontend", []*os.File{frontendSock, notAPipe}, &out)
 		err = cmd.Run()
-		frontendSock.Close()
 
 		Expect(err).To(HaveOccurred(), "child without a PSK pipe on fd 4 should exit non-zero; output: %s", out.String())
 		Expect(out.String()).To(ContainSubstring("not spawned by the launcher"),
@@ -206,6 +208,37 @@ func lowestFreeFD() int {
 	return fd
 }
 
+var _ = DescribeTable("filterEnv strips exactly the named keys",
+	// Two call sites now -- the launcher's children and the --daemon re-exec --
+	// and no coverage at all. Swapping the key comparison for a prefix match
+	// would strip every PUPPET_CA_* variable from all three children, silently:
+	// the CA would come up with none of its configuration and the operator would
+	// have nothing pointing at the cause.
+	func(env []string, keys []string, want []string) {
+		Expect(filterEnv(env, keys...)).To(Equal(want))
+	},
+	Entry("removes a named key and keeps the rest",
+		[]string{"A=1", "PUPPET_CA_ROLE=signer", "B=2"},
+		[]string{"PUPPET_CA_ROLE"},
+		[]string{"A=1", "B=2"}),
+	Entry("matches the whole key, not a prefix of it",
+		[]string{"PUPPET_CA_ROLE=signer", "PUPPET_CA_ROLE_EXTRA=x"},
+		[]string{"PUPPET_CA_ROLE"},
+		[]string{"PUPPET_CA_ROLE_EXTRA=x"}),
+	Entry("keeps a value containing an equals sign",
+		[]string{"PUPPET_CA_AUTOSIGN=a=b", "PUPPET_CA_DAEMON=1"},
+		[]string{"PUPPET_CA_DAEMON"},
+		[]string{"PUPPET_CA_AUTOSIGN=a=b"}),
+	Entry("is a no-op when nothing matches",
+		[]string{"A=1"},
+		[]string{"PUPPET_CA_ROLE"},
+		[]string{"A=1"}),
+	Entry("keeps a bare name with no equals sign",
+		[]string{"WEIRD", "PUPPET_CA_ROLE=signer"},
+		[]string{"PUPPET_CA_ROLE"},
+		[]string{"WEIRD"}),
+)
+
 var _ = Describe("spawnChild and its cleanup", func() {
 	// runLauncher itself has no test and cannot easily have one -- it re-execs
 	// this binary twice and then blocks on signal forwarding -- so the two rules
@@ -227,6 +260,39 @@ var _ = Describe("spawnChild and its cleanup", func() {
 			"the child must be waited on, not merely signalled")
 	})
 
+	It("drops the parent's copies of both descriptors once the child holds them", func() {
+		// The success path, which no spec reached: the end-to-end fd-contract spec
+		// re-implements the spawn by hand and so satisfies this invariant itself,
+		// leaving the helper's copy of it unguarded. Deleting the socketpair close
+		// left the whole suite green while the launcher kept both endpoints alive
+		// for its lifetime -- falsifying "only the two children hold endpoints"
+		// and stopping the signer from ever seeing EOF when the frontend dies.
+		psk := make([]byte, 32)
+		_, err := rand.Read(psk)
+		Expect(err).NotTo(HaveOccurred())
+
+		sock, otherEnd, err := signer.Socketpair()
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(func() { _ = otherEnd.Close(); _ = sock.Close() })
+
+		// A child that exits immediately: this spec is about the parent's
+		// descriptors, not about the handshake.
+		exe, err := exec.LookPath("true")
+		Expect(err).NotTo(HaveOccurred())
+
+		before := lowestFreeFD()
+		cmd, err := spawnChild(exe, os.Environ(), "signer", sock, hex.EncodeToString(psk))
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(func() { killAndReap(cmd) })
+
+		// Two descriptors handed over, two closed: the lowest free slot must not
+		// have moved up, and both of the parent's copies are gone.
+		Expect(lowestFreeFD()).To(BeNumerically("<=", before),
+			"the parent must not still hold the socketpair end or the PSK pipe")
+		Expect(sock.Close()).To(MatchError(os.ErrClosed),
+			"the socketpair end must already be closed by the helper")
+	})
+
 	It("is safe on a child that was never started", func() {
 		// The frontend-failure path calls this with whatever the signer spawn
 		// returned, and a spawn that failed before Start returns a nil Cmd.
@@ -245,14 +311,19 @@ var _ = Describe("spawnChild and its cleanup", func() {
 
 		sock, otherEnd, err := signer.Socketpair()
 		Expect(err).NotTo(HaveOccurred())
-		DeferCleanup(func() { _ = otherEnd.Close() })
+		// Both ends: spawnChild closes sock on the failure path now, and a second
+		// Close on an os.File is a no-op rather than a close of a reused fd.
+		DeferCleanup(func() { _ = otherEnd.Close(); _ = sock.Close() })
 
 		before := lowestFreeFD()
 		cmd, err := spawnChild(filepath.Join(GinkgoT().TempDir(), "does-not-exist"),
 			os.Environ(), "signer", sock, hex.EncodeToString(psk))
 		Expect(err).To(HaveOccurred(), "a missing executable must not start")
 		Expect(cmd).To(BeNil())
-		Expect(lowestFreeFD()).To(Equal(before),
+		// Not equality: the helper also closes the socket end it was handed, so
+		// the lowest free slot legitimately moves *down*. What must not happen is
+		// it moving up, which is what a descriptor left open would do.
+		Expect(lowestFreeFD()).To(BeNumerically("<=", before),
 			"a pipe left open would occupy this slot, pushing the next one higher")
 	})
 })

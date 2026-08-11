@@ -29,7 +29,6 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
-	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -305,21 +304,53 @@ func checkPSKFD(fd int) error {
 // wedged start with no diagnosis at all.
 const pskReadTimeout = 10 * time.Second
 
-// readPSK reads the PSK from f, giving up after timeout.
-func readPSK(f *os.File, timeout time.Duration) ([]byte, error) {
-	// ErrNoDeadline is tolerated rather than fatal. A descriptor the runtime
-	// cannot poll gives back exactly the unbounded read this deadline exists to
-	// avoid, which is no worse than before it existed -- where refusing to start
-	// over it would turn a diagnosis problem into an availability one.
-	if err := f.SetReadDeadline(time.Now().Add(timeout)); err != nil && !errors.Is(err, os.ErrNoDeadline) {
-		return nil, fmt.Errorf("setting the PSK read deadline: %w", err)
+// readPSK reads the PSK from r, giving up after timeout.
+//
+// The bound is a timer and a goroutine rather than r.SetReadDeadline, and the
+// reason is worth recording because the obvious implementation does not work.
+// A deadline needs a descriptor the runtime can poll, and the one this reads is
+// not: exec.Cmd's Start calls File.Fd on every ExtraFiles entry, and Fd clears
+// O_NONBLOCK on the open file description that the child's copy shares, so in
+// the child os.NewFile returns a file whose SetReadDeadline can only fail with
+// os.ErrNoDeadline. The first version of this timeout therefore never bound on
+// any descriptor the launcher passes -- it bound only on an in-process os.Pipe,
+// which is what its spec used. Three reviewers traced that through the standard
+// library, and making ErrNoDeadline fatal proved it: the end-to-end spec failed
+// with "file type does not support deadline" on a perfectly correct spawn.
+//
+// Setting the descriptor non-blocking again would arm the deadline, and does work
+// here, but it trades one platform assumption for another: on Darwin kqueue does
+// not reliably wake a reader when the last FIFO writer closes, which would risk
+// delaying the *legitimate* start by the whole timeout. A timer depends on
+// neither the descriptor's provenance nor the platform, which is what a
+// fail-safe path should ask for.
+//
+// The goroutine can stay blocked on the read for ever. That is deliberate: every
+// caller turns this error into a refusal to start, so the process is on its way
+// out, and the alternative -- no bound at all -- is the wedge this exists to
+// prevent.
+func readPSK(r io.Reader, timeout time.Duration) ([]byte, error) {
+	type outcome struct {
+		psk []byte
+		err error
 	}
-	psk, err := parsePSK(f)
-	if errors.Is(err, os.ErrDeadlineExceeded) {
+	// Buffered, so the goroutine can always send and exit even after the timeout
+	// has fired and nobody is listening.
+	done := make(chan outcome, 1)
+	go func() {
+		psk, err := parsePSK(r)
+		done <- outcome{psk, err}
+	}()
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case got := <-done:
+		return got.psk, got.err
+	case <-timer.C:
 		return nil, fmt.Errorf("no PSK arrived within %s: fd %d is a pipe, but not one the "+
 			"launcher wrote to (process not spawned by the launcher?)", timeout, PSKFD)
 	}
-	return psk, err
 }
 
 // parsePSK reads a hex-encoded PSK from r and decodes and validates it.
