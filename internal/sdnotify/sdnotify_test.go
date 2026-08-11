@@ -240,8 +240,8 @@ var _ = Describe("Notifier", func() {
 		})
 
 		It("survives a service manager that has gone away", func() {
-			// The third failure mode named in send's comment: connected at
-			// startup, peer gone later. systemd restarting mid-run does this.
+			// The failure send's comment leads with: connected at startup,
+			// peer gone later. systemd restarting mid-run does this.
 			Expect(mgr.stop()).To(Succeed())
 
 			n.Ready("still here")
