@@ -16,6 +16,9 @@
 
 Global flags may be placed before or after the subcommand name.
 
+`--ca-cert` takes precedence over `--insecure`: if both are given, the server
+certificate is still verified, against the supplied CA certificate.
+
 `openvox-ca-ctl --version` prints the version (including commit metadata when
 built from a git checkout) and exits. Unlike the global flags above,
 `--version` is accepted only on the root command, not after a subcommand.

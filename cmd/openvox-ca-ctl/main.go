@@ -62,9 +62,13 @@ type Client struct {
 	HTTPClient *http.Client
 }
 
-func newClient() (*Client, error) {
-	transport := &http.Transport{}
-
+// newTLSConfig builds the client TLS configuration from the resolved global
+// flags, writing the operator-facing notice about the chosen server
+// verification mode to notices.
+//
+// --ca-cert takes precedence over --insecure: an explicitly supplied trust
+// anchor is never downgraded to "verify nothing".
+func newTLSConfig(notices io.Writer) (*tls.Config, error) {
 	tlsCfg := &tls.Config{}
 
 	if globalCACert != "" {
@@ -85,7 +89,9 @@ func newClient() (*Client, error) {
 	} else if globalInsecure {
 		// SECURITY: Operator explicitly opted in to skip TLS verification.
 		// NIST 800-53: SC-8 (Transmission Confidentiality and Integrity)
-		fmt.Fprintln(os.Stderr, "WARNING: --insecure specified; TLS server certificate will NOT be verified (vulnerable to MITM)")
+		// The notice is advisory; a failed write to stderr must not stop the
+		// command, and the slog line below carries the same warning.
+		_, _ = fmt.Fprintln(notices, "WARNING: --insecure specified; TLS server certificate will NOT be verified (vulnerable to MITM)")
 		slog.Warn("TLS server verification disabled", "server", globalServerURL)
 		tlsCfg.InsecureSkipVerify = true
 	} else {
@@ -94,7 +100,8 @@ func newClient() (*Client, error) {
 		// not in the system store, the connection will fail with a clear error,
 		// which is the safe default.
 		// NIST 800-53: SC-8 (Transmission Confidentiality and Integrity)
-		fmt.Fprintln(os.Stderr, "NOTE: --ca-cert not provided; using system trust store for TLS verification. "+
+		// Advisory notice; a failed write to stderr must not stop the command.
+		_, _ = fmt.Fprintln(notices, "NOTE: --ca-cert not provided; using system trust store for TLS verification. "+
 			"If the server uses a self-signed CA certificate, provide --ca-cert or use --insecure.")
 	}
 
@@ -110,12 +117,19 @@ func newClient() (*Client, error) {
 		tlsCfg.Certificates = []tls.Certificate{cert}
 	}
 
-	transport.TLSClientConfig = tlsCfg
+	return tlsCfg, nil
+}
+
+func newClient() (*Client, error) {
+	tlsCfg, err := newTLSConfig(os.Stderr)
+	if err != nil {
+		return nil, err
+	}
 
 	return &Client{
 		BaseURL: strings.TrimRight(globalServerURL, "/"),
 		HTTPClient: &http.Client{
-			Transport: transport,
+			Transport: &http.Transport{TLSClientConfig: tlsCfg},
 			Timeout:   30 * time.Second,
 		},
 	}, nil

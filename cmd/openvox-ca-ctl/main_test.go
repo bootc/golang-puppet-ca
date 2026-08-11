@@ -23,9 +23,25 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	"github.com/spf13/cobra"
 
 	"github.com/voxpupuli/openvox-ca/internal/version"
 )
+
+// saveCtlGlobals registers a DeferCleanup restoring the package-level flag
+// globals. Both newRootCmd() (which re-registers the persistent flags against
+// them) and executing a command mutate these, so specs must not leak their
+// resolved values into later ones.
+func saveCtlGlobals() {
+	serverURL, caCert := globalServerURL, globalCACert
+	clientCert, clientKey := globalClientCert, globalClientKey
+	verbose, insecure, configFile := globalVerbose, globalInsecure, globalConfigFile
+	DeferCleanup(func() {
+		globalServerURL, globalCACert = serverURL, caCert
+		globalClientCert, globalClientKey = clientCert, clientKey
+		globalVerbose, globalInsecure, globalConfigFile = verbose, insecure, configFile
+	})
+}
 
 var _ = Describe("Root command", func() {
 	It("prints the release version for --version", func() {
@@ -75,5 +91,79 @@ var _ = Describe("Root command", func() {
 		flag := cmd.PersistentFlags().ShorthandLookup("v")
 		Expect(flag).NotTo(BeNil())
 		Expect(flag.Name).To(Equal("verbose"))
+	})
+})
+
+// The precedence chain documented in docs/operator-cli.md (CLI flag → env var
+// → config file → built-in default) is only assembled in the root command's
+// PersistentPreRunE. config_test.go exercises loadCtlConfig/applyCtlEnv
+// directly and so never reaches the CLI-flag overlay; these specs run the
+// whole chain, with the TLS-relevant --insecure and --ca-cert as subjects.
+var _ = Describe("Global flag precedence", func() {
+	// runProbe executes a no-op subcommand so PersistentPreRunE resolves the
+	// configuration without any real subcommand touching storage or network.
+	runProbe := func(configFile string, args ...string) {
+		cmd := newRootCmd()
+		cmd.AddCommand(&cobra.Command{
+			Use:  "probe",
+			RunE: func(*cobra.Command, []string) error { return nil },
+		})
+		cmd.SetArgs(append([]string{"probe", "--config", configFile}, args...))
+		cmd.SetOut(io.Discard)
+		cmd.SetErr(io.Discard)
+		Expect(cmd.Execute()).To(Succeed())
+	}
+
+	BeforeEach(func() {
+		saveCtlGlobals()
+		clearCtlEnv()
+	})
+
+	It("prefers an explicit --insecure over the env var and config file", func() {
+		cfgFile := writeTempCtlConfig("insecure: true\n")
+		setCtlEnv("PUPPET_CA_CTL_INSECURE", "true")
+
+		runProbe(cfgFile, "--insecure=false")
+
+		Expect(globalInsecure).To(BeFalse(),
+			"Insecure = true; want the explicit --insecure=false to beat the env var and config file")
+	})
+
+	It("prefers an explicit --ca-cert over the env var and config file", func() {
+		cfgFile := writeTempCtlConfig("ca_cert: /from/file.pem\n")
+		setCtlEnv("PUPPET_CA_CTL_CA_CERT", "/from/env.pem")
+
+		runProbe(cfgFile, "--ca-cert", "/from/cli.pem")
+
+		Expect(globalCACert).To(Equal("/from/cli.pem"),
+			"CACert = %q; want the explicit --ca-cert to beat the env var and config file", globalCACert)
+	})
+
+	// The pf.Changed() gate is what makes this work: without it, every unset
+	// flag's zero value would clobber the env var and config file below.
+	It("falls back to the env var when the flag is unset", func() {
+		cfgFile := writeTempCtlConfig("insecure: false\nca_cert: /from/file.pem\n")
+		setCtlEnv("PUPPET_CA_CTL_INSECURE", "true")
+		setCtlEnv("PUPPET_CA_CTL_CA_CERT", "/from/env.pem")
+
+		runProbe(cfgFile)
+
+		Expect(globalInsecure).To(BeTrue(),
+			"Insecure = false; want the env var to win when --insecure is unset")
+		Expect(globalCACert).To(Equal("/from/env.pem"),
+			"CACert = %q; want the env var to win when --ca-cert is unset", globalCACert)
+	})
+
+	It("falls back to the config file when neither the flag nor the env var is set", func() {
+		cfgFile := writeTempCtlConfig("insecure: true\nca_cert: /from/file.pem\n")
+
+		runProbe(cfgFile)
+
+		Expect(globalInsecure).To(BeTrue(),
+			"Insecure = false; want the config file value")
+		Expect(globalCACert).To(Equal("/from/file.pem"),
+			"CACert = %q; want the config file value", globalCACert)
+		Expect(globalServerURL).To(Equal("https://localhost:8140"),
+			"ServerURL = %q; want the built-in default", globalServerURL)
 	})
 })
