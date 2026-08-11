@@ -289,6 +289,22 @@ func newTagGateRepo(constVersion, chartVersion, chartAppVersion string) *tagGate
 	return &tagGateRepo{dir: dir, sha: git("rev-parse", "HEAD")}
 }
 
+// git runs a git command inside the fixture, with the fixture's environment.
+// Every call site goes through this rather than building its own exec.Command:
+// forgetting cmd.Env at one of them is precisely how the fixtures came to
+// operate on the real repository, and a read is as dangerous as a write — a
+// `rev-parse HEAD` that answers from the ambient GIT_DIR hands the gate a
+// commit the fixture does not contain, which it then skips, passing a spec that
+// exists to watch it fail.
+func (r *tagGateRepo) git(args ...string) string {
+	cmd := exec.Command("git", args...)
+	cmd.Dir = r.dir
+	cmd.Env = fixtureEnv()
+	out, err := cmd.CombinedOutput()
+	Expect(err).NotTo(HaveOccurred(), "git %s: %s", strings.Join(args, " "), out)
+	return strings.TrimSpace(string(out))
+}
+
 // push runs the hook the way git does: the pushed refs arrive on stdin as
 // "<local-ref> <local-sha> <remote-ref> <remote-sha>".
 func (r *tagGateRepo) push(remoteRef, localSHA string) (string, error) {
@@ -380,18 +396,9 @@ var _ = Describe("the pre-push tag gate", func() {
 			filepath.Join(repo.dir, "charts", "openvox-ca", "Chart.yaml"),
 			[]byte("apiVersion: v2\nversion: "+version+"\nappVersion: "+version+"\n"), 0o644,
 		)).To(Succeed())
-		commit := exec.Command("git", "commit", "--quiet", "--no-gpg-sign", "-a", "-m", "unquoted")
-		commit.Dir = repo.dir
-		commit.Env = fixtureEnv()
-		out, err := commit.CombinedOutput()
-		Expect(err).NotTo(HaveOccurred(), string(out))
+		repo.git("commit", "--quiet", "--no-gpg-sign", "-a", "-m", "unquoted")
 
-		head := exec.Command("git", "rev-parse", "HEAD")
-		head.Dir = repo.dir
-		sha, err := head.Output()
-		Expect(err).NotTo(HaveOccurred())
-
-		hookOut, err := repo.push("refs/tags/v"+version, strings.TrimSpace(string(sha)))
+		hookOut, err := repo.push("refs/tags/v"+version, repo.git("rev-parse", "HEAD"))
 		Expect(err).To(HaveOccurred())
 		Expect(hookOut).To(ContainSubstring(`appVersion=""`))
 	})
