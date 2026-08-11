@@ -114,14 +114,15 @@ Conventions:
   per `It`. `Context` descriptions read as conditions ("when the CA has expired").
 - Use `DescribeTable`/`Entry` for table-driven cases instead of in-test loops.
 - Per-spec setup/teardown belongs in `BeforeEach`/`AfterEach` (or `DeferCleanup`),
-  never in package-level `var` initialisers — specs must be isolated. The repo's
-  only `Ordered`/`BeforeAll` containers are the two in
-  `internal/api/authbaseline_test.go`, where a shared CA and RSA key pool would
-  otherwise cost minutes per spec and `ContinueOnFailure` is what makes a change
-  report every cell it moves rather than the first; the file states the case at
-  its own `Describe`. Adding a third needs a reason of that kind, not
-  convenience — the specs there stay independent regardless, since every
-  certificate is re-minted per route.
+  never in package-level `var` initialisers — specs must be isolated.
+  `Ordered`/`BeforeAll` is a standing exception for one container, the
+  `Authorisation baseline` table in `internal/api/authbaseline_test.go`, which
+  states its own case: a shared RSA key pool that would otherwise cost minutes
+  per spec, and `ContinueOnFailure` (which needs `Ordered`) so a change reports
+  every cell it moves rather than the first. Another one needs a reason of that
+  kind rather than convenience — a fixture that merely replays cached PEMs is
+  affordable per spec, as the configuration-axes block below it and
+  `auth_test.go` both show.
 - Mutating process state: prefer hermetic alternatives. When a test must set an
   environment variable, save and restore it in `BeforeEach`/`DeferCleanup` so it
   never leaks into sibling specs (Go's `t.Setenv` is unavailable inside Ginkgo

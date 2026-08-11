@@ -252,14 +252,13 @@ func classify(rec *httptest.ResponseRecorder) denialKind {
 	}
 }
 
-// The repo's only two Ordered/BeforeAll containers are both in this file (the
-// other is the configuration-axes Describe below), against the
-// BeforeEach convention in AGENTS.md, and are deliberate on both counts: the
-// shared CA and RSA key pool are built once in BeforeAll because rebuilding
-// them per spec costs minutes, and ContinueOnFailure (which requires Ordered)
-// is what makes a change that moves several cells report all of them rather
-// than the first. Specs stay independent regardless — every certificate is
-// re-minted per route, for the reason set out above the key pool.
+// This is the repo's only Ordered/BeforeAll container, against the BeforeEach
+// convention in AGENTS.md, and deliberate on both counts: the shared CA and RSA
+// key pool are built once in BeforeAll because rebuilding them per spec costs
+// minutes, and ContinueOnFailure (which requires Ordered) is what makes a change
+// that moves several cells report all of them rather than the first. Specs stay
+// independent regardless — every certificate is re-minted per route, for the
+// reason set out above the key pool.
 var _ = Describe("Authorisation baseline", Ordered, ContinueOnFailure, func() {
 	var (
 		ctx        context.Context
@@ -1308,7 +1307,12 @@ func foreignClientCert(cn string) *x509.Certificate {
 // tier change touch the same route from opposite directions, and NoPpCliAuth is
 // the one input that *narrows* admin authority, so a restructure that drops it
 // or wires it per-issuer would otherwise be recorded nowhere.
-var _ = Describe("Authorisation baseline: configuration axes", Ordered, ContinueOnFailure, func() {
+// A plain BeforeEach, unlike the table above: this block's fixture is the
+// cached CA PEMs replayed into a fresh store, with no key generation and no
+// pool, so per-spec setup costs nothing that would justify an Ordered
+// container. It also stops the specs sharing one CA, which matters because two
+// of them reach the real reissue handler through it.
+var _ = Describe("Authorisation baseline: configuration axes", func() {
 	var (
 		ctx    context.Context
 		caCert *x509.Certificate
@@ -1316,7 +1320,7 @@ var _ = Describe("Authorisation baseline: configuration axes", Ordered, Continue
 		myCA   *ca.CA
 	)
 
-	BeforeAll(func() {
+	BeforeEach(func() {
 		ctx = context.Background()
 		store := storage.New(GinkgoT().TempDir())
 		myCA = ca.New(store, ca.AutosignConfig{Mode: "off"}, "puppet.test")

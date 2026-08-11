@@ -11,7 +11,7 @@ All endpoints are served under both the bare path and `/puppet-ca/v1/<path>`, so
 | --- | --- | --- |
 | `GET` | `/certificate_status/{subject}` | Get status: `signed`, `requested`, or `revoked` |
 | `PUT` | `/certificate_status/{subject}` | Change state (`signed` or `revoked`); supports `cert_ttl` (seconds). `revoked` returns `409 Conflict` when the stored CRL was not signed by the CA certificate this process loaded — see the note below |
-| `DELETE` | `/certificate_status/{subject}` | Revoke + delete cert and CSR (`puppet cert clean`). The delete happens even if the revocation fails — see the note below |
+| `DELETE` | `/certificate_status/{subject}` | Revoke + delete cert and CSR (`puppet cert clean`). The delete happens even if the revocation fails, as does the deletion of any pending request — see the note below and [Authorization tiers](#authorization-tiers) |
 
 `PUT` body:
 
@@ -117,6 +117,12 @@ Response:
 ```json
 { "cleaned": ["a.example.com"], "not-found": ["missing.example.com"], "clean-errors": [] }
 ```
+
+Each subject goes through the same path as `DELETE
+/certificate_status/{subject}`, with the same best-effort revoke and delete, so
+`clean-errors` does not capture either failure: a subject whose revocation or
+deletion failed is reported under `cleaned`. The CRL is the authority for what
+was actually revoked — see [Authorization tiers](#authorization-tiers).
 
 ## CRL
 
@@ -226,14 +232,17 @@ certificate goes away:
   displaces it. Eviction reads the same per-process CRL cache as the admission
   check described below, so on the HA backends a peer that has not yet seen the
   revocation instead answers `200 OK` and silently discards the CSR.
-- `DELETE /certificate_status/{subject}` deletes the stored certificate
-  immediately, on shared storage, so the removal does not depend on any
-  replica's cache. It revokes first, but only as far as it can: a revocation
-  that fails is logged and the delete proceeds anyway, and the endpoint still
-  answers `204`. Since admission reads the CRL rather than storage, a delete
-  whose revocation failed removes the file and leaves the certificate usable —
-  so confirm the serial in `GET /certificate_revocation_list/ca` before
-  treating the subject as revoked.
+- `DELETE /certificate_status/{subject}` revokes and then deletes, both against
+  shared storage, so neither step depends on any replica's cache. Both are
+  best-effort: a failure in either is logged and the handler carries on, and the
+  endpoint answers `204` regardless — so a `204` records that the subject
+  existed, not that it was revoked or removed. Since admission reads the CRL
+  rather than storage, the dangerous combination is a delete whose revocation
+  failed: the file is gone and the certificate still works. Confirm the serial
+  in `GET /certificate_revocation_list/ca`, and treat the server's
+  `Clean: revoke failed` / `Clean: delete cert failed` warnings as the signal —
+  `puppetca_crl_update_failures_total` does not cover a revocation that failed
+  before the CRL was written.
 
 Otherwise the next CSR is accepted: with autosign enabled it is signed at once
 and the agent is back with a fresh, unrevoked certificate; with autosign off it
