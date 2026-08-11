@@ -17,9 +17,10 @@
 Global flags may be placed before or after the subcommand name.
 
 `--ca-cert` takes precedence over `--insecure`: if both are given, the server
-certificate is still verified, against the supplied CA certificate. To override a
-`ca_cert` set in the config file or environment and reach `--insecure`, pass an
-empty `--ca-cert=""` alongside it.
+certificate is still verified, against the supplied CA certificate, and a `NOTE:`
+on stderr says `--insecure` was ignored. To override a `ca_cert` set in the config
+file or environment and reach `--insecure`, pass an empty `--ca-cert=""`
+alongside it.
 
 The file *replaces* the system trust store rather than adding to it, so a server
 whose certificate chains to a public CA stops verifying once `--ca-cert` is
@@ -31,11 +32,12 @@ before the connection is attempted rather than failing later in the handshake.
 `--client-cert` and `--client-key` must be supplied together; giving only one is
 an error.
 
-Subcommands that contact the server write one advisory line to **stderr**, not
-stdout: a `WARNING:` about MITM exposure when `--insecure` is in effect,
-otherwise a `NOTE:` when no `--ca-cert` is supplied, and nothing at all when
-`--ca-cert` is. Both are expected output, not failures. `setup`, `import` and
-`migrate` build no client, so they write neither line and never check `--ca-cert`.
+Subcommands that contact the server write at most one advisory line to
+**stderr**, not stdout: a `WARNING:` about MITM exposure when `--insecure` is in
+effect, a `NOTE:` when no `--ca-cert` is supplied, the override `NOTE:` above when
+both are, and nothing at all when only `--ca-cert` is. These are expected output,
+not failures. `setup`, `import` and `migrate` build no client, so they write no
+advisory line and never check `--ca-cert`.
 
 `openvox-ca-ctl --version` prints the version (including commit metadata when
 built from a git checkout) and exits. Unlike the global flags above,
