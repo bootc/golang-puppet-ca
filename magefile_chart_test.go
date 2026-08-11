@@ -224,20 +224,42 @@ type tagGateRepo struct {
 	sha string
 }
 
+// fixtureEnv is the environment every fixture git command runs with: the
+// ambient one stripped of *every* GIT_* variable, then given back only what the
+// fixture chooses.
+//
+// Stripping is the whole point, and it is not theoretical. git exports GIT_DIR,
+// GIT_WORK_TREE, GIT_INDEX_FILE and GIT_OBJECT_DIRECTORY to the hooks it runs,
+// and those outrank cmd.Dir — so a fixture built from os.Environ() inside a
+// pre-push hook commits into the *real* repository and moves its branch. These
+// specs run from the pre-push hook (`go test ./...`), and that is exactly what
+// happened: six fixture commits landed on the branch being pushed. Standalone
+// runs cannot reproduce it, because standalone runs have no GIT_DIR to inherit.
+func fixtureEnv() []string {
+	env := make([]string, 0, len(os.Environ())+6)
+	for _, kv := range os.Environ() {
+		if strings.HasPrefix(kv, "GIT_") {
+			continue
+		}
+		env = append(env, kv)
+	}
+	// No signing, no hooks, no ambient identity: the fixture must build
+	// identically on a maintainer's machine and on a CI runner.
+	return append(env,
+		"GIT_CONFIG_GLOBAL=/dev/null",
+		"GIT_CONFIG_SYSTEM=/dev/null",
+		"GIT_AUTHOR_NAME=test", "GIT_AUTHOR_EMAIL=test@example.com",
+		"GIT_COMMITTER_NAME=test", "GIT_COMMITTER_EMAIL=test@example.com",
+	)
+}
+
 func newTagGateRepo(constVersion, chartVersion, chartAppVersion string) *tagGateRepo {
 	dir := GinkgoT().TempDir()
 
 	git := func(args ...string) string {
 		cmd := exec.Command("git", args...)
 		cmd.Dir = dir
-		// No signing, no hooks, no ambient identity: the fixture must build
-		// identically on a maintainer's machine and on a CI runner.
-		cmd.Env = append(os.Environ(),
-			"GIT_CONFIG_GLOBAL=/dev/null",
-			"GIT_CONFIG_SYSTEM=/dev/null",
-			"GIT_AUTHOR_NAME=test", "GIT_AUTHOR_EMAIL=test@example.com",
-			"GIT_COMMITTER_NAME=test", "GIT_COMMITTER_EMAIL=test@example.com",
-		)
+		cmd.Env = fixtureEnv()
 		out, err := cmd.CombinedOutput()
 		Expect(err).NotTo(HaveOccurred(), "git %s: %s", strings.Join(args, " "), out)
 		return strings.TrimSpace(string(out))
@@ -275,6 +297,11 @@ func (r *tagGateRepo) push(remoteRef, localSHA string) (string, error) {
 
 	cmd := exec.Command("sh", script)
 	cmd.Dir = r.dir
+	// The script's own `git show` must read the fixture, not whatever repo the
+	// ambient GIT_DIR names — under a real pre-push hook that is the repo being
+	// pushed, so an inherited environment made every one of these specs assert
+	// against the wrong commit.
+	cmd.Env = fixtureEnv()
 	cmd.Stdin = strings.NewReader(fmt.Sprintf("%s %s %s %s\n", remoteRef, localSHA, remoteRef, strings.Repeat("0", 40)))
 	out, err := cmd.CombinedOutput()
 	return string(out), err
@@ -290,6 +317,37 @@ var _ = Describe("the pre-push tag gate", func() {
 		out, err := repo.push("refs/tags/v"+version, repo.sha)
 		Expect(err).NotTo(HaveOccurred(), out)
 		Expect(out).To(BeEmpty())
+	})
+
+	// The regression that made this suite dangerous rather than merely wrong.
+	// Run from a pre-push hook, os.Environ() carries GIT_DIR and GIT_WORK_TREE
+	// for the repo being pushed; they outrank cmd.Dir, so the fixture committed
+	// onto the real branch and the specs then asserted against the real repo.
+	// A decoy standing in for the hook's repo proves the isolation holds.
+	It("builds its fixture in its own repository even when GIT_DIR names another", func() {
+		decoy := GinkgoT().TempDir()
+		initDecoy := exec.Command("git", "init", "--quiet")
+		initDecoy.Dir = decoy
+		initDecoy.Env = fixtureEnv()
+		Expect(initDecoy.Run()).To(Succeed())
+		// A file to stage, so a leak lands a real commit here — the harm as it
+		// actually occurred — rather than failing on an empty index.
+		Expect(os.WriteFile(filepath.Join(decoy, "tracked.txt"), []byte("x\n"), 0o644)).To(Succeed())
+
+		GinkgoT().Setenv("GIT_DIR", filepath.Join(decoy, ".git"))
+		GinkgoT().Setenv("GIT_WORK_TREE", decoy)
+
+		repo := newTagGateRepo(version, version, version)
+		out, err := repo.push("refs/tags/v"+version, repo.sha)
+		Expect(err).NotTo(HaveOccurred(), out)
+		Expect(out).To(BeEmpty())
+
+		// Nothing may have landed in the decoy: no fixture commit, no ref moved.
+		log := exec.Command("git", "log", "--oneline", "--all")
+		log.Dir = decoy
+		log.Env = fixtureEnv()
+		logOut, _ := log.CombinedOutput()
+		Expect(string(logOut)).NotTo(ContainSubstring("fixture"))
 	})
 
 	It("refuses a tag the internal/version constant disagrees with", func() {
@@ -324,10 +382,7 @@ var _ = Describe("the pre-push tag gate", func() {
 		)).To(Succeed())
 		commit := exec.Command("git", "commit", "--quiet", "--no-gpg-sign", "-a", "-m", "unquoted")
 		commit.Dir = repo.dir
-		commit.Env = append(os.Environ(),
-			"GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_SYSTEM=/dev/null",
-			"GIT_AUTHOR_NAME=test", "GIT_AUTHOR_EMAIL=test@example.com",
-			"GIT_COMMITTER_NAME=test", "GIT_COMMITTER_EMAIL=test@example.com")
+		commit.Env = fixtureEnv()
 		out, err := commit.CombinedOutput()
 		Expect(err).NotTo(HaveOccurred(), string(out))
 
