@@ -803,6 +803,52 @@ var _ = Describe("EtcdInventoryPrune", func() {
 		Expect(bytes.Split(bytes.TrimRight(inv, "\n"), []byte{'\n'})).To(HaveLen(total - 65))
 	})
 
+	It("keeps the per-call budget across fence-conflict retries", func() {
+		// The 900-entry bound is a promise about one CALL, not one attempt: a
+		// fence conflict part-way through must not grant the retry a fresh
+		// allowance, or a busy CA could remove many times the documented cap
+		// in a single pass while holding the CRL lock.
+		cli, stop := startEmbeddedEtcd()
+		defer stop()
+		b := newBackend(cli, "/test-inv-prune-budget")
+		ctx := context.Background()
+
+		const total = 1250
+		blob := ""
+		for i := 1; i <= total; i++ {
+			blob += fmt.Sprintf("%04d 2024-01-01T00:00:00UTC 2029-01-01T00:00:00UTC /node%d\n", i, i%8)
+		}
+		Expect(b.Put(ctx, KeyInventory, []byte(blob), BlobPrivate)).To(Succeed(), "Put inventory")
+		svc := NewWithBackend(b, filepath.Join(GinkgoT().TempDir(), "private"))
+		Expect(svc.InitHMAC(ctx)).To(Succeed(), "InitHMAC")
+
+		// Conflict the fence exactly once, after the 15th committed batch, so
+		// the call is forced into a retry with half its budget spent.
+		commits := 0
+		b.pruneBatchHook = func() {
+			commits++
+			if commits == 15 {
+				_, err := cli.Put(ctx, "/test-inv-prune-budget/inventory/seq", fmt.Sprintf("%d", total))
+				Expect(err).NotTo(HaveOccurred(), "hook: bump fence")
+			}
+		}
+		defer func() { b.pruneBatchHook = nil }()
+
+		bound := etcdPruneMaxBatchesPerCall * etcdPruneBatch
+		removed, err := svc.PruneInventory(ctx, func(e InventoryEntry) bool { return e.Serial > "1200" })
+		Expect(err).NotTo(HaveOccurred(), "PruneInventory")
+		Expect(removed).To(HaveLen(bound), "the call must stop at its budget even though the conflict forced a retry")
+		serials := make(map[string]bool, len(removed))
+		for _, e := range removed {
+			serials[e.Serial] = true
+		}
+		Expect(serials).To(HaveLen(bound), "no entry reported twice across the retry")
+
+		inv, err := svc.ReadInventory(ctx)
+		Expect(err).NotTo(HaveOccurred(), "chain must verify after the budgeted prune")
+		Expect(bytes.Split(bytes.TrimRight(inv, "\n"), []byte{'\n'})).To(HaveLen(total - bound))
+	})
+
 	It("bounds one call to the per-call batch budget, deferring the oldest matches", func() {
 		// Beyond etcdPruneMaxBatchesPerCall batches, a call removes only the
 		// newest matches and defers the rest to later runs. The slicing here
@@ -1184,6 +1230,31 @@ var _ = Describe("EtcdLegacyInventoryDecompose", func() {
 			Expect(rec.State).To(Equal(CertStateUnknown), "ambiguous serials must not masquerade as signed or revoked")
 			Expect(rec.RevokedAt).To(BeNil())
 		}
+
+		// The sentinel must outlive a partial prune: removing ONE bearer of
+		// the duplicated serial keeps the serial reserved and the survivor
+		// unknown — index writes for it were refused all along, so its
+		// stored state cannot be trusted just because the duplicate count
+		// dropped to one.
+		removed, err := svc.PruneInventory(ctx, func(e InventoryEntry) bool { return e.Subject != "node2" })
+		Expect(err).NotTo(HaveOccurred(), "prune one bearer")
+		Expect(removed).To(HaveLen(1))
+		err = svc.AppendInventory(ctx, "0001 2024-01-03T00:00:00UTC 2029-01-03T00:00:00UTC /node3")
+		Expect(err).To(MatchError(ErrDuplicateSerial), "the serial must stay reserved while a bearer survives")
+		recs, _, err = svc.CertStatuses(ctx, "")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(recs).To(HaveLen(1))
+		Expect(recs[0].Subject).To(Equal("node1"))
+		Expect(recs[0].State).To(Equal(CertStateUnknown), "the surviving bearer stays unknown while the sentinel stands")
+		_, err = svc.ReadInventory(ctx)
+		Expect(err).NotTo(HaveOccurred(), "chain must verify after the partial prune")
+
+		// Pruning the last bearer finally releases the serial.
+		removed, err = svc.PruneInventory(ctx, func(e InventoryEntry) bool { return e.Subject != "node1" })
+		Expect(err).NotTo(HaveOccurred(), "prune last bearer")
+		Expect(removed).To(HaveLen(1))
+		Expect(svc.AppendInventory(ctx, "0001 2024-01-04T00:00:00UTC 2029-01-04T00:00:00UTC /node4")).
+			To(Succeed(), "a fully released serial is reusable")
 	})
 
 	It("removes the stale whole-blob head when upgrading a CA whose inventory is empty", func() {
@@ -1238,22 +1309,13 @@ var _ = Describe("EtcdLegacyInventoryDecompose", func() {
 		Expect(svc.InitHMAC(ctx)).To(MatchError(ErrInventoryTampered), "verification must stay fail-closed")
 	})
 
-	It("leaves the empty-inventory head alone when the HMAC key is missing or malformed", func() {
-		// Like the mismatch arm, the two cannot-verify arms must not delete
-		// the tamper baseline: deleting entries AND the key must not buy a
-		// clean re-baseline.
-		for name, corrupt := range map[string]func(cli *clientv3.Client, prefix string){
-			"missing key": func(cli *clientv3.Client, prefix string) {
-				_, err := cli.Delete(context.Background(), prefix+"/private/hmac_key")
-				Expect(err).NotTo(HaveOccurred())
-			},
-			"malformed key": func(cli *clientv3.Client, prefix string) {
-				_, err := cli.Put(context.Background(), prefix+"/private/hmac_key",
-					string(encodeBlob(time.Now(), []byte("short"))))
-				Expect(err).NotTo(HaveOccurred())
-			},
-		} {
+	// Like the mismatch arm, the two cannot-verify arms must not delete the
+	// tamper baseline: deleting entries AND the key must not buy a clean
+	// re-baseline.
+	DescribeTable("leaves the empty-inventory head alone when it cannot be verified",
+		func(corrupt func(cli *clientv3.Client, prefix string)) {
 			cli, stop := startEmbeddedEtcd()
+			defer stop()
 			ctx := context.Background()
 			const prefix = "/test-inv-legacy-empty-nokey"
 
@@ -1261,18 +1323,26 @@ var _ = Describe("EtcdLegacyInventoryDecompose", func() {
 			corrupt(cli, prefix)
 
 			b := NewEtcdBackendFromClient(cli, prefix, 5*time.Second)
-			Expect(b.EnsureReady(ctx)).To(Succeed(), "%s: EnsureReady itself succeeds", name)
+			defer b.Close()
+			Expect(b.EnsureReady(ctx)).To(Succeed(), "EnsureReady itself succeeds")
 			headResp, err := cli.Get(ctx, prefix+"/inventory/hmac")
 			Expect(err).NotTo(HaveOccurred())
-			Expect(headResp.Kvs).To(HaveLen(1), "%s: the unverifiable head must be left in place", name)
+			Expect(headResp.Kvs).To(HaveLen(1), "the unverifiable head must be left in place")
 
 			svc := NewWithBackend(b, filepath.Join(GinkgoT().TempDir(), "private"))
 			Expect(svc.InitHMAC(ctx)).To(MatchError(ErrInventoryTampered),
-				"%s: verification must stay fail-closed", name)
-			b.Close()
-			stop()
-		}
-	})
+				"verification must stay fail-closed")
+		},
+		Entry("missing key", func(cli *clientv3.Client, prefix string) {
+			_, err := cli.Delete(context.Background(), prefix+"/private/hmac_key")
+			Expect(err).NotTo(HaveOccurred())
+		}),
+		Entry("malformed key", func(cli *clientv3.Client, prefix string) {
+			_, err := cli.Put(context.Background(), prefix+"/private/hmac_key",
+				string(encodeBlob(time.Now(), []byte("short"))))
+			Expect(err).NotTo(HaveOccurred())
+		}),
+	)
 
 	It("lets two replicas decompose concurrently without double-importing", func() {
 		// The mainline cluster upgrade: every replica starts together against

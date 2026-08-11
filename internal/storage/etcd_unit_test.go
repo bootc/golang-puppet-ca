@@ -253,6 +253,19 @@ var _ = Describe("EtcdInventoryDecodeCorruptKeyspace", func() {
 	})
 })
 
+// EtcdPruneBacklogGrowing pins the log-level decision the operator docs
+// advertise: a deferral larger than one whole call's removal capacity means
+// the backlog is growing at the current cleanup cadence and warrants a
+// warning rather than an informational line.
+var _ = Describe("EtcdPruneBacklogGrowing", func() {
+	It("warns only when more is deferred than a full call can remove", func() {
+		capacity := etcdPruneMaxBatchesPerCall * etcdPruneBatch
+		Expect(pruneBacklogGrowing(0)).To(BeFalse())
+		Expect(pruneBacklogGrowing(capacity)).To(BeFalse(), "a backlog one run can clear is not growing")
+		Expect(pruneBacklogGrowing(capacity+1)).To(BeTrue(), "beyond one run's capacity the backlog outpaces the cadence")
+	})
+})
+
 // EtcdLegacyPrefixCheck pins the discriminator the decomposition uses to tell
 // a resumable interrupted import (entries are the import-written prefix of
 // the blob) from an unsupported mixed-version state.

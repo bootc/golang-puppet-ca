@@ -57,20 +57,24 @@ func (b *EtcdBackend) Statuses(ctx context.Context, stateFilter string) ([]CertR
 	if err != nil {
 		return nil, err
 	}
-	// Ascending issuance order: a later record for the same subject wins.
-	// Serials borne by more than one record (imported legacy duplicates)
-	// cannot have index-maintained state — mutateRecordBySerial refuses
-	// writes for them — so report those records as CertStateUnknown, which
-	// tells the reader to derive state from the signed CRL instead of
-	// trusting a value that revocation writes were never able to update.
-	serialCount := make(map[string]int, len(recs))
-	for _, r := range recs {
-		serialCount[r.rec.Serial]++
+	ambiguous, err := b.ambiguousSerials(ctx)
+	if err != nil {
+		return nil, err
 	}
+	// Ascending issuance order: a later record for the same subject wins.
+	// Serials whose by-serial key carries the ambiguity sentinel (imported
+	// legacy duplicates) cannot have index-maintained state —
+	// mutateRecordBySerial refuses writes for them — so report those records
+	// as CertStateUnknown, which tells the reader to derive state from the
+	// signed CRL instead of trusting a value that revocation writes were
+	// never able to update. The sentinel, not a live duplicate count, is the
+	// source of truth: it survives a partial prune, so a lone remaining
+	// bearer whose writes were refused while it was ambiguous stays unknown
+	// until the serial is fully released.
 	latest := make(map[string]CertRecord, len(recs))
 	for _, r := range recs {
 		rec := r.rec
-		if serialCount[rec.Serial] > 1 {
+		if ambiguous[rec.Serial] {
 			rec.State = CertStateUnknown
 			rec.RevokedAt = nil
 		}
@@ -94,6 +98,26 @@ func (b *EtcdBackend) Statuses(ctx context.Context, stateFilter string) ([]CertR
 		records = append(records, rec)
 	}
 	return records, nil
+}
+
+// ambiguousSerials returns the set of serials whose by-serial key holds the
+// ambiguity sentinel — duplicated legacy imports whose certificate-index
+// writes are refused. One range read over the by-serial namespace, values
+// included (they are a few bytes each).
+func (b *EtcdBackend) ambiguousSerials(ctx context.Context) (map[string]bool, error) {
+	ctx, cancel := b.callCtx(ctx)
+	defer cancel()
+	resp, err := b.client.Get(ctx, b.invPhys(etcdInvSerialSub), clientv3.WithPrefix())
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]bool)
+	for _, kv := range resp.Kvs {
+		if string(kv.Value) == etcdSerialAmbiguous {
+			out[strings.TrimPrefix(string(kv.Key), b.invPhys(etcdInvSerialSub))] = true
+		}
+	}
+	return out, nil
 }
 
 // SetRevoked marks the entry bearing serial as revoked at the given time.

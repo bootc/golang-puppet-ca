@@ -38,6 +38,51 @@ import (
 	"github.com/voxpupuli/openvox-ca/internal/testutil"
 )
 
+// unknownRepairBackend wraps a real structured backend, relabelling one
+// subject's Statuses record as CertStateUnknown with no projection — the
+// shape the etcd backend reports for ambiguous (duplicated legacy) serials —
+// and, once recording is enabled, logging every certificate-index write so
+// the repair pass's skip behaviour is observable.
+type unknownRepairBackend struct {
+	*storage.SQLBackend
+	subject   string
+	recording bool
+	writes    []string
+}
+
+func (b *unknownRepairBackend) Statuses(ctx context.Context, stateFilter string) ([]storage.CertRecord, error) {
+	recs, err := b.SQLBackend.Statuses(ctx, stateFilter)
+	for i := range recs {
+		if recs[i].Subject == b.subject {
+			recs[i].State = storage.CertStateUnknown
+			recs[i].RevokedAt = nil
+			recs[i].CertProjection = storage.CertProjection{}
+		}
+	}
+	return recs, err
+}
+
+func (b *unknownRepairBackend) record(op, serial string) {
+	if b.recording {
+		b.writes = append(b.writes, op+":"+serial)
+	}
+}
+
+func (b *unknownRepairBackend) SetRevoked(ctx context.Context, serial string, at time.Time) error {
+	b.record("SetRevoked", serial)
+	return b.SQLBackend.SetRevoked(ctx, serial, at)
+}
+
+func (b *unknownRepairBackend) ClearRevoked(ctx context.Context, serial string) error {
+	b.record("ClearRevoked", serial)
+	return b.SQLBackend.ClearRevoked(ctx, serial)
+}
+
+func (b *unknownRepairBackend) SetProjection(ctx context.Context, serial string, proj storage.CertProjection) error {
+	b.record("SetProjection", serial)
+	return b.SQLBackend.SetProjection(ctx, serial, proj)
+}
+
 // signLeafWithAuthRole builds a leaf certificate for subject signed directly
 // by the cached test CA, carrying a pp_auth_role authorization extension —
 // something the normal signing path can never produce, since it strips
@@ -397,6 +442,68 @@ var _ = Describe("CA certificate index", func() {
 			Expect(ok).To(BeTrue(), "index serial must be hex")
 			Expect(crl.RevokedCertificateEntries[0].SerialNumber.Cmp(node2Serial)).To(BeZero(),
 				"the revoked index record's serial must be the CRL entry's serial")
+		})
+
+		It("skips unknown-state records during repair while still repairing siblings", func() {
+			// The etcd backend reports CertStateUnknown for records whose
+			// serial it cannot address one-to-one; index writes for them are
+			// refused, so the repair pass must skip them entirely — no
+			// backfill attempt, no state reconciliation, no per-start
+			// warnings — while siblings are repaired as normal. Simulate the
+			// backend with a wrapper that relabels one subject's record.
+			dir := GinkgoT().TempDir()
+			inner, err := storage.NewSQLBackend(storage.SQLConfig{
+				Dialect: storage.SQLitePure,
+				DSN:     "file:" + filepath.Join(dir, "ca.db"),
+			})
+			Expect(err).NotTo(HaveOccurred())
+			DeferCleanup(func() { _ = inner.Close() })
+			Expect(inner.EnsureReady(ctx)).To(Succeed())
+			wrapper := &unknownRepairBackend{SQLBackend: inner, subject: "node-unknown"}
+			wrapped := storage.NewWithBackend(wrapper, dir)
+			wrappedCA := newCA(wrapped)
+
+			signLive(wrappedCA, "node-unknown")
+			signLive(wrappedCA, "node-sibling")
+			// Leave the sibling's index claiming a revocation the pristine
+			// CRL does not corroborate, so repair has real work to do for it.
+			Expect(wrappedCA.Revoke(ctx, "node-sibling")).To(Succeed())
+			Expect(wrapped.UpdateCRL(ctx, cachedCrlPEM)).To(Succeed())
+
+			recs, _, err := wrapped.CertStatuses(ctx, "")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(recs).To(HaveLen(2))
+			var unknownSerial string
+			for _, r := range recs {
+				if r.Subject == "node-unknown" {
+					unknownSerial = r.Serial
+					Expect(r.State).To(Equal(storage.CertStateUnknown))
+					Expect(r.Fingerprint).To(BeEmpty(), "relabelled record must look backfillable")
+				}
+			}
+			Expect(unknownSerial).NotTo(BeEmpty())
+
+			// Record index writes only from the repair pass onwards.
+			wrapper.recording = true
+			restarted := ca.New(wrapped, ca.AutosignConfig{Mode: "off"}, "puppet.test")
+			Expect(restarted.Init(ctx)).To(Succeed())
+
+			for _, w := range wrapper.writes {
+				Expect(w).NotTo(ContainSubstring(unknownSerial),
+					"repair must not write to an unknown-state record: %v", wrapper.writes)
+			}
+			Expect(wrapper.writes).NotTo(BeEmpty(), "the sibling's stale revocation must have been repaired")
+
+			recs, _, err = wrapped.CertStatuses(ctx, "")
+			Expect(err).NotTo(HaveOccurred())
+			bySubject := map[string]storage.CertRecord{}
+			for _, r := range recs {
+				bySubject[r.Subject] = r
+			}
+			Expect(bySubject["node-sibling"].State).To(Equal(storage.CertStateSigned),
+				"the sibling must be repaired despite the unknown record being skipped")
+			Expect(bySubject["node-unknown"].State).To(Equal(storage.CertStateUnknown),
+				"the unknown record must be untouched")
 		})
 	})
 })

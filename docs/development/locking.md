@@ -244,13 +244,13 @@ path — still provides no cross-replica guarantee anyway.
    would be the consequence, back the lock with a storage-level invariant that
    holds even without it — and check the invariant's own scope.
    `AppendInventory`'s duplicate-serial check (`ErrDuplicateSerial`) is the
-   worked example, but it is a cluster-wide guarantee only on SQL backends,
-   where the database's unique index enforces it; on blob backends the scan
-   runs under the process-local `inventoryMu` only, and etcd's CAS-guarded
-   append protects the blob against lost updates, not serial uniqueness (the
-   doc comment on `ErrDuplicateSerial` in
-   [storage.go](../../internal/storage/storage.go) spells this out, and the
-   blob-backend gap is tracked as
+   worked example: it is a cluster-wide guarantee on the structured backends —
+   SQL via the database's unique index, etcd via the `by-serial` key's
+   `CreateRevision == 0` guard inside the append transaction — but on the
+   remaining blob backends (filesystem, redis) the scan runs under the
+   process-local `inventoryMu` only (the doc comment on `ErrDuplicateSerial`
+   in [storage.go](../../internal/storage/storage.go) spells this out, and
+   the blob-backend gap is tracked as
    [#204](https://github.com/voxpupuli/openvox-ca/issues/204)).
 7. **New lock names are protocol.** Add them to the constants in
    [init.go](../../internal/ca/init.go) (and keep `migrateLockName` in
@@ -319,9 +319,11 @@ state when the document was last updated and is not guaranteed exhaustive.
   command (or the planned offline `generate`,
   [#175](https://github.com/voxpupuli/openvox-ca/issues/175)) racing a running
   server on the same cadir is uncoordinated. The related blob-backend gap —
-  nothing wraps `AppendInventory` in a cluster lock on etcd/Redis either, so
-  its duplicate-serial check is not cross-replica there — is tracked separately
-  as [#204](https://github.com/voxpupuli/openvox-ca/issues/204).
+  nothing wraps `AppendInventory` in a cluster lock on Redis, so its
+  duplicate-serial check is not cross-replica there — is tracked separately
+  as [#204](https://github.com/voxpupuli/openvox-ca/issues/204); the etcd
+  half of that gap was closed by the decomposed inventory's atomic
+  `by-serial` guard ([#138](https://github.com/voxpupuli/openvox-ca/issues/138)).
 - [#171](https://github.com/voxpupuli/openvox-ca/issues/171) — `cachedCRL` is
   per-replica, so authentication and renewal keep accepting a certificate
   revoked elsewhere until this process re-signs the CRL.
@@ -337,10 +339,12 @@ state when the document was last updated and is not guaranteed exhaustive.
   (re-check from *storage* under the subject lock) and also moves `Revoke`
   itself under `subject:<name>` → `crl`; the Tier 1 lock table describes
   current `main`, and that PR carries its own update to the table when it lands.
-- On blob backends (filesystem/etcd/redis), an inventory append and its HMAC
+- On blob backends (filesystem/redis), an inventory append and its HMAC
   update are two writes, not one atomic unit; the failure window is documented
-  at the write site in `AppendInventory` and the structured (SQL) inventory is
-  the durable answer. See [the inventory store](inventory-store.md).
+  at the write site in `AppendInventory` and the structured (SQL, etcd)
+  inventory — which commits the entry and its integrity head in one
+  transaction — is the durable answer. See
+  [the inventory store](inventory-store.md).
 
 ## Tests
 

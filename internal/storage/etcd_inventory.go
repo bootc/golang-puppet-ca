@@ -85,13 +85,29 @@ const (
 )
 
 // etcdPruneMaxBatchesPerCall bounds one PruneEntries call to this many
-// committed batches (currently 900 entries). Each batch writes an
-// intermediate head folded over the entries that remain, so a prune's total
-// hashing cost grows with batches × survivors; an unbounded call over a large
-// backlog could not finish inside the caller's lock budget. Deferred entries
-// stay present and consistent and are removed by subsequent calls (the
-// cleanup job runs periodically), which the PruneEntries contract permits.
+// committed batches (currently 900 entries) — a budget shared across the
+// call's retry attempts, so a fence conflict cannot grant a fresh allowance.
+// Each batch writes an intermediate head folded over the entries that remain,
+// so a prune's total hashing cost grows with batches × survivors; an
+// unbounded call over a large backlog could not finish inside the caller's
+// lock budget. Deferred entries stay present and consistent and are removed
+// by subsequent calls (the cleanup job runs periodically), which the
+// PruneEntries contract permits.
 const etcdPruneMaxBatchesPerCall = 30
+
+// pruneBacklogGrowing reports whether a prune's deferred-match count exceeds
+// what one whole call can remove — the signal that, at the current cleanup
+// cadence, the backlog is growing rather than draining, which the deferral
+// log escalates to a warning.
+func pruneBacklogGrowing(deferred int) bool {
+	return deferred > etcdPruneMaxBatchesPerCall*etcdPruneBatch
+}
+
+// etcdDecomposeLockName is the distributed lock serialising the one-time
+// legacy inventory blob conversion across replicas starting up together. Lock
+// names are protocol (see docs/development/locking.md); this one is scoped to
+// the etcd backend, which is the only backend with a blob to decompose.
+const etcdDecomposeLockName = "inventory-decompose"
 
 // etcdSerialAmbiguous is the by-serial index value recorded for a serial that
 // appears on more than one imported record (possible only in a legacy blob:
@@ -401,13 +417,19 @@ func (b *EtcdBackend) PruneEntries(ctx context.Context, keep func(InventoryEntry
 		return entriesOf(all)
 	}
 
+	// The per-call bound is a budget shared across retry attempts: a conflict
+	// after some batches committed must not grant the next attempt a fresh
+	// allowance, or a call under sustained conflicts could remove many times
+	// the documented cap while holding the caller's lock.
+	budget := etcdPruneMaxBatchesPerCall
 	for attempt := range etcdMaxTxnRetries {
-		committed, conflict, err := b.pruneEntriesOnce(ctx, keep, advanceHead)
+		committed, batches, conflict, err := b.pruneEntriesOnce(ctx, keep, advanceHead, budget)
 		all = append(all, committed...)
+		budget -= batches
 		if err != nil {
 			return finish(), err
 		}
-		if !conflict {
+		if !conflict || budget <= 0 {
 			return finish(), nil
 		}
 		if err := b.txnBackoff(ctx, attempt); err != nil {
@@ -431,10 +453,10 @@ func (b *EtcdBackend) PruneEntries(ctx context.Context, keep func(InventoryEntry
 // tail — one O(n) checkpoint pass plus the survivor tails, instead of a full
 // O(n) refold per batch (quadratic when a large expiry cleanup prunes most of
 // a large inventory).
-func (b *EtcdBackend) pruneEntriesOnce(ctx context.Context, keep func(InventoryEntry) bool, advanceHead func(prev []byte, e InventoryEntry) []byte) ([]etcdIndexedRecord, bool, error) {
+func (b *EtcdBackend) pruneEntriesOnce(ctx context.Context, keep func(InventoryEntry) bool, advanceHead func(prev []byte, e InventoryEntry) []byte, maxBatches int) ([]etcdIndexedRecord, int, bool, error) {
 	recs, seq, err := b.readIndexedRecords(ctx)
 	if err != nil {
-		return nil, false, err
+		return nil, 0, false, err
 	}
 
 	var removed []etcdIndexedRecord
@@ -447,7 +469,7 @@ func (b *EtcdBackend) pruneEntriesOnce(ctx context.Context, keep func(InventoryE
 		}
 	}
 	if len(removed) == 0 {
-		return nil, false, nil
+		return nil, 0, false, nil
 	}
 
 	// Fence value: unchanged when present; derived from the highest allocated
@@ -462,14 +484,16 @@ func (b *EtcdBackend) pruneEntriesOnce(ctx context.Context, keep func(InventoryE
 	for s := 0; s < len(removed); s += etcdPruneBatch {
 		starts = append(starts, s)
 	}
-	// Bound one call's work (see etcdPruneMaxBatchesPerCall). Batches run
-	// tail-first, so keeping the last starts removes the newest matches and
-	// defers the older ones — which stay present and consistent — to later
-	// calls. Never silently: the caller's log should explain a short count.
-	if len(starts) > etcdPruneMaxBatchesPerCall {
-		starts = starts[len(starts)-etcdPruneMaxBatchesPerCall:]
+	// Bound this attempt to the call's remaining budget (see
+	// etcdPruneMaxBatchesPerCall — PruneEntries threads what is left across
+	// retries). Batches run tail-first, so keeping the last starts removes
+	// the newest matches and defers the older ones — which stay present and
+	// consistent — to later calls. Never silently: the caller's log should
+	// explain a short count.
+	if len(starts) > maxBatches {
+		starts = starts[len(starts)-maxBatches:]
 		logFn := slog.Info
-		if starts[0] > etcdPruneMaxBatchesPerCall*etcdPruneBatch {
+		if pruneBacklogGrowing(starts[0]) {
 			// More is deferred than a whole run can remove: at the current
 			// cleanup interval the backlog is growing, not draining. Make
 			// that visible rather than inferable — the operator's lever is
@@ -509,8 +533,20 @@ func (b *EtcdBackend) pruneEntriesOnce(ctx context.Context, keep func(InventoryE
 		subjSurvLast[r.rec.Subject] = r
 	}
 
+	// Bearer counts per serial across the WHOLE record set, so a duplicated
+	// legacy serial's shared by-serial key (the ambiguity sentinel) is only
+	// deleted when its last bearer goes. Deleting it while another bearer —
+	// a survivor, a deferred match, or an entry in a later batch — remains
+	// would un-reserve a serial still borne by a stored record and re-enable
+	// the index-write aliasing the sentinel exists to prevent.
+	bearers := make(map[string]int, len(recs))
+	for _, r := range recs {
+		bearers[r.rec.Serial]++
+	}
+
 	seqRev := seq.rev
 	committedFrom := len(removed) // removal index from which deletes have committed
+	batchesCommitted := 0
 	for si := len(starts) - 1; si >= 0; si-- {
 		s := starts[si]
 		batch := removed[s:min(s+etcdPruneBatch, len(removed))]
@@ -519,10 +555,15 @@ func (b *EtcdBackend) pruneEntriesOnce(ctx context.Context, keep func(InventoryE
 		ops := make([]clientv3.Op, 0, 3*len(batch)+3)
 		subjects := make(map[string]bool, len(batch))
 		for _, r := range batch {
-			ops = append(ops,
-				clientv3.OpDelete(b.entryPhys(r.seq)),
-				clientv3.OpDelete(b.invPhys(etcdInvSerialSub+r.rec.Serial)),
-			)
+			ops = append(ops, clientv3.OpDelete(b.entryPhys(r.seq)))
+			bearers[r.rec.Serial]--
+			if bearers[r.rec.Serial] == 0 {
+				// Last bearer of this serial: release the by-serial key
+				// (for a unique serial that is every removal; for a
+				// duplicated one this frees the ambiguity sentinel only
+				// once no stored record carries the serial any more).
+				ops = append(ops, clientv3.OpDelete(b.invPhys(etcdInvSerialSub+r.rec.Serial)))
+			}
 			subjects[r.rec.Subject] = true
 		}
 		// Repoint each affected subject at its newest entry still present in
@@ -563,22 +604,23 @@ func (b *EtcdBackend) pruneEntriesOnce(ctx context.Context, keep func(InventoryE
 		).Then(ops...).Commit()
 		cancel()
 		if err != nil {
-			return removed[committedFrom:], false, err
+			return removed[committedFrom:], batchesCommitted, false, err
 		}
 		if !resp.Succeeded {
-			return removed[committedFrom:], true, nil
+			return removed[committedFrom:], batchesCommitted, true, nil
 		}
 		// Our own put moved the fence; subsequent batches guard on the new
 		// revision, which every op in this transaction committed at.
 		seqRev = resp.Header.Revision
 		committedFrom = s
+		batchesCommitted++
 		if b.pruneBatchHook != nil {
 			b.pruneBatchHook()
 		}
 	}
 	// All selected batches committed; entries before starts[0] (if any) were
 	// deferred by the per-call bound and remain in the inventory.
-	return removed[starts[0]:], false, nil
+	return removed[starts[0]:], batchesCommitted, false, nil
 }
 
 // --- KeyInventory blob shim ---
@@ -960,7 +1002,7 @@ func (b *EtcdBackend) decomposeLegacyInventory(ctx context.Context) error {
 	}
 
 	// Serialise the import across replicas starting up together.
-	ul, err := b.AcquireLock(ctx, "inventory-decompose")
+	ul, err := b.AcquireLock(ctx, etcdDecomposeLockName)
 	if err != nil {
 		return fmt.Errorf("locking for inventory decomposition: %w", err)
 	}

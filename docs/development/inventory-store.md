@@ -276,9 +276,13 @@ Rules that keep the decomposed structure coherent:
   that keeps the serial reserved against reissue but makes certificate-index
   writes for it explicit no-ops, since a one-to-one index cannot say which
   bearer such a write is meant for. `Statuses` reports those records with
-  `CertStateUnknown`, the statuses handler derives their real state from the
-  signed CRL, and the startup repair pass skips them (they can never
-  converge). All replicas must still upgrade together:
+  `CertStateUnknown` — driven by the sentinel itself, not a live duplicate
+  count — the statuses handler derives their real state from the signed CRL,
+  and the startup repair pass skips them (they can never converge). The
+  sentinel outlives partial prunes: a prune releases a by-serial key only
+  when the last record bearing that serial is removed, so a lone surviving
+  bearer stays reserved and unknown until the serial is fully released. All
+  replicas must still upgrade together:
   an old-version writer appending to the blob mid-import is detected via the
   marker guard and the import restarts, but the race only closes once the old
   writers are gone.
