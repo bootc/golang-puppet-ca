@@ -53,13 +53,29 @@ func (b *EtcdBackend) Statuses(ctx context.Context, stateFilter string) ([]CertR
 		stored[strings.TrimPrefix(key, certPrefix)] = true
 	}
 
-	recs, _, err := b.readIndexedRecords(ctx)
+	// Entries and by-serial sentinels are read in ONE transaction: read
+	// separately, a prune deleting a duplicated serial's last bearer between
+	// the two reads would yield a snapshot containing the bearer without its
+	// sentinel, briefly presenting the record's stale stored state as
+	// authoritative.
+	readCtx, cancel := b.callCtx(ctx)
+	resp, err := b.client.Txn(readCtx).Then(
+		clientv3.OpGet(b.invPhys(etcdInvEntriesSub), clientv3.WithPrefix()),
+		clientv3.OpGet(b.invPhys(etcdInvSerialSub), clientv3.WithPrefix()),
+	).Commit()
+	cancel()
 	if err != nil {
 		return nil, err
 	}
-	ambiguous, err := b.ambiguousSerials(ctx)
+	recs, err := decodeIndexedRecords(b.invPhys(etcdInvEntriesSub), resp.Responses[0].GetResponseRange().Kvs)
 	if err != nil {
 		return nil, err
+	}
+	ambiguous := make(map[string]bool)
+	for _, kv := range resp.Responses[1].GetResponseRange().Kvs {
+		if string(kv.Value) == etcdSerialAmbiguous {
+			ambiguous[strings.TrimPrefix(string(kv.Key), b.invPhys(etcdInvSerialSub))] = true
+		}
 	}
 	// Ascending issuance order: a later record for the same subject wins.
 	// Serials whose by-serial key carries the ambiguity sentinel (imported
@@ -98,26 +114,6 @@ func (b *EtcdBackend) Statuses(ctx context.Context, stateFilter string) ([]CertR
 		records = append(records, rec)
 	}
 	return records, nil
-}
-
-// ambiguousSerials returns the set of serials whose by-serial key holds the
-// ambiguity sentinel — duplicated legacy imports whose certificate-index
-// writes are refused. One range read over the by-serial namespace, values
-// included (they are a few bytes each).
-func (b *EtcdBackend) ambiguousSerials(ctx context.Context) (map[string]bool, error) {
-	ctx, cancel := b.callCtx(ctx)
-	defer cancel()
-	resp, err := b.client.Get(ctx, b.invPhys(etcdInvSerialSub), clientv3.WithPrefix())
-	if err != nil {
-		return nil, err
-	}
-	out := make(map[string]bool)
-	for _, kv := range resp.Kvs {
-		if string(kv.Value) == etcdSerialAmbiguous {
-			out[strings.TrimPrefix(string(kv.Key), b.invPhys(etcdInvSerialSub))] = true
-		}
-	}
-	return out, nil
 }
 
 // SetRevoked marks the entry bearing serial as revoked at the given time.

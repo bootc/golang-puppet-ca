@@ -52,6 +52,16 @@ type partialPruneBackend struct {
 	*storage.SQLBackend
 	pruneErr           error
 	blockUntilDeadline bool
+	failCRLPut         bool
+}
+
+// Put fails CRL writes when armed, modelling a CRL re-sign that cannot be
+// persisted after a successful prune. Everything else delegates.
+func (b *partialPruneBackend) Put(ctx context.Context, key string, data []byte, kind storage.BlobKind) error {
+	if b.failCRLPut && key == storage.KeyCRL {
+		return fmt.Errorf("simulated CRL write failure")
+	}
+	return b.SQLBackend.Put(ctx, key, data, kind)
 }
 
 func (b *partialPruneBackend) PruneEntries(ctx context.Context, keep func(storage.InventoryEntry) bool, advanceHead func(prev []byte, e storage.InventoryEntry) []byte) ([]storage.InventoryEntry, error) {
@@ -277,6 +287,48 @@ var _ = Describe("CA CleanupExpiredCerts", func() {
 			"the CRL entry must be dropped despite the prune error")
 		Expect(store.HasCert(ctx, "expired-node")).To(BeFalse(),
 			"the stored cert must be deleted despite the prune error")
+	})
+
+	It("still deletes stored certs when the CRL rewrite fails", func() {
+		// A CRL re-sign failure after a successful prune must not abort the
+		// blob cleanup: the pruned entries are gone from the inventory, so a
+		// cert blob not deleted now is orphaned forever. The CRL entry itself
+		// legitimately survives (the write failed) and is re-attempted by a
+		// later pass while its cert remains prunable — but the blob and the
+		// count must not depend on the CRL write.
+		inner, err := storage.NewSQLBackend(storage.SQLConfig{
+			Dialect: storage.SQLitePure,
+			DSN:     "file:" + filepath.Join(tmpDir, "crlfail-prune.db"),
+		})
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(func() { _ = inner.Close() })
+		Expect(inner.EnsureReady(ctx)).To(Succeed())
+		wrapper := &partialPruneBackend{SQLBackend: inner}
+		store = storage.NewWithBackend(wrapper, filepath.Join(tmpDir, "crlfail-private"))
+		myCA = ca.New(store, ca.AutosignConfig{Mode: "off"}, "puppet.test")
+		Expect(store.EnsureDirs(ctx)).To(Succeed())
+		Expect(store.SaveCAKey(ctx, cachedKeyPEM)).To(Succeed())
+		Expect(store.SaveCACert(ctx, cachedCrtPEM)).To(Succeed())
+		Expect(store.UpdateCRL(ctx, cachedCrlPEM)).To(Succeed())
+		Expect(store.WriteSerial(ctx, "0001")).To(Succeed())
+		Expect(store.TouchInventory(ctx)).To(Succeed())
+		Expect(myCA.Init(ctx)).To(Succeed())
+
+		seedCert("expired-node", big.NewInt(0xEE03), time.Now().Add(-3*365*24*time.Hour))
+		Expect(parseStoredCRL(store).RevokedCertificateEntries).To(HaveLen(1))
+
+		wrapper.failCRLPut = true
+		removed, err := myCA.CleanupExpiredCerts(ctx, time.Hour)
+		wrapper.failCRLPut = false
+		Expect(err).To(MatchError(ContainSubstring("simulated CRL write failure")),
+			"the CRL failure must surface")
+		Expect(removed).To(Equal(1), "the durably removed entry must still be counted")
+
+		Expect(inventoryString()).NotTo(ContainSubstring("/expired-node"))
+		Expect(store.HasCert(ctx, "expired-node")).To(BeFalse(),
+			"the stored cert must be deleted despite the CRL failure")
+		Expect(parseStoredCRL(store).RevokedCertificateEntries).To(HaveLen(1),
+			"the CRL entry legitimately survives the failed rewrite")
 	})
 
 	It("still cleans up when the prune exhausts the context deadline", func() {

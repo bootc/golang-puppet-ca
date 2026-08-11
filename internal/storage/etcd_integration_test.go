@@ -825,9 +825,11 @@ var _ = Describe("EtcdInventoryPrune", func() {
 		// Conflict the fence exactly once, after the 15th committed batch, so
 		// the call is forced into a retry with half its budget spent.
 		commits := 0
+		fired := false
 		b.pruneBatchHook = func() {
 			commits++
 			if commits == 15 {
+				fired = true
 				_, err := cli.Put(ctx, "/test-inv-prune-budget/inventory/seq", fmt.Sprintf("%d", total))
 				Expect(err).NotTo(HaveOccurred(), "hook: bump fence")
 			}
@@ -837,6 +839,7 @@ var _ = Describe("EtcdInventoryPrune", func() {
 		bound := etcdPruneMaxBatchesPerCall * etcdPruneBatch
 		removed, err := svc.PruneInventory(ctx, func(e InventoryEntry) bool { return e.Serial > "1200" })
 		Expect(err).NotTo(HaveOccurred(), "PruneInventory")
+		Expect(fired).To(BeTrue(), "the mid-call conflict must actually have been injected — without it this spec pins nothing the bounds spec does not")
 		Expect(removed).To(HaveLen(bound), "the call must stop at its budget even though the conflict forced a retry")
 		serials := make(map[string]bool, len(removed))
 		for _, e := range removed {

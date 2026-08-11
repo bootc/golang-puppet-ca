@@ -483,6 +483,19 @@ var _ = Describe("CA certificate index", func() {
 			}
 			Expect(unknownSerial).NotTo(BeEmpty())
 
+			// Snapshot the stored row through the INNER backend: the wrapper
+			// rewrites node-unknown's record on every read, so untouchedness
+			// can only be asserted against the unwrapped rows.
+			innerBefore, err := inner.Statuses(ctx, "")
+			Expect(err).NotTo(HaveOccurred())
+			var storedBefore storage.CertRecord
+			for _, r := range innerBefore {
+				if r.Subject == "node-unknown" {
+					storedBefore = r
+				}
+			}
+			Expect(storedBefore.Serial).To(Equal(unknownSerial))
+
 			// Record index writes only from the repair pass onwards.
 			wrapper.recording = true
 			restarted := ca.New(wrapped, ca.AutosignConfig{Mode: "off"}, "puppet.test")
@@ -503,7 +516,19 @@ var _ = Describe("CA certificate index", func() {
 			Expect(bySubject["node-sibling"].State).To(Equal(storage.CertStateSigned),
 				"the sibling must be repaired despite the unknown record being skipped")
 			Expect(bySubject["node-unknown"].State).To(Equal(storage.CertStateUnknown),
-				"the unknown record must be untouched")
+				"the unknown record must still be listed as unknown")
+
+			// Untouchedness is asserted against the inner backend's rows —
+			// the wrapper's rewrite cannot mask a mutation there.
+			innerAfter, err := inner.Statuses(ctx, "")
+			Expect(err).NotTo(HaveOccurred())
+			var storedAfter storage.CertRecord
+			for _, r := range innerAfter {
+				if r.Subject == "node-unknown" {
+					storedAfter = r
+				}
+			}
+			Expect(storedAfter).To(Equal(storedBefore), "the unknown record's stored row must be untouched by the repair")
 		})
 	})
 })

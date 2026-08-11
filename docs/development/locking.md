@@ -31,11 +31,16 @@ process-local named `sync.Mutex`, which is correct for genuinely single-node
 backends (filesystem, SQLite).
 
 The lock names are part of the cross-replica protocol: every replica must agree
-on them, so they are **stable across releases**. They are defined in
+on them, so they are **stable across releases**. Names taken through
+`WithLock` by the CA layer are defined in
 [init.go](../../internal/ca/init.go) — with one mirror: `migrateLockName` in
 [migrate.go](../../internal/storage/migrate.go) redefines `"bootstrap"`
 independently (the `internal/storage` package cannot import `internal/ca`), so
 the two are coupled only by the string literal and must be renamed together.
+Backend-internal locks live beside the backend that takes them, for the same
+import-direction reason: `etcdDecomposeLockName` (`"inventory-decompose"`) in
+[etcd_inventory.go](../../internal/storage/etcd_inventory.go). They are no
+less protocol for it.
 
 | Lock name | Serialises | Taken by |
 | --- | --- | --- |
@@ -252,11 +257,13 @@ path — still provides no cross-replica guarantee anyway.
    in [storage.go](../../internal/storage/storage.go) spells this out, and
    the blob-backend gap is tracked as
    [#204](https://github.com/voxpupuli/openvox-ca/issues/204)).
-7. **New lock names are protocol.** Add them to the constants in
-   [init.go](../../internal/ca/init.go) (and keep `migrateLockName` in
+7. **New lock names are protocol.** Define CA-layer names as constants in
+   [init.go](../../internal/ca/init.go) (keeping `migrateLockName` in
    [migrate.go](../../internal/storage/migrate.go) in sync — it redefines
-   `"bootstrap"` independently), keep them stable across releases, and document
-   them in the table above. All callers using a name contend on one lock, so
+   `"bootstrap"` independently) and backend-internal names as constants in the
+   owning backend package (e.g. `etcdDecomposeLockName` in
+   [etcd_inventory.go](../../internal/storage/etcd_inventory.go)); keep them
+   all stable across releases, and document them in the table above. All callers using a name contend on one lock, so
    never derive a name from unvalidated input (subject names pass
    `ValidateSubject` first). `ValidateSubject` is necessary but not sufficient
    on the SQL backends: there the lock identity is a 64-bit FNV-1a hash of the
