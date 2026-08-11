@@ -98,8 +98,8 @@ with the server:
 ```console
 $ helm install openvox-ca \
     oci://ghcr.io/voxpupuli/openvox-ca-charts/openvox-ca \
-    --version 0.9.0 \
-    --namespace puppet --create-namespace
+    --namespace puppet --create-namespace \
+    --set tls.existingSecret=openvox-ca-server-tls
 ```
 
 See [deploying with Helm](docs/helm-chart.md) for the guide and the

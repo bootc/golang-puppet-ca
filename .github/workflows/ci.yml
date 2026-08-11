@@ -119,11 +119,12 @@ jobs:
         run: mage test:mixin
 
   # -- Helm chart --------------------------------------------------------------
-  # Three gates in one job: the chart's version tracks internal/version, the
-  # chart lints under every fixture in charts/openvox-ca/ci/, and every
-  # manifest it renders validates against the real Kubernetes and CRD schemas.
-  # The publish workflow does none of this — it only packages and pushes — so
-  # this is where a broken chart is caught.
+  # Everything the chart is gated on, in one job: its version tracks
+  # internal/version, it lints under every fixture in charts/openvox-ca/ci/,
+  # every manifest it renders validates against the real Kubernetes and CRD
+  # schemas, the rendered values are asserted (schema validity is not
+  # correctness), and it packages. The publish workflow only packages and
+  # pushes, so this is where a broken chart is caught.
   chart:
     name: Helm chart (Helm ${{ matrix.helm }})
     runs-on: ubuntu-latest

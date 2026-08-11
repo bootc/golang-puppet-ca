@@ -20,6 +20,7 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"os/exec"
@@ -63,6 +64,55 @@ var _ = Describe("chartValuesFiles", func() {
 		// finds no such fixture; assert the pair agree so a rename fails here
 		// with an obvious message too.
 		Expect(names).To(ContainElement(chartFloorFixture))
+	})
+})
+
+var _ = Describe("verifyChartPins", func() {
+	// Runs against the repository's real files: this is the cross-check that
+	// keeps Chart.yaml's advertised kubeVersion floor, the constant CI
+	// validates against, and the Helm version the publish workflow packages
+	// with from drifting apart. Also runs as part of `mage dev:check`.
+	It("finds the real pins in agreement", func() {
+		Expect(verifyChartPins()).To(Succeed())
+	})
+
+	// The failure branches are what make the guard a guard: feed synthetic
+	// contents with exactly one pin out of agreement and assert the error
+	// names it.
+	Describe("drift detection", func() {
+		goodChart := []byte("apiVersion: v2\nversion: 0.9.0-dev\nappVersion: \"0.9.0-dev\"\nkubeVersion: \">=" + kubeconformFloorVersion + "-0\"\n")
+		goodCI := []byte("jobs:\n  chart:\n    strategy:\n      matrix:\n        helm: [v3.21.3, v4.2.3]\n")
+		goodPublish := []byte("      - name: Set up Helm\n        uses: azure/setup-helm@abc\n        with:\n          version: v3.21.3\n")
+
+		It("accepts synthetic files that agree", func() {
+			Expect(verifyChartPinsIn(goodChart, goodCI, goodPublish)).To(Succeed())
+		})
+
+		It("rejects a kubeVersion floor the constant does not match", func() {
+			bad := bytes.Replace(goodChart, []byte(kubeconformFloorVersion), []byte("1.99.0"), 1)
+			Expect(verifyChartPinsIn(bad, goodCI, goodPublish)).To(
+				MatchError(ContainSubstring("does not match the kubeVersion floor")))
+		})
+
+		It("rejects a packaging Helm outside the validated matrix", func() {
+			bad := bytes.Replace(goodPublish, []byte("v3.21.3"), []byte("v3.20.0"), 1)
+			Expect(verifyChartPinsIn(goodChart, goodCI, bad)).To(
+				MatchError(ContainSubstring("not in ci.yml's chart matrix")))
+		})
+
+		It("accepts the other validated matrix entry as the packaging version", func() {
+			ok := bytes.Replace(goodPublish, []byte("v3.21.3"), []byte("v4.2.3"), 1)
+			Expect(verifyChartPinsIn(goodChart, goodCI, ok)).To(Succeed())
+		})
+
+		It("refuses to pass when a pin cannot be parsed at all", func() {
+			Expect(verifyChartPinsIn([]byte("apiVersion: v2\n"), goodCI, goodPublish)).To(
+				MatchError(ContainSubstring("could not parse the kubeVersion floor")))
+			Expect(verifyChartPinsIn(goodChart, []byte("jobs: {}\n"), goodPublish)).To(
+				MatchError(ContainSubstring("could not parse the chart job's helm matrix")))
+			Expect(verifyChartPinsIn(goodChart, goodCI, []byte("steps: []\n"))).To(
+				MatchError(ContainSubstring("could not parse the setup-helm version")))
+		})
 	})
 })
 

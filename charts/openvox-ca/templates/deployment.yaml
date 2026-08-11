@@ -230,13 +230,17 @@ spec:
         - name: config
           configMap:
             name: {{ include "openvox-ca.configMapName" . }}
+        {{- /*
+          The three key-material volumes below are all mode 0600. Combined with
+          the pod's fsGroup the kubelet ORs group access in, so the container
+          user can read them and nothing else can. The comment sits here rather
+          than between secretName and defaultMode so that chart:test can assert
+          the two as one contiguous string.
+        */}}
         {{- if .Values.tls.existingSecret }}
         - name: tls
           secret:
             secretName: {{ .Values.tls.existingSecret }}
-            # 0600 plus the pod's fsGroup: the kubelet ORs group access in when
-            # fsGroup is set, so the container user can read it and nothing
-            # else can.
             defaultMode: 0600
         {{- end }}
         {{- if .Values.ca.existingSecret }}

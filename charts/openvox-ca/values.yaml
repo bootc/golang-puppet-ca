@@ -70,7 +70,7 @@ config: {}
 #
 # This turns off everything downstream of that rendering, because the chart no
 # longer knows what the server is configured with:
-#   * `config`, `verbosity`, `listen`, `puppetServers`, `autosign`,
+#   * `config`, `verbosity`, `listen.host`, `puppetServers`, `autosign`,
 #     `extraConfigFiles` and `kubernetesExport.targets` stop being written
 #     anywhere — set the equivalents in your own ConfigMap.
 #   * The tls/ca/caKeyPassphrase Secrets are still *mounted*, but nothing points
@@ -79,7 +79,16 @@ config: {}
 #   * The TLS precondition is not checked, and the probes assume HTTPS. Set
 #     `httpGet.scheme` explicitly if your config.yaml sets no_tls_required.
 #   * Export RBAC cannot narrow `patch` to your target names, so it grants it
-#     in full.
+#     in full, and the ServiceAccount token is mounted unconditionally.
+#
+# Two values keep working and must be kept in step with your own config.yaml by
+# hand, because they shape the pod rather than the config file:
+#   * `listen.port` is the container port, the target of all three probes, and
+#     what the Service forwards to. Set it to whatever your config.yaml's
+#     `port` says or the pod never becomes ready.
+#   * `metrics.port` and `metrics.enabled` likewise open the pod and Service
+#     metrics port; your config.yaml still has to set `metrics_listen` on the
+#     matching port.
 existingConfigMap: ""
 
 # Where the config ConfigMap is mounted. openvox-ca auto-detects
@@ -127,6 +136,14 @@ autosign:
 # Server TLS certificate for the HTTPS listener. Typically a kubernetes.io/tls
 # Secret issued by cert-manager. When set, the Secret is mounted read-only and
 # tls_cert/tls_key are pointed at it.
+#
+# IMPORTANT: openvox-ca reads the keypair once, at startup, and has no reload
+# path. When cert-manager renews the Secret the running pods keep serving the
+# old certificate until they restart — and the probes speak to that same
+# listener, so readiness stays green until it expires and every agent fails at
+# once. Restart on renewal: `kubectl rollout restart`, a
+# `reloader.stakater.com/secret-auto` pod annotation (see
+# ci/postgres-ha-values.yaml), or your own controller.
 tls:
   existingSecret: ""
   certKey: tls.crt
@@ -293,6 +310,14 @@ envFrom: []
 #     name: openvox-ca-extra
 #   prefix: PUPPET_CA_
 
+# 64Mi is a hard cap, and the server's footprint grows with the size of the
+# fleet: it holds a serial index and a cache of pre-signed OCSP responses, one
+# entry per known certificate, pruned only on revocation or expired-cert
+# cleanup. Raise the limit before a growing inventory reaches it — crossing it
+# is an OOMKill, and with the default `strategy: Recreate` that is CA downtime.
+# Setting GOMEMLIMIT (via `env`) to just under the limit turns the cliff into GC
+# pressure. With `persistence.enabled: false` and the default `medium: Memory`,
+# the cadir tmpfs counts against this limit too.
 resources:
   requests:
     cpu: 10m
@@ -549,6 +574,10 @@ podDisruptionBudget:
   # Kubernetes 1.27+.
   unhealthyPodEvictionPolicy: ""
 
+# At least one metric source is required when enabled: an HPA with nothing to
+# act on holds the replica count at minReplicas while looking like it
+# autoscales, so the chart refuses that combination at install time. Scaling out
+# also needs an external storage backend.
 autoscaling:
   enabled: false
   minReplicas: 2

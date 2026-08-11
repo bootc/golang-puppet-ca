@@ -172,11 +172,13 @@ Notes:
 - `<commit-sha>` is optional; without it you tag `HEAD`, which is only correct
   if your local `main` is exactly `origin/main`. Being explicit is safer.
 - If you have the repository's git hooks installed (`lefthook install`), the
-  pre-push hook runs the version-match check locally and refuses a
-  mismatching `v*` tag before it ever reaches the remote — the same check
-  the server-side gate would fail, minus the delete/fix/re-tag round trip.
+  pre-push hook runs the version-match checks locally — both the
+  `internal/version` constant and the chart's `version`/`appVersion` — and
+  refuses a mismatching `v*` tag before it ever reaches the remote, the same
+  checks the server-side gate would fail, minus the delete/fix/re-tag round
+  trip.
 
-Then watch both workflows:
+Then watch all three workflows:
 
 ```console
 $ gh run list --limit 5
@@ -251,10 +253,13 @@ hand-editing.
 ## Pre-1.0 and pre-release tags
 
 A **semver pre-release tag** — any tag with a hyphen, e.g. `v0.9.0-rc1` — is
-handled specially by both workflows: the GitHub release is created with
+handled specially by the Release and Container images workflows: the GitHub release is created with
 `--prerelease` (it will not appear as the latest stable release), and
-`docker/metadata-action` withholds the `latest` container tags. Use one for
-anything you do not want users upgrading to by default.
+`docker/metadata-action` withholds the `latest` container tags. The Helm chart
+workflow treats it like any other tag — the chart publishes at that exact
+version — and because only `-dev` versions publish from `main`, merging the
+`-rc1` release-prep PR deliberately publishes nothing. Use a pre-release tag
+for anything you do not want users upgrading to by default.
 
 A plain `v0.9.0`, by contrast, is **not** a pre-release in semver terms
 despite the `0.` major: it publishes as the latest stable GitHub release and
@@ -393,5 +398,5 @@ can work around at release time. They are worth fixing before 1.0.
 
 | Gap | Impact |
 | --- | --- |
-| **No signing or attestation of release artefacts.** | `checksums.txt` establishes integrity against tampering in transit, but nothing establishes provenance. Image provenance attestations are also explicitly disabled, because they break the push-by-digest manifest merge, and the Helm chart is pushed without a provenance file (`helm push --sign`), so `helm verify` has nothing to check. |
+| **No signing or attestation of release artefacts.** | `checksums.txt` establishes integrity against tampering in transit, but nothing establishes provenance. Image provenance attestations are also explicitly disabled, because they break the push-by-digest manifest merge, and the chart is packaged without `helm package --sign`, so no `.prov` provenance file exists for `helm push` to upload and `helm verify` has nothing to check. |
 | **Release builds restore Go caches saved by CI runs on `main`.** | A deliberate trade-off for fast tag builds: the published binaries link against `~/.cache/go-build` contents that are not checksum-verified (unlike the module cache, which `go.sum` covers), so code already running in `main`'s CI could in principle poison a cache that a later release build consumes. Signing/attestation (above) would be the durable fix. |

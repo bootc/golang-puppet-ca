@@ -13,12 +13,13 @@ This is the narrative guide. The exhaustive values table is the
 ## Installing
 
 The chart is distributed as an **OCI artefact only** — there is no HTTP chart
-repository and no `helm repo add` step:
+repository and no `helm repo add` step. The commands below omit `--version`, so
+helm resolves the newest published chart; add `--version X.Y.Z` to pin one (the
+chart version is the openvox-ca version):
 
 ```console
 $ helm install openvox-ca \
     oci://ghcr.io/voxpupuli/openvox-ca-charts/openvox-ca \
-    --version 0.9.0 \
     --namespace puppet --create-namespace \
     --values my-values.yaml
 ```
@@ -26,9 +27,9 @@ $ helm install openvox-ca \
 Inspect it before installing:
 
 ```console
-$ helm show values oci://ghcr.io/voxpupuli/openvox-ca-charts/openvox-ca --version 0.9.0
+$ helm show values oci://ghcr.io/voxpupuli/openvox-ca-charts/openvox-ca
 $ helm template openvox-ca oci://ghcr.io/voxpupuli/openvox-ca-charts/openvox-ca \
-    --version 0.9.0 --values my-values.yaml
+    --values my-values.yaml
 ```
 
 The chart lives in a GHCR package of its own, separate from the container
@@ -157,7 +158,15 @@ stops asserting rather than refusing an install it cannot judge. In those modes
 the probes assume HTTPS, and it is on you to set `httpGet.scheme` if the server
 is actually serving cleartext.
 
-Two consequences follow from the CA terminating its own TLS:
+**A renewed certificate needs a pod restart.** openvox-ca reads the keypair once
+at startup and has no reload path, so when cert-manager rotates the Secret the
+running pods keep serving the old certificate. The probes talk to that same
+listener, so readiness stays green right up to expiry, at which point every
+agent fails at once. Restart on renewal with `kubectl rollout restart`, or let a
+controller do it — a `reloader.stakater.com/secret-auto` pod annotation is what
+`ci/postgres-ha-values.yaml` uses.
+
+Two further consequences follow from the CA terminating its own TLS:
 
 - **Ingress must pass TLS through**, not terminate it (see below).
 - **The pod's `fsGroup` must match its `runAsGroup`.** Mounted Secrets are
@@ -209,6 +218,28 @@ The `strategy` change matters: the chart defaults to `Recreate` because a
 surging replacement pod cannot mount the default ReadWriteOnce volume. Once
 state is external, a zero-downtime rollout is safe. `podDisruptionBudget` and
 `autoscaling` become meaningful at that point too.
+
+### Sizing
+
+The default memory limit is 64Mi, and it is a hard cap. The server's footprint
+grows with the size of the fleet: it keeps a serial index and a cache of
+pre-signed OCSP responses, one entry per known certificate, pruned only on
+revocation or expired-certificate cleanup. Crossing the limit is an OOMKill, and
+with the default `Recreate` strategy that is CA downtime. Raise
+`resources.limits.memory` before a growing inventory reaches it, and consider
+setting `GOMEMLIMIT` just under it through `env` so the Go runtime collects
+harder instead of hitting the cgroup wall:
+
+```yaml
+resources:
+  limits:
+    memory: 256Mi
+env:
+  GOMEMLIMIT: 240MiB
+```
+
+With `persistence.enabled: false` and the default `emptyDir.medium: Memory`, the
+cadir tmpfs counts against the same limit.
 
 The 30-second default `terminationGracePeriodSeconds` nests the server's
 25-second drain plus the supervisor's 3-second headroom. If you raise
@@ -530,10 +561,10 @@ openvox-ca:
 ```console
 $ helm upgrade openvox-ca \
     oci://ghcr.io/voxpupuli/openvox-ca-charts/openvox-ca \
-    --version 0.10.0 --namespace puppet --reuse-values
+    --version X.Y.Z --namespace puppet --reuse-values
 ```
 
-Two things worth knowing:
+Three things worth knowing:
 
 - With the default `Recreate` strategy there is a brief outage while the old
   pod releases the volume. External-backend deployments using `RollingUpdate`

@@ -193,14 +193,29 @@ autosign.conf: |
 {{/*
 Whether the pod needs to talk to the Kubernetes API: for the export feature, or
 for OpenBao's native Kubernetes auth (which reads the projected SA token).
+
+Reads the *merged* config, not .Values.config, so that export targets and an
+openbao auth_method supplied through `config.kubernetes_export` /
+`config.openbao` count — the server treats export as enabled whenever targets
+are present, regardless of the chart's own kubernetesExport.enabled.
+
+And when the configuration is not fully known the answer is "true", matching
+what openvox-ca.tlsConfigured does with the same uncertainty: an unnecessary
+projected token costs nothing, whereas a missing one makes the export or the
+key provider fail while readiness still reports healthy.
 */}}
 {{- define "openvox-ca.needsAPIAccess" -}}
-{{- if .Values.kubernetesExport.enabled -}}
+{{- if ne (include "openvox-ca.configFullyKnown" .) "true" -}}
 true
-{{- else if eq (dig "openbao" "auth_method" "" .Values.config) "kubernetes" -}}
+{{- else -}}
+{{- $config := include "openvox-ca.config" . | fromYaml -}}
+{{- if or .Values.kubernetesExport.enabled (dig "kubernetes_export" "targets" list $config) -}}
+true
+{{- else if eq (dig "openbao" "auth_method" "" $config) "kubernetes" -}}
 true
 {{- else -}}
 false
+{{- end -}}
 {{- end -}}
 {{- end -}}
 

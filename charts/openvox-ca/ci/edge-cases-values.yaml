@@ -2,6 +2,17 @@
 # to make sure that every documented value has at least one rendering behind it,
 # which is the rule AGENTS.md states and which several of these branches were
 # quietly failing before.
+#
+# Two documented values are deliberately covered by a chart:test render
+# assertion rather than here, because what matters about them is a rendered
+# string rather than schema validity: `emptyDir` with both fields cleared (the
+# volume source must not go null) and `backendPort: metrics` (the Ingress must
+# get the port name, the Gateway routes the number).
+#
+# `service.loadBalancerIP` and `service.loadBalancerClass` are not covered
+# anywhere: the template only emits them for `type: LoadBalancer`, and this
+# fixture needs `type: NodePort` for `nodePort`/`metricsNodePort`. They are
+# plain pass-throughs guarded by that `if`.
 
 fullnameOverride: ca-edge
 
@@ -9,13 +20,18 @@ fullnameOverride: ca-edge
 config:
   no_tls_required: true
 
-# Node-backed disk rather than tmpfs: both emptyDir fields cleared.
+# Node-backed disk with an explicit cap: medium cleared, sizeLimit set. (The
+# both-cleared case is a chart:test render assertion rather than a fixture,
+# since it is about the volume source not going null.)
 persistence:
   enabled: false
   retain: false
 emptyDir:
   medium: ""
-  sizeLimit: ""
+  sizeLimit: 256Mi
+
+podLabels:
+  example.com/tier: pki
 
 # The raw autosign setting rather than the rendered allowlist.
 autosign:
@@ -30,10 +46,27 @@ extraArgs:
 imagePullSecrets:
   - name: ghcr-pull
 
+# The metrics exporter is on so that metricsNodePort has something to attach
+# to, and so the ServiceMonitor pass-throughs below have a port to scrape.
+metrics:
+  enabled: true
+  serviceMonitor:
+    enabled: true
+    jobLabel: app.kubernetes.io/name
+    targetLabels:
+      - app.kubernetes.io/part-of
+    relabelings:
+      - sourceLabels: [__meta_kubernetes_pod_node_name]
+        targetLabel: node
+
 service:
   type: NodePort
   nodePort: 30140
+  metricsNodePort: 30914
   publishNotReadyAddresses: true
+  clusterIP: 10.96.0.42
+  externalIPs:
+    - 192.0.2.20
 
 podDisruptionBudget:
   enabled: true

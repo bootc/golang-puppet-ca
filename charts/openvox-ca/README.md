@@ -5,9 +5,10 @@ Puppet-compatible X.509 certificate authority and a drop-in replacement for the
 CA built into OpenVox/Puppet Server.
 
 The chart is released in lockstep with openvox-ca itself: its `version` and
-`appVersion` are always the release version, so chart `0.9.0` deploys
-openvox-ca `0.9.0`. It is published as an OCI artefact only — there is no HTTP
-chart repository to add.
+`appVersion` are always the release version, so chart `X.Y.Z` deploys
+openvox-ca `X.Y.Z`. It is published as an OCI artefact only — there is no HTTP
+chart repository to add. Omitting `--version` installs the newest published
+chart; pass `--version X.Y.Z` to pin one.
 
 A server TLS certificate is **required**: openvox-ca refuses to serve plain
 HTTP on a non-loopback address, so the chart refuses to render an install that
@@ -16,7 +17,6 @@ has none rather than handing you a crash-looping pod.
 ```console
 $ helm install openvox-ca \
     oci://ghcr.io/voxpupuli/openvox-ca-charts/openvox-ca \
-    --version 0.9.0 \
     --namespace puppet --create-namespace \
     --set tls.existingSecret=openvox-ca-server-tls
 ```
@@ -97,7 +97,7 @@ Helm 3.21 or 4.2; both are exercised in CI.
 
 | Key | Default | Description |
 | --- | --- | --- |
-| `tls.existingSecret` | `""` | Secret holding the server certificate; sets `tls_cert`/`tls_key` |
+| `tls.existingSecret` | `""` | Secret holding the server certificate; sets `tls_cert`/`tls_key`. The server reads it once at startup, so a renewal needs a pod restart |
 | `tls.certKey` / `tls.keyKey` | `tls.crt` / `tls.key` | Data keys within that Secret |
 | `tls.mountPath` | `/run/secrets/openvox-ca-tls` | |
 | `ca.existingSecret` | `""` | Secret holding the CA certificate and key; sets `ca_cert_file`/`ca_key_file` |
@@ -164,7 +164,7 @@ Helm 3.21 or 4.2; both are exercised in CI.
 | `env` | `{}` | Literal environment variables, as a map |
 | `extraEnv` | `[]` | Environment variables in list form, for `valueFrom` |
 | `envFrom` | `[]` | `configMapRef`/`secretRef` sources, verbatim |
-| `resources` | 10m CPU / 48–64Mi | |
+| `resources` | 10m CPU / 48–64Mi | The memory limit is a hard cap and the footprint grows with the certificate count; raise it before a growing inventory reaches it |
 | `configChecksumAnnotation` | `true` | Roll the pods when the rendered config changes. Inert when `existingConfigMap` is set |
 | `podAnnotations` / `podLabels` | `{}` | |
 | `deploymentAnnotations` | `{}` | Annotations on the Deployment rather than the pods |
@@ -227,7 +227,7 @@ certificate, so the controller **must** pass TLS through untouched.
 | `gateway.tlsRoute.enabled` | `false` | TLS passthrough — preserves client certificates, and the right choice for a CA |
 | `gateway.tlsRoute.apiVersion` | `gateway.networking.k8s.io/v1alpha2` | TLSRoute is in the experimental channel |
 | `gateway.tlsRoute.parentRefs` / `.hostnames` | `[]` | Templated |
-| `gateway.tlsRoute.backendPort` | `https` | `https` or `metrics` |
+| `gateway.tlsRoute.backendPort` | `https` | `https` or `metrics`; `metrics` requires `metrics.enabled` |
 | `gateway.tlsRoute.rules` | `[]` | Replaces the generated rule |
 | `gateway.tlsRoute.annotations` / `.labels` | `{}` | |
 | `gateway.httpRoute.*` | as above | Terminates TLS at the Gateway, so mTLS endpoints stop authenticating; `apiVersion` defaults to `gateway.networking.k8s.io/v1` |
@@ -251,7 +251,7 @@ certificate, so the controller **must** pass TLS through untouched.
 | `podDisruptionBudget.minAvailable` | `1` | Ignored when `maxUnavailable` is set |
 | `podDisruptionBudget.maxUnavailable` | `""` | `0` is honoured (block every voluntary eviction), not treated as unset |
 | `podDisruptionBudget.unhealthyPodEvictionPolicy` | `""` | Kubernetes 1.27+ |
-| `autoscaling.enabled` | `false` | Requires an external storage backend |
+| `autoscaling.enabled` | `false` | Requires an external storage backend, and at least one of `targetCPUUtilizationPercentage`, `targetMemoryUtilizationPercentage` or `metrics` — the chart refuses an install with none set |
 | `autoscaling.minReplicas` / `.maxReplicas` | `2` / `6` | |
 | `autoscaling.targetCPUUtilizationPercentage` | `80` | |
 | `autoscaling.targetMemoryUtilizationPercentage` | `""` | |

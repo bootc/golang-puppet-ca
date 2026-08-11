@@ -227,6 +227,11 @@ gateway:
       - ca.example.com
     annotations:
       example.com/route: tls
+    # Exercises the rules override on the TLS side too, not just httpRoute.
+    rules:
+      - backendRefs:
+          - name: '{{ include "openvox-ca.fullname" . }}'
+            port: 8140
   httpRoute:
     enabled: true
     parentRefs:

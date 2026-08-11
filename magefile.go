@@ -770,6 +770,78 @@ func (Chart) Version() error {
 	return nil
 }
 
+// verifyChartPins asserts the two hand-maintained cross-file agreements the
+// chart depends on, in the same spirit as verifyDistVariants and wired into
+// dev:check alongside it:
+//
+//   - kubeconformFloorVersion must be the floor Chart.yaml advertises, so the
+//     "checked promise rather than a claim" the constant's comment makes is
+//     actually true.
+//   - the Helm version helm-chart.yml packages with must be one the chart was
+//     validated against in ci.yml's matrix, because packaging with a Helm
+//     nobody linted the chart on is how a chart ships broken.
+//
+// Both were previously guarded only by comments asking the next editor to keep
+// them in step.
+func verifyChartPins() error {
+	chartSrc, err := os.ReadFile(filepath.Join(chartDir, "Chart.yaml"))
+	if err != nil {
+		return err
+	}
+	ciSrc, err := os.ReadFile(filepath.Join(".github", "workflows", "ci.yml"))
+	if err != nil {
+		return err
+	}
+	publishSrc, err := os.ReadFile(filepath.Join(".github", "workflows", "helm-chart.yml"))
+	if err != nil {
+		return err
+	}
+	return verifyChartPinsIn(chartSrc, ciSrc, publishSrc)
+}
+
+var (
+	// kubeVersion: ">=1.26.0-0" — capture the bare version.
+	chartKubeVersionRe = regexp.MustCompile(`(?m)^kubeVersion: "[^0-9]*([0-9]+\.[0-9]+\.[0-9]+)[^"]*"`)
+	// ci.yml's chart job: helm: [v3.21.3, v4.2.3]
+	ciHelmMatrixRe = regexp.MustCompile(`(?m)^\s*helm: \[([^\]]+)\]`)
+	// helm-chart.yml's setup-helm step: version: v3.21.3
+	publishHelmRe = regexp.MustCompile(`(?m)^\s*version: (v[0-9]+\.[0-9]+\.[0-9]+)`)
+)
+
+// verifyChartPinsIn is verifyChartPins over caller-supplied file contents, so
+// the mismatch branches are testable without editing the real files.
+func verifyChartPinsIn(chartSrc, ciSrc, publishSrc []byte) error {
+	m := chartKubeVersionRe.FindSubmatch(chartSrc)
+	if m == nil {
+		return fmt.Errorf("could not parse the kubeVersion floor from %s/Chart.yaml", chartDir)
+	}
+	if floor := string(m[1]); floor != kubeconformFloorVersion {
+		return fmt.Errorf("kubeconformFloorVersion (%s) does not match the kubeVersion floor in %s/Chart.yaml (%s); "+
+			"the floor is only a checked promise while the two agree",
+			kubeconformFloorVersion, chartDir, floor)
+	}
+
+	m = ciHelmMatrixRe.FindSubmatch(ciSrc)
+	if m == nil {
+		return fmt.Errorf("could not parse the chart job's helm matrix from ci.yml")
+	}
+	var validated []string
+	for _, v := range strings.Split(string(m[1]), ",") {
+		validated = append(validated, strings.TrimSpace(v))
+	}
+
+	m = publishHelmRe.FindSubmatch(publishSrc)
+	if m == nil {
+		return fmt.Errorf("could not parse the setup-helm version from helm-chart.yml")
+	}
+	if packaging := string(m[1]); !slices.Contains(validated, packaging) {
+		return fmt.Errorf("helm-chart.yml packages with Helm %s, which is not in ci.yml's chart matrix (%s); "+
+			"the chart would ship packaged by a Helm it was never validated against",
+			packaging, strings.Join(validated, ", "))
+	}
+	return nil
+}
+
 // chartFixtureName is the label a fixture's rendering is filed under.
 func chartFixtureName(path string) string {
 	base := filepath.Base(path)
@@ -825,6 +897,10 @@ func (Chart) Validate() error {
 	if err := os.MkdirAll(outDir, 0755); err != nil {
 		return err
 	}
+	cacheDir := filepath.Join(".test-output", "kubeconform-cache")
+	if err := os.MkdirAll(cacheDir, 0755); err != nil {
+		return err
+	}
 
 	floorChecked := false
 	for _, f := range values {
@@ -853,6 +929,12 @@ func (Chart) Validate() error {
 			if err := sh.RunV("kubeconform",
 				"-strict",
 				"-summary",
+				// Both schema locations are remote, and this runs once per
+				// fixture per Helm major — fourteen times a CI run. Without a
+				// cache each invocation re-downloads the same documents from
+				// raw.githubusercontent.com, so a rate limit there blocks every
+				// merge.
+				"-cache", cacheDir,
 				"-kubernetes-version", kubeVersion,
 				"-schema-location", "default",
 				"-schema-location", crdSchemaLocation,
@@ -1122,6 +1204,22 @@ func (Chart) Test() error {
 			wants: []string{"automountServiceAccountToken: true"},
 		},
 		{
+			name: "export targets set through config alone still mount the token",
+			// The server enables export whenever targets are present, whatever
+			// kubernetesExport.enabled says, so the token decision has to read
+			// the merged config rather than the chart's own flag.
+			sets:  []string{tls, "config.kubernetes_export.targets[0].kind=Secret", "config.kubernetes_export.targets[0].metadata.name=trust", "config.kubernetes_export.targets[0].cert=true"},
+			wants: []string{"automountServiceAccountToken: true"},
+		},
+		{
+			name: "a config the chart cannot read mounts the token conservatively",
+			// Same uncertainty the probes resolve towards HTTPS: a spare token
+			// costs nothing, a missing one fails the export or the key provider
+			// while readiness stays green.
+			sets:  []string{"existingConfigMap=mine"},
+			wants: []string{"automountServiceAccountToken: true"},
+		},
+		{
 			name: "a config change rolls the pods",
 			// Asserting the annotation exists would pass on a constant, which
 			// would roll nothing. Assert instead that a different config does
@@ -1136,12 +1234,96 @@ func (Chart) Test() error {
 			// would loosen permissions on the CA private key, its passphrase
 			// and the server TLS key while passing lint and kubeconform, which
 			// accept any mode or none.
+			//
+			// Each want pins secretName and defaultMode as one contiguous
+			// string: anchoring on the explanatory comment instead would pass
+			// with the mode deleted, which is exactly the refactor this case
+			// exists to catch.
 			sets: []string{tls, "ca.existingSecret=ca-material", "caKeyPassphrase.existingSecret=ca-passphrase"},
 			wants: []string{
-				"secretName: openvox-ca-tls\n            # 0600",
+				"secretName: openvox-ca-tls\n            defaultMode: 0600",
 				"secretName: ca-material\n            defaultMode: 0600",
 				"secretName: ca-passphrase\n            defaultMode: 0600",
 			},
+		},
+		{
+			name: "a loopback listen address is exempt from the TLS precondition",
+			// The other side of the guard: 127.0.0.0/8 and localhost are the
+			// only spellings that both satisfy the server's isLoopback and
+			// produce a parseable listen address, and this is the sidecar-only
+			// deployment the failure message offers as a remedy.
+			sets:     []string{"listen.host=127.0.0.1"},
+			wants:    []string{"kind: Deployment", "scheme: HTTP\n"},
+			notWants: []string{"scheme: HTTPS"},
+		},
+		{
+			name:  "localhost is exempt too",
+			sets:  []string{"listen.host=localhost"},
+			wants: []string{"kind: Deployment"},
+		},
+		{
+			name: "a certificate supplied through env satisfies the precondition",
+			// Environment variables outrank the config file, so this is a
+			// documented remedy; the helper has to notice it or the install is
+			// refused and the probes pick the wrong scheme.
+			sets:     []string{"env.PUPPET_CA_TLS_CERT=/run/tls/tls.crt", "env.PUPPET_CA_TLS_KEY=/run/tls/tls.key"},
+			wants:    []string{"kind: Deployment", "scheme: HTTPS"},
+			notWants: []string{"scheme: HTTP\n"},
+		},
+		{
+			name:     "a certificate supplied through extraEnv satisfies it as well",
+			sets:     []string{"extraEnv[0].name=PUPPET_CA_TLS_CERT", "extraEnv[0].value=/run/tls/tls.crt", "extraEnv[1].name=PUPPET_CA_TLS_KEY", "extraEnv[1].value=/run/tls/tls.key"},
+			wants:    []string{"kind: Deployment", "scheme: HTTPS"},
+			notWants: []string{"scheme: HTTP\n"},
+		},
+		{
+			name: "an explicit probe scheme survives the computed default",
+			// TLS is configured, so the chart would choose HTTPS; the liveness
+			// probe overrides it and the other two must still default.
+			sets:  []string{tls, "livenessProbe.httpGet.scheme=HTTP"},
+			wants: []string{"scheme: HTTP\n", "scheme: HTTPS"},
+		},
+		{
+			name: "an ingress routed to the metrics port names it",
+			// The accepted half of the backendPort guard. Ingress references
+			// the Service port by name...
+			sets:  []string{tls, "metrics.enabled=true", "ingress.enabled=true", "ingress.backendPort=metrics"},
+			wants: []string{"port:\n                  name: metrics"},
+		},
+		{
+			name: "a TLSRoute routed to the metrics port numbers it",
+			// ...while a Gateway API backendRef takes the number, which is the
+			// asymmetry openvox-ca.routeBackendName/routeBackendPort exist for.
+			sets:  []string{tls, "metrics.enabled=true", "gateway.tlsRoute.enabled=true", "gateway.tlsRoute.backendPort=metrics"},
+			wants: []string{"port: 9140"},
+		},
+		{
+			name:  "NOTES warns when every CSR is signed unreviewed",
+			notes: true,
+			// The positive control that makes the suppression case below mean
+			// something.
+			sets:  []string{tls, "autosign.mode=true"},
+			wants: []string{"signed without review"},
+		},
+		{
+			name:  "NOTES warns that an HTTPRoute stops mTLS authenticating",
+			notes: true,
+			sets:  []string{tls, "gateway.httpRoute.enabled=true"},
+			wants: []string{"stops authenticating"},
+		},
+		{
+			name:  "NOTES warns when no TLS certificate is configured",
+			notes: true,
+			sets:  []string{"config.no_tls_required=true"},
+			// Single-line fragments only: the notes probe indents the rendered
+			// body, so a want spanning a line break would never match.
+			wants: []string{"no server TLS certificate is configured"},
+		},
+		{
+			name:  "NOTES warns when export RBAC cannot be narrowed",
+			notes: true,
+			sets:  []string{"existingConfigMap=mine", "kubernetesExport.enabled=true"},
+			wants: []string{"patch on every"},
 		},
 		{
 			name: "a lowercase export target kind passes through as written",
@@ -1283,6 +1465,20 @@ func (Chart) Test() error {
 			name:       "an allow-list entry carrying a newline, which would inject a ConfigMap key",
 			sets:       []string{tls},
 			valuesYAML: "puppetServers:\n  - \"ca.example.com\\ninjected: value\"\n",
+			wantErr:    "single non-empty line",
+		},
+		{
+			name: "an empty allow-list entry, the guard's other arm",
+			// A blank line in the mTLS admin allow list or the autosign
+			// allow list is the second thing the guard refuses.
+			sets:       []string{tls},
+			valuesYAML: "puppetServers:\n  - \"\"\n",
+			wantErr:    "single non-empty line",
+		},
+		{
+			name:       "a whitespace-only autosign pattern",
+			sets:       []string{tls},
+			valuesYAML: "autosign:\n  patterns:\n    - \"   \"\n",
 			wantErr:    "single non-empty line",
 		},
 		{
@@ -1982,6 +2178,10 @@ func (Dev) Check() error {
 	}
 	fmt.Println("Checking release variant lists...")
 	if err := verifyDistVariants(); err != nil {
+		return err
+	}
+	fmt.Println("Checking chart version pins...")
+	if err := verifyChartPins(); err != nil {
 		return err
 	}
 	// Vet the one package with a non-Linux build-tagged file. Every CI check
