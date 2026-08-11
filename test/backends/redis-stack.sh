@@ -1164,15 +1164,28 @@ if [ "$FAILURES" -ne 0 ] || [ "$PHASE1_RC" -ne 0 ]; then
     # own account of *why* -- say, the error behind a 409 on every revocation in
     # the Race E storm -- lived in the container logs, which the EXIT trap then
     # tore down unread. On a flake that cannot be reproduced locally that is the
-    # difference between a diagnosis and a re-run, so dump both replicas here,
-    # while the stack is still up. Readiness timeouts already dump via
-    # abort_not_ready; this covers everything after that point.
-    dump_logs openvox-ca 200
-    dump_logs openvox-ca-2 200
-    # Phase 1 is the puppet-stack suite, so a failure there usually needs the
-    # master's side of the conversation too.
-    if [ "$PHASE1_RC" -ne 0 ]; then
-        dump_logs puppet-master 200
+    # difference between a diagnosis and a re-run. Readiness timeouts already
+    # dump via abort_not_ready; this covers everything after that point.
+    #
+    # Gated on the same condition cleanup() tears the stack down under, because
+    # that is what makes the logs unrecoverable. A --keep run (or a run against
+    # an already-started stack) leaves them available to `compose logs`, and
+    # phase 1 runs the puppet wrapper with the stack already up, so gating also
+    # keeps a phase 1 failure from dumping the same containers twice.
+    if $DO_UP && ! $DO_KEEP; then
+        dump_logs openvox-ca 200
+        dump_logs openvox-ca-2 200
+        # Redis is the backend under test in every phase and has no readiness
+        # wait, so this is its only dump path. The CA log carries the wrapped
+        # Redis error; this is Redis's own side of it (eviction, OOM, config).
+        dump_logs redis 200
+        # Phase 1 is the puppet-stack suite, so a failure there usually needs
+        # the master's side of the conversation -- and OpenVoxDB's, since an
+        # unhealthy one fails the catalog run (see the readiness wait above).
+        if [ "$PHASE1_RC" -ne 0 ]; then
+            dump_logs puppet-master 200
+            dump_logs openvoxdb 200
+        fi
     fi
     exit 1
 fi

@@ -181,6 +181,25 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# -- Helper: replay a service's container logs to our stderr ---------------
+# Shared by the readiness aborts and the end-of-run failure dump, both of
+# which need the container's own account of what went wrong. Deliberately a
+# copy of the helper in test/backends/redis-stack.sh rather than a sourced
+# file: run-puppet-stack-on-redis.sh execs a sed-rewritten copy of this script
+# from a temp directory, where a path-relative `source` would not resolve.
+dump_logs() {  # service-name  [tail-lines]
+    local _svc="$1" _tail="${2:-80}"
+    printf '# ---- last %s log lines from %s ----\n' "$_tail" "$_svc" >&2
+    # Send both the container's stdout and stderr to our stderr. Do NOT add
+    # `2>/dev/null`: with `>&2` alone, fd1 is redirected to the current stderr
+    # and fd2 already points there, so both streams reach the operator. A
+    # `2>/dev/null` would instead route the command's stderr to the bit-bucket
+    # -- and under `podman logs` a container's stderr (where Go services write
+    # their startup/abort diagnostics) is replayed to *our* stderr, so the very
+    # lines that explain the failed bootstrap would be discarded.
+    "${_COMPOSE[@]}" logs --tail "$_tail" "$_svc" >&2 || true
+}
+
 # -- Helper: abort a readiness wait loudly, dumping the culprit's logs ------
 # Without this the wait loops below printed " OK" whether or not the endpoint
 # ever answered, so a service that never came up surfaced only as a confusing
@@ -189,15 +208,7 @@ trap cleanup EXIT
 abort_not_ready() {  # human-description  service-name
     printf ' TIMEOUT\n'
     printf 'FATAL: %s did not become ready in time\n' "$1" >&2
-    printf '# ---- last 80 log lines from %s ----\n' "$2" >&2
-    # Send both the container's stdout and stderr to our stderr. Do NOT add
-    # `2>/dev/null`: with `>&2` alone, fd1 is redirected to the current stderr
-    # and fd2 already points there, so both streams reach the operator. A
-    # `2>/dev/null` would instead route the command's stderr to the bit-bucket
-    # -- and under `podman logs` a container's stderr (where Go services write
-    # their startup/abort diagnostics) is replayed to *our* stderr, so the very
-    # lines that explain the failed bootstrap would be discarded.
-    "${_COMPOSE[@]}" logs --tail 80 "$2" >&2 || true
+    dump_logs "$2"
     exit 1
 }
 
@@ -802,4 +813,22 @@ refresh_master_crl && printf '#   master CRL refreshed\n' || true
 printf '\n# Results: %d/%d passed, %d failed\n' \
     $(( T - FAILURES )) "$T" "$FAILURES"
 
-[ "$FAILURES" -eq 0 ]
+if [ "$FAILURES" -ne 0 ]; then
+    # Same reasoning as the failure dump in test/backends/redis-stack.sh: a
+    # failed assertion printed its `not ok` line and nothing else, and the EXIT
+    # trap then tore the containers down, taking the only account of why with
+    # them. Readiness timeouts already dump via abort_not_ready; this covers
+    # everything after that point.
+    #
+    # Gated on the same condition cleanup() tears the stack down under, since
+    # that is what makes the logs unrecoverable: a --keep run leaves them
+    # available to `compose logs`, and redis-stack.sh drives this script with
+    # the stack already up and dumps these services from its own failure block.
+    if $DO_UP && ! $DO_KEEP; then
+        dump_logs openvox-ca 200
+        dump_logs puppet-master 200
+        dump_logs openvoxdb 200
+    fi
+    exit 1
+fi
+exit 0
