@@ -256,6 +256,30 @@ var _ = Describe("CA CRL reissuance", func() {
 			Expect(snap.Number).NotTo(BeNil())
 		})
 
+		It("does not adopt a CRL older than the one already cached", func() {
+			// The guard is a comparison, not an assignment: an unconditional
+			// c.cachedCRL = crl would pass every other spec here. What that
+			// would cost is the CRL number going backwards on a replica whose
+			// storage read raced a re-sign.
+			Expect(myCA.ReissueCRL(context.Background())).To(Succeed())
+			ahead, ok := myCA.CRLSnapshot()
+			Expect(ok).To(BeTrue())
+
+			// Put an older CRL back into storage behind the CA's back, then
+			// let a not-due refresh read it.
+			Expect(store.UpdateCRL(context.Background(), cachedCrlPEM)).To(Succeed())
+			stored := parseStoredCRL(store)
+			Expect(stored.Number.Cmp(ahead.Number)).To(Equal(-1), "storage is now behind the cache")
+
+			reissued, err := myCA.RefreshCRLIfDue(context.Background(), time.Hour)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(reissued).To(BeFalse())
+
+			after, ok := myCA.CRLSnapshot()
+			Expect(ok).To(BeTrue())
+			Expect(after.Number).To(Equal(ahead.Number), "the cache must not go backwards")
+		})
+
 		It("tracks re-signs of the CRL", func() {
 			before, ok := myCA.CRLSnapshot()
 			Expect(ok).To(BeTrue())

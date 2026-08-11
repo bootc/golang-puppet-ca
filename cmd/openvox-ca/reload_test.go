@@ -48,14 +48,22 @@ import (
 // two directories.
 func writeTestKeypair(dir, cn string) (certPath, keyPath string) {
 	GinkgoHelper()
+	return writeTestKeypairValid(dir, cn, time.Now().Add(-time.Hour), time.Now().Add(24*time.Hour))
+}
+
+// writeTestKeypairValid is writeTestKeypair with an explicit validity window,
+// so a spec can produce a certificate that is already expired or not yet
+// valid — the cases a rotation is supposed to warn about.
+func writeTestKeypairValid(dir, cn string, notBefore, notAfter time.Time) (certPath, keyPath string) {
+	GinkgoHelper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	Expect(err).NotTo(HaveOccurred())
 
 	tmpl := &x509.Certificate{
 		SerialNumber: big.NewInt(1),
 		Subject:      pkix.Name{CommonName: cn},
-		NotBefore:    time.Now().Add(-time.Hour),
-		NotAfter:     time.Now().Add(24 * time.Hour),
+		NotBefore:    notBefore,
+		NotAfter:     notAfter,
 		DNSNames:     []string{cn},
 	}
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
@@ -182,6 +190,46 @@ var _ = Describe("TLS certificate reloading", func() {
 		Expect(os.WriteFile(certPath, []byte("-----BEGIN CERTIFICATE-----\ntruncated"), 0600)).To(Succeed())
 		Expect(reloader.reload()).To(HaveOccurred())
 		Expect(servedCN(reloader)).To(Equal("first.example.com"))
+	})
+
+	DescribeTable("warns about a keypair outside its validity window",
+		func(notBefore, notAfter time.Time, want string) {
+			// LoadX509KeyPair checks only that certificate and key
+			// correspond, and a Go TLS server does not validate its own
+			// leaf — so without this the reload reports success while every
+			// new handshake fails at the agent.
+			var buf bytes.Buffer
+			orig := slog.Default()
+			slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+			defer slog.SetDefault(orig)
+
+			dir := GinkgoT().TempDir()
+			certPath, keyPath := writeTestKeypairValid(dir, "rotated.example.com", notBefore, notAfter)
+			reloader, err := newCertReloader(certPath, keyPath)
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(servedCN(reloader)).To(Equal("rotated.example.com"),
+				"an out-of-window certificate is still installed; refusing it would leave no certificate at all")
+			Expect(buf.String()).To(ContainSubstring(want))
+		},
+		Entry("already expired",
+			time.Now().Add(-48*time.Hour), time.Now().Add(-time.Hour),
+			"has already expired"),
+		Entry("not yet valid",
+			time.Now().Add(time.Hour), time.Now().Add(48*time.Hour),
+			"is not valid yet"),
+	)
+
+	It("says nothing about a keypair inside its window", func() {
+		var buf bytes.Buffer
+		orig := slog.Default()
+		slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+		defer slog.SetDefault(orig)
+
+		certPath, keyPath := writeTestKeypair(GinkgoT().TempDir(), "current.example.com")
+		_, err := newCertReloader(certPath, keyPath)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(buf.String()).To(BeEmpty())
 	})
 
 	It("rejects a certificate that does not match the key", func() {

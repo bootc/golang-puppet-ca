@@ -386,7 +386,12 @@ var _ = Describe("Service manager heartbeat", func() {
 			// Close underneath both of them, exactly as the deferred Close in
 			// main.go can, before the context is cancelled.
 			Expect(n.Close()).To(Succeed())
-			Consistently(func() bool { return true }, 20*time.Millisecond).Should(BeTrue())
+
+			// Deliberately widen the window between the close and the cancel,
+			// so both goroutines get ticks in against a closed notifier. Not
+			// an assertion — there is nothing to poll for here, and dressing
+			// the wait up as one would only look like a check.
+			time.Sleep(20 * time.Millisecond)
 
 			cancel()
 			wg.Wait()

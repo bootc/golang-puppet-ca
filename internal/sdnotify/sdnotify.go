@@ -67,9 +67,7 @@ type Notifier struct {
 	// fed within, or zero when the watchdog is disabled.
 	watchdog time.Duration
 
-	// warnedSendFailure records whether a write failure has already been
-	// reported at Warn, so a persistently unreachable socket does not flood
-	// the journal at heartbeat rate. Guarded by mu.
+	// warnedSendFailure latches the first write failure; see send. Guarded by mu.
 	warnedSendFailure bool
 }
 
@@ -234,12 +232,6 @@ func (n *Notifier) send(msg string) {
 		slog.Debug("Failed to set the notification write deadline", "error", err)
 	}
 	if _, err := n.conn.Write([]byte(msg)); err != nil {
-		// The first failure after a successful connect is worth an operator's
-		// attention: the socket was reachable at startup, so something has
-		// changed, and with a watchdog configured this path ends in the
-		// service manager killing an otherwise healthy CA. Subsequent
-		// failures drop to Debug so a persistent fault cannot flood the
-		// journal at heartbeat rate.
 		if !n.warnedSendFailure {
 			n.warnedSendFailure = true
 			slog.Warn("Failed to notify the service manager; further failures will be logged at debug level",

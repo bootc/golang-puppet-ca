@@ -18,14 +18,15 @@ $ sudo useradd --system --home-dir /var/lib/puppet-ca --shell /usr/sbin/nologin 
 $ sudo install -m 0755 openvox-ca openvox-ca-ctl /usr/local/bin/
 $ sudo install -m 0644 openvox-ca.service /etc/systemd/system/
 $ sudo install -d -m 0755 /etc/puppet-ca
-$ sudo install -o root -g puppet-ca -m 0640 config.yaml /etc/puppet-ca/config.yaml
+$ sudoedit /etc/puppet-ca/config.yaml   # your own file; see configuration.md
+$ sudo chown root:puppet-ca /etc/puppet-ca/config.yaml && sudo chmod 0640 /etc/puppet-ca/config.yaml
 $ sudo systemctl daemon-reload
 $ sudo systemctl enable --now openvox-ca.service
 ```
 
 Building from source instead? `mage build:all` puts the binaries in `bin/` and the unit stays at `packaging/systemd/openvox-ca.service`; install from there.
 
-`config.yaml` is **0640 root:puppet-ca** because it can hold credentials — `etcd_password`, or an inline OpenBao `role_id` — and the service only needs to read it. The server auto-detects that path, so the unit passes no `--config` and `PUPPET_CA_CONFIG` still works in a drop-in.
+The configuration file is yours to write — it is not in the tarball — and [configuring the server](configuration.md#config-file) has a worked example. Make it **0640 root:puppet-ca**, because it can hold credentials — `etcd_password`, or an inline OpenBao `role_id` — and the service only needs to read it. The server auto-detects that path, so the unit passes no `--config` and `PUPPET_CA_CONFIG` still works in a drop-in.
 
 The unit expects the binary at `/usr/local/bin/openvox-ca` and its configuration at `/etc/puppet-ca/config.yaml`. See [configuring the server](configuration.md).
 
