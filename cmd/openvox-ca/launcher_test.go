@@ -30,6 +30,8 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 
@@ -134,9 +136,15 @@ var _ = Describe("launcher fd contract", func() {
 		// immediately after that child starts, so only the children hold the
 		// socketpair ends and pipe read ends.
 		Expect(signerCmd.Start()).To(Succeed(), "starting signer child")
+		// Registered before anything else can fail: a mid-spec failure aborts
+		// the body by panic, so relying on the Wait calls below to reap these
+		// leaves a child running whenever the spec fails -- which is exactly
+		// when it matters. The sibling spec below already does this.
+		DeferCleanup(func() { killAndReap(signerCmd) })
 		signerSock.Close()
 		signerPipe.Close()
 		Expect(frontendCmd.Start()).To(Succeed(), "starting frontend child")
+		DeferCleanup(func() { killAndReap(frontendCmd) })
 		frontendSock.Close()
 		frontendPipe.Close()
 
@@ -180,6 +188,72 @@ var _ = Describe("launcher fd contract", func() {
 		Expect(err).To(HaveOccurred(), "child without a PSK pipe on fd 4 should exit non-zero; output: %s", out.String())
 		Expect(out.String()).To(ContainSubstring("not spawned by the launcher"),
 			"child should report the missing PSK pipe")
+	})
+})
+
+// lowestFreeFD returns the descriptor number a fresh pipe is given, which by the
+// POSIX lowest-available-fd rule is the lowest free slot. Comparing it before and
+// after an operation detects a descriptor the operation left open, without
+// reading /dev/fd -- which is a magic directory that cannot be listed portably
+// (on Darwin the listing's own descriptor invalidates the read).
+func lowestFreeFD() int {
+	GinkgoHelper()
+	r, w, err := os.Pipe()
+	Expect(err).NotTo(HaveOccurred())
+	fd := int(r.Fd())
+	Expect(r.Close()).To(Succeed())
+	Expect(w.Close()).To(Succeed())
+	return fd
+}
+
+var _ = Describe("spawnChild and its cleanup", func() {
+	// runLauncher itself has no test and cannot easily have one -- it re-execs
+	// this binary twice and then blocks on signal forwarding -- so the two rules
+	// its failure path depends on are pinned on the extracted helpers instead.
+	It("reaps a child rather than only signalling it", func() {
+		// The launcher kills the signer when the frontend fails to start. Kill
+		// alone leaves a zombie for as long as the launcher lives, and the
+		// launcher does not necessarily exit straight away.
+		cmd := exec.Command("/bin/sh", "-c", "sleep 300")
+		Expect(cmd.Start()).To(Succeed())
+		pid := cmd.Process.Pid
+
+		killAndReap(cmd)
+
+		// Signal 0 probes for existence. A reaped child is gone; a zombie would
+		// still be found, because a zombie is still a process table entry owned
+		// by this process.
+		Expect(syscall.Kill(pid, 0)).To(MatchError(syscall.ESRCH),
+			"the child must be waited on, not merely signalled")
+	})
+
+	It("is safe on a child that was never started", func() {
+		// The frontend-failure path calls this with whatever the signer spawn
+		// returned, and a spawn that failed before Start returns a nil Cmd.
+		killAndReap(nil)
+		killAndReap(&exec.Cmd{})
+	})
+
+	It("does not leak a PSK pipe when the child cannot start", func() {
+		// A pipe is created before the fork, so a Start that fails owns the only
+		// remaining reference to it. Leaking one per attempt is a descriptor
+		// leak in the one code path an operator hits repeatedly: a launcher
+		// crash-looping because the binary cannot exec.
+		psk := make([]byte, 32)
+		_, err := rand.Read(psk)
+		Expect(err).NotTo(HaveOccurred())
+
+		sock, otherEnd, err := signer.Socketpair()
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(func() { _ = otherEnd.Close() })
+
+		before := lowestFreeFD()
+		cmd, err := spawnChild(filepath.Join(GinkgoT().TempDir(), "does-not-exist"),
+			os.Environ(), "signer", sock, hex.EncodeToString(psk))
+		Expect(err).To(HaveOccurred(), "a missing executable must not start")
+		Expect(cmd).To(BeNil())
+		Expect(lowestFreeFD()).To(Equal(before),
+			"a pipe left open would occupy this slot, pushing the next one higher")
 	})
 })
 

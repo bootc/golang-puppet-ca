@@ -116,50 +116,20 @@ func runLauncher(drain time.Duration) error {
 	baseEnv := filterEnv(os.Environ(), "PUPPET_CA_ROLE", "PUPPET_CA_DAEMON", "PUPPET_CA_SIGNER_PSK")
 	baseEnv = baseEnv[:len(baseEnv):len(baseEnv)]
 
-	// Spawn signer child.
-	signerPSK, err := pskPipe(pskHex)
+	signerCmd, err := spawnChild(exe, baseEnv, "signer", signerSock, pskHex)
 	if err != nil {
 		return err
 	}
-	signerCmd := exec.Command(exe, os.Args[1:]...) //nolint:gosec // G204: re-execs this same binary (os.Executable) with the operator's own os.Args
-	signerCmd.Env = append(baseEnv,
-		"PUPPET_CA_ROLE=signer",
-		"PUPPET_CA_DAEMON=1",
-	)
-	signerCmd.ExtraFiles = []*os.File{signerSock, signerPSK} // fd 3, fd 4
-	signerCmd.Stdout = os.Stdout
-	signerCmd.Stderr = os.Stderr
-	if err := signerCmd.Start(); err != nil {
-		signerPSK.Close()
-		return fmt.Errorf("starting signer process: %w", err)
-	}
-	// Close our copies of the signer's socket end and PSK pipe; only the
-	// child should hold them.
-	signerSock.Close()
-	signerPSK.Close()
 
-	// Spawn frontend child.
-	frontendPSK, err := pskPipe(pskHex)
+	frontendCmd, err := spawnChild(exe, baseEnv, "frontend", frontendSock, pskHex)
 	if err != nil {
-		signerCmd.Process.Kill()
+		// The signer is already running and nothing will ever connect to it, so
+		// it has to go -- and be reaped, not merely signalled: Kill on its own
+		// leaves a zombie for as long as this process lives, and the launcher
+		// does not necessarily exit straight away.
+		killAndReap(signerCmd)
 		return err
 	}
-	frontendCmd := exec.Command(exe, os.Args[1:]...) //nolint:gosec // G204: re-execs this same binary (os.Executable) with the operator's own os.Args
-	frontendCmd.Env = append(baseEnv,
-		"PUPPET_CA_ROLE=frontend",
-		"PUPPET_CA_DAEMON=1",
-	)
-	frontendCmd.ExtraFiles = []*os.File{frontendSock, frontendPSK} // fd 3, fd 4
-	frontendCmd.Stdout = os.Stdout
-	frontendCmd.Stderr = os.Stderr
-	if err := frontendCmd.Start(); err != nil {
-		frontendPSK.Close()
-		signerCmd.Process.Kill()
-		return fmt.Errorf("starting frontend process: %w", err)
-	}
-	// Close our copies of the frontend's socket end and PSK pipe.
-	frontendSock.Close()
-	frontendPSK.Close()
 
 	slog.Info("CA processes started",
 		"signer_pid", signerCmd.Process.Pid,
@@ -213,6 +183,51 @@ func runLauncher(drain time.Duration) error {
 		timer.Stop()
 		return fmt.Errorf("%s process exited unexpectedly: %w", result.name, result.err)
 	}
+}
+
+// spawnChild starts one isolated child in the given role, handing it the
+// socketpair end on fd 3 and a freshly loaded PSK pipe on fd 4.
+//
+// Extracted so the two spawns cannot drift apart and so the failure ordering is
+// testable: the parent's copies of both descriptors must be dropped as soon as
+// the child holds them, and a PSK pipe created for a child that never starts
+// must not be leaked. Both rules were open-coded twice.
+func spawnChild(exe string, baseEnv []string, role string, sock *os.File, pskHex string) (*exec.Cmd, error) {
+	pskRead, err := pskPipe(pskHex)
+	if err != nil {
+		return nil, err
+	}
+
+	cmd := exec.Command(exe, os.Args[1:]...) //nolint:gosec // G204: re-execs this same binary (os.Executable) with the operator's own os.Args
+	cmd.Env = append(baseEnv,
+		"PUPPET_CA_ROLE="+role,
+		"PUPPET_CA_DAEMON=1",
+	)
+	cmd.ExtraFiles = []*os.File{sock, pskRead} // fd 3, fd 4
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	if err := cmd.Start(); err != nil {
+		pskRead.Close()
+		return nil, fmt.Errorf("starting %s process: %w", role, err)
+	}
+	// Only the child should hold these now -- the PSK pipe especially: while the
+	// parent keeps the read end open the pipe never reaches EOF for the child.
+	sock.Close()
+	pskRead.Close()
+	return cmd, nil
+}
+
+// killAndReap signals a started child and waits for it, so a launcher that fails
+// partway through leaves nothing behind. Errors are deliberately ignored: the
+// caller is already returning a failure, and a child that has exited on its own
+// is the outcome this wants anyway.
+func killAndReap(cmd *exec.Cmd) {
+	if cmd == nil || cmd.Process == nil {
+		return
+	}
+	_ = cmd.Process.Kill()
+	_, _ = cmd.Process.Wait()
 }
 
 // pskPipe returns the read end of a pipe pre-loaded with the hex-encoded

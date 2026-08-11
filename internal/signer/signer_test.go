@@ -403,3 +403,85 @@ var _ = Describe("awaitShutdown", func() {
 		Expect(closer.Closed()).To(BeTrue(), "connection was not closed after signal; ServeConn would block forever")
 	})
 })
+
+var _ = Describe("PSK read deadline", func() {
+	// A foreign FIFO at fd 4 whose write end is held open satisfies loadPSK's
+	// S_IFIFO check and then never reaches EOF. io.LimitReader does not shorten a
+	// blocking read -- it only synthesises EOF once its own budget is spent -- so
+	// without a deadline the signer hangs before it has logged anything, which
+	// presents as a wedged start with no diagnosis. Exercised on readPSK directly
+	// so the spec costs milliseconds rather than the production timeout.
+	It("gives up on a pipe nobody writes to, and says why", func() {
+		r, w, err := os.Pipe()
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(func() { _ = r.Close(); _ = w.Close() })
+
+		done := make(chan error, 1)
+		go func() {
+			_, readErr := readPSK(r, 100*time.Millisecond)
+			done <- readErr
+		}()
+
+		var readErr error
+		Eventually(done, 5*time.Second).Should(Receive(&readErr),
+			"the read must not block for ever on a pipe whose write end is open")
+		Expect(readErr).To(MatchError(ContainSubstring("not spawned by the launcher")),
+			"a timeout must report the fd contract, not a bare deadline error")
+	})
+
+	It("still reads a PSK that is already there", func() {
+		// The companion: a deadline that rejected everything would satisfy the
+		// assertion above just as well. The write end is closed before the read,
+		// exactly as the launcher does it.
+		psk := make([]byte, pskLen)
+		_, err := rand.Read(psk)
+		Expect(err).NotTo(HaveOccurred())
+
+		r, w, err := os.Pipe()
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(func() { _ = r.Close() })
+		_, err = w.WriteString(hex.EncodeToString(psk))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(w.Close()).To(Succeed())
+
+		got, err := readPSK(r, 10*time.Second)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(got).To(Equal(psk))
+	})
+})
+
+var _ = Describe("PSK descriptor check", func() {
+	// loadPSK has two independent fail-closed branches, and the end-to-end spec
+	// in cmd/openvox-ca covers only the second: it hands the child /dev/null,
+	// which is open but not a FIFO. The first -- fd 4 not open at all -- is what
+	// an operator running the signer role by hand hits, and it cannot be reached
+	// through a child process at all, because closing fd 4 there frees the slot
+	// for the runtime to reuse and the check then sees whatever took it.
+	It("refuses a descriptor that was never open", func() {
+		// Far above anything this process has opened, so Fstat gives EBADF.
+		const neverOpened = 900
+		err := checkPSKFD(neverOpened)
+		Expect(err).To(MatchError(ContainSubstring("unavailable")))
+		Expect(err).To(MatchError(ContainSubstring("not spawned by the launcher")))
+	})
+
+	It("refuses a descriptor that is open but not a pipe", func() {
+		f, err := os.Open(os.DevNull)
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(func() { _ = f.Close() })
+
+		err = checkPSKFD(int(f.Fd()))
+		Expect(err).To(MatchError(ContainSubstring("is not a pipe")))
+		Expect(err).To(MatchError(ContainSubstring("not spawned by the launcher")))
+	})
+
+	It("accepts a pipe", func() {
+		// The companion both refusals need: a check that rejected everything
+		// would satisfy them just as well.
+		r, w, err := os.Pipe()
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(func() { _ = r.Close(); _ = w.Close() })
+
+		Expect(checkPSKFD(int(r.Fd()))).To(Succeed())
+	})
+})

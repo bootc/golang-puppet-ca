@@ -29,6 +29,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -37,6 +38,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 )
 
 // InheritedFD is the file descriptor number used to pass the socketpair
@@ -254,25 +256,70 @@ func (r *RemoteSigner) Close() error {
 // tooling such as systemd-coredump; a pipe is consumed once and leaves no
 // such residue.
 func loadPSK() ([]byte, error) {
-	// Verify fd 4 really is a pipe before wrapping it in an os.File. If the
-	// process was not spawned by the launcher, fd 4 is either closed or owned
-	// by something else entirely (e.g. the runtime's poller), and it must not
-	// be read from or closed.
-	var st syscall.Stat_t
-	if err := syscall.Fstat(PSKFD, &st); err != nil {
-		return nil, fmt.Errorf("PSK pipe fd %d unavailable (process not spawned by the launcher?): %w", PSKFD, err)
-	}
-	if st.Mode&syscall.S_IFMT != syscall.S_IFIFO {
-		return nil, fmt.Errorf("fd %d is not a pipe (process not spawned by the launcher?)", PSKFD)
+	if err := checkPSKFD(PSKFD); err != nil {
+		return nil, err
 	}
 
 	f := os.NewFile(uintptr(PSKFD), "signer-psk-pipe")
 	defer f.Close()
-	psk, err := parsePSK(f)
+	psk, err := readPSK(f, pskReadTimeout)
 	if err != nil {
 		return nil, fmt.Errorf("reading PSK from inherited fd %d: %w", PSKFD, err)
 	}
 	return psk, nil
+}
+
+// checkPSKFD verifies that fd really is a pipe before anything wraps it in an
+// os.File. If the process was not spawned by the launcher, fd 4 is either closed
+// or owned by something else entirely (e.g. the runtime's poller), and it must
+// not be read from or closed.
+//
+// It takes the descriptor number rather than reading PSKFD directly so both
+// refusals are reachable from a test. The absent-descriptor branch cannot be
+// driven through a real child process: closing fd 4 in the child frees the slot
+// and the Go runtime reuses it for its own descriptors before main gets there, so
+// the Fstat succeeds and the wrong-type branch fires instead. A number that was
+// never open reaches it deterministically.
+func checkPSKFD(fd int) error {
+	var st syscall.Stat_t
+	if err := syscall.Fstat(fd, &st); err != nil {
+		return fmt.Errorf("PSK pipe fd %d unavailable (process not spawned by the launcher?): %w", fd, err)
+	}
+	if st.Mode&syscall.S_IFMT != syscall.S_IFIFO {
+		return fmt.Errorf("fd %d is not a pipe (process not spawned by the launcher?)", fd)
+	}
+	return nil
+}
+
+// pskReadTimeout bounds the fd 4 read.
+//
+// The launcher pre-loads the pipe and closes the write end before spawning, so
+// the PSK is already there and a correct spawn never waits. It matters when fd 4
+// is *not* the launcher's pipe: exec rewrites only fds 0-2 and the ExtraFiles
+// range, so a descriptor inherited from a wrapper stays open at its original
+// number -- lefthook's pre-push hook leaks one, as do some CI runners. A foreign
+// FIFO whose write end is held open by an unrelated process satisfies the
+// S_IFIFO check above and then never reaches EOF, and io.LimitReader does not
+// shorten a blocking read: it only synthesises EOF once its own budget is spent.
+// Unbounded, the signer hangs before it has logged anything, which presents as a
+// wedged start with no diagnosis at all.
+const pskReadTimeout = 10 * time.Second
+
+// readPSK reads the PSK from f, giving up after timeout.
+func readPSK(f *os.File, timeout time.Duration) ([]byte, error) {
+	// ErrNoDeadline is tolerated rather than fatal. A descriptor the runtime
+	// cannot poll gives back exactly the unbounded read this deadline exists to
+	// avoid, which is no worse than before it existed -- where refusing to start
+	// over it would turn a diagnosis problem into an availability one.
+	if err := f.SetReadDeadline(time.Now().Add(timeout)); err != nil && !errors.Is(err, os.ErrNoDeadline) {
+		return nil, fmt.Errorf("setting the PSK read deadline: %w", err)
+	}
+	psk, err := parsePSK(f)
+	if errors.Is(err, os.ErrDeadlineExceeded) {
+		return nil, fmt.Errorf("no PSK arrived within %s: fd %d is a pipe, but not one the "+
+			"launcher wrote to (process not spawned by the launcher?)", timeout, PSKFD)
+	}
+	return psk, err
 }
 
 // parsePSK reads a hex-encoded PSK from r and decodes and validates it.
