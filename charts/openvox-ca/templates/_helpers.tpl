@@ -268,10 +268,16 @@ false
 Whether Kubernetes export is configured, by either route the server honours:
 the chart's own flag, or targets set directly in config.
 
-One definition, because this predicate is read by both the token decision and
-the reason the NOTES warning gives, and an earlier pair of copies had already
-drifted — the NOTE tested only kubernetesExport.enabled and so gave no reason
-for a config-supplied export.
+One definition, because this predicate is read by the token decision, the
+reason the NOTES warning gives, and the RBAC gate, and an earlier pair of
+copies had already drifted — the NOTE tested only kubernetesExport.enabled and
+so gave no reason for a config-supplied export.
+
+Note the config half is read even under existingConfigMap, where the chart
+renders no config.yaml and those targets never reach the server. That is
+deliberate for the token and the Role, which fail open, but it means a
+config-derived export reason in the NOTE may name inert values —
+exportTargetNames takes the stricter view and reports "unknown" there.
 */}}
 {{- define "openvox-ca.exportConfigured" -}}
 {{- $config := include "openvox-ca.config" . | fromYaml -}}
@@ -352,9 +358,21 @@ ConfigMap or Secret the chart never reads (envFrom) — each of those layers
 outranks or replaces what the chart renders. Where the answer is "no", the
 chart says so rather than asserting: it neither refuses an install it cannot
 judge nor claims to know which scheme the probes should use.
+
+A --config in extraArgs counts too, and is the subtlest of the four. The
+chart renders its own --config and appends extraArgs straight after it, so a
+second one wins outright (it is a plain pflag StringVar) and the server reads
+a file the chart never saw — while the ConfigMap it did render goes unread.
+Both spellings are caught: --config=/path, and the bare --config whose value
+sits in the following element.
 */}}
 {{- define "openvox-ca.configFullyKnown" -}}
-{{- if or .Values.existingConfigMap .Values.args .Values.envFrom -}}
+{{- $configOverridden := false -}}
+{{- range .Values.extraArgs -}}
+{{- $arg := . | toString -}}
+{{- if or (eq $arg "--config") (hasPrefix "--config=" $arg) }}{{ $configOverridden = true }}{{ end -}}
+{{- end -}}
+{{- if or .Values.existingConfigMap .Values.args .Values.envFrom $configOverridden -}}
 false
 {{- else -}}
 true

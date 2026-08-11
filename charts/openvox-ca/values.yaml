@@ -412,9 +412,10 @@ enableServiceLinks: false
 # null lets the chart decide: mounted when the pod needs the Kubernetes API —
 # Kubernetes export (from either `kubernetesExport.enabled` or
 # `config.kubernetes_export.targets`) or OpenBao Kubernetes auth (from
-# `config.openbao.auth_method`, or PUPPET_CA_OPENBAO_AUTH_METHOD in `env` or
-# `extraEnv`) — and also whenever the chart cannot see the whole configuration,
-# because `existingConfigMap`, `args` and `envFrom` can each carry those settings
+# `config.openbao.auth_method`, PUPPET_CA_OPENBAO_AUTH_METHOD in `env` or
+# `extraEnv`, or `--openbao-auth-method` in `extraArgs`) — and also whenever the
+# chart cannot see the whole configuration, because `existingConfigMap`, `args`,
+# `envFrom` and a `--config` in `extraArgs` can each carry those settings
 # somewhere it does not read. A spare token costs nothing; a missing one fails
 # the feature while readiness stays green. Set true/false to force the decision.
 automountServiceAccountToken: null

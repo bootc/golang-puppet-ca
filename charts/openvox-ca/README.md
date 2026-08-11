@@ -178,7 +178,7 @@ Helm 3.21 or 4.2; both are exercised in CI.
 | `priorityClassName` / `runtimeClassName` / `schedulerName` | `""` | |
 | `dnsPolicy` / `dnsConfig` / `hostAliases` | `""` / `{}` / `[]` | |
 | `enableServiceLinks` | `false` | |
-| `automountServiceAccountToken` | `null` | `null` mounts the token when the pod needs the API — Kubernetes export (`kubernetesExport.enabled` or `config.kubernetes_export.targets`), or OpenBao Kubernetes auth (`config.openbao.auth_method`, or `PUPPET_CA_OPENBAO_AUTH_METHOD` in `env`/`extraEnv`) — and whenever the chart cannot tell: `existingConfigMap`, `args`, `envFrom`, or an `extraEnv` `valueFrom` for that variable |
+| `automountServiceAccountToken` | `null` | `null` mounts the token when the pod needs the API — Kubernetes export (`kubernetesExport.enabled` or `config.kubernetes_export.targets`), or OpenBao Kubernetes auth (`config.openbao.auth_method`, `PUPPET_CA_OPENBAO_AUTH_METHOD` in `env`/`extraEnv`, or `--openbao-auth-method=kubernetes` in `extraArgs`) — and whenever the chart cannot tell: `existingConfigMap`, `args`, `envFrom`, an `extraEnv` `valueFrom` for that variable, or a bare `--openbao-auth-method` in `extraArgs`. See [the guide](https://github.com/voxpupuli/openvox-ca/blob/main/docs/helm-chart.md) for the full table |
 | `initContainers` / `extraContainers` | `[]` | Templated, so they can reference `.Values` |
 | `extraVolumes` | `[]` | Templated |
 | `extraVolumeMounts` | `[]` | Passed through as written |

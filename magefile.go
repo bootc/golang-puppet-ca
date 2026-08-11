@@ -845,26 +845,31 @@ func ciChartHelmMatrix(src []byte) ([]string, error) {
 		return nil, fmt.Errorf("ci.yml's chart job has no helm matrix entries")
 	}
 
-	const matrixExpr = "${{ matrix.helm }}"
-	for _, step := range j.Steps {
-		if !strings.HasPrefix(step.Uses, "azure/setup-helm@") {
-			continue
-		}
-		if v := step.With["version"]; v != matrixExpr {
-			return nil, fmt.Errorf("ci.yml's chart job installs Helm %q instead of %s, so both matrix legs "+
-				"would run the same version while one is named for the other", v, matrixExpr)
-		}
-		return j.Strategy.Matrix.Helm, nil
+	v, err := setupHelmVersion(src, "chart", "ci.yml")
+	if err != nil {
+		return nil, err
 	}
-	return nil, fmt.Errorf("ci.yml's chart job has no azure/setup-helm step, so its helm matrix installs nothing")
+	// The matrix leg must reach the install step, or both legs run the same
+	// Helm while one is named for the other. Accept any interior spacing:
+	// ${{matrix.helm}} is what GitHub itself accepts, and rejecting it would
+	// fail the gate on a workflow that installs exactly the right version.
+	if !regexp.MustCompile(`^\$\{\{\s*matrix\.helm\s*\}\}$`).MatchString(v) {
+		return nil, fmt.Errorf("ci.yml's chart job installs Helm %q instead of ${{ matrix.helm }}, so both "+
+			"matrix legs would run the same version while one is named for the other", v)
+	}
+	return j.Strategy.Matrix.Helm, nil
 }
 
-// publishHelmVersion returns the Helm version helm-chart.yml packages with,
-// read from the azure/setup-helm step's own `with.version` rather than from the
-// first version-shaped line in the file — the publish job runs several pinned
-// actions, and a gate that matched the wrong one would pass while validating
-// nothing.
-func publishHelmVersion(src []byte) (string, error) {
+// setupHelmVersion returns the `with.version` of the named job's
+// azure/setup-helm step. Both the CI gate and the publish pin need exactly
+// this, and they had a copy each until the two uses diverged in spelling
+// rather than in meaning.
+//
+// The action reference is matched case-insensitively because GitHub resolves
+// `uses:` owner/repo that way: Azure/setup-helm is how the action's own README
+// spells it, and a gate that reported "no setup-helm step" for a step sitting
+// right there would send a maintainer chasing a phantom.
+func setupHelmVersion(src []byte, job, file string) (string, error) {
 	var doc struct {
 		Jobs map[string]struct {
 			Steps []struct {
@@ -876,20 +881,29 @@ func publishHelmVersion(src []byte) (string, error) {
 	if err := yaml.Unmarshal(src, &doc); err != nil {
 		return "", err
 	}
-	j, ok := doc.Jobs["publish"]
+	j, ok := doc.Jobs[job]
 	if !ok {
-		return "", fmt.Errorf("helm-chart.yml has no 'publish' job")
+		return "", fmt.Errorf("%s has no '%s' job", file, job)
 	}
 	for _, step := range j.Steps {
-		if !strings.HasPrefix(step.Uses, "azure/setup-helm@") {
+		if !strings.HasPrefix(strings.ToLower(step.Uses), "azure/setup-helm@") {
 			continue
 		}
 		if v := step.With["version"]; v != "" {
 			return v, nil
 		}
-		return "", fmt.Errorf("helm-chart.yml's azure/setup-helm step sets no with.version")
+		return "", fmt.Errorf("%s's azure/setup-helm step in the '%s' job sets no with.version", file, job)
 	}
-	return "", fmt.Errorf("helm-chart.yml's publish job has no azure/setup-helm step")
+	return "", fmt.Errorf("%s's '%s' job has no azure/setup-helm step, so it installs no pinned Helm", file, job)
+}
+
+// publishHelmVersion returns the Helm version helm-chart.yml packages with,
+// read from the azure/setup-helm step's own `with.version` rather than from the
+// first version-shaped line in the file — the publish job runs several pinned
+// actions, and a gate that matched the wrong one would pass while validating
+// nothing.
+func publishHelmVersion(src []byte) (string, error) {
+	return setupHelmVersion(src, "publish", "helm-chart.yml")
 }
 
 // verifyChartPinsIn is verifyChartPins over caller-supplied file contents, so
@@ -1505,13 +1519,52 @@ func (Chart) Test() error {
 			// extraArgs is appended to the argv the chart builds, so unlike
 			// `args` the chart can read it — and the flag outranks both the
 			// config file and the environment.
-			sets:  []string{tls, "config.ca_key_provider=openbao", "extraArgs[0]=--openbao-auth-method=kubernetes"},
-			wants: []string{"serviceAccountName: openvox-ca\n      automountServiceAccountToken: true"},
+			sets: []string{tls, "config.ca_key_provider=openbao", "extraArgs[0]=--openbao-auth-method=kubernetes"},
+			// The argv want is the premise the scan rests on: were the extraArgs
+			// block dropped from the deployment, the token line alone would still
+			// render, and the chart would be deciding from a flag the container
+			// never receives.
+			wants: []string{"serviceAccountName: openvox-ca\n      automountServiceAccountToken: true",
+				"- --openbao-auth-method=kubernetes"},
 		},
 		{
 			name:  "a non-Kubernetes auth method through extraArgs does not",
 			sets:  []string{tls, "config.ca_key_provider=openbao", "extraArgs[0]=--openbao-auth-method=approle"},
 			wants: []string{"serviceAccountName: openvox-ca\n      automountServiceAccountToken: false"},
+		},
+		{
+			name: "a bare auth-method flag in extraArgs mounts the token",
+			// The separated spelling leaves the value in the next element, which
+			// the chart does not reassemble — so it fails open. Written as a
+			// prefix match instead, this would swallow the `=approle` case above
+			// and mount a token that case asserts stays unmounted.
+			sets: []string{tls, "config.ca_key_provider=openbao",
+				"extraArgs[0]=--openbao-auth-method", "extraArgs[1]=kubernetes"},
+			wants: []string{"serviceAccountName: openvox-ca\n      automountServiceAccountToken: true"},
+		},
+		{
+			name: "a --config in extraArgs makes the whole configuration unknown",
+			// The chart renders its own --config and appends extraArgs after it,
+			// and --config is a plain StringVar, so the second one wins and the
+			// server reads a file the chart never saw. Judging the token from the
+			// chart's own config there would withhold it from a pod whose real
+			// config configures export or Kubernetes auth.
+			sets:  []string{tls, "extraArgs[0]=--config=/mnt/other/config.yaml"},
+			wants: []string{"serviceAccountName: openvox-ca\n      automountServiceAccountToken: true"},
+		},
+		{
+			name:  "the separated --config spelling counts too",
+			sets:  []string{tls, "extraArgs[0]=--config", "extraArgs[1]=/mnt/other/config.yaml"},
+			wants: []string{"serviceAccountName: openvox-ca\n      automountServiceAccountToken: true"},
+		},
+		{
+			name: "export configured only through config still gets a Role",
+			// Gating RBAC on kubernetesExport.enabled alone left this route with a
+			// mounted token, a NOTE naming export, and no Role — the exporter
+			// refused by RBAC while readiness stayed green.
+			sets: []string{tls, "config.kubernetes_export.targets[0].kind=Secret",
+				"config.kubernetes_export.targets[0].metadata.name=ca-bundle"},
+			wants: []string{"kind: Role", "verbs: [\"patch\"]\n    resourceNames:\n      - ca-bundle"},
 		},
 		{
 			name: "an empty env value does not erase the auth method the config set",
@@ -1530,6 +1583,18 @@ func (Chart) Test() error {
 			sets: []string{"existingConfigMap=mine", "kubernetesExport.enabled=true",
 				"networkPolicy.enabled=true", "networkPolicy.egress.enabled=true"},
 			wants: []string{"(Kubernetes export)"},
+		},
+		{
+			name:  "an unreadable config alone names no reason at all",
+			notes: true,
+			// needsAPIAccess answers true for existingConfigMap by construction,
+			// so without the fully-known guard the reason would reach the OpenBao
+			// arm and invent a cause the chart cannot actually see. Empty means
+			// only that no reason is visible.
+			sets: []string{"existingConfigMap=mine", "networkPolicy.enabled=true",
+				"networkPolicy.egress.enabled=true"},
+			wants:    []string{"egress is restricted"},
+			notWants: []string{"(OpenBao Kubernetes auth)", "(Kubernetes export)"},
 		},
 		{
 			name: "an auth method fed from a Secret mounts the token, since the chart cannot read it",

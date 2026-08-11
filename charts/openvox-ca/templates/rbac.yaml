@@ -1,4 +1,12 @@
-{{- if and .Values.kubernetesExport.enabled .Values.kubernetesExport.rbac.create }}
+{{/*
+Gated on exportConfigured, not on kubernetesExport.enabled alone: targets set
+straight into config.kubernetes_export configure the exporter just as well, and
+gating on the flag left that route with a mounted token, a NOTE naming export as
+the reason, and no Role at all — the exporter refused by RBAC while readiness
+stayed green. The rules below already take their names from the merged config,
+so the two now agree on what "export is configured" means.
+*/}}
+{{- if and (eq (include "openvox-ca.exportConfigured" .) "true") .Values.kubernetesExport.rbac.create }}
 {{- $fullName := include "openvox-ca.fullname" . }}
 {{- $namespace := include "openvox-ca.namespace" . }}
 {{- $labels := include "openvox-ca.labels" . }}

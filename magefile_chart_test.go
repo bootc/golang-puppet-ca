@@ -177,6 +177,39 @@ var _ = Describe("verifyChartPins", func() {
 			Expect(verifyChartPinsIn(goodChart, bad, goodPublish)).To(
 				MatchError(ContainSubstring("no azure/setup-helm step")))
 		})
+
+		// A gate whose diagnosis contradicts the file it rejected is worse than
+		// no gate: it sends a maintainer looking for a step that is plainly
+		// there. GitHub resolves `uses:` owner/repo case-insensitively, and
+		// Azure/setup-helm is the casing the action's own README uses.
+		It("accepts the action reference in the casing its own README uses", func() {
+			ok := []byte("jobs:\n  chart:\n    strategy:\n      matrix:\n        helm: [v3.21.3, v4.2.3]\n" +
+				"    steps:\n      - uses: Azure/setup-helm@abc\n        with:\n          version: ${{ matrix.helm }}\n")
+			Expect(verifyChartPinsIn(goodChart, ok, goodPublish)).To(Succeed())
+		})
+
+		// GitHub accepts an expression with no interior spaces, so rejecting it
+		// would fail the gate on a workflow that installs exactly the right Helm.
+		It("accepts the matrix expression without interior spaces", func() {
+			ok := []byte("jobs:\n  chart:\n    strategy:\n      matrix:\n        helm: [v3.21.3, v4.2.3]\n" +
+				"    steps:\n      - uses: azure/setup-helm@abc\n        with:\n          version: ${{matrix.helm}}\n")
+			Expect(verifyChartPinsIn(goodChart, ok, goodPublish)).To(Succeed())
+		})
+
+		// The expression must still name the helm matrix and nothing else — a
+		// neighbouring key would install one version under both leg names.
+		It("refuses an expression naming a different matrix key", func() {
+			bad := []byte("jobs:\n  chart:\n    strategy:\n      matrix:\n        helm: [v3.21.3, v4.2.3]\n" +
+				"    steps:\n      - uses: azure/setup-helm@abc\n        with:\n          version: ${{ matrix.kubernetes }}\n")
+			Expect(verifyChartPinsIn(goodChart, bad, goodPublish)).To(
+				MatchError(ContainSubstring("instead of ${{ matrix.helm }}")))
+		})
+
+		It("reads the publish pin through the same casing tolerance", func() {
+			pub := []byte("jobs:\n  publish:\n    steps:\n      - uses: Azure/setup-helm@abc\n" +
+				"        with:\n          version: v3.21.3\n")
+			Expect(verifyChartPinsIn(goodChart, goodCI, pub)).To(Succeed())
+		})
 	})
 })
 

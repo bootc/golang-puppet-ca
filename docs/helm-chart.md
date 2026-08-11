@@ -486,16 +486,20 @@ binding. `rbac.scope: ClusterRole` grants it cluster-wide instead, which is
 worth it only if you export into many namespaces.
 
 The chart mounts the ServiceAccount token automatically when this (or OpenBao's
-Kubernetes auth) is enabled, and leaves it unmounted otherwise. Four things
-count as enabled, three of them because the chart cannot see far enough to rule
-them out:
+Kubernetes auth) is enabled, and leaves it unmounted otherwise. These are the
+inputs it counts as enabled — some because it can see the setting, the rest
+because it cannot see far enough to rule it out:
 
 | Input | Why it mounts |
 | --- | --- |
 | `kubernetesExport.enabled`, or `config.kubernetes_export.targets` | Export is configured, so the exporter needs the API |
-| `config.openbao.auth_method: kubernetes`, or `PUPPET_CA_OPENBAO_AUTH_METHOD` in `env`/`extraEnv` | The key provider authenticates with the pod's own token. Environment variables outrank the config file, so the chart reads those two values too |
-| An `extraEnv` entry for `PUPPET_CA_OPENBAO_AUTH_METHOD` fed by `valueFrom` | The chart cannot read which method the Secret names, so it assumes the one that needs a token |
+| `config.openbao.auth_method: kubernetes` | The key provider authenticates with the pod's own token |
+| `PUPPET_CA_OPENBAO_AUTH_METHOD: kubernetes` in `env` or `extraEnv` | Environment variables outrank the config file, so the chart reads those two values too. An empty value is ignored, as the server ignores it |
+| `--openbao-auth-method=kubernetes` in `extraArgs` | Arguments outrank both, and `extraArgs` is appended to the argv the chart builds, so it is readable |
+| An `extraEnv` entry for that variable fed by `valueFrom` | The chart cannot read which method the Secret names, so it assumes the one needing a token |
+| A bare `--openbao-auth-method` in `extraArgs`, with the value in the next element | The chart does not reassemble the separated form, so it assumes the same |
 | `existingConfigMap`, `args` or `envFrom` | Each can configure either feature somewhere the chart does not read at all |
+| A `--config` in `extraArgs` | The chart renders its own `--config` and appends `extraArgs` after it, so a second one wins and the server reads a file the chart never saw |
 
 `automountServiceAccountToken` forces the decision either way.
 
