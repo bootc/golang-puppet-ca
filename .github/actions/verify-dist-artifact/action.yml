@@ -12,10 +12,6 @@ inputs:
   variant:
     description: "Variant short name, e.g. linux_arm64_fips"
     required: true
-  fips:
-    description: "Whether the variant is a boringcrypto FIPS build"
-    required: false
-    default: "false"
 
 runs:
   using: composite
@@ -30,7 +26,6 @@ runs:
       shell: bash
       env:
         VARIANT: ${{ inputs.variant }}
-        FIPS: ${{ inputs.fips }}
       run: |
         ver="$(sed -n 's/^const Version = "\(.*\)"$/\1/p' internal/version/version.go)"
         if [ -z "$ver" ]; then
@@ -48,13 +43,18 @@ runs:
         # The _fips artefacts must really be boringcrypto builds: fipsEnv in
         # the magefile is the only thing setting GOEXPERIMENT for dist, so a
         # regression there would otherwise ship standard-crypto binaries
-        # under a FIPS label. (grep without -q: reading all input avoids a
-        # SIGPIPE race under pipefail.)
-        if [ "$FIPS" = "true" ]; then
-          for bin in openvox-ca openvox-ca-ctl; do
-            if ! go version -m "$RUNNER_TEMP/$bin" | grep boringcrypto > /dev/null; then
-              echo "::error::${VARIANT}/${bin} is not a boringcrypto build"
-              exit 1
-            fi
-          done
-        fi
+        # under a FIPS label. FIPS-ness is derived from the variant name
+        # rather than taken as an input, so there is no hand-maintained flag
+        # to drift; the suffix-implies-boringcrypto invariant is pinned by
+        # the distVariants spec in magefile_test.go. (grep without -q:
+        # reading all input avoids a SIGPIPE race under pipefail.)
+        case "$VARIANT" in
+          *_fips)
+            for bin in openvox-ca openvox-ca-ctl; do
+              if ! go version -m "$RUNNER_TEMP/$bin" | grep boringcrypto > /dev/null; then
+                echo "::error::${VARIANT}/${bin} is not a boringcrypto build"
+                exit 1
+              fi
+            done
+            ;;
+        esac

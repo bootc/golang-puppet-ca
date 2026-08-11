@@ -7,7 +7,10 @@
 #
 # Hooks degrade gracefully: if a tool is missing the command prints a SKIP
 # notice and exits 0 rather than blocking the commit/push. Run the same checks
-# manually via `mage dev:check` (lint) and `go test ./...`.
+# manually via `mage dev:check` (lint), `go test ./...`, and
+# `mage test:magefile` (the build-tagged magefile suite); the pre-push hook
+# additionally refuses v* tags that do not match internal/version (see
+# .lefthook/pre-push/verify-tags.sh).
 
 pre-commit:
   parallel: false

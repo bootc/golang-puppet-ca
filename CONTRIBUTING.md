@@ -81,6 +81,7 @@ See [`AGENTS.md`](AGENTS.md) for the details. The essentials:
 - Keep commits focused: imperative subject ≤ 72 characters, with a body that
   explains *why*. Stage files by name and review `git diff --staged` before
   committing.
-- Make sure `mage dev:check`, `mage test:unit`, and `markdownlint-cli2` pass.
+- Make sure `mage dev:check`, `mage test:unit`, `mage test:magefile`, and
+  `markdownlint-cli2` pass.
 - Internal design notes live under [docs/development/](docs/development/); update
   them when you change the behaviour they describe.

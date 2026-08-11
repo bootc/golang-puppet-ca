@@ -86,18 +86,16 @@ var _ = Describe("fipsCrossCC", func() {
 	// Pin the exact cross-compiler names: CI only ever builds each FIPS
 	// variant natively, so a wrong name here would otherwise go undetected
 	// until someone cross-builds locally.
-	It("maps cross architectures to the GNU cross compilers", func() {
-		crossCC := map[string]string{
-			"amd64": "x86_64-linux-gnu-gcc",
-			"arm64": "aarch64-linux-gnu-gcc",
-		}
-		for goarch, cc := range crossCC {
+	DescribeTable("maps cross architectures to the GNU cross compilers",
+		func(goarch, cc string) {
 			if runtime.GOOS == "linux" && runtime.GOARCH == goarch {
-				continue // native: covered by the spec below
+				Skip("native on this host: covered by the native-build spec")
 			}
-			Expect(fipsCrossCC(goarch)).To(Equal(cc), "goarch %s", goarch)
-		}
-	})
+			Expect(fipsCrossCC(goarch)).To(Equal(cc))
+		},
+		Entry("amd64", "amd64", "x86_64-linux-gnu-gcc"),
+		Entry("arm64", "arm64", "aarch64-linux-gnu-gcc"),
+	)
 
 	It("returns empty for a native Linux build", func() {
 		if runtime.GOOS != "linux" {
@@ -150,6 +148,17 @@ var _ = Describe("distVariants", func() {
 				Expect(v.env["CGO_ENABLED"]).To(Equal("0"))
 			}
 		}
+	})
+})
+
+var _ = Describe("Release.Prepare", func() {
+	// The bare-semver guard is Prepare's first statement, returning before
+	// any git, gh, or filesystem side effect, so the rejection path is
+	// hermetic — this pins both the wiring and that validation stays ahead
+	// of the side effects.
+	It("rejects a non-bare-semver version before any side effect", func() {
+		err := Release{}.Prepare("v0.9.0")
+		Expect(err).To(MatchError(ContainSubstring("is not bare semver")))
 	})
 })
 

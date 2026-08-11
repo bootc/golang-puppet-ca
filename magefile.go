@@ -637,9 +637,6 @@ func unitTestPackages() ([]string, error) {
 	return pkgs, nil
 }
 
-// Unit runs the unit test suite with coverage, piping output through tparse
-// for a colorful per-package summary table. The package set is discovered
-// dynamically (see unitTestPackages); only unitTestExcludes is omitted.
 // Magefile runs the magefile's own Ginkgo suite. The suite is build-tagged
 // like the magefile itself, so ordinary `go test ./...` and the go-list-based
 // test:unit discovery cannot see it; this target is the canonical way to run
@@ -648,6 +645,9 @@ func (Test) Magefile() error {
 	return sh.RunV("go", "test", "-tags", "mage", ".")
 }
 
+// Unit runs the unit test suite with coverage, piping output through tparse
+// for a colorful per-package summary table. The package set is discovered
+// dynamically (see unitTestPackages); only unitTestExcludes is omitted.
 func (Test) Unit() error {
 	fmt.Println("Running unit tests...")
 
