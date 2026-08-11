@@ -1,5 +1,5 @@
 {{- if .Values.ingress.enabled }}
-{{- $backend := ternary "metrics" "https" (eq .Values.ingress.backendPort "metrics") }}
+{{- $backend := include "openvox-ca.routeBackendName" (dict "backendPort" .Values.ingress.backendPort "root" $) }}
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:

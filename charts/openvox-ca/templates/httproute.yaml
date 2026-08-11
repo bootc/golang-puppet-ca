@@ -1,6 +1,5 @@
 {{- if .Values.gateway.httpRoute.enabled }}
-{{- $backend := ternary "metrics" "https" (eq .Values.gateway.httpRoute.backendPort "metrics") }}
-{{- $port := ternary .Values.metrics.port (.Values.service.port | int) (eq $backend "metrics") }}
+{{- $port := include "openvox-ca.routeBackendPort" (dict "backendPort" .Values.gateway.httpRoute.backendPort "root" $) }}
 {{/*
 An HTTPRoute makes the Gateway terminate TLS, so openvox-ca never sees the
 agent's client certificate and every mTLS-authenticated endpoint stops

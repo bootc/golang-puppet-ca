@@ -61,7 +61,7 @@ type Build mg.Namespace   // build:all  build:fips  build:dist  build:distVarian
 type Test mg.Namespace    // test:unit  test:magefile  test:integcompose  test:integcomposefips  test:loadcompose  test:bench  test:puppet  test:puppetfips  test:migration  test:backendsRedis  test:backendsEtcd
 type Dev mg.Namespace     // dev:check  dev:tidy    dev:clean  dev:container
 type Release mg.Namespace // release:prepare
-type Chart mg.Namespace   // chart:version  chart:lint  chart:validate  chart:package
+type Chart mg.Namespace   // chart:version  chart:lint  chart:validate  chart:test  chart:package
 
 // -- Helpers ------------------------------------------------------------------─
 
@@ -874,16 +874,21 @@ func (Chart) Validate() error {
 // chartConfigChecksum renders the chart and returns the checksum/config value
 // it produced, so a case can assert that a *different* input yields a
 // different checksum rather than that the annotation merely exists.
-func chartConfigChecksum(sets ...string) string {
+//
+// Errors are returned rather than encoded as a sentinel string: the value feeds
+// a notWants assertion, and a sentinel could never appear in real helm output,
+// so a broken render here would silently satisfy the very check it exists to
+// make.
+func chartConfigChecksum(sets ...string) (string, error) {
 	out, err := helmTemplate(sets)
 	if err != nil {
-		return "<render failed>"
+		return "", fmt.Errorf("rendering the comparison config: %w\n%s", err, out)
 	}
 	m := regexp.MustCompile(`checksum/config: ([0-9a-f]{64})`).FindStringSubmatch(out)
 	if m == nil {
-		return "<no checksum rendered>"
+		return "", fmt.Errorf("no checksum/config annotation in the comparison render")
 	}
-	return m[1]
+	return m[1], nil
 }
 
 // chartRenderCase is one assertion over a rendering of the chart: render with
@@ -1041,6 +1046,15 @@ func (Chart) Test() error {
 	}
 	defaultTag += "-alpine"
 
+	// The checksum a *different* config produces, so the change-detection case
+	// can assert the annotation moved rather than that it exists. Computed here
+	// so a failure to render it fails the target instead of quietly weakening
+	// the assertion that consumes it.
+	otherChecksum, err := chartConfigChecksum(tls, "config.crl_validity_days=7")
+	if err != nil {
+		return err
+	}
+
 	renders := []chartRenderCase{
 		{
 			name:  "an unset tag resolves to the Alpine variant of the appVersion",
@@ -1114,7 +1128,43 @@ func (Chart) Test() error {
 			// not produce the checksum this one does.
 			sets:     []string{tls},
 			wants:    []string{"checksum/config: "},
-			notWants: []string{chartConfigChecksum(tls, "config.crl_validity_days=7")},
+			notWants: []string{otherChecksum},
+		},
+		{
+			name: "the CA's key material is mounted read-only to the container user alone",
+			// 0600 plus the pod's fsGroup. A refactor that dropped defaultMode
+			// would loosen permissions on the CA private key, its passphrase
+			// and the server TLS key while passing lint and kubeconform, which
+			// accept any mode or none.
+			sets: []string{tls, "ca.existingSecret=ca-material", "caKeyPassphrase.existingSecret=ca-passphrase"},
+			wants: []string{
+				"secretName: openvox-ca-tls\n            # 0600",
+				"secretName: ca-material\n            defaultMode: 0600",
+				"secretName: ca-passphrase\n            defaultMode: 0600",
+			},
+		},
+		{
+			name: "a lowercase export target kind passes through as written",
+			// The schema accepts either case because the server matches the
+			// kind case-insensitively; the chart's job is to hand it over
+			// untouched rather than normalise it.
+			sets:  []string{tls, "kubernetesExport.enabled=true", "kubernetesExport.targets[0].kind=secret", "kubernetesExport.targets[0].metadata.name=trust", "kubernetesExport.targets[0].cert=true"},
+			wants: []string{"kind: secret"},
+		},
+		{
+			name: "envFrom stops the TLS precondition firing",
+			// envFrom can carry PUPPET_CA_TLS_CERT/KEY from a Secret the chart
+			// never reads, so the guard has to stand down — with no tls block
+			// set, this rendering succeeding *is* the assertion.
+			sets:  []string{"envFrom[0].secretRef.name=openvox-ca-env"},
+			wants: []string{"kind: Deployment"},
+		},
+		{
+			name: "a replaced argv stops the TLS precondition firing",
+			sets: []string{"args[0]=--config=/etc/puppet-ca/config.yaml", "args[1]=--tls-cert=/run/tls/tls.crt", "args[2]=--tls-key=/run/tls/tls.key"},
+			// And the chart stops constructing arguments of its own.
+			wants:    []string{"--tls-cert=/run/tls/tls.crt"},
+			notWants: []string{"--verbosity"},
 		},
 		{
 			name:     "an externally managed ConfigMap cannot be checksummed",

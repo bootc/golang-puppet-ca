@@ -3,7 +3,7 @@
 # The server's own settings live under `config` below: that block is written
 # verbatim to /etc/puppet-ca/config.yaml, where openvox-ca auto-detects it, so
 # every key in docs/configuration.md is reachable without the chart needing a
-# value of its own for each one. The blocks above it (tls, ca, puppetServers,
+# value of its own for each one. The blocks below it (tls, ca, puppetServers,
 # metrics, kubernetesExport, …) are conveniences that wire up the Kubernetes
 # side — volumes, RBAC, ports — *and* set the matching config keys for you.
 # Anything you set in `config` wins over what those blocks compute.

@@ -217,6 +217,27 @@ token only when something actually needs it.
 {{- end -}}
 
 {{/*
+Which Service port a route or ingress forwards to, given a backendPort
+selection ("https" or "metrics"). Two spellings because the two APIs differ: an
+Ingress backend references the port by name, a Gateway API backendRef by
+number. Centralised so the rule lives in one place instead of being re-derived
+in ingress.yaml, httproute.yaml and tlsroute.yaml.
+
+Call with (dict "backendPort" <value> "root" $).
+*/}}
+{{- define "openvox-ca.routeBackendName" -}}
+{{- if eq .backendPort "metrics" -}}metrics{{- else -}}https{{- end -}}
+{{- end -}}
+
+{{- define "openvox-ca.routeBackendPort" -}}
+{{- if eq .backendPort "metrics" -}}
+{{- .root.Values.metrics.port -}}
+{{- else -}}
+{{- .root.Values.service.port | int -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
 Whether the chart can see the server's whole configuration.
 
 It cannot when the config file is somebody else's (existingConfigMap), when
@@ -463,6 +484,23 @@ https://github.com/voxpupuli/openvox-ca/blob/main/docs/storage-backends.md
 WARNING: autosigning is set to "true", so every CSR that reaches the CA is
 signed without review. Anyone who can reach the API can obtain a valid
 certificate for any name. Use this in development only.
+{{- end }}
+{{- if .Values.gateway.httpRoute.enabled }}
+
+WARNING: gateway.httpRoute is enabled. An HTTPRoute makes the Gateway terminate
+TLS, so openvox-ca never sees an agent's client certificate and every endpoint
+authenticated by one — signing, revoking, listing — stops authenticating. Use
+gateway.tlsRoute for agent traffic, which passes the connection through intact,
+and keep the HTTPRoute for the anonymous endpoints (CRL, OCSP, health) only.
+{{- end }}
+{{- if and .Values.kubernetesExport.enabled .Values.kubernetesExport.rbac.create (eq (include "openvox-ca.exportTargetNames" .) "unknown") }}
+
+WARNING: Kubernetes export RBAC was created with {{ if eq .Values.kubernetesExport.rbac.scope "ClusterRole" }}cluster-wide{{ else }}namespace-wide{{ end }} patch on every
+Secret and ConfigMap in scope. The export targets live in a ConfigMap the chart
+does not render (existingConfigMap), so it cannot narrow the grant to their
+names. To restrict it, move the targets into kubernetesExport.targets, or drop
+kubernetesExport.rbac.create and manage the Role yourself with an explicit
+resourceNames list.
 {{- end }}
 {{- if and .Values.metrics.enabled (not .Values.networkPolicy.enabled) }}
 

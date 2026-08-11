@@ -1,6 +1,5 @@
 {{- if .Values.gateway.tlsRoute.enabled }}
-{{- $backend := ternary "metrics" "https" (eq .Values.gateway.tlsRoute.backendPort "metrics") }}
-{{- $port := ternary .Values.metrics.port (.Values.service.port | int) (eq $backend "metrics") }}
+{{- $port := include "openvox-ca.routeBackendPort" (dict "backendPort" .Values.gateway.tlsRoute.backendPort "root" $) }}
 {{/*
 TLSRoute forwards the TLS connection to the backend without terminating it, so
 agents' client certificates reach openvox-ca intact. It is in the Gateway API

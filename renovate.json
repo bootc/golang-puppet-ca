@@ -40,10 +40,11 @@
     },
     {
       "customType": "regex",
-      "description": "Update kubeconform version pinned via 'go install' in GitHub Actions workflows and the magefile",
+      "description": "Update kubeconform version pinned via 'go install' in GitHub Actions workflows, the magefile, and the contributor guide",
       "managerFilePatterns": [
         "/^\\.github/workflows/.*\\.ya?ml$/",
-        "/^magefile\\.go$/"
+        "/^magefile\\.go$/",
+        "/^CONTRIBUTING\\.md$/"
       ],
       "matchStrings": [
         "go install github\\.com/yannh/kubeconform/cmd/kubeconform@(?<currentValue>v\\d+\\.\\d+\\.\\d+)"
