@@ -13,8 +13,8 @@
 # Output: TAP format.  Exit 0 on all pass, exit 1 on any failure.
 #
 # On failure, an --up run replays the tail of every stack service's container
-# log to stderr (all but puppet-client, whose agent output is already echoed
-# with the failing assertion) before tearing the stack down, since teardown is
+# log to stderr (all but puppet-client, whose log is empty by construction)
+# before tearing the stack down, since teardown is
 # what makes those logs unrecoverable. --up --keep skips that teardown dump and
 # leaves the containers up for `compose logs` instead; a readiness timeout
 # still prints the timed-out service's own log either way.
@@ -204,8 +204,9 @@ dump_logs() {  # service-name
 # -- Every container worth hearing from when the run fails -----------------
 # postgres is included because OpenVoxDB will not start until it is healthy,
 # so a postgres fault shows up as an empty OpenVoxDB log. puppet-client is
-# deliberately absent: the agent output that matters is captured inline and
-# echoed by fail().
+# deliberately absent: its entrypoint is `tail -f /dev/null` and the agent runs
+# through exec_client, so its container log holds nothing to dump -- the
+# agent's own output is captured by the caller instead.
 FAILURE_LOG_SERVICES=(openvox-ca puppet-master openvoxdb postgres)
 
 dump_failure_logs() {  # [service-already-dumped]

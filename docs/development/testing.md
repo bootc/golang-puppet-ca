@@ -110,8 +110,9 @@ When `test:puppet`, `test:puppetFIPS` or `test:backendsRedis` fails, the
 harness replays the tail of each stack service's container log to stderr
 before tearing the stack down: the CA (both replicas for the Redis
 topology), the puppet master, OpenVoxDB, PostgreSQL, and Redis for the
-backend suite. `puppet-client` is the one exception — the agent output that
-matters is captured inline and printed with the failing assertion. A
+backend suite. `puppet-client` is the one exception, and there is nothing to
+miss: the agent runs through `compose exec`, so its output is captured by the
+harness and that container's own log stays empty. A
 failing CI job is therefore self-sufficient — the TAP `not ok` line is
 followed by the containers' own account of what went wrong, which teardown
 would otherwise destroy.
