@@ -144,6 +144,20 @@ var _ = Describe("verifyChartPins", func() {
 				[]byte("jobs:\n  publish:\n    steps:\n      - uses: actions/checkout@abc\n"))).To(
 				MatchError(ContainSubstring("no azure/setup-helm step")))
 		})
+
+		// setup-helm with no version installs whatever is latest, so an absent
+		// pin is the realistic drift — not a malformed file.
+		It("refuses a setup-helm step that pins no version", func() {
+			Expect(verifyChartPinsIn(goodChart, goodCI,
+				[]byte("jobs:\n  publish:\n    steps:\n      - uses: azure/setup-helm@abc\n        with:\n          token: xyz\n"))).To(
+				MatchError(ContainSubstring("sets no with.version")))
+		})
+
+		It("refuses a chart job that declares no helm matrix", func() {
+			Expect(verifyChartPinsIn(goodChart,
+				[]byte("jobs:\n  chart:\n    strategy:\n      matrix:\n        other: [a]\n"), goodPublish)).To(
+				MatchError(ContainSubstring("no helm matrix entries")))
+		})
 	})
 })
 

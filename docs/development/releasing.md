@@ -254,13 +254,12 @@ hand-editing.
 
 A **semver pre-release tag** — any tag with a hyphen, e.g. `v0.9.0-rc1` — is
 handled specially by the Release and Container images workflows: the GitHub
-release is created with
-`--prerelease` (it will not appear as the latest stable release), and
-`docker/metadata-action` withholds the `latest` container tags. The Helm chart
-workflow treats it like any other tag — the chart publishes at that exact
-version — and because only `-dev` versions publish from `main`, merging the
-`-rc1` release-prep PR deliberately publishes nothing. Use a pre-release tag
-for anything you do not want users upgrading to by default.
+release is created with `--prerelease` (it will not appear as the latest stable
+release), and `docker/metadata-action` withholds the `latest` container tags.
+The Helm chart workflow treats it like any other tag — the chart publishes at
+that exact version — and because only `-dev` versions publish from `main`,
+merging the `-rc1` release-prep PR deliberately publishes nothing. Use a
+pre-release tag for anything you do not want users upgrading to by default.
 
 A plain `v0.9.0`, by contrast, is **not** a pre-release in semver terms
 despite the `0.` major: it publishes as the latest stable GitHub release and

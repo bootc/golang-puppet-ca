@@ -210,18 +210,60 @@ on, because they all outrank or replace the config file the chart renders:
 `--openbao-auth-method=kubernetes` through `args`, and
 PUPPET_CA_OPENBAO_AUTH_METHOD through a ConfigMap or Secret named in `envFrom`
 (see docs/openbao-transit.md). The chart cannot read any of them.
+
+It can read `env` and `extraEnv`, though, and those carry the same variable —
+so they are scanned here exactly as openvox-ca.tlsConfigured scans them for
+PUPPET_CA_TLS_CERT/KEY. Without that, `config.ca_key_provider: openbao` plus
+`env.PUPPET_CA_OPENBAO_AUTH_METHOD: kubernetes` would leave the config fully
+known, the merged config's openbao.auth_method empty, and the pod without the
+projected token its key provider needs.
 */}}
 {{- define "openvox-ca.needsAPIAccess" -}}
 {{- if ne (include "openvox-ca.configFullyKnown" .) "true" -}}
 true
 {{- else -}}
 {{- $config := include "openvox-ca.config" . | fromYaml -}}
+{{- $authMethod := dig "openbao" "auth_method" "" $config -}}
+{{- range $name, $value := .Values.env -}}
+{{- if eq $name "PUPPET_CA_OPENBAO_AUTH_METHOD" }}{{ $authMethod = $value }}{{ end -}}
+{{- end -}}
+{{- range .Values.extraEnv -}}
+{{- if and (eq .name "PUPPET_CA_OPENBAO_AUTH_METHOD") .value }}{{ $authMethod = .value }}{{ end -}}
+{{/*
+  A valueFrom reference has no readable value, so its mere presence is the
+  signal: the operator is feeding the auth method in from a Secret or ConfigMap
+  and the chart cannot see which method it names.
+*/}}
+{{- if and (eq .name "PUPPET_CA_OPENBAO_AUTH_METHOD") (not .value) }}{{ $authMethod = "kubernetes" }}{{ end -}}
+{{- end -}}
 {{- if or .Values.kubernetesExport.enabled (dig "kubernetes_export" "targets" list $config) -}}
 true
-{{- else if eq (dig "openbao" "auth_method" "" $config) "kubernetes" -}}
+{{- else if eq ($authMethod | toString) "kubernetes" -}}
 true
 {{- else -}}
 false
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Why the pod needs the Kubernetes API, as an operator-facing phrase, or empty
+when the chart cannot tell.
+
+Exists so the NOTES warning names the same reason the token decision acted on
+instead of re-deriving it: an earlier copy tested only
+.Values.kubernetesExport.enabled, so an export configured through
+config.kubernetes_export got no reason at all even though that is precisely
+what had made needsAPIAccess true.
+*/}}
+{{- define "openvox-ca.apiAccessReason" -}}
+{{- if ne (include "openvox-ca.configFullyKnown" .) "true" -}}
+{{- else -}}
+{{- $config := include "openvox-ca.config" . | fromYaml -}}
+{{- if or .Values.kubernetesExport.enabled (dig "kubernetes_export" "targets" list $config) -}}
+Kubernetes export
+{{- else if eq (include "openvox-ca.needsAPIAccess" .) "true" -}}
+OpenBao Kubernetes auth
 {{- end -}}
 {{- end -}}
 {{- end -}}
@@ -533,7 +575,7 @@ networkPolicy.enabled: true.
 {{- end }}
 {{- if and .Values.networkPolicy.enabled .Values.networkPolicy.egress.enabled (eq (include "openvox-ca.needsAPIAccess" .) "true") }}
 
-NOTE: this pod may talk to the Kubernetes API{{ if .Values.kubernetesExport.enabled }} (Kubernetes export){{ else if eq (dig "openbao" "auth_method" "" $config) "kubernetes" }} (OpenBao Kubernetes auth){{ end }}, but
+NOTE: this pod may talk to the Kubernetes API{{ with (include "openvox-ca.apiAccessReason" .) }} ({{ . }}){{ end }}, but
 egress is restricted and the chart cannot know your API server's address. If it
 does, add a rule for it to networkPolicy.egress.rules, or the feature will fail
 while readiness still reports healthy.

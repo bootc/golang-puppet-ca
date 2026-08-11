@@ -96,6 +96,8 @@ See [`AGENTS.md`](AGENTS.md) for the details. The essentials:
 - Changed the Helm chart? `mage chart:validate` and `mage chart:test` are
   required checks too. A new template branch needs a fixture under
   `charts/openvox-ca/ci/`, and anything a reader has to trust needs a case in
-  `chart:test`.
+  `chart:test`. `chart:validate` caches the remote Kubernetes schemas under
+  `.test-output/`; that cache never revalidates, so if it passes locally and
+  fails in CI, clear it with `mage dev:clean` and re-run.
 - Internal design notes live under [docs/development/](docs/development/); update
   them when you change the behaviour they describe.

@@ -666,6 +666,13 @@ const kubeconformVersion = "1.31.0"
 // chart README's requirements section.
 const kubeconformFloorVersion = "1.26.0"
 
+// kubeconformCacheDir is where chart:validate keeps kubeconform's downloaded
+// schemas, and what dev:clean removes. Named once because sh.Rm treats a
+// missing path as success: two literals would let a rename here leave dev:clean
+// quietly cleaning nothing, and clearing this cache is the documented remedy
+// for a stale local copy passing what CI fails.
+var kubeconformCacheDir = filepath.Join(".test-output", "kubeconform-cache")
+
 // chartFloorFixture is the fixture that stands in for the chart's defaults and
 // is therefore the one held to the floor. Named here rather than inline so
 // that renaming it fails loudly instead of quietly skipping the check.
@@ -807,6 +814,13 @@ var chartKubeVersionRe = regexp.MustCompile(`(?m)^kubeVersion: "[^0-9]*([0-9]+\.
 
 // ciChartHelmMatrix returns the Helm versions ci.yml's chart job validates the
 // chart against.
+//
+// It trusts the matrix declaration and does not check that the chart job's own
+// setup-helm step interpolates it: doing so would mean asserting the shape of a
+// `${{ matrix.helm }}` expression, which is a weaker check than it looks, and a
+// chart job that pinned a literal instead would fail its own two-major matrix
+// visibly (both legs running the same Helm) rather than silently. The publish
+// side is checked at step level because there the wrong pin ships a chart.
 func ciChartHelmMatrix(src []byte) ([]string, error) {
 	var doc struct {
 		Jobs map[string]struct {
@@ -947,8 +961,7 @@ func (Chart) Validate() error {
 	if err := os.MkdirAll(outDir, 0755); err != nil {
 		return err
 	}
-	cacheDir := filepath.Join(".test-output", "kubeconform-cache")
-	if err := os.MkdirAll(cacheDir, 0755); err != nil {
+	if err := os.MkdirAll(kubeconformCacheDir, 0755); err != nil {
 		return err
 	}
 
@@ -990,7 +1003,7 @@ func (Chart) Validate() error {
 				// while `default` below resolves to a mutable upstream branch,
 				// so a long-lived local copy can pass what CI fails. `mage
 				// dev:clean` removes it.
-				"-cache", cacheDir,
+				"-cache", kubeconformCacheDir,
 				"-kubernetes-version", kubeVersion,
 				"-schema-location", "default",
 				"-schema-location", crdSchemaLocation,
@@ -1420,6 +1433,46 @@ func (Chart) Test() error {
 				"config.kubernetes_export.targets[0].kind=Secret", "config.kubernetes_export.targets[0].metadata.name=trust", "config.kubernetes_export.targets[0].cert=true"},
 			wants:    []string{"egress is restricted"},
 			notWants: []string{"OpenBao Kubernetes auth"},
+		},
+		{
+			name:  "the egress NOTE names Kubernetes export when that is the reason",
+			notes: true,
+			// The notWants above is only meaningful if the arms it excludes can
+			// actually fire; these two prove each one does.
+			sets: []string{tls, "networkPolicy.enabled=true", "networkPolicy.egress.enabled=true",
+				"kubernetesExport.enabled=true", "kubernetesExport.targets[0].kind=Secret",
+				"kubernetesExport.targets[0].metadata.name=trust", "kubernetesExport.targets[0].cert=true"},
+			wants:    []string{"(Kubernetes export)"},
+			notWants: []string{"(OpenBao Kubernetes auth)"},
+		},
+		{
+			name:  "the egress NOTE names OpenBao when that is the reason",
+			notes: true,
+			sets: []string{tls, "networkPolicy.enabled=true", "networkPolicy.egress.enabled=true",
+				"config.ca_key_provider=openbao", "config.openbao.auth_method=kubernetes"},
+			wants:    []string{"(OpenBao Kubernetes auth)"},
+			notWants: []string{"(Kubernetes export)"},
+		},
+		{
+			name: "an OpenBao auth method supplied through env still mounts the token",
+			// The chart can read env and extraEnv, so unlike args/envFrom this
+			// is not an uncertainty case — it must be detected outright, the way
+			// tlsConfigured detects PUPPET_CA_TLS_CERT there.
+			sets:  []string{tls, "config.ca_key_provider=openbao", "env.PUPPET_CA_OPENBAO_AUTH_METHOD=kubernetes"},
+			wants: []string{"automountServiceAccountToken: true"},
+		},
+		{
+			name:     "a non-Kubernetes auth method through env does not",
+			sets:     []string{tls, "config.ca_key_provider=openbao", "env.PUPPET_CA_OPENBAO_AUTH_METHOD=approle"},
+			wants:    []string{"automountServiceAccountToken: false"},
+			notWants: []string{"automountServiceAccountToken: true"},
+		},
+		{
+			name: "an auth method fed from a Secret mounts the token, since the chart cannot read it",
+			sets: []string{tls, "config.ca_key_provider=openbao",
+				"extraEnv[0].name=PUPPET_CA_OPENBAO_AUTH_METHOD",
+				"extraEnv[0].valueFrom.secretKeyRef.name=openbao", "extraEnv[0].valueFrom.secretKeyRef.key=method"},
+			wants: []string{"automountServiceAccountToken: true"},
 		},
 		{
 			name: "a lowercase export target kind passes through as written",
@@ -2343,7 +2396,7 @@ func (Dev) Tidy() error {
 // always starts empty, fails. This is the documented way to clear it.
 func (Dev) Clean() error {
 	fmt.Println("Cleaning...")
-	if err := sh.Rm(filepath.Join(".test-output", "kubeconform-cache")); err != nil {
+	if err := sh.Rm(kubeconformCacheDir); err != nil {
 		return err
 	}
 	return sh.Rm("bin")
