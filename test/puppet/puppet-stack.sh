@@ -12,10 +12,12 @@
 #
 # Output: TAP format.  Exit 0 on all pass, exit 1 on any failure.
 #
-# On failure, an --up run replays the tail of each stack service's container
-# log to stderr before tearing the stack down, since teardown is what makes
-# those logs unrecoverable. --up --keep skips that dump and leaves the
-# containers up for `compose logs` instead.
+# On failure, an --up run replays the tail of every stack service's container
+# log to stderr (all but puppet-client, whose agent output is already echoed
+# with the failing assertion) before tearing the stack down, since teardown is
+# what makes those logs unrecoverable. --up --keep skips that teardown dump and
+# leaves the containers up for `compose logs` instead; a readiness timeout
+# still prints the timed-out service's own log either way.
 #
 # NOTE: Group 6 revokes the client cert.  clean_client_cert() revokes any
 # stale cert and clears the client SSL dir before Groups 3 and 8.

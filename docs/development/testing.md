@@ -23,6 +23,9 @@ mage test:integCompose
 # Run the full OpenVox stack (CA TLS + WEBrick master + OpenVoxDB + agent)
 mage test:puppet
 
+# The same stack against a FIPS build (GOEXPERIMENT=boringcrypto)
+mage test:puppetFIPS
+
 # Run k6 load tests (correctness + throughput + saturation) via compose
 mage test:bench
 ```
@@ -107,11 +110,15 @@ When `test:puppet`, `test:puppetFIPS` or `test:backendsRedis` fails, the
 harness replays the tail of each stack service's container log to stderr
 before tearing the stack down: the CA (both replicas for the Redis
 topology), the puppet master, OpenVoxDB, PostgreSQL, and Redis for the
-backend suite. A failing CI job is therefore self-sufficient — the TAP
-`not ok` line is followed by the containers' own account of what went
-wrong, which teardown would otherwise destroy.
+backend suite. `puppet-client` is the one exception — the agent output that
+matters is captured inline and printed with the failing assertion. A
+failing CI job is therefore self-sufficient — the TAP `not ok` line is
+followed by the containers' own account of what went wrong, which teardown
+would otherwise destroy.
 
 To keep the stack for interactive inspection instead, run the script
-directly with `--up --keep` and use `compose logs`. The automatic dump is
+directly with `--up --keep` and use `compose logs`. The teardown dump is
 deliberately skipped in that mode: nothing is being destroyed, so the logs
-are still there to be read.
+are still there to be read. A readiness timeout still prints the timed-out
+service's log either way, since that is the one thing worth reading
+immediately.

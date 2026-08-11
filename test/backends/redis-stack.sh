@@ -17,10 +17,12 @@
 #
 # Output: TAP format. Exit 0 on all pass, exit 1 on any failure.
 #
-# On failure, an --up run replays the tail of each stack service's container
-# log to stderr before tearing the stack down, since teardown is what makes
-# those logs unrecoverable. --up --keep skips that dump and leaves the
-# containers up for `compose logs` instead.
+# On failure, an --up run replays the tail of every stack service's container
+# log to stderr (all but puppet-client, whose agent output is already echoed
+# with the failing assertion) before tearing the stack down, since teardown is
+# what makes those logs unrecoverable. --up --keep skips that teardown dump and
+# leaves the containers up for `compose logs` instead; a readiness timeout
+# still prints the timed-out service's own log either way.
 
 set -uo pipefail
 
@@ -67,13 +69,19 @@ done
 # -- How much of each container's log to replay when the run fails ---------
 # One knob for every dump site, deliberately: when the readiness abort dumped
 # the timed-out service at its own shallower depth, the culprit ended up with
-# the least log of anything in the run -- and it is the one whose first
-# start attempt (these services carry restart: on-failure) holds the reason.
+# the least log of anything in the run. Deep enough matters most for the two
+# CA replicas, the only services here with restart: on-failure -- their log is
+# several concatenated start attempts, and it is the first one that holds the
+# reason.
 FAILURE_LOG_TAIL=200
 
 # -- Helper: replay a service's container logs to our stderr ---------------
 # Shared by the readiness aborts and the end-of-run failure dump, both of
 # which need the container's own account of what went wrong.
+#
+# A copy of this helper, the tail constant and dump_failure_logs below lives in
+# test/puppet/puppet-stack.sh (which explains why they are copied rather than
+# sourced) -- keep the two in step.
 dump_logs() {  # service-name
     local _svc="$1" _tail="$FAILURE_LOG_TAIL"
     printf '# ---- last %s log lines from %s ----\n' "$_tail" "$_svc" >&2
