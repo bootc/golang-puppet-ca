@@ -375,15 +375,7 @@ func newRootCmd() *cobra.Command {
 					return fmt.Errorf("failed to determine executable: %w", err)
 				}
 				c := exec.Command(exe, os.Args[1:]...) //nolint:gosec // G204: re-execs this same binary (os.Executable) with the operator's own os.Args to daemonize
-				// Strip internal role/PSK vars to prevent stale values from a
-				// previous run from confusing the daemon child.
-				// NOTIFY_SOCKET goes too: the child would otherwise report
-				// readiness for a unit whose main process has just exited.
-				// Copied rather than appended in place, so the shared
-				// internalEnvKeys backing array is never written through.
-				daemonEnv := filterEnv(os.Environ(),
-					append(append([]string{}, internalEnvKeys...), "NOTIFY_SOCKET")...)
-				c.Env = append(daemonEnv, "PUPPET_CA_DAEMON=1")
+				c.Env = append(daemonEnv(os.Environ()), "PUPPET_CA_DAEMON=1")
 				c.Stdin = nil
 				c.Stdout = nil
 				c.Stderr = nil
@@ -938,6 +930,20 @@ func applyOpenBaoFlagOverrides(cmd *cobra.Command, cfg *serverConfig, v *openBao
 	set("openbao-kubernetes-jwt-file", func() { cfg.OpenBao.KubernetesJWTFile = v.k8sJWTFile })
 }
 
+// ignoreReloadSignal makes this process immune to SIGHUP.
+//
+// The signer holds no reloadable configuration, but SIGHUP's default action is
+// to terminate. Ignoring it means a reload signal delivered to the process
+// group (rather than to the launcher alone) cannot take the CA key holder down
+// and force a full restart.
+//
+// A function rather than a bare call inside runSignerMode so a spec can drive
+// it: runSignerMode needs storage, a CA directory and a socketpair peer before
+// it reaches this line, which is why the disposition went unasserted.
+func ignoreReloadSignal() {
+	signal.Ignore(syscall.SIGHUP)
+}
+
 // runSignerMode runs the isolated CA key signer process. It initializes the CA
 // (bootstrapping on first run), then serves signing requests over the inherited
 // socketpair fd. The signer has no network exposure; it only communicates with
@@ -963,11 +969,7 @@ func runSignerMode(ctx context.Context, cfg *serverConfig, absCADir string) erro
 		}()
 	}
 
-	// The signer holds no reloadable configuration, but SIGHUP's default
-	// action is to terminate. Ignoring it means a reload signal delivered to
-	// the process group (rather than to the launcher alone) cannot take the CA
-	// key holder down and force a full restart.
-	signal.Ignore(syscall.SIGHUP)
+	ignoreReloadSignal()
 
 	slog.Info("Starting CA signer process",
 		"cadir", absCADir,

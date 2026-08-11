@@ -42,6 +42,7 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
+	"github.com/voxpupuli/openvox-ca/internal/ca"
 	"github.com/voxpupuli/openvox-ca/internal/sdnotify"
 	"github.com/voxpupuli/openvox-ca/internal/signer"
 )
@@ -94,6 +95,18 @@ func runPSKChild(role string) int {
 			return 1
 		}
 		fmt.Println("SIGN-OK")
+		return 0
+	case "sighup-ignored":
+		// The signer's disposition, then a SIGHUP at this very process.
+		// SIGHUP's default action is termination and kill(2) delivers to self
+		// before it returns, so reaching the print at all is the assertion:
+		// without the disposition this child dies inside the Kill call.
+		ignoreReloadSignal()
+		if err := syscall.Kill(os.Getpid(), syscall.SIGHUP); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+		fmt.Println("ALIVE")
 		return 0
 	default:
 		fmt.Fprintf(os.Stderr, "unknown %s role %q\n", pskChildEnv, role)
@@ -693,6 +706,66 @@ var _ = Describe("Launcher supervisor loop", func() {
 	})
 })
 
+// SECURITY: the signer is the process holding the CA private key. A reload
+// signal that reaches the process group rather than the launcher alone must not
+// take it down -- the launcher would read the exit as a crash and tear the
+// whole unit down with it.
+var _ = Describe("the signer's SIGHUP disposition", func() {
+	It("survives a SIGHUP delivered to itself", func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		var out bytes.Buffer
+		cmd := pskChildCmd(ctx, "sighup-ignored", nil, &out)
+
+		Expect(cmd.Run()).To(Succeed(), "the child died on SIGHUP: %s", out.String())
+		Expect(out.String()).To(ContainSubstring("ALIVE"))
+	})
+})
+
+// SECURITY: what each child is and is not handed is a boundary, not a detail --
+// the signer holds the CA private key. These drive the two functions the
+// launcher and the --daemon re-exec actually call, so removing either strip
+// fails a spec rather than passing silently.
+var _ = Describe("the environments the launcher builds", func() {
+	base := []string{
+		"PATH=/usr/bin",
+		"NOTIFY_SOCKET=/run/systemd/notify",
+		"WATCHDOG_USEC=30000000",
+		"PUPPET_CA_CADIR=/var/lib/puppet-ca",
+	}
+
+	It("withholds the notification socket from the signer, and nothing else", func() {
+		Expect(signerEnv(base)).To(Equal([]string{
+			"PATH=/usr/bin",
+			"WATCHDOG_USEC=30000000",
+			"PUPPET_CA_CADIR=/var/lib/puppet-ca",
+		}))
+	})
+
+	It("withholds the socket and every internal variable from the daemon child", func() {
+		// A stale role would make the child adopt a role it was not spawned
+		// for; the socket would make it report readiness for a unit whose main
+		// process has just exited.
+		parent := append([]string{"PUPPET_CA_ROLE=signer", "PUPPET_CA_SIGNER_PSK=stale"}, base...)
+
+		Expect(daemonEnv(parent)).To(Equal([]string{
+			"PATH=/usr/bin",
+			"WATCHDOG_USEC=30000000",
+			"PUPPET_CA_CADIR=/var/lib/puppet-ca",
+		}))
+	})
+
+	It("does not write through the shared internalEnvKeys slice", func() {
+		// daemonEnv appends the socket to a copy; appending to internalEnvKeys
+		// itself would corrupt the list every other caller reads.
+		before := append([]string(nil), internalEnvKeys...)
+		daemonEnv(base)
+
+		Expect(internalEnvKeys).To(Equal(before))
+	})
+})
+
 // The shipped unit encodes numbers derived from constants in this package.
 // Nothing else notices when they drift apart, and the failure mode is systemd
 // killing the CA part-way through a drain it was asked to wait for.
@@ -732,8 +805,17 @@ var _ = Describe("The shipped systemd unit", func() {
 	It("sets a watchdog the heartbeat can honour", func() {
 		watchdog, err := time.ParseDuration(unit["WatchdogSec"])
 		Expect(err).NotTo(HaveOccurred())
-		Expect(watchdog).To(BeNumerically(">=", 2*shortWatchdogWarnBelow),
-			"a shorter WatchdogSec would make the CA warn on every start")
+
+		// The binding constraint, and the reason the unit says 90s rather than
+		// 60s: the status line the heartbeat sends takes the CA's read lock, so
+		// a storage operation holding the write lock stalls the heartbeat for
+		// up to the cluster-lock budget. A watchdog inside that budget has
+		// systemd kill a healthy CA that is waiting on a slow backend.
+		Expect(watchdog).To(BeNumerically(">", ca.LockTimeout),
+			"WatchdogSec must outlast internal/ca's cluster-lock timeout")
+
+		// Secondary, and far looser: below this the CA warns on every start.
+		Expect(watchdog).To(BeNumerically(">=", 2*shortWatchdogWarnBelow))
 	})
 
 	It("does not pin --config, which would disable PUPPET_CA_CONFIG", func() {

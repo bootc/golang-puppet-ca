@@ -134,7 +134,7 @@ func (c *CA) ImportCertificate(ctx context.Context, subject string, certPEM []by
 		return nil, fmt.Errorf("%w: NotAfter (%s) is not after NotBefore (%s)", ErrImportInvalid, cert.NotAfter, cert.NotBefore)
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, lockTimeout)
+	ctx, cancel := context.WithTimeout(ctx, LockTimeout)
 	defer cancel()
 
 	var out *ImportResult

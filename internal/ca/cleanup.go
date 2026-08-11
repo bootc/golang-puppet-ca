@@ -49,7 +49,7 @@ func (c *CA) CleanupExpiredCerts(ctx context.Context, retain time.Duration) (int
 	}
 	cutoff := time.Now().Add(-retain)
 
-	ctx, cancel := context.WithTimeout(ctx, lockTimeout)
+	ctx, cancel := context.WithTimeout(ctx, LockTimeout)
 	defer cancel()
 
 	var removed int

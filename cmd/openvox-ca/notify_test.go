@@ -65,7 +65,17 @@ func startNotifyRecorder(env map[string]string) *notifyRecorder {
 				close(r.msgs)
 				return
 			}
-			r.msgs <- string(buf[:n])
+			// Never block: a spec that starts the recorder for its side
+			// effect and ignores the messages (the heartbeat specs do) would
+			// otherwise fill the buffer, park this goroutine for good and stop
+			// it draining the socket -- and once the kernel's datagram queue
+			// filled too, every send would stall for the notifier's whole
+			// write deadline while holding its mutex. Close() only wakes a
+			// goroutine blocked in Read, never one blocked here.
+			select {
+			case r.msgs <- string(buf[:n]):
+			default:
+			}
 		}
 	}()
 

@@ -128,14 +128,9 @@ func runLauncher(drain time.Duration, notify *sdnotify.Notifier, hupCh <-chan os
 	// share a backing array.
 	baseEnv := filterEnv(os.Environ(), internalEnvKeys...)
 
-	// SECURITY: the signer holds the CA key and talks to nothing but the
-	// frontend, so it has no state a service manager wants to hear about.
-	// Withholding $NOTIFY_SOCKET keeps the notification channel to exactly the
-	// two processes that use it (this launcher and the frontend) even under
-	// NotifyAccess=all. The frontend keeps it: it is the process that knows
-	// when the listener is accepting, so it reports READY=1.
-	// NIST 800-53: SC-3 (Security Function Isolation)
-	signerCmd, err := spawnChild(exe, filterEnv(baseEnv, "NOTIFY_SOCKET"), "signer", signerSock, pskHex)
+	// The frontend gets baseEnv untouched: it is the process that knows when
+	// the listener is accepting, so it is the one that reports READY=1.
+	signerCmd, err := spawnChild(exe, signerEnv(baseEnv), "signer", signerSock, pskHex)
 	if err != nil {
 		return err
 	}
@@ -272,6 +267,40 @@ func (s *supervisor) stopBoth(budget time.Duration) *time.Timer {
 		_ = s.frontend.Kill()
 		_ = s.signer.Kill()
 	})
+}
+
+// daemonEnv is the environment the --daemon re-exec child is given: the
+// parent's own, less the internal role/PSK variables and the notification
+// socket.
+//
+// The role and PSK variables go because a stale value from a previous run
+// would make the daemon child adopt a role it was not spawned for.
+// $NOTIFY_SOCKET goes because the child would otherwise report readiness for a
+// unit whose main process -- the parent, which returns as soon as it has
+// forked -- has just exited. The parent's slice is copied rather than appended
+// to in place, so the shared internalEnvKeys backing array is never written
+// through.
+//
+// Named for the same reason as signerEnv: so a spec can drive it.
+func daemonEnv(parent []string) []string {
+	return filterEnv(parent, append(append([]string{}, internalEnvKeys...), "NOTIFY_SOCKET")...)
+}
+
+// signerEnv is the environment the signer child is given: the launcher's own,
+// less the service-manager notification socket.
+//
+// SECURITY: the signer holds the CA key and talks to nothing but the frontend,
+// so it has no state a service manager wants to hear about. Withholding
+// $NOTIFY_SOCKET keeps the notification channel to exactly the two processes
+// that use it (this launcher and the frontend) even under NotifyAccess=all.
+//
+// Named rather than inlined at the call site so the boundary has something a
+// spec can drive. As one argument among five it was a one-token edit away from
+// passing baseEnv straight through, and no assertion would have noticed.
+//
+// NIST 800-53: SC-3 (Security Function Isolation)
+func signerEnv(baseEnv []string) []string {
+	return filterEnv(baseEnv, "NOTIFY_SOCKET")
 }
 
 // internalEnvKeys are the variables the launcher and the --daemon re-exec strip

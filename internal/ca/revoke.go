@@ -39,7 +39,7 @@ func (c *CA) Revoke(ctx context.Context, subject string) error {
 		return err
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, lockTimeout)
+	ctx, cancel := context.WithTimeout(ctx, LockTimeout)
 	defer cancel()
 	return c.Storage.WithLock(ctx, lockNameCRL, func() error {
 		c.mu.Lock()

@@ -162,7 +162,7 @@ func (c *CA) Sign(ctx context.Context, subject string) ([]byte, error) {
 	if err := ValidateSubject(subject); err != nil {
 		return nil, err
 	}
-	ctx, cancel := context.WithTimeout(ctx, lockTimeout)
+	ctx, cancel := context.WithTimeout(ctx, LockTimeout)
 	defer cancel()
 	var out []byte
 	err := c.Storage.WithLock(ctx, subjectLockName(subject), func() error {
@@ -185,7 +185,7 @@ func (c *CA) SignWithTTL(ctx context.Context, subject string, ttl time.Duration)
 	if err := ValidateSubject(subject); err != nil {
 		return nil, err
 	}
-	ctx, cancel := context.WithTimeout(ctx, lockTimeout)
+	ctx, cancel := context.WithTimeout(ctx, LockTimeout)
 	defer cancel()
 	var out []byte
 	err := c.Storage.WithLock(ctx, subjectLockName(subject), func() error {
@@ -484,7 +484,7 @@ func (c *CA) Clean(ctx context.Context, subject string) error {
 		return err
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, lockTimeout)
+	ctx, cancel := context.WithTimeout(ctx, LockTimeout)
 	defer cancel()
 
 	// Hold the per-subject lock for the entire check+revoke+delete sequence to
@@ -664,7 +664,7 @@ func (c *CA) SaveRequest(ctx context.Context, subject string, csrPEM []byte) (bo
 	// autosign sequence. This prevents TOCTOU races where two concurrent
 	// SaveRequest calls (same or different replicas) both pass eviction and
 	// produce duplicate certificates.
-	ctx, cancel := context.WithTimeout(ctx, lockTimeout)
+	ctx, cancel := context.WithTimeout(ctx, LockTimeout)
 	defer cancel()
 	var autosigned bool
 	lockErr := c.Storage.WithLock(ctx, subjectLockName(subject), func() error {
@@ -739,7 +739,7 @@ func (c *CA) Renew(ctx context.Context, subject string, csrPEM []byte) ([]byte, 
 		return nil, fmt.Errorf("CSR CN %q does not match subject %q", csr.Subject.CommonName, subject)
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, lockTimeout)
+	ctx, cancel := context.WithTimeout(ctx, LockTimeout)
 	defer cancel()
 	var out []byte
 	err = c.Storage.WithLock(ctx, subjectLockName(subject), func() error {
@@ -830,7 +830,7 @@ func (c *CA) AutoRenew(ctx context.Context, presentedCert *x509.Certificate) ([]
 		return nil, fmt.Errorf("rejecting auto-renewal for %s: %w", subject, err)
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, lockTimeout)
+	ctx, cancel := context.WithTimeout(ctx, LockTimeout)
 	defer cancel()
 
 	var extraExtensions []pkix.Extension

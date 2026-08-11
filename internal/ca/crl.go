@@ -154,7 +154,7 @@ func newEmptyCRL(cert *x509.Certificate, key crypto.Signer, validity time.Durati
 // replica (and concurrently with Revoke) against shared storage; the last
 // writer under the lock wins and bumps the CRL number monotonically.
 func (c *CA) ReissueCRL(ctx context.Context) error {
-	ctx, cancel := context.WithTimeout(ctx, lockTimeout)
+	ctx, cancel := context.WithTimeout(ctx, LockTimeout)
 	defer cancel()
 	return c.Storage.WithLock(ctx, lockNameCRL, func() error {
 		c.mu.Lock()
@@ -280,7 +280,7 @@ func (c *CA) parseStoredCRL(ctx context.Context) (*storedCRL, error) {
 // and the rest observe a fresh CRL and return (false, nil). This makes the
 // background refresh job safe to run on any number of replicas sharing storage.
 func (c *CA) RefreshCRLIfDue(ctx context.Context, refreshBefore time.Duration) (bool, error) {
-	ctx, cancel := context.WithTimeout(ctx, lockTimeout)
+	ctx, cancel := context.WithTimeout(ctx, LockTimeout)
 	defer cancel()
 	var reissued bool
 	err := c.Storage.WithLock(ctx, lockNameCRL, func() error {

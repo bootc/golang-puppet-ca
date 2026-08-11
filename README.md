@@ -69,15 +69,18 @@ root for a Docker/Podman Compose deployment.
 
 ### Release tarballs
 
-Each release publishes `openvox-ca_linux_amd64.tar.gz`, `openvox-ca_linux_arm64.tar.gz`, and a FIPS build
-`openvox-ca_linux_amd64_fips.tar.gz`, plus `checksums.txt`. Every archive contains both binaries
-(`openvox-ca`, `openvox-ca-ctl`) and the systemd unit `openvox-ca.service`:
+Each release publishes four tarballs — `linux_amd64` and `linux_arm64`, each in a standard and a
+FIPS (`_fips`) build — plus `checksums.txt`. Every archive contains both binaries (`openvox-ca`,
+`openvox-ca-ctl`) and the systemd unit `openvox-ca.service`. Asset names carry the release version,
+so set `VERSION` to the release you want (the newest is on the
+[releases page](https://github.com/voxpupuli/openvox-ca/releases/latest)) and download by tag:
 
 ```console
-$ curl -LO https://github.com/voxpupuli/openvox-ca/releases/latest/download/openvox-ca_linux_amd64.tar.gz
-$ curl -LO https://github.com/voxpupuli/openvox-ca/releases/latest/download/checksums.txt
+$ VERSION=0.9.0
+$ curl -fLO https://github.com/voxpupuli/openvox-ca/releases/download/v${VERSION}/openvox-ca_${VERSION}_linux_amd64.tar.gz
+$ curl -fLO https://github.com/voxpupuli/openvox-ca/releases/download/v${VERSION}/checksums.txt
 $ sha256sum --ignore-missing -c checksums.txt
-$ tar xzf openvox-ca_linux_amd64.tar.gz
+$ tar xzf openvox-ca_${VERSION}_linux_amd64.tar.gz
 ```
 
 See [running under systemd](docs/systemd.md) for the rest of a VM install.

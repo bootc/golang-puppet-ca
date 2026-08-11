@@ -18,6 +18,8 @@
 package sdnotify_test
 
 import (
+	"bytes"
+	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
@@ -250,6 +252,26 @@ var _ = Describe("Notifier", func() {
 
 			Expect(n.Enabled()).To(BeTrue(), "a failed write must not disable the notifier")
 			Expect(n.Close()).To(Succeed())
+		})
+
+		It("warns once about a wedged service manager, then drops to debug", func() {
+			// The heartbeat runs for the life of the process, so warning on
+			// every failed send would fill the journal at heartbeat rate. The
+			// latch is the whole reason the first failure is distinguishable
+			// from the rest, and nothing but this log line shows it working.
+			var buf bytes.Buffer
+			orig := slog.Default()
+			slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+			defer slog.SetDefault(orig)
+
+			Expect(mgr.stop()).To(Succeed())
+
+			n.Status("first")
+			n.Status("second")
+			n.Status("third")
+
+			Expect(strings.Count(buf.String(), "Failed to notify the service manager")).To(Equal(1),
+				"the first failure warns; the rest are logged at debug level")
 		})
 
 		It("is safe to close twice", func() {
