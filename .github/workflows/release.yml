@@ -35,12 +35,16 @@ jobs:
         include:
           - variant: linux_amd64
             runner: ubuntu-latest
+            fips: false
           - variant: linux_arm64
             runner: ubuntu-24.04-arm
+            fips: false
           - variant: linux_amd64_fips
             runner: ubuntu-latest
+            fips: true
           - variant: linux_arm64_fips
             runner: ubuntu-24.04-arm
+            fips: true
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
@@ -64,6 +68,15 @@ jobs:
         run: go install github.com/magefile/mage@v1.17.2
       - name: Build release artifact
         run: mage build:distVariant ${{ matrix.variant }}
+      - name: Verify artifact
+        # The exact binaries being published are executed and (for FIPS
+        # variants) checked for boringcrypto build info before upload —
+        # "the commit passed CI" does not by itself verify these artefacts,
+        # since release builds restore Go caches saved by CI runs on main.
+        uses: ./.github/actions/verify-dist-artifact
+        with:
+          variant: ${{ matrix.variant }}
+          fips: ${{ matrix.fips }}
       - name: Upload artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

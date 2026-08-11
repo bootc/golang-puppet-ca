@@ -20,6 +20,7 @@
 package main
 
 import (
+	"bytes"
 	"os"
 	"runtime"
 
@@ -201,7 +202,7 @@ var _ = Describe("shellVariantList", func() {
 
 	It("errors when no loop is present", func() {
 		_, err := shellVariantList([]byte("nothing here"))
-		Expect(err).To(HaveOccurred())
+		Expect(err).To(MatchError(ContainSubstring("no 'for variant in")))
 	})
 })
 
@@ -211,5 +212,68 @@ var _ = Describe("verifyDistVariants", func() {
 	// drifting apart (it also runs as part of `mage dev:check`).
 	It("finds all hand-maintained variant lists in agreement", func() {
 		Expect(verifyDistVariants()).To(Succeed())
+	})
+
+	// The failure branches are what make the guard a guard: feed synthetic
+	// workflow contents with exactly one list out of agreement and assert
+	// the error names the disagreeing location.
+	Describe("drift detection", func() {
+		// Synthetic workflow fragments agreeing with distVariants()
+		// (linux_amd64, linux_arm64, linux_amd64_fips, linux_arm64_fips).
+		goodCI := []byte(`
+jobs:
+  dist:
+    strategy:
+      matrix:
+        include:
+          - variant: linux_amd64
+          - variant: linux_arm64
+          - variant: linux_amd64_fips
+          - variant: linux_arm64_fips
+`)
+		goodRel := []byte(`
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - variant: linux_amd64
+          - variant: linux_arm64
+          - variant: linux_amd64_fips
+          - variant: linux_arm64_fips
+  release:
+    steps:
+      - run: |
+          for variant in linux_amd64 linux_arm64 linux_amd64_fips linux_arm64_fips; do
+            ls
+          done
+          if [ "$tarballs" -ne 4 ]; then
+            exit 1
+          fi
+`)
+
+		It("accepts synthetic workflows that agree with distVariants", func() {
+			Expect(verifyDistVariantsIn(goodCI, goodRel)).To(Succeed())
+		})
+
+		It("rejects a drifted ci.yml dist matrix and names it", func() {
+			badCI := bytes.Replace(goodCI, []byte("- variant: linux_arm64_fips"), []byte("- variant: linux_riscv64_fips"), 1)
+			Expect(verifyDistVariantsIn(badCI, goodRel)).To(MatchError(ContainSubstring("ci.yml dist job matrix")))
+		})
+
+		It("rejects a drifted release.yml build matrix and names it", func() {
+			badRel := bytes.Replace(goodRel, []byte("          - variant: linux_amd64_fips\n"), nil, 1)
+			Expect(verifyDistVariantsIn(goodCI, badRel)).To(MatchError(ContainSubstring("release.yml build job matrix")))
+		})
+
+		It("rejects a drifted checksum-step shell loop and names it", func() {
+			badRel := bytes.Replace(goodRel, []byte("for variant in linux_amd64 "), []byte("for variant in "), 1)
+			Expect(verifyDistVariantsIn(goodCI, badRel)).To(MatchError(ContainSubstring("checksum-step shell loop")))
+		})
+
+		It("rejects a stale tarball-count literal and names the counts", func() {
+			badRel := bytes.Replace(goodRel, []byte(`-ne 4`), []byte(`-ne 3`), 1)
+			Expect(verifyDistVariantsIn(goodCI, badRel)).To(MatchError(ContainSubstring("expects 3 tarballs")))
+		})
 	})
 })

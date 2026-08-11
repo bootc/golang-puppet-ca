@@ -40,8 +40,21 @@ runs:
         # .lefthook/pre-push/verify-tags.sh).
         sha="$(git rev-parse 'HEAD^{commit}')"
 
-        passed="$(gh api "repos/$GITHUB_REPOSITORY/commits/$sha/check-runs" --paginate \
-          --jq '[.check_runs[] | select(.name == "CI success" and .conclusion == "success")] | length')"
+        # --slurp combines the paginated pages into one array before --jq
+        # runs; without it gh applies the filter per page, so a commit with
+        # >100 check runs would yield multi-line output here, the integer
+        # test below would error with status 2, and the if-condition would
+        # swallow that as false — the gate would fail open. The explicit
+        # integer guard keeps it failing closed even if the output shape
+        # ever regresses.
+        passed="$(gh api "repos/$GITHUB_REPOSITORY/commits/$sha/check-runs" --paginate --slurp \
+          --jq '[.[].check_runs[] | select(.name == "CI success" and .conclusion == "success")] | length')"
+        case "$passed" in
+          ''|*[!0-9]*)
+            echo "::error::Check-run count query returned non-numeric output: '$passed'"
+            exit 1
+            ;;
+        esac
         if [ "$passed" -lt 1 ]; then
           echo "::error::Commit $sha has no passing 'CI success' check run. Tag a commit that has gone green on main (and wait for CI to finish before tagging)."
           exit 1

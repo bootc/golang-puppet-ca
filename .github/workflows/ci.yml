@@ -34,8 +34,9 @@ jobs:
         run: mage dev:check
       - name: Magefile tests
         # The magefile is build-tagged, so its Ginkgo suite is invisible to
-        # the ordinary `go test ./...` run and needs the tag spelled out.
-        run: go test -tags mage .
+        # the ordinary `go test ./...` run; test:magefile is the canonical
+        # invocation, shared with the pre-push hook.
+        run: mage test:magefile
 
   # -- Dockerfile lint (hadolint) ----------------------------------------------
   # Lints every Dockerfile in the repo. hadolint has no auto-fix mode (it only
@@ -155,46 +156,12 @@ jobs:
       - name: Build release artifact
         run: mage build:distVariant ${{ matrix.variant }}
       - name: Verify artifact
-        # Assert the expected artefact rather than just exit-zero: naming
-        # drift against the internal/version constant should fail here. The
-        # sed parse matches the one in release.yml's tag gate. The runner is
-        # native to the variant's architecture, so the binaries are executed
-        # directly.
-        #
-        # shell: bash upgrades the default shell to `bash -eo pipefail`, so a
-        # binary that prints the expected --version line but exits non-zero
-        # still fails the piped greps below.
-        shell: bash
-        env:
-          VARIANT: ${{ matrix.variant }}
-          FIPS: ${{ matrix.fips }}
-        run: |
-          ver="$(sed -n 's/^const Version = "\(.*\)"$/\1/p' internal/version/version.go)"
-          if [ -z "$ver" ]; then
-            echo "::error::Could not parse the Version constant from internal/version/version.go"
-            exit 1
-          fi
-          tarball="dist/openvox-ca_${ver}_${VARIANT}.tar.gz"
-          if [ ! -f "$tarball" ]; then
-            echo "::error::Expected artefact $tarball is missing"
-            exit 1
-          fi
-          tar xzf "$tarball" -C "$RUNNER_TEMP"
-          "$RUNNER_TEMP/openvox-ca" --version | grep -F "openvox-ca version $ver"
-          "$RUNNER_TEMP/openvox-ca-ctl" --version | grep -F "openvox-ca-ctl version $ver"
-          # The _fips artefacts must really be boringcrypto builds: fipsEnv in
-          # the magefile is the only thing setting GOEXPERIMENT for dist, so a
-          # regression there would otherwise ship standard-crypto binaries
-          # under a FIPS label. (grep without -q: reading all input avoids a
-          # SIGPIPE race under pipefail.)
-          if [ "$FIPS" = "true" ]; then
-            for bin in openvox-ca openvox-ca-ctl; do
-              if ! go version -m "$RUNNER_TEMP/$bin" | grep boringcrypto > /dev/null; then
-                echo "::error::${VARIANT}/${bin} is not a boringcrypto build"
-                exit 1
-              fi
-            done
-          fi
+        # Shared with the Release workflow's build job, so the artefacts that
+        # actually get published receive the same verification as PR builds.
+        uses: ./.github/actions/verify-dist-artifact
+        with:
+          variant: ${{ matrix.variant }}
+          fips: ${{ matrix.fips }}
 
   # -- Puppet stack integration tests ------------------------------------------
   # Runs the full OpenVox 8 stack: Go CA (TLS) → OpenVox Server (WEBrick) →

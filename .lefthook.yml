@@ -41,4 +41,6 @@ pre-push:
       use_stdin: true  # git feeds the pushed refs to the pre-push hook on stdin
   commands:
     go-test:
-      run: go test ./...
+      # The second invocation covers the build-tagged magefile suite, which
+      # `go test ./...` cannot see (same suite CI runs via `mage test:magefile`).
+      run: go test ./... && go test -tags mage .

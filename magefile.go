@@ -42,7 +42,7 @@ import (
 
 	"github.com/magefile/mage/mg"
 	"github.com/magefile/mage/sh"
-	"gopkg.in/yaml.v3"
+	yaml "go.yaml.in/yaml/v3"
 
 	"github.com/caarlos0/env/v11"
 	openbao "github.com/openbao/openbao/api/v2"
@@ -58,7 +58,7 @@ import (
 // -- Namespaces ----------------------------------------------------------------
 
 type Build mg.Namespace   // build:all  build:fips  build:dist  build:distVariant
-type Test mg.Namespace    // test:unit  test:integcompose  test:integcomposefips  test:loadcompose  test:bench  test:puppet  test:puppetfips  test:migration  test:backendsRedis  test:backendsEtcd
+type Test mg.Namespace    // test:unit  test:magefile  test:integcompose  test:integcomposefips  test:loadcompose  test:bench  test:puppet  test:puppetfips  test:migration  test:backendsRedis  test:backendsEtcd
 type Dev mg.Namespace     // dev:check  dev:tidy    dev:clean  dev:container
 type Release mg.Namespace // release:prepare
 
@@ -265,12 +265,6 @@ func shellVariantList(src []byte) ([]string, error) {
 // release.yml's build job matrix, and release.yml's checksum-step shell loop
 // and tarball-count literal.
 func verifyDistVariants() error {
-	want := make([]string, 0, len(distVariants()))
-	for _, v := range distVariants() {
-		want = append(want, v.name)
-	}
-	sortedWant := slices.Sorted(slices.Values(want))
-
 	ciSrc, err := os.ReadFile(filepath.Join(".github", "workflows", "ci.yml"))
 	if err != nil {
 		return err
@@ -279,6 +273,18 @@ func verifyDistVariants() error {
 	if err != nil {
 		return err
 	}
+	return verifyDistVariantsIn(ciSrc, relSrc)
+}
+
+// verifyDistVariantsIn is verifyDistVariants over caller-supplied workflow
+// contents, split out so the mismatch branches are testable without touching
+// the real workflow files.
+func verifyDistVariantsIn(ciSrc, relSrc []byte) error {
+	want := make([]string, 0, len(distVariants()))
+	for _, v := range distVariants() {
+		want = append(want, v.name)
+	}
+	sortedWant := slices.Sorted(slices.Values(want))
 
 	checks := []struct {
 		where string
@@ -634,6 +640,14 @@ func unitTestPackages() ([]string, error) {
 // Unit runs the unit test suite with coverage, piping output through tparse
 // for a colorful per-package summary table. The package set is discovered
 // dynamically (see unitTestPackages); only unitTestExcludes is omitted.
+// Magefile runs the magefile's own Ginkgo suite. The suite is build-tagged
+// like the magefile itself, so ordinary `go test ./...` and the go-list-based
+// test:unit discovery cannot see it; this target is the canonical way to run
+// it, used by CI's check job and the pre-push hook.
+func (Test) Magefile() error {
+	return sh.RunV("go", "test", "-tags", "mage", ".")
+}
+
 func (Test) Unit() error {
 	fmt.Println("Running unit tests...")
 

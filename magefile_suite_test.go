@@ -27,7 +27,8 @@ import (
 )
 
 // The magefile is build-tagged, so this suite only compiles and runs under
-// `go test -tags mage .` (wired into CI's check job).
+// `go test -tags mage .` — canonically via `mage test:magefile`, which CI's
+// check job and the pre-push hook both run.
 func TestMagefile(t *testing.T) {
 	RegisterFailHandler(Fail)
 	RunSpecs(t, "Magefile Suite")

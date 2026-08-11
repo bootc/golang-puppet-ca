@@ -44,7 +44,7 @@ verify gate described below, which checks that CI already passed.
 
 | Workflow | File | What it does on a `v*` tag |
 | --- | --- | --- |
-| **Release** | [`release.yml`](../../.github/workflows/release.yml) | Verifies the tag equals `"v" +` the `internal/version` constant, builds each variant on a runner native to its architecture (`mage build:distVariant`, no cross toolchain), then aggregates the tarballs, generates `checksums.txt`, and runs `gh release create` |
+| **Release** | [`release.yml`](../../.github/workflows/release.yml) | Verifies the tag equals `"v" +` the `internal/version` constant, builds each variant on a runner native to its architecture (`mage build:distVariant`, no cross toolchain), verifies each built artefact (binaries execute, FIPS variants carry boringcrypto build info), then aggregates the tarballs, generates `checksums.txt`, and runs `gh release create` |
 | **Container images** | [`container-images.yml`](../../.github/workflows/container-images.yml) | After the same verify gate, builds both image variants on native amd64 and arm64 runners and publishes multi-arch manifests. See [publishing container images](publishing-images.md) |
 
 > **CI's full suite does not re-run on tags.** Instead, both tag-triggered
