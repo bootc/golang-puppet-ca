@@ -44,9 +44,6 @@ linters:
         # launcher is already exiting or returning the primary error.
         - (*os.Process).Kill
         - (*os.Process).Signal
-        # Best-effort env cleanup in the signer; failure cannot affect the
-        # already-completed operation.
-        - os.Unsetenv
     gosec:
       # Categorical false-positives confirmed in the security audit. The
       # per-site rules G204/G115/G118 are instead suppressed inline with a

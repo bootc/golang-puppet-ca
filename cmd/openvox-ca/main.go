@@ -349,7 +349,7 @@ func newRootCmd() *cobra.Command {
 				c := exec.Command(exe, os.Args[1:]...) //nolint:gosec // G204: re-execs this same binary (os.Executable) with the operator's own os.Args to daemonize
 				// Strip internal role/PSK vars to prevent stale values from a
 				// previous run from confusing the daemon child.
-				daemonEnv := filterEnv(os.Environ(), "PUPPET_CA_ROLE", "PUPPET_CA_DAEMON", "PUPPET_CA_SIGNER_PSK")
+				daemonEnv := filterEnv(os.Environ(), internalEnvKeys...)
 				c.Env = append(daemonEnv, "PUPPET_CA_DAEMON=1")
 				c.Stdin = nil
 				c.Stdout = nil
@@ -363,6 +363,22 @@ func newRootCmd() *cobra.Command {
 
 			// --- Role dispatch (key isolation) ---
 			role := os.Getenv("PUPPET_CA_ROLE")
+
+			// SECURITY: an unrecognised role must not fall through. Without this,
+			// a typo -- a stale Environment= line, "fronted", "Frontend" -- skips
+			// the launcher (role is non-empty) *and* skips the frontend's dial
+			// (role is not "frontend"), so no signer is spawned, no remote signer
+			// is wired, and the process serves the HTTP API with the CA private
+			// key in its own address space. Exit code 0, no warning: the exact
+			// inverse of the property this topology exists for, and of what
+			// docs/ca-key-security.md promises. The whole fd contract is spent on
+			// making a wrong *descriptor* refuse to start; a wrong role string
+			// disabled the isolation those descriptors protect.
+			switch role {
+			case "", "signer", "frontend":
+			default:
+				return fmt.Errorf("unrecognised PUPPET_CA_ROLE %q: expected \"signer\", \"frontend\", or unset", role)
+			}
 
 			// Signer mode: load key, serve signing requests on socketpair, exit.
 			if role == "signer" {

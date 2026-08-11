@@ -113,7 +113,7 @@ func runLauncher(drain time.Duration) error {
 	// over a pipe, and a variable by that name must never reach a child.
 	// spawnChild clips this before appending to it, so the two children cannot
 	// share a backing array.
-	baseEnv := filterEnv(os.Environ(), "PUPPET_CA_ROLE", "PUPPET_CA_DAEMON", "PUPPET_CA_SIGNER_PSK")
+	baseEnv := filterEnv(os.Environ(), internalEnvKeys...)
 
 	signerCmd, err := spawnChild(exe, baseEnv, "signer", signerSock, pskHex)
 	if err != nil {
@@ -184,6 +184,18 @@ func runLauncher(drain time.Duration) error {
 	}
 }
 
+// internalEnvKeys are the variables the launcher and the --daemon re-exec strip
+// before handing an environment to a child. One list, because the two call sites
+// spelled it out separately and a fourth variable added to one and missed at the
+// other would reach a child stale, with nothing to notice.
+var internalEnvKeys = []string{"PUPPET_CA_ROLE", "PUPPET_CA_DAEMON", "PUPPET_CA_SIGNER_PSK"}
+
+// pskPipeFn is the pipe constructor spawnChild uses. A variable so a spec can
+// capture the descriptor the helper creates and assert directly that it was
+// closed -- the fd-slot arithmetic that stood in for that could not distinguish a
+// leaked pipe from a closed socket, so it passed either way.
+var pskPipeFn = pskPipe
+
 // spawnChild starts one isolated child in the given role, handing it the
 // socketpair end on fd 3 and a freshly loaded PSK pipe on fd 4.
 //
@@ -191,12 +203,6 @@ func runLauncher(drain time.Duration) error {
 // testable: the parent's copies of both descriptors must be dropped as soon as
 // the child holds them, and a PSK pipe created for a child that never starts
 // must not be leaked. Both rules were open-coded twice.
-// pskPipeFn is the pipe constructor spawnChild uses. A variable so a spec can
-// capture the descriptor the helper creates and assert directly that it was
-// closed -- the fd-slot arithmetic that stood in for that could not distinguish a
-// leaked pipe from a closed socket, so it passed either way.
-var pskPipeFn = pskPipe
-
 func spawnChild(exe string, baseEnv []string, role string, sock *os.File, pskHex string) (*exec.Cmd, error) {
 	pskRead, err := pskPipeFn(pskHex)
 	if err != nil {
