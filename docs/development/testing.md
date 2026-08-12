@@ -32,7 +32,8 @@ mage test:bench
 
 `test:unit` runs under `-race`. Several specs exist only to prove concurrency
 guarantees — the storage lock serialising CA bootstrap and key creation, the CRL
-cache, the API's in-flight bookkeeping — and without the race detector they can
+cache, the API's in-flight bookkeeping, the systemd notification path — and
+without the race detector they can
 pass over a genuine data race. The race detector needs cgo, so the target sets
 `CGO_ENABLED=1` and a C compiler has to be installed — see
 [Prerequisites](../../CONTRIBUTING.md#prerequisites). It costs roughly 40% more

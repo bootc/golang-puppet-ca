@@ -15,15 +15,13 @@ guide is the human-friendly entry point; where the two overlap, AGENTS.md wins.
 - [Mage](https://magefile.org/), the build tool this repo uses instead of Make:
   `go install github.com/magefile/mage@latest` (or run targets with
   `go run mage.go <Target>`)
-- A C compiler (gcc or clang), because `mage test:unit` runs the suite under
-  the race detector, which needs cgo. Present by default on most systems; a
+- A C compiler (gcc or clang; `build-essential` on Debian/Ubuntu, the Xcode
+  Command Line Tools on macOS), because `mage test:unit` runs the suite under
+  the race detector, which needs cgo — see
+  [Testing](docs/development/testing.md). Present by default on most systems; a
   slim container image may not have one. The product build is unaffected — it
   is still `CGO_ENABLED=0`.
 - Docker or Podman with the Compose plugin, for the integration and stack tests
-- A C compiler (gcc or clang; `build-essential` on Debian/Ubuntu, the Xcode
-  Command Line Tools on macOS). `mage test:unit` runs under the race detector,
-  which needs cgo — see [Testing](docs/development/testing.md). The binaries
-  themselves still build with `CGO_ENABLED=0`.
 
 ## Building
 
