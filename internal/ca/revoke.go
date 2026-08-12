@@ -22,7 +22,9 @@ import (
 	"context"
 	"crypto/x509"
 	"encoding/pem"
+	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"math/big"
 	"strings"
@@ -53,6 +55,25 @@ func (c *CA) revokeLocked(ctx context.Context, subject string) error {
 
 	serialStr, err := c.findSerialForSubject(ctx, subject)
 	if err != nil {
+		// A read failure is counted; a subject that was simply never issued is
+		// not. The metric's documented meaning is "a revocation that could not be
+		// recorded", and an inventory read that fails is one. On a blob backend
+		// that includes an HMAC verification failure -- a tamper signal -- since
+		// the read goes through ReadInventory; the SQL backends answer from an
+		// indexed SELECT, which verifies nothing, so there the counted cases are
+		// connection and query failures. An *absent* inventory on a blob backend
+		// reaches fs.ErrNotExist and is classed as never-issued, so it is not
+		// counted either. It matters
+		// because Clean swallows this error and deletes anyway, so without the
+		// increment a clean silently became delete-without-revoke with one WARN
+		// line and a flat counter, leaving the alert the mixin ships unable to
+		// fire. Not-found is excluded deliberately: a typo'd certname would
+		// otherwise page someone.
+		// Both the blob and the SQL inventory report a missing subject by
+		// wrapping fs.ErrNotExist, so one check covers every backend.
+		if !errors.Is(err, fs.ErrNotExist) {
+			c.crlUpdateFailures.Add(1)
+		}
 		return fmt.Errorf("could not find certificate for subject %s: %w", subject, err)
 	}
 
@@ -79,16 +100,16 @@ func (c *CA) revokeSerialLocked(ctx context.Context, serialStr string) error {
 		return fmt.Errorf("malformed serial %q", serialStr)
 	}
 
-	// 1. Load CRL
-	crl, err := c.readStoredCRL(ctx)
+	// 1. Load CRL. readStoredCRL counts its own failures now, so this path must
+	// not add a second increment for the same event.
+	stored, err := c.readStoredCRL(ctx)
 	if err != nil {
-		c.crlUpdateFailures.Add(1)
 		return err
 	}
 
 	// 2. Check for duplicate revocation: a serial that's already in the CRL
 	// should not be appended again (prevents unbounded CRL growth on retries).
-	for _, entry := range crl.RevokedCertificateEntries {
+	for _, entry := range stored.own.RevokedCertificateEntries {
 		if entry.SerialNumber.Cmp(serialInt) == 0 {
 			slog.Debug("Certificate already revoked", "serial", serialStr)
 			// Still project the state into the certificate index: a retried
@@ -107,10 +128,10 @@ func (c *CA) revokeSerialLocked(ctx context.Context, serialStr string) error {
 		RevocationTime: time.Now(),
 	}
 
-	revokedCerts := crl.RevokedCertificateEntries
+	revokedCerts := stored.own.RevokedCertificateEntries
 	revokedCerts = append(revokedCerts, newRevoked)
 
-	if err := c.signCRLLocked(ctx, crl.Number, revokedCerts); err != nil {
+	if err := c.signCRLLocked(ctx, stored, revokedCerts); err != nil {
 		return err
 	}
 

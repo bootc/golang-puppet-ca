@@ -68,7 +68,10 @@ openvox-ca-ctl sign --all
 # Revoke a certificate
 openvox-ca-ctl revoke --certname agent.example.com
 
-# Revoke + delete cert and CSR
+# Revoke + delete cert and CSR. The delete happens even if the revocation
+# fails, so check the server log: a certificate that could not be revoked
+# stays a valid credential until it expires, and it is no longer in storage
+# to clean again. See docs/api.md for the state that causes it.
 openvox-ca-ctl clean --certname agent.example.com
 
 # Re-sign the CRL with a fresh validity window (preserves all revocations)
@@ -90,7 +93,18 @@ openvox-ca-ctl import \
   --cadir      /etc/puppetlabs/puppet/ssl \
   --cert-bundle ca_cert.pem \
   --private-key ca_key.pem \
-  --crl-chain   ca_crl.pem     # optional; a new CRL is generated if omitted
+  --crl-chain   ca_crl.pem     # optional; omitting it leaves the stored CRL
+                               # chain alone. One is generated if none is
+                               # stored, and the import is refused if nothing
+                               # stored was signed by the certificate being
+                               # imported -- pass --crl-chain to replace it.
+                               # --crl-chain may hold several concatenated
+                               # CRLs in any order. This CA's own is identified
+                               # by signature and moved to the front; the rest
+                               # are kept and served so agents can do full-chain
+                               # revocation checking. Every X509 CRL block must
+                               # parse; other PEM block types are ignored and
+                               # not stored.
 
 # Migrate an entire CA between storage backends offline (any pair of backends:
 # filesystem, sqlite, postgres, mysql, etcd, redis/valkey). Each backend is

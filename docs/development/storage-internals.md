@@ -15,7 +15,7 @@ interface. Every backend serves the following logical keys:
 | `ca_cert` | CA certificate (PEM) | bootstrap / import |
 | `ca_pubkey` | CA public key (PEM, companion to `ca_cert`) | bootstrap |
 | `ca_key` | CA private key (PEM, optionally AES-256-GCM encrypted) | bootstrap / import |
-| `crl` | Current Certificate Revocation List (PEM) | bootstrap, revoke, rotate |
+| `crl` | Certificate Revocation List (PEM). May hold several concatenated CRLs when a chain has been imported: this CA's own first, ancestors after it. The re-sign path (`readStoredCRL`) and every reader that parses a single CRL (`loadCRLCache`, the metrics collector, `/expirations`) take block 0; the whole-blob consumers are `GET`/`PUT /certificate_revocation_list/ca`, the Kubernetes exporter, and — to preserve ancestor blocks — `crlChainLocked` on the re-sign path and `storedCRLChain` on the import path. Revocation questions are answered from `cachedCRL`, which `loadCRLCache` fills with the block this CA signed — the newest block it signed, wherever it sits, so a stale copy of ours at block 0 is passed over as readily as an ancestor's | bootstrap, revoke, rotate, import |
 | `serial` | Next leaf certificate serial counter | sign |
 | `inventory` | Append-only log of issued/revoked certificates | sign / revoke |
 | `inventory_hmac` | Inventory integrity head (blob HMAC or hash chain on SQL) | sign / revoke |

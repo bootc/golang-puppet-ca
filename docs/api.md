@@ -10,14 +10,34 @@ All endpoints are served under both the bare path and `/puppet-ca/v1/<path>`, so
 | Method | Path | Description |
 | --- | --- | --- |
 | `GET` | `/certificate_status/{subject}` | Get status: `signed`, `requested`, or `revoked` |
-| `PUT` | `/certificate_status/{subject}` | Change state (`signed` or `revoked`); supports `cert_ttl` (seconds) |
-| `DELETE` | `/certificate_status/{subject}` | Revoke + delete cert and CSR (`puppet cert clean`) |
+| `PUT` | `/certificate_status/{subject}` | Change state (`signed` or `revoked`); supports `cert_ttl` (seconds). `revoked` returns `409 Conflict` when the stored CRL was not signed by the CA certificate this process loaded — see the note below |
+| `DELETE` | `/certificate_status/{subject}` | Revoke + delete cert and CSR (`puppet cert clean`). The delete happens even if the revocation fails — see the note below |
 
 `PUT` body:
 
 ```json
 { "desired_state": "signed", "cert_ttl": 86400 }
 ```
+
+> **Note:** revoking amends this CA's own CRL, so it fails with `409 Conflict`
+> when the stored CRL was not signed by the CA certificate this process loaded —
+> re-signing it would destroy a list this CA cannot reproduce. The usual cause is
+> a CA certificate replaced under a running process, since it is read once at
+> startup; the response body names the cause and the remedy, which is to restart
+> the replica holding the stale certificate. `PUT /certificate_revocation_list/ca`
+> refuses the same state for the same reason.
+>
+> **`clean` is not symmetric with `revoke` here.** Clean's job is to remove the
+> certificate, so a revocation that fails does not stop it: `DELETE
+> /certificate_status/{subject}` and `PUT /clean` return success, delete the
+> certificate, and leave it unrevoked and usable as a credential until it expires.
+> In the `409` state above that means the whole revoke family does *not* fail
+> closed — the `PUT` refuses, the `DELETE` succeeds. The revoke failure is logged
+> at `WARN` ("stays a valid credential until it expires") and counted in
+> `puppetca_crl_update_failures_total`, so
+> [`PuppetCACRLUpdateFailing`](metrics.md#crl) fires. Recovering needs both a
+> restart of the stale replica *and* the serial revoked by hand, because the
+> certificate is no longer in storage to clean again.
 
 `GET` response:
 
@@ -98,14 +118,14 @@ Response:
 
 | Method | Path | Description |
 | --- | --- | --- |
-| `GET` | `/certificate_revocation_list/ca` | Download the current CRL PEM |
-| `PUT` | `/certificate_revocation_list/ca` | Re-sign the CRL with a fresh validity window (preserves all revocations); admin-only. Returns the new CRL PEM |
+| `GET` | `/certificate_revocation_list/ca` | Download the stored CRL PEM verbatim. When a CRL **chain** was imported (see `--crl-chain`) the response is that whole chain, this CA's own CRL first, so agents can perform full-chain revocation checking (Puppet's default `certificate_revocation = chain`). Ancestor CRLs are preserved across re-signing but are never fetched or refreshed by this CA — they are only ever as current as what was imported |
+| `PUT` | `/certificate_revocation_list/ca` | Re-sign **this CA's own** CRL with a fresh validity window (preserves all revocations and every ancestor block); admin-only. Returns the whole stored chain, this CA's own CRL first. Returns `409 Conflict` when the stored CRL was not signed by the CA certificate this process loaded — the usual cause is a replaced CA certificate on an unrestarted replica, and the response body names the remedy |
 
 ## Expirations
 
 | Method | Path | Description |
 | --- | --- | --- |
-| `GET` | `/expirations` | CA cert and CRL expiry dates |
+| `GET` | `/expirations` | CA cert and CRL expiry dates. The CRL date is **this CA's own CRL (block 0) only** — imported ancestor CRLs are not reflected, so an ancestor can be past its `nextUpdate` while this reports a comfortable date. See [metrics](metrics.md#crl) |
 
 ## Server-side key generation
 

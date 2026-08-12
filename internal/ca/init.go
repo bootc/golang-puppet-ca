@@ -180,17 +180,11 @@ func (c *CA) seedSupportingState(ctx context.Context) error {
 		} else if !errors.Is(err, fs.ErrNotExist) {
 			return fmt.Errorf("re-checking CRL: %w", err)
 		}
-		now := time.Now().UTC()
-		crlTemplate := &x509.RevocationList{
-			Number:     big.NewInt(1),
-			ThisUpdate: now,
-			NextUpdate: now.Add(c.crlValidity()),
-		}
-		crlBytes, err := x509.CreateRevocationList(rand.Reader, crlTemplate, c.CACert, c.CAKey)
+		crl, err := newEmptyCRL(c.CACert, c.CAKey, c.crlValidity())
 		if err != nil {
 			return fmt.Errorf("creating initial CRL: %w", err)
 		}
-		crlPEM := pem.EncodeToMemory(&pem.Block{Type: "X509 CRL", Bytes: crlBytes})
+		crlPEM := pem.EncodeToMemory(&pem.Block{Type: "X509 CRL", Bytes: crl.Raw})
 		// Bootstrap-only write: runs before any CRL consumer exists, so it
 		// deliberately skips the crlNotify signal (see signCRLLocked).
 		if err := c.Storage.UpdateCRL(ctx, crlPEM); err != nil {
@@ -457,28 +451,20 @@ func (c *CA) bootstrapCA(ctx context.Context) error {
 	}
 
 	// Generate empty CRL.
-	crlTemplate := &x509.RevocationList{
-		Number:     big.NewInt(1),
-		ThisUpdate: now,
-		NextUpdate: now.Add(c.crlValidity()),
-	}
-	crlBytes, err := x509.CreateRevocationList(rand.Reader, crlTemplate, c.CACert, c.CAKey)
+	crl, err := newEmptyCRL(c.CACert, c.CAKey, c.crlValidity())
 	if err != nil {
-		return fmt.Errorf("failed to create initial CRL: %w", err)
+		return err
 	}
-	crlPEM := pem.EncodeToMemory(&pem.Block{Type: "X509 CRL", Bytes: crlBytes})
+	crlPEM := pem.EncodeToMemory(&pem.Block{Type: "X509 CRL", Bytes: crl.Raw})
 	// Bootstrap-only write: runs before any CRL consumer exists, so it
 	// deliberately skips the crlNotify signal (see signCRLLocked).
 	if err := c.Storage.UpdateCRL(ctx, crlPEM); err != nil {
 		return fmt.Errorf("failed to write initial CRL: %w", err)
 	}
 
-	// Cache the CRL we just created.
-	parsedCRL, err := x509.ParseRevocationList(crlBytes)
-	if err != nil {
-		return fmt.Errorf("failed to parse initial CRL for cache: %w", err)
-	}
-	c.cachedCRL = parsedCRL
+	// Cache the CRL we just created. newEmptyCRL returns it parsed, so there is
+	// nothing to re-parse and no second failure mode to report.
+	c.cachedCRL = crl
 
 	// Touch inventory.
 	if err := c.Storage.TouchInventory(ctx); err != nil {
@@ -501,6 +487,12 @@ func (c *CA) loadCRLCache(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("reading CRL: %w", err)
 	}
+	// Block 0 is parsed on its own, and is the only part whose failure is fatal.
+	// Decoding the whole blob here would make a single corrupt trailing block
+	// abort startup — which is both harsher than this function's own policy for
+	// a strictly worse condition (a foreign block 0, warned about below) and
+	// unnecessary: the cache answers from block 0, and handleGetCRL streams the
+	// blob without parsing it, so a malformed ancestor block affects neither.
 	block, _ := pem.Decode(crlPEM)
 	if block == nil {
 		return fmt.Errorf("CRL is empty or not PEM-encoded")
@@ -509,6 +501,80 @@ func (c *CA) loadCRLCache(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("parsing CRL: %w", err)
 	}
+
+	// The cache answers "did we revoke this serial", so it must hold our own
+	// CRL. Block 0 is ours by construction — signCRLLocked writes it first and
+	// import reorders to match — but a hand-assembled blob could put an
+	// ancestor's CRL there, and checking revocation against an ancestor's list
+	// would let a certificate this CA revoked go on authenticating.
+	//
+	// A warning rather than a hard failure: refusing to start leaves the CA
+	// entirely unavailable, where continuing gives a running CA with a loud,
+	// actionable message. The write path (readStoredCRL) does fail closed,
+	// because re-signing over an ancestor's CRL destroys it.
+	//
+	// The remedy offered is a re-import. 'openvox-ca-ctl reissue-crl' is
+	// deliberately not suggested: it reaches readStoredCRL and fails closed on
+	// this very condition, so it would send the operator to a command that
+	// returns 500 without surfacing why.
+	// The search runs unconditionally, not only when block 0 is foreign. Block 0
+	// being ours is not the same as block 0 being our *newest*: a blob holding a
+	// stale export ahead of the current one passes the ownership check, and the
+	// cache then answers "did we revoke this serial" from a list missing every
+	// serial revoked since the export -- so a certificate this CA revoked
+	// authenticates, silently, which is the exact failure the foreign-block-0
+	// search exists to prevent. Gating the search on the foreign case left the
+	// stale case uncovered, and the stale case is the one an upgrade produces:
+	// the released build's import wrote the operator's bundle verbatim.
+	// Captured before the selection replaces crl. The remedy warning below has to
+	// describe the blob as *stored*, not as repaired: on [foreign, ours] the
+	// selection makes crl ours, so testing it afterwards suppressed the one line
+	// that names the fix -- and every write path still fails closed on that blob,
+	// so the operator was left with an informational "found later in the chain"
+	// line and no remedy, indistinguishable from the benign stale-duplicate case
+	// that self-heals at the next re-sign.
+	leadIsOurs := c.ownsCRL(crl)
+
+	newest, position, decodeErr := c.selectOwnCRL(crlPEM)
+	switch {
+	case decodeErr != nil:
+		// A chain that will not decode keeps block 0, warned about below if it is
+		// also foreign. The blob is served without parsing and the cache answers
+		// from block 0, so neither is affected by a malformed ancestor.
+		slog.Warn("Could not decode the stored CRL chain to look for this CA's own block; "+
+			"continuing with block 0", "error", decodeErr)
+	case newest == nil:
+		// Nothing in the blob is ours. There is nothing better to cache, so the
+		// foreign block stays: the same outcome as an empty CRL, and the
+		// deliberate availability trade-off described above.
+	case position > 0:
+		slog.Warn("Using this CA's own CRL found later in the stored chain",
+			"position", position, "crl_number", newest.Number)
+		crl = newest
+	case newerCRL(newest, crl):
+		// position == 0 and still newer than what block 0 parsed to cannot
+		// happen; kept as a belt-and-braces arm so the selection, not this
+		// switch, decides which block wins.
+		crl = newest
+	}
+
+	if !leadIsOurs {
+		slog.Warn("Stored CRL does not lead with this CA's own CRL; revocation checks may be using the wrong list. "+
+			"Re-import the CRL chain with this CA's own CRL first",
+			"crl_authority_key_id", fmt.Sprintf("%x", crl.AuthorityKeyId),
+			"ca_subject_key_id", fmt.Sprintf("%x", c.CACert.SubjectKeyId))
+	}
+
 	c.cachedCRL = crl
 	return nil
+}
+
+// indexOfCRL returns the position of crl in chain, for diagnostics.
+func indexOfCRL(chain []*x509.RevocationList, crl *x509.RevocationList) int {
+	for i, candidate := range chain {
+		if candidate == crl {
+			return i
+		}
+	}
+	return -1
 }

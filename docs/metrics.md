@@ -90,6 +90,40 @@ the Unix epoch, the Prometheus convention for `*_timestamp_seconds` gauges.
 | `puppetca_crl_revoked_certificates` | Number of certificates currently listed in the CRL. |
 | `puppetca_crl_update_failures_total` | Counter of failures to amend the CRL — a revocation that could not be recorded, or a CRL that could not be re-signed or written (across the revoke, cleanup, reissue and refresh paths). A rising value means the CRL is not being maintained; for revocations it means a superseded certificate may still be a valid credential. Resets to `0` on process restart. |
 
+The four CRL gauges above describe the **first block of the stored blob**, which
+is normally this CA's own CRL and not always: a hand-assembled blob can lead with
+an ancestor's, and the CA then answers revocation from its own block found later
+in the chain (see [storage internals](development/storage-internals.md)) while
+these series still describe block 0. Startup warns loudly in that state, and every
+write path refuses it, so it is a condition to fix rather than to monitor. When a CRL chain has been imported, the ancestor CRLs that follow it
+are not covered: this CA cannot re-sign them, so their expiry is not something a
+refresh can fix and not something these series track.
+
+> **The shipped CRL expiry alerts do not cover ancestor CRLs.**
+> `PuppetCACRLExpiringSoon` and `PuppetCACRLExpired` read
+> `puppetca_crl_next_update_timestamp_seconds`, which is block 0 — and the
+> background refresher keeps block 0 perpetually fresh. So an ancestor CRL can
+> lapse, breaking full-chain revocation checking for every agent running Puppet's
+> default `certificate_revocation = chain`, while both alerts stay green. Until
+> a chain-aware series exists, track ancestor `nextUpdate` deadlines out of band
+> and re-import before they lapse.
+>
+> **No series tracks the chain's length either, so watch the log during a rolling
+> upgrade.** A replica running a build from before chain preservation re-signs the
+> CRL by writing one block, dropping every ancestor — and nothing detects it,
+> because the next re-sign on an upgraded replica then reads one block and writes
+> one block while `puppetca_crl_number` keeps climbing. Upgrade every replica
+> before importing a chain, and keep the imported bundle so it can be re-imported
+> if this does happen. A re-sign that *can* see a difference says so, at `WARN`:
+>
+> ```text
+> level=WARN msg="Stored CRL chain length changed while re-signing" blocks_read=2 blocks_written=1
+> ```
+>
+> On a healthy CA that line never appears: every block that is not ours is carried
+> across, and import discards duplicates of our own. Treat one as a chain to
+> inspect.
+
 ### Leaf certificates
 
 One series per known (non-deleted) leaf certificate or pending request. Cleaned
