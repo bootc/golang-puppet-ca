@@ -221,8 +221,10 @@ flat, the reads are succeeding and the stored CRL genuinely has not advanced.
 
 Restarting the replica reloads the CRL, selecting the newest block this CA
 signed the same way the sync does. If the stored chain carries none, startup
-warns rather than serving from a list it cannot vouch for, and the re-sign paths
-refuse it outright — see
+warns loudly and keeps serving from whatever block 0 holds — an availability
+trade rather than a fail-closed refusal — while the re-sign paths refuse that
+blob outright. The sync then replaces the foreign copy as soon as a CRL of ours
+is stored. See
 [Revocation across replicas](configuration.md#revocation-across-replicas).
 
 ## Alerting

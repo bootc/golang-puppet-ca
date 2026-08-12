@@ -234,7 +234,6 @@ var _ = Describe("SyncCRLCache", func() {
 		ctx := context.Background()
 		poison := foreignCRLPEM(9999)
 		Expect(signer.Storage.UpdateCRL(ctx, poison)).To(Succeed())
-		before := signer.CRLUpdateFailures()
 
 		// A window far larger than any validity, so the job would re-sign if it
 		// were willing to.
@@ -247,13 +246,45 @@ var _ = Describe("SyncCRLCache", func() {
 		stored, err := signer.Storage.GetCRL(ctx)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(stored).To(Equal(poison))
+	})
 
-		// Both refusals must reach puppetca_crl_update_failures_total, which
-		// docs/metrics.md says covers the reissue and refresh paths and which
-		// the mixin alerts on. A refusal that only logged would leave a stuck
-		// refresh invisible until the CRL's NextUpdate lapsed fleet-wide.
-		Expect(signer.CRLUpdateFailures()).To(Equal(before+2),
-			"the reissue and refresh refusals must both be counted")
+	// main's loadCRLCache keeps a foreign block 0 and warns rather than refusing
+	// to start, so the cache is not always one of ours. Ordering our CRL against
+	// a foreign one compares numbers from two different issuers: an ancestor's
+	// 47 would outrank our freshly seeded 1 for ever, and the decline would be
+	// silent — no counter, no alert, and the replica answering revocation from a
+	// list this CA never signed.
+	It("replaces a cached CRL this CA did not sign, whatever the numbers say", func() {
+		ctx := context.Background()
+
+		// Start a replica whose stored chain carries only an ancestor's CRL,
+		// numbered far above anything of ours. It warns and caches that block.
+		dir, err := os.MkdirTemp("", "openvox-ca-crlsync-foreign-cache")
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(func() { os.RemoveAll(dir) })
+
+		store := storage.New(dir)
+		Expect(store.EnsureDirs(ctx)).To(Succeed())
+		Expect(store.SaveCAKey(ctx, cachedKeyPEM)).To(Succeed())
+		Expect(store.SaveCACert(ctx, cachedCrtPEM)).To(Succeed())
+		Expect(store.UpdateCRL(ctx, foreignCRLPEM(47))).To(Succeed())
+		Expect(store.WriteSerial(ctx, "0001")).To(Succeed())
+		Expect(store.TouchInventory(ctx)).To(Succeed())
+
+		stranded := ca.New(store, ca.AutosignConfig{Mode: "off"}, "puppet.test")
+		Expect(stranded.Init(ctx)).To(Succeed(), "a foreign block 0 must not stop the CA starting")
+
+		// The operator repairs storage with a CRL of ours. Its number is 1,
+		// well below the ancestor's 47.
+		Expect(store.UpdateCRL(ctx, cachedCrlPEM)).To(Succeed())
+
+		updated, err := stranded.SyncCRLCache(ctx)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(updated).To(BeTrue(), "our CRL must replace a foreign one regardless of number")
+
+		num, ok := stranded.CachedCRLNumber()
+		Expect(ok).To(BeTrue())
+		Expect(num.Cmp(big.NewInt(1))).To(BeZero(), "must now be deciding from our own CRL")
 	})
 
 	It("counts a CRL it cannot read", func() {

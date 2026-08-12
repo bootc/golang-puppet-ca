@@ -409,11 +409,16 @@ func parseCert(pemData []byte) (*x509.Certificate, error) {
 	return x509.ParseCertificate(block.Bytes)
 }
 
-// parseCRL decodes a PEM-encoded X.509 CRL, taking the first block — which is
-// the CA's own, the convention every reader of the stored blob shares (see
-// ca.ownStoredCRLLocked). puppetca_crl_number is compared against
-// puppetca_crl_cached_number by the mixin's lag alert, so reading a different
-// block here than the cache does would make that difference meaningless.
+// parseCRL decodes a PEM-encoded X.509 CRL, taking the first block.
+//
+// The cache reads whichever block this CA signed most recently (ca.selectOwnCRL)
+// rather than block 0, so puppetca_crl_number and puppetca_crl_cached_number
+// agree only while block 0 is that block — which it is on any CA whose chain was
+// written by import or a re-sign, both of which put ours first. On a
+// hand-assembled blob that leads with an ancestor the two describe different
+// issuers, and the mixin's lag alert would read the difference as a lag. Startup
+// warns about exactly that blob and every write path refuses it, so it is a
+// state to repair rather than one to monitor: see docs/metrics.md.
 func parseCRL(pemData []byte) (*x509.RevocationList, error) {
 	block, _ := pem.Decode(pemData)
 	if block == nil {

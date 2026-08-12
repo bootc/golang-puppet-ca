@@ -18,6 +18,7 @@
 package ca
 
 import (
+	"bytes"
 	"context"
 	"crypto/x509"
 	"fmt"
@@ -84,11 +85,34 @@ func (c *CA) SyncCRLCache(ctx context.Context) (bool, error) {
 	}
 
 	// Nothing new: the overwhelmingly common outcome, since the job ticks far
-	// more often than anything revokes. newerCRL is the same ordering the rest
-	// of the package uses, so an unnumbered CRL of ours — openssl's V1 output
-	// cannot carry a number — is ordered the same way here as at import.
-	if c.cachedCRL != nil && !newerCRL(ours, c.cachedCRL) {
+	// more often than anything revokes, and the cheapest thing to establish —
+	// the same bytes are the same CRL, whoever signed them.
+	if c.cachedCRL != nil && bytes.Equal(ours.Raw, c.cachedCRL.Raw) {
 		return false, nil
+	}
+
+	// The cached copy is not always one of ours, so it cannot simply be ordered
+	// against what we just selected. loadCRLCache keeps a foreign block 0 and
+	// warns rather than refusing to start — an availability trade this package
+	// makes deliberately — and comparing CRL numbers issued by two different
+	// authorities is meaningless: an ancestor's number 47 would outrank our
+	// freshly generated number 1 for ever, and the decline would be silent,
+	// leaving this replica answering revocation from a list this CA never
+	// signed with no counter moving and no alert firing.
+	//
+	// So ordering only applies between two CRLs of ours. Where the cached one is
+	// foreign, ours replaces it unconditionally: that direction is always the
+	// correct one.
+	if c.cachedCRL != nil && c.ownsCRL(c.cachedCRL) {
+		// newerCRL is the same ordering the rest of the package uses, so an
+		// unnumbered CRL of ours — openssl's V1 output cannot carry a number —
+		// is ordered the same way here as at import.
+		if !newerCRL(ours, c.cachedCRL) {
+			return false, nil
+		}
+	} else if c.cachedCRL != nil {
+		slog.Warn("Replacing a cached CRL this CA did not sign with our own",
+			"crl_number", ours.Number)
 	}
 
 	previous := c.cachedCRL
