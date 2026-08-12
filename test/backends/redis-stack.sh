@@ -16,6 +16,13 @@
 #   ./test/backends/redis-stack.sh --up --keep  # start stack, run, keep running
 #
 # Output: TAP format. Exit 0 on all pass, exit 1 on any failure.
+#
+# On failure, an --up run replays the tail of every stack service's container
+# log to stderr (all but puppet-client, whose log is empty by construction)
+# before tearing the stack down, since teardown is
+# what makes those logs unrecoverable. --up --keep skips that teardown dump and
+# leaves the containers up for `compose logs` instead; a readiness timeout
+# still prints the timed-out service's own log either way.
 
 set -uo pipefail
 
@@ -59,16 +66,25 @@ for arg in "$@"; do
     esac
 done
 
-# -- Helper: abort a readiness wait loudly, dumping the culprit's logs ------
-# The wait loops below used to print " OK" whether or not the endpoint ever
-# answered, so a replica that never came up surfaced only as a downstream
-# cascade of HTTP-000 test failures. Calling this on timeout instead turns
-# that into a single actionable failure plus the container logs that explain
-# why (e.g. a Phase 1 bootstrap abort on the losing replica).
-abort_not_ready() {  # human-description  service-name
-    printf ' TIMEOUT\n'
-    printf 'FATAL: %s did not become ready in time\n' "$1" >&2
-    printf '# ---- last 80 log lines from %s ----\n' "$2" >&2
+# -- How much of each container's log to replay when the run fails ---------
+# One knob for every dump site, deliberately: when the readiness abort dumped
+# the timed-out service at its own shallower depth, the culprit ended up with
+# the least log of anything in the run. Deep enough matters most for the two
+# CA replicas, the only services here with restart: on-failure -- their log is
+# several concatenated start attempts, and it is the first one that holds the
+# reason.
+FAILURE_LOG_TAIL=200
+
+# -- Helper: replay a service's container logs to our stderr ---------------
+# Shared by the readiness aborts and the end-of-run failure dump, both of
+# which need the container's own account of what went wrong.
+#
+# A copy of this helper, the tail constant and dump_failure_logs below lives in
+# test/puppet/puppet-stack.sh (which explains why they are copied rather than
+# sourced) -- keep the two in step.
+dump_logs() {  # service-name
+    local _svc="$1" _tail="$FAILURE_LOG_TAIL"
+    printf '# ---- last %s log lines from %s ----\n' "$_tail" "$_svc" >&2
     # Send both the container's stdout and stderr to our stderr. Do NOT add
     # `2>/dev/null`: with `>&2` alone, fd1 is redirected to the current stderr
     # and fd2 already points there, so both streams reach the operator. A
@@ -76,7 +92,42 @@ abort_not_ready() {  # human-description  service-name
     # -- and under `podman logs` a container's stderr (where Go services write
     # their startup/abort diagnostics) is replayed to *our* stderr, so the very
     # lines that explain the failed bootstrap would be discarded.
-    "${_COMPOSE[@]}" logs --tail 80 "$2" >&2 || true
+    "${_COMPOSE[@]}" logs --tail "$_tail" "$_svc" >&2 || true
+}
+
+# -- Every container worth hearing from when the run fails -----------------
+# The CA replicas and Redis for the backend assertions; the master and
+# OpenVoxDB for the Phase 1 catalog run; postgres because OpenVoxDB will not
+# start until it is healthy, so a postgres fault shows up as an empty
+# OpenVoxDB log. puppet-client is deliberately absent: its entrypoint is
+# `tail -f /dev/null` and the agent runs through `compose exec`, so its
+# container log holds nothing to dump -- the agent's own output is captured by
+# the caller instead.
+FAILURE_LOG_SERVICES=(openvox-ca openvox-ca-2 redis puppet-master openvoxdb postgres)
+
+dump_failure_logs() {  # [service-already-dumped]
+    local _skip="${1:-}" _svc
+    for _svc in "${FAILURE_LOG_SERVICES[@]}"; do
+        [ "$_svc" = "$_skip" ] && continue
+        dump_logs "$_svc"
+    done
+}
+
+# -- Helper: abort a readiness wait loudly, dumping the culprit's logs ------
+# The wait loops below used to print " OK" whether or not the endpoint ever
+# answered, so a replica that never came up surfaced only as a downstream
+# cascade of HTTP-000 test failures. Calling this on timeout instead turns
+# that into a single actionable failure plus the container logs that explain
+# why (e.g. a Phase 1 bootstrap abort on the losing replica).
+#
+# The culprit's own logs are dumped here, unconditionally and first, because
+# they are what the operator wants to read; cleanup() adds the rest of the
+# stack below when it is about to destroy it.
+abort_not_ready() {  # human-description  service-name
+    printf ' TIMEOUT\n'
+    printf 'FATAL: %s did not become ready in time\n' "$1" >&2
+    dump_logs "$2"
+    _ABORTED_SERVICE="$2"  # so cleanup() does not replay these lines again
     exit 1
 }
 
@@ -84,7 +135,24 @@ abort_not_ready() {  # human-description  service-name
 WORK_DIR=$(mktemp -d /tmp/redis-stack-integ.XXXXXX)
 
 cleanup() {
+    # First statement: $? here is the status the script is exiting with.
+    local _rc=$?
     rm -rf "$WORK_DIR"
+
+    # Any non-zero exit means something went wrong and the containers are
+    # about to be destroyed, taking their account of it with them: a failed
+    # assertion (which used to print its TAP line and nothing else), a
+    # readiness abort, or a shell error. Dumping from the trap rather than
+    # from each failure site is what makes that true of *every* exit path,
+    # including ones added later. Ordered before the teardown below so the
+    # containers still exist. On a --keep run (or a run against a stack this
+    # script did not start) nothing is destroyed, so the logs stay available
+    # to `compose logs` and are left there.
+    if [ "$_rc" -ne 0 ] && $DO_UP && ! $DO_KEEP; then
+        printf '\n# Run failed (exit %d) -- dumping container logs before teardown\n' "$_rc" >&2
+        dump_failure_logs "${_ABORTED_SERVICE:-}"
+    fi
+
     if $DO_UP && ! $DO_KEEP; then
         printf '\n# Tearing down compose stack...\n'
         "${_COMPOSE[@]}" down --volumes --timeout 10 2>/dev/null || true
@@ -1152,6 +1220,10 @@ printf '\n# Phase 2 results: %d/%d passed, %d failed\n' \
 if [ "$FAILURES" -ne 0 ] || [ "$PHASE1_RC" -ne 0 ]; then
     printf '# Overall: FAIL  (phase1_rc=%d phase2_failures=%d)\n' \
         "$PHASE1_RC" "$FAILURES"
+    # cleanup() dumps every container's logs on the way out, so the failing
+    # assertion above is followed by the CA's own account of why -- e.g. the
+    # error behind a 409 on every revocation in the Race E storm, which this
+    # script used to discard at teardown.
     exit 1
 fi
 printf '# Overall: PASS\n'

@@ -12,6 +12,13 @@
 #
 # Output: TAP format.  Exit 0 on all pass, exit 1 on any failure.
 #
+# On failure, an --up run replays the tail of every stack service's container
+# log to stderr (all but puppet-client, whose log is empty by construction)
+# before tearing the stack down, since teardown is
+# what makes those logs unrecoverable. --up --keep skips that teardown dump and
+# leaves the containers up for `compose logs` instead; a readiness timeout
+# still prints the timed-out service's own log either way.
+#
 # NOTE: Group 6 revokes the client cert.  clean_client_cert() revokes any
 # stale cert and clears the client SSL dir before Groups 3 and 8.
 
@@ -168,11 +175,72 @@ run_master_agent() {
         "$@" 2>&1
 }
 
+# -- How much of each container's log to replay when the run fails ---------
+# One knob for every dump site, deliberately: when the readiness abort dumped
+# the timed-out service at its own shallower depth, the culprit ended up with
+# the least log of anything in the run.
+FAILURE_LOG_TAIL=200
+
+# -- Helper: replay a service's container logs to our stderr ---------------
+# Shared by the readiness aborts and cleanup()'s failure dump, both of which
+# need the container's own account of what went wrong. Deliberately a copy of
+# the helper in test/backends/redis-stack.sh rather than a shared sourced file:
+# nothing under test/ is sourced today, and these two harnesses already keep
+# independent copies of their engine detection, argument parsing and TAP
+# helpers, so a lone shared file would be the odd one out.
+dump_logs() {  # service-name
+    local _svc="$1" _tail="$FAILURE_LOG_TAIL"
+    printf '# ---- last %s log lines from %s ----\n' "$_tail" "$_svc" >&2
+    # Send both the container's stdout and stderr to our stderr. Do NOT add
+    # `2>/dev/null`: with `>&2` alone, fd1 is redirected to the current stderr
+    # and fd2 already points there, so both streams reach the operator. A
+    # `2>/dev/null` would instead route the command's stderr to the bit-bucket
+    # -- and under `podman logs` a container's stderr (where Go services write
+    # their startup/abort diagnostics) is replayed to *our* stderr, so the very
+    # lines that explain the failed bootstrap would be discarded.
+    "${_COMPOSE[@]}" logs --tail "$_tail" "$_svc" >&2 || true
+}
+
+# -- Every container worth hearing from when the run fails -----------------
+# postgres is included because OpenVoxDB will not start until it is healthy,
+# so a postgres fault shows up as an empty OpenVoxDB log. puppet-client is
+# deliberately absent: its entrypoint is `tail -f /dev/null` and the agent runs
+# through exec_client, so its container log holds nothing to dump -- the
+# agent's own output is captured by the caller instead.
+FAILURE_LOG_SERVICES=(openvox-ca puppet-master openvoxdb postgres)
+
+dump_failure_logs() {  # [service-already-dumped]
+    local _skip="${1:-}" _svc
+    for _svc in "${FAILURE_LOG_SERVICES[@]}"; do
+        [ "$_svc" = "$_skip" ] && continue
+        dump_logs "$_svc"
+    done
+}
+
 # -- Stack lifecycle ------------------------------------------------------─
+# Defined after the dump helpers above, so nothing the EXIT trap calls is
+# still undefined at the moment the trap is installed.
 
 cleanup() {
+    # First statement: $? here is the status the script is exiting with.
+    local _rc=$?
     rm -rf "$WORK_DIR"
     exec_client rm -rf /etc/puppetlabs/puppet/ssl 2>/dev/null || true
+
+    # Any non-zero exit means something went wrong and the containers are about
+    # to be destroyed, taking their account of it with them: a failed assertion
+    # (which used to print its `not ok` line and nothing else), a readiness
+    # abort, the pre-flight CA fetch, or a shell error. Dumping from the trap
+    # rather than from each failure site is what makes that true of *every*
+    # exit path, including ones added later. Ordered before the teardown below
+    # so the containers still exist. On a --keep run (which is how
+    # run-puppet-stack-on-redis.sh drives this script) nothing is destroyed
+    # here, so the logs stay available to `compose logs` and to that caller's
+    # own failure dump.
+    if [ "$_rc" -ne 0 ] && $DO_UP && ! $DO_KEEP; then
+        printf '\n# Run failed (exit %d) -- dumping container logs before teardown\n' "$_rc" >&2
+        dump_failure_logs "${_ABORTED_SERVICE:-}"
+    fi
 
     if $DO_UP && ! $DO_KEEP; then
         printf '\n# Tearing down compose stack...\n'
@@ -189,15 +257,8 @@ trap cleanup EXIT
 abort_not_ready() {  # human-description  service-name
     printf ' TIMEOUT\n'
     printf 'FATAL: %s did not become ready in time\n' "$1" >&2
-    printf '# ---- last 80 log lines from %s ----\n' "$2" >&2
-    # Send both the container's stdout and stderr to our stderr. Do NOT add
-    # `2>/dev/null`: with `>&2` alone, fd1 is redirected to the current stderr
-    # and fd2 already points there, so both streams reach the operator. A
-    # `2>/dev/null` would instead route the command's stderr to the bit-bucket
-    # -- and under `podman logs` a container's stderr (where Go services write
-    # their startup/abort diagnostics) is replayed to *our* stderr, so the very
-    # lines that explain the failed bootstrap would be discarded.
-    "${_COMPOSE[@]}" logs --tail 80 "$2" >&2 || true
+    dump_logs "$2"
+    _ABORTED_SERVICE="$2"  # so cleanup() does not replay these lines again
     exit 1
 }
 
@@ -802,4 +863,6 @@ refresh_master_crl && printf '#   master CRL refreshed\n' || true
 printf '\n# Results: %d/%d passed, %d failed\n' \
     $(( T - FAILURES )) "$T" "$FAILURES"
 
+# A non-zero status here sends cleanup() down its failure-dump path, so a
+# failed assertion is followed by the container logs that explain it.
 [ "$FAILURES" -eq 0 ]
