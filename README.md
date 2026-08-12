@@ -148,6 +148,15 @@ The complete flag, environment-variable, and config-file reference is in
 | [Container images](docs/container-images.md) | Pulling and running the published images |
 | [Migration guide](docs/migrating-from-puppet-server.md) | Replacing an OpenVox/Puppet Server built-in CA |
 
+Two behaviours differ from what an OpenVox/Puppet Server operator will expect,
+and both refuse a request that used to succeed: `GET
+/certificate_status/{subject}` is admin-only rather than readable by any agent,
+and `POST /certificate_renewal` accepts only certificates this CA issued and has
+not revoked. Each is described with its symptom, its denial log line and the
+opt-out, under [authorisation
+parity](docs/migrating-from-puppet-server.md#authorisation-parity) and [renewal
+eligibility](docs/migrating-from-puppet-server.md#renewal-eligibility).
+
 ## Contributing
 
 Contributions are welcome. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for how to

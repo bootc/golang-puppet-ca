@@ -86,8 +86,9 @@ All endpoints are served under both the bare path and `/puppet-ca/v1/<path>`, so
 
 Requires a valid CA-signed client certificate. The new certificate is issued immediately without entering the pending-CSR queue or autosign evaluation, and the certificate it replaces is revoked once the new one is safely stored (see `revoke_on_auto_renew` below for the auto-renewal case).
 
-<a id="renewal-eligibility"></a>
-**Renewal eligibility.** The presented client certificate must be one **this CA** issued, must not be revoked, and must be the certificate for the subject being renewed. Today none of the three produces a distinct error: the authorisation middleware trusts exactly this CA's certificate, so it refuses a foreign or revoked certificate first with `403 access denied`, and the subject condition cannot be reached at all because the handler derives the subject from the presented certificate. The CA's own `403 certificate not eligible for renewal` becomes reachable for the first two once a second issuer can be trusted for client authentication; the third guards future callers of the internal API rather than any request path.
+### Renewal eligibility
+
+The presented client certificate must be one **this CA** issued, must not be revoked, and must be the certificate for the subject being renewed. Today none of the three produces a distinct error: the authorisation middleware trusts exactly this CA's certificate, so it refuses a foreign or revoked certificate first with `403 access denied`, and the subject condition cannot be reached at all because the handler derives the subject from the presented certificate. The CA's own `403 certificate not eligible for renewal` becomes reachable for the first two once a second issuer can be trusted for client authentication; the third guards future callers of the internal API rather than any request path.
 
 - **CSR body (re-key):** the CSR Common Name must match the authenticated client CN — an agent can only renew its own certificate, not another's. Issues a certificate for the new key in the CSR. Puppet OID extensions are copied from the CSR **except** authorization-arc OIDs (`1.3.6.1.4.1.34380.1.3.*`, such as `pp_cli_auth`), which are stripped so a submitted CSR cannot request elevated privileges.
 

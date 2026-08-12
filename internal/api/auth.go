@@ -69,7 +69,7 @@ const (
 //   - tierPublic: no client cert required (bootstrap endpoints)
 //   - tierAnyClient: any CA-signed client cert
 //   - tierSelfOrAdmin: own cert or admin CN
-//   - tierAdminOnly: admin CN only (signing, revocation, generation)
+//   - tierAdminOnly: admin CN only (signing, revocation, generation, status reads)
 //
 // NIST 800-53: AC-3 (Access Enforcement), IA-3 (Device Identification and Authentication)
 func newAuthMiddleware(cfg *AuthConfig, myCA *ca.CA, next http.Handler) http.Handler {

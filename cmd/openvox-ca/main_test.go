@@ -20,6 +20,9 @@ package main
 import (
 	"bytes"
 	"io"
+	"log/slog"
+	"os"
+	"path/filepath"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -55,5 +58,49 @@ var _ = Describe("Root command", func() {
 		flag := cmd.Flags().ShorthandLookup("v")
 		Expect(flag).NotTo(BeNil())
 		Expect(flag.Name).To(Equal("verbosity"))
+	})
+})
+
+// The migration guide tells operators the denial log renders as
+// reason="route requires admin access" on stderr and
+// "reason":"route requires admin access" when logfile is set, attributing the
+// difference to the handler this function picks. The API suite pins the fields;
+// this pins the half of the claim that lives here.
+var _ = Describe("setupLogger handler selection", func() {
+	var orig *slog.Logger
+
+	BeforeEach(func() {
+		orig = slog.Default()
+		DeferCleanup(func() { slog.SetDefault(orig) })
+	})
+
+	It("writes JSON to the log file when one is configured", func() {
+		path := filepath.Join(GinkgoT().TempDir(), "ca.log")
+		f, err := setupLogger(&serverConfig{LogFile: path})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(f).NotTo(BeNil())
+		DeferCleanup(func() { Expect(f.Close()).To(Succeed()) })
+
+		slog.Warn("Request denied by authorisation middleware",
+			"reason", "route requires admin access")
+
+		data, err := os.ReadFile(path)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(string(data)).To(ContainSubstring(`"reason":"route requires admin access"`))
+	})
+
+	It("writes text to stderr when no log file is configured", func() {
+		f, err := setupLogger(&serverConfig{})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(f).To(BeNil(), "nothing to close when logging to stderr")
+
+		// The handler is the text one, so the same call renders key=value
+		// rather than JSON. Asserted through a buffer of our own rather than
+		// by capturing stderr, which the suite shares.
+		var buf bytes.Buffer
+		slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+		slog.Warn("Request denied by authorisation middleware",
+			"reason", "route requires admin access")
+		Expect(buf.String()).To(ContainSubstring(`reason="route requires admin access"`))
 	})
 })
