@@ -91,15 +91,38 @@ var _ = Describe("setupLogger handler selection", func() {
 	})
 
 	It("writes text to stderr when no log file is configured", func() {
+		// Both halves of the guide's claim: the text rendering, and that it
+		// goes to stderr. The handler captures whatever os.Stderr names when
+		// it is constructed, so swapping in a pipe around the call is enough
+		// to read back what an operator's journal would receive.
+		r, w, err := os.Pipe()
+		Expect(err).NotTo(HaveOccurred())
+		origStderr := os.Stderr
+		os.Stderr = w
 		f, err := setupLogger(&serverConfig{})
+		os.Stderr = origStderr
 		Expect(err).NotTo(HaveOccurred())
 		Expect(f).To(BeNil(), "nothing to close when logging to stderr")
 
-		// The handler this installed, not one the spec supplies: the rendering
-		// the migration guide promises follows from the type, and asserting a
-		// buffer we wired ourselves would pass just as well if main.go picked
-		// JSON here. Its destination is the process's stderr, which the suite
-		// shares, so the type is what can be checked.
 		Expect(slog.Default().Handler()).To(BeAssignableToTypeOf(&slog.TextHandler{}))
+
+		slog.Warn("Request denied by authorisation middleware",
+			"reason", "route requires admin access")
+		Expect(w.Close()).To(Succeed())
+		out, err := io.ReadAll(r)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(r.Close()).To(Succeed())
+		Expect(string(out)).To(ContainSubstring(`reason="route requires admin access"`))
+	})
+
+	It("refuses to start when the log file cannot be opened", func() {
+		// Both callers return this straight out of the command, so a bad
+		// logfile is a startup failure; the path is what an operator needs to
+		// see in it.
+		missing := filepath.Join(GinkgoT().TempDir(), "no-such-dir", "ca.log")
+		f, err := setupLogger(&serverConfig{LogFile: missing})
+		Expect(err).To(MatchError(ContainSubstring("failed to open log file")))
+		Expect(err).To(MatchError(ContainSubstring(missing)))
+		Expect(f).To(BeNil())
 	})
 })

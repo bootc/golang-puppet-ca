@@ -156,13 +156,17 @@ Two rules catch operators out, neither of which changes a stock deployment.
 
 `GET /certificate_status/{subject}` is admin-only. That matches OpenVox/Puppet
 Server's shipped `auth.conf`, so only a configuration that had been relaxed to
-let ordinary agent certificates read statuses loses that access — and there are
-three ways to grant it back. Denials are logged, with the string to grep for, in
+let ordinary agent certificates read statuses loses that access. It can be
+granted back two ways, both of which confer the whole admin tier — signing and
+revocation included — plus an escape hatch that makes the route public rather
+than authenticated. Denials are logged, with the string to grep for, in
 [authorisation parity](docs/migrating-from-puppet-server.md#authorisation-parity).
 
 `POST /certificate_renewal` accepts only certificates this CA issued and has not
 revoked. In the default single-issuer topology nothing reaches that check that
-was not already refused at the TLS layer; it becomes load-bearing once a second
+the authorisation middleware had not already refused with `403 access denied` —
+TLS itself requests a client certificate without verifying it, so the middleware
+is where any of this is enforced. The gate becomes load-bearing once a second
 issuer can be trusted for client authentication. There is no opt-out: an agent
 holding a certificate from a replaced CA must re-enrol. See [renewal
 eligibility](docs/migrating-from-puppet-server.md#renewal-eligibility).

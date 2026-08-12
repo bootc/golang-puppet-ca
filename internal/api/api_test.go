@@ -30,6 +30,7 @@ import (
 	"encoding/asn1"
 	"encoding/json"
 	"encoding/pem"
+	"log/slog"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
@@ -1370,6 +1371,7 @@ var _ = Describe("API Workflow", func() {
 		Context("when the middleware trusts an issuer the CA did not", func() {
 			var (
 				splitMux      http.Handler
+				logBuf        *bytes.Buffer
 				foreignCert   *x509.Certificate
 				foreignCACert *x509.Certificate
 				foreignCAPriv *rsa.PrivateKey
@@ -1410,6 +1412,14 @@ var _ = Describe("API Workflow", func() {
 				splitServer := api.New(myCA)
 				splitServer.AuthConfig = &api.AuthConfig{CACert: foreignCA}
 				splitMux = splitServer.Routes()
+
+				// The eligibility refusals are logged, and the migration guide
+				// tells operators to grep for them, so capture the default
+				// logger for these specs.
+				logBuf = &bytes.Buffer{}
+				orig := slog.Default()
+				slog.SetDefault(slog.New(slog.NewTextHandler(logBuf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+				DeferCleanup(func() { slog.SetDefault(orig) })
 			})
 
 			It("refuses an empty-body renewal with 403 from the handler", func() {
@@ -1423,6 +1433,14 @@ var _ = Describe("API Workflow", func() {
 				// handler, and the authorisation oracle relies on telling them
 				// apart.
 				Expect(rr.Body.String()).To(ContainSubstring("not eligible for renewal"))
+
+				// The migration guide publishes this string as a grep target,
+				// which makes it a contract like the middleware's own denial
+				// log. The empty-body form has its own message: an operator
+				// filtering for one must not silently miss the other.
+				Expect(logBuf.String()).To(ContainSubstring("Auto-renewal rejected: certificate not eligible"))
+				Expect(logBuf.String()).To(ContainSubstring("subject=" + subject))
+				Expect(logBuf.String()).To(ContainSubstring("error="))
 			})
 
 			It("refuses a CSR-based renewal with 403 from the handler", func() {
@@ -1435,6 +1453,10 @@ var _ = Describe("API Workflow", func() {
 
 				Expect(rr.Code).To(Equal(http.StatusForbidden))
 				Expect(rr.Body.String()).To(ContainSubstring("not eligible for renewal"))
+
+				Expect(logBuf.String()).To(ContainSubstring("Renewal rejected: certificate not eligible"))
+				Expect(logBuf.String()).To(ContainSubstring("subject=" + subject))
+				Expect(logBuf.String()).To(ContainSubstring("error="))
 			})
 
 			It("refuses a foreign certificate whose CN is not certname-shaped with 403, not 500", func() {
