@@ -1,0 +1,130 @@
+# promtool rule tests for the CRL-propagation alerts.
+#
+# Run with `mage test:mixin` from the repository root, which renders the mixin
+# to the path below and then runs both promtool checks over it.
+#
+# These cover PuppetCACRLStale, whose expression is the only one in the mixin
+# built from set operators (`or`, `unless`, `and on(...)`). Its two arms exist
+# for different failure shapes and the qualifier on the second exists to keep it
+# quiet during a third, none of which is obvious from reading the PromQL.
+#
+# The firing behaviour is the contract here; the annotation prose is not, so
+# repeating it below is a maintenance cost rather than an assertion worth
+# having. It is repeated anyway because promtool gives no choice: exp_annotations
+# is compared whenever a case expects an alert, and omitting it asserts the
+# alert carries none. Reword an annotation in alerts.libsonnet and this file has
+# to be updated in step.
+rule_files:
+  # Relative to this file; written by mage test:mixin.
+  - ../.test-output/mixin-alerts.yaml
+
+evaluation_interval: 1m
+
+tests:
+  # A replica whose cached CRL trails the stored one is stale, and pages once
+  # the lag outlives crlLagFor (10m). A gap shorter than that is just the sync
+  # interval doing its job after a revocation, and must stay quiet.
+  - interval: 1m
+    name: cached CRL behind the stored one
+    input_series:
+      - series: 'puppetca_crl_number{job="openvox-ca",instance="ca-1:9140"}'
+        values: "7+0x30"
+      - series: 'puppetca_crl_cached_number{job="openvox-ca",instance="ca-1:9140"}'
+        values: "6+0x30"
+      - series: 'puppetca_collector_scrape_success{job="openvox-ca",instance="ca-1:9140"}'
+        values: "1+0x30"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: PuppetCACRLStale
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: PuppetCACRLStale
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: openvox-ca
+              instance: ca-1:9140
+            exp_annotations:
+              summary: "Puppet CA replica is enforcing an out-of-date CRL."
+              description: "The Puppet CA on ca-1:9140 has not caught up with the CRL in storage for more than 10m, so certificates revoked on another replica are still being accepted here. Either it is behind the stored CRL, or the stored CRL cannot be read at all (in which case puppetca_crl_number is absent for this instance). Check puppetca_crl_sync_failures_total and the CA logs. A restart reloads the CRL, selecting the newest block this CA signed; if the stored chain carries none, startup warns and the re-sign paths refuse it, so check the stored chain rather than restarting repeatedly."
+
+  # A replica in step with storage must never fire, however long it runs.
+  - interval: 1m
+    name: cached CRL level with the stored one
+    input_series:
+      - series: 'puppetca_crl_number{job="openvox-ca",instance="ca-1:9140"}'
+        values: "7+0x30"
+      - series: 'puppetca_crl_cached_number{job="openvox-ca",instance="ca-1:9140"}'
+        values: "7+0x30"
+      - series: 'puppetca_collector_scrape_success{job="openvox-ca",instance="ca-1:9140"}'
+        values: "1+0x30"
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: PuppetCACRLStale
+        exp_alerts: []
+
+  # The second arm. An unreadable or unparseable stored CRL drops
+  # puppetca_crl_number while the cached number keeps being published, so the
+  # subtraction has no left operand — without this arm the alert would go silent
+  # in one of the two cases it exists for.
+  - interval: 1m
+    name: stored CRL unreadable while the scrape still succeeds
+    input_series:
+      - series: 'puppetca_crl_cached_number{job="openvox-ca",instance="ca-1:9140"}'
+        values: "6+0x30"
+      - series: 'puppetca_collector_scrape_success{job="openvox-ca",instance="ca-1:9140"}'
+        values: "1+0x30"
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: PuppetCACRLStale
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: openvox-ca
+              instance: ca-1:9140
+            exp_annotations:
+              summary: "Puppet CA replica is enforcing an out-of-date CRL."
+              description: "The Puppet CA on ca-1:9140 has not caught up with the CRL in storage for more than 10m, so certificates revoked on another replica are still being accepted here. Either it is behind the stored CRL, or the stored CRL cannot be read at all (in which case puppetca_crl_number is absent for this instance). Check puppetca_crl_sync_failures_total and the CA logs. A restart reloads the CRL, selecting the newest block this CA signed; if the stored chain carries none, startup warns and the re-sign paths refuse it, so check the stored chain rather than restarting repeatedly."
+
+  # ...and the qualifier on that arm. A storage outage drops the same series,
+  # but is already paged by PuppetCAScrapeFailing, so this must not double-page.
+  - interval: 1m
+    name: whole gather failing is left to the scrape alert
+    input_series:
+      - series: 'puppetca_crl_cached_number{job="openvox-ca",instance="ca-1:9140"}'
+        values: "6+0x30"
+      - series: 'puppetca_collector_scrape_success{job="openvox-ca",instance="ca-1:9140"}'
+        values: "0+0x30"
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: PuppetCACRLStale
+        exp_alerts: []
+
+  # The sync-failure warning is a plain increase() over a restart-resetting
+  # counter, but it is meant to lead the page above: crlSyncFor (5m) is shorter
+  # than crlLagFor (10m), so at 8m the warning is firing and the critical is not.
+  - interval: 1m
+    name: sync failures warn before the lag pages
+    input_series:
+      - series: 'puppetca_crl_sync_failures_total{job="openvox-ca",instance="ca-1:9140"}'
+        values: "0 1+1x30"
+      - series: 'puppetca_crl_number{job="openvox-ca",instance="ca-1:9140"}'
+        values: "7+0x30"
+      - series: 'puppetca_crl_cached_number{job="openvox-ca",instance="ca-1:9140"}'
+        values: "6+0x30"
+      - series: 'puppetca_collector_scrape_success{job="openvox-ca",instance="ca-1:9140"}'
+        values: "1+0x30"
+    alert_rule_test:
+      - eval_time: 8m
+        alertname: PuppetCACRLSyncFailing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: openvox-ca
+              instance: ca-1:9140
+            exp_annotations:
+              summary: "Puppet CA cannot reload its CRL from storage."
+              description: "The Puppet CA on ca-1:9140 could not reload the stored CRL (puppetca_crl_sync_failures_total is rising), so it is enforcing whichever CRL it already held. A certificate revoked on another replica may still be accepted here. Check CRL storage, and whether the CA certificate was replaced without restarting this replica."
+      - eval_time: 8m
+        alertname: PuppetCACRLStale
+        exp_alerts: []

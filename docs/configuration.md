@@ -97,6 +97,11 @@ csr_rate_limit: 60    # max CSR submissions per IP per minute; 0 = disable rate 
 disable_crl_refresh: false     # true = never auto-refresh the CRL
 crl_refresh_interval_sec: 0    # how often to check; 0 = built-in default (1h)
 crl_refresh_before_sec: 0      # re-sign when remaining validity < this; 0 = crl_validity/3
+# Background CRL sync reloads the stored CRL into the copy this replica's
+# revocation checks read, so a revocation performed on another replica takes
+# effect here. Read-only, runs on every replica, and is not covered by
+# disable_crl_refresh. See "Revocation across replicas" below.
+crl_sync_interval_sec: 0       # how often to reload; 0 = built-in default (60s)
 # Background expired-certificate cleanup (opt-in). When enabled, a job removes
 # certificates that expired more than the retention grace period ago from the
 # inventory and the CRL, and deletes their stored signed certificate. Safe to run
@@ -177,6 +182,7 @@ The CA key passphrase can also be provided via `PUPPET_CA_KEY_PASSPHRASE` (env v
 | `disable_crl_refresh` | `PUPPET_CA_DISABLE_CRL_REFRESH` |
 | `crl_refresh_interval_sec` | `PUPPET_CA_CRL_REFRESH_INTERVAL_SEC` |
 | `crl_refresh_before_sec` | `PUPPET_CA_CRL_REFRESH_BEFORE_SEC` |
+| `crl_sync_interval_sec` | `PUPPET_CA_CRL_SYNC_INTERVAL_SEC` |
 | `enable_expired_cert_cleanup` | `PUPPET_CA_ENABLE_EXPIRED_CERT_CLEANUP` |
 | `expired_cert_retention_sec` | `PUPPET_CA_EXPIRED_CERT_RETENTION_SEC` |
 | `expired_cert_cleanup_interval_sec` | `PUPPET_CA_EXPIRED_CERT_CLEANUP_INTERVAL_SEC` |
@@ -197,6 +203,68 @@ The CA key passphrase can also be provided via `PUPPET_CA_KEY_PASSPHRASE` (env v
 
 Boolean env vars accept any value accepted by `strconv.ParseBool`: `1`, `t`, `true`,
 `yes`, `on` (case-insensitive) to enable; `0`, `f`, `false`, `no`, `off` to disable.
+
+## Revocation across replicas
+
+The CA answers "is this certificate revoked?" from a copy of the CRL it holds in
+memory, not from storage — the check is on the hot path of every authenticated
+request, and it also backs the OCSP responses this replica signs. The copy is
+loaded at startup and rewritten whenever *that* process re-signs the CRL, which
+on a single node is the whole story.
+
+On the shared backends (`etcd`, `redis`, `postgres`, `mysql`) it is not: only
+the replica that handled the revocation re-signs, so every other
+replica would go on accepting the certificate until it happened to re-sign on
+its own. `crl_sync_interval_sec` closes that. Each replica re-reads the stored
+CRL on the interval and installs it if it has advanced, which makes the interval
+the worst-case window in which a revoked certificate still works against a
+replica that did not revoke it. The default is 60 seconds.
+
+Two things the window does not cover, both worth knowing before you rely on it:
+
+- **OCSP responses already handed out.** The responder signs each response with
+  four hours of validity and clients cache it, so a verifier that asked before
+  the revocation can keep treating the certificate as valid for that long. The
+  sync drops this replica's own cached responses for newly revoked serials, but
+  answers already in a client's or proxy's cache cannot be recalled. This
+  applies only if you have enabled the responder with `--ocsp-url`.
+- **Certificates issued to the agent before it was locked out.** Revoking one
+  serial does not revoke another the same subject already holds. Renewal is not
+  a way out — `POST /certificate_renewal` re-reads the CRL from storage rather
+  than trusting the cached copy, so a revoked certificate is refused there even
+  on a replica that has not synced — but if you are locking out a compromised
+  node rather than retiring one certificate, check the inventory for other live
+  serials for that subject, or use `openvox-ca-ctl clean` to revoke and remove
+  them together.
+- **A renewal that coincides with a storage read failure.** That re-read is
+  best-effort: if it fails, the check falls back to the CRL already in memory
+  rather than refusing every renewal in the fleet over a transient backend
+  error. Such a renewal is bounded by the ordinary propagation window instead of
+  by the read-through check. `puppetca_crl_sync_failures_total` is what tells
+  you it happened.
+
+The read is one small blob, takes no cluster lock, and writes nothing, so it
+costs the same on every backend and needs no leader. Lengthening the interval
+trades that cost against the window; there is no switch to turn it off, and
+`disable_crl_refresh` does not — that setting governs whether this deployment
+*re-signs* the CRL on a timer, which is a separate question from whether
+revocations reach it.
+
+`filesystem` and `sqlite` are single-node, so the sync has nothing to find and
+the setting does not matter there.
+
+To confirm propagation, compare `puppetca_crl_cached_number` (per replica)
+against `puppetca_crl_number` (from storage) — see
+[metrics](metrics.md#watching-revocation-propagate).
+
+Restarting a replica also reloads its CRL. The sync installs only a CRL this CA
+signed, picking out the newest such block wherever it sits in the stored chain —
+the same selection the startup loader and the re-sign paths make. A stored chain
+carrying nothing of ours leaves the replica on the CRL it already holds and
+raises `puppetca_crl_sync_failures_total`; startup warns about the same
+condition and the re-sign paths refuse it outright. See
+[storage backends](storage-backends.md) for how that state is reached and
+repaired.
 
 ## Autosigning
 

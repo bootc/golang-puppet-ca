@@ -19,6 +19,8 @@ package metrics_test
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 
 	dto "github.com/prometheus/client_model/go"
 
@@ -138,6 +140,102 @@ var _ = Describe("Collector", func() {
 		crlUpdateFailures := g.findByLabels("puppetca_crl_update_failures_total", nil)
 		Expect(crlUpdateFailures).NotTo(BeNil())
 		Expect(counterValue(crlUpdateFailures)).To(Equal(0.0))
+
+		// Likewise the CRL-sync failure counter, which is what tells an operator
+		// this replica may be enforcing an out-of-date revocation list.
+		crlSyncFailures := g.findByLabels("puppetca_crl_sync_failures_total", nil)
+		Expect(crlSyncFailures).NotTo(BeNil())
+		Expect(counterValue(crlSyncFailures)).To(Equal(0.0))
+
+		// The cached CRL number is the copy this replica decides revocation
+		// from; on a replica that is up to date it equals the stored one.
+		cached := g.findByLabels("puppetca_crl_cached_number", nil)
+		Expect(cached).NotTo(BeNil())
+		Expect(gaugeValue(cached)).To(Equal(gaugeValue(g.findByLabels("puppetca_crl_number", nil))))
+	})
+
+	It("reports a cached CRL number behind the stored one on a replica that has not synced", func() {
+		signCert("divergent-node")
+
+		// A second CA over the same storage, with a CRL cache of its own.
+		peer := ca.New(storage.New(store.CADir()), ca.AutosignConfig{Mode: "off"}, "puppet.test")
+		Expect(peer.Init(ctx)).To(Succeed())
+
+		Expect(myCA.Revoke(ctx, "divergent-node")).To(Succeed())
+
+		g := gather(metrics.NewCollector(peer))
+		stored := gaugeValue(g.findByLabels("puppetca_crl_number", nil))
+		cached := gaugeValue(g.findByLabels("puppetca_crl_cached_number", nil))
+		Expect(cached).To(BeNumerically("<", stored),
+			"the gap the alert fires on must be visible in the metrics")
+
+		updated, err := peer.SyncCRLCache(ctx)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(updated).To(BeTrue())
+
+		g = gather(metrics.NewCollector(peer))
+		Expect(gaugeValue(g.findByLabels("puppetca_crl_cached_number", nil))).To(Equal(stored))
+	})
+
+	It("reports a nonzero sync-failure count once a replica has failed to reload", func() {
+		peer := ca.New(storage.New(store.CADir()), ca.AutosignConfig{Mode: "off"}, "puppet.test")
+		Expect(peer.Init(ctx)).To(Succeed())
+
+		// Corrupt the stored CRL so the next sync refuses it.
+		Expect(store.UpdateCRL(ctx, []byte("not a CRL"))).To(Succeed())
+		_, err := peer.SyncCRLCache(ctx)
+		Expect(err).To(HaveOccurred())
+
+		// Asserting the value rather than just its presence is the point: both
+		// failure counters start at zero and are otherwise only ever observed
+		// there, so transposing their descriptors would go unnoticed.
+		g := gather(metrics.NewCollector(peer))
+		Expect(counterValue(g.findByLabels("puppetca_crl_sync_failures_total", nil))).
+			To(Equal(float64(peer.CRLSyncFailures())))
+		Expect(counterValue(g.findByLabels("puppetca_crl_sync_failures_total", nil))).
+			To(BeNumerically(">", 0))
+		Expect(counterValue(g.findByLabels("puppetca_crl_update_failures_total", nil))).
+			To(Equal(0.0), "a failed reload is not a failed amendment")
+	})
+
+	// The whole reason these two are emitted ahead of the gather's error return
+	// is that a storage outage is when an operator most needs them: it is what
+	// makes a replica fall behind in the first place. Worth a spec, since the
+	// ordering is a one-line accident away from being lost.
+	It("keeps reporting the in-process CRL tallies when the storage gather fails", func() {
+		signCert("gather-failure-node")
+
+		before := gather(metrics.NewCollector(myCA))
+		cachedBefore := gaugeValue(before.findByLabels("puppetca_crl_cached_number", nil))
+
+		// Replace the directory ListCerts enumerates with a plain file, so the
+		// listing returns a real error rather than an empty set.
+		signedDir := filepath.Join(store.CADir(), "signed")
+		Expect(os.RemoveAll(signedDir)).To(Succeed())
+		Expect(os.WriteFile(signedDir, []byte("not a directory"), 0o600)).To(Succeed())
+
+		g := gather(metrics.NewCollector(myCA))
+		Expect(gaugeValue(g.findByLabels("puppetca_collector_scrape_success", nil))).To(Equal(0.0),
+			"precondition: the gather must actually have failed")
+		Expect(g.findByLabels("puppetca_crl_number", nil)).To(BeNil(),
+			"precondition: the storage-derived series drop out")
+
+		Expect(counterValue(g.findByLabels("puppetca_crl_sync_failures_total", nil))).
+			To(Equal(float64(myCA.CRLSyncFailures())))
+		cached := g.findByLabels("puppetca_crl_cached_number", nil)
+		Expect(cached).NotTo(BeNil(), "the cached CRL number must survive a failed gather")
+		Expect(gaugeValue(cached)).To(Equal(cachedBefore))
+	})
+
+	It("omits the cached CRL number rather than reporting zero when no CRL is loaded", func() {
+		// The alert subtracts the cached number from the stored one, so a zero
+		// here would read as "maximally behind" and page for every replica that
+		// has not finished initialising. Absent is the only safe encoding.
+		uninitialised := ca.New(storage.New(GinkgoT().TempDir()), ca.AutosignConfig{Mode: "off"}, "puppet.test")
+
+		g := gather(metrics.NewCollector(uninitialised))
+		Expect(g.findByLabels("puppetca_crl_cached_number", nil)).To(BeNil())
+		Expect(gaugeValue(g.findByLabels("puppetca_ca_ready", nil))).To(Equal(0.0))
 	})
 
 	It("reports per-leaf metrics with issuance state", func() {

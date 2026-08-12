@@ -718,6 +718,47 @@ func (Test) Unit() error {
 	return tparseErr
 }
 
+// Mixin renders the Jsonnet monitoring mixin and checks the alerting rules it
+// produces: `promtool check rules` for syntax, then `promtool test rules` for
+// the behaviour of the ones whose expressions are not simple thresholds (see
+// mixin/tests.yaml).
+//
+// The mixin ships rules but no Go code, so nothing else in the suite would
+// notice a malformed selector substitution, or an expression that parses fine
+// and silently never matches. Skips with a message when jsonnet or promtool is
+// absent, so a contributor without them can still run everything else.
+func (Test) Mixin() error {
+	fmt.Println("Checking the monitoring mixin...")
+
+	for _, tool := range []string{"jsonnet", "promtool"} {
+		if _, err := exec.LookPath(tool); err != nil {
+			fmt.Printf("Skipping mixin checks: %s not found in PATH\n", tool)
+			return nil
+		}
+	}
+
+	if err := os.MkdirAll(".test-output", 0755); err != nil {
+		return err
+	}
+	// mixin/tests.yaml names this path in its rule_files, so the two have to
+	// agree; it is relative to that file, hence the ../ there.
+	rendered := filepath.Join(".test-output", "mixin-alerts.yaml")
+
+	out, err := sh.Output("jsonnet", "-S", "-J", "mixin",
+		"-e", "std.manifestYamlDoc((import 'mixin/mixin.libsonnet').prometheusAlerts)")
+	if err != nil {
+		return fmt.Errorf("rendering the mixin: %w", err)
+	}
+	if err := os.WriteFile(rendered, []byte(out), 0600); err != nil {
+		return fmt.Errorf("writing %s: %w", rendered, err)
+	}
+
+	if err := sh.RunV("promtool", "check", "rules", rendered); err != nil {
+		return err
+	}
+	return sh.RunV("promtool", "test", "rules", filepath.Join("mixin", "tests.yaml"))
+}
+
 // IntegCompose builds the binaries locally then runs the multi-host compose
 // integration test suite, tearing down on exit.
 func (Test) IntegCompose() error {

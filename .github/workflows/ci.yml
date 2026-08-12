@@ -75,6 +75,49 @@ jobs:
       - name: Run markdownlint-cli2
         run: npx --yes markdownlint-cli2@0.23.1
 
+  # -- Monitoring mixin --------------------------------------------------------
+  # The mixin ships Prometheus alerting rules and no Go code, so nothing in the
+  # unit suite would catch a malformed selector substitution, or an expression
+  # that parses but silently never matches. Renders it with jsonnet, then runs
+  # promtool over the result: `check rules` for syntax, `test rules` for the
+  # behaviour of the rules whose expressions are not simple thresholds.
+  mixin:
+    name: Monitoring mixin
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Install jsonnet
+        run: go install github.com/google/go-jsonnet/cmd/jsonnet@v0.21.0
+      # From the release tarball rather than `go install`: the prometheus module
+      # carries replace directives, so installing its commands from source
+      # fails. Release assets are mutable, so the download is pinned by digest
+      # as well as by version — every other third-party artefact this workflow
+      # pulls in is content-pinned (actions by commit SHA, Go modules by the
+      # checksum database), and an unverified binary we then execute should not
+      # be the exception. PROMETHEUS_SHA256 is the published sha256sums.txt
+      # entry for the tarball below; bump both together.
+      - name: Install promtool
+        env:
+          PROMETHEUS_VERSION: 3.13.2
+          PROMETHEUS_SHA256: 0e8c4d46101bd025ea8265e377d2caabc57f488fc1be1c367f37db69ea41be6f
+        run: |
+          set -euo pipefail
+          tarball="prometheus-${PROMETHEUS_VERSION}.linux-amd64"
+          curl -fsSL -o promtool.tar.gz \
+            "https://github.com/prometheus/prometheus/releases/download/v${PROMETHEUS_VERSION}/${tarball}.tar.gz"
+          echo "${PROMETHEUS_SHA256}  promtool.tar.gz" | sha256sum -c -
+          tar -xzf promtool.tar.gz "${tarball}/promtool"
+          install -m 0755 "${tarball}/promtool" "$(go env GOPATH)/bin/promtool"
+          rm -rf promtool.tar.gz "${tarball}"
+      - name: Install Mage
+        run: go install github.com/magefile/mage@v1.17.2
+      - name: Check the mixin
+        run: mage test:mixin
+
   # -- Unit tests --------------------------------------------------------------─
   unit:
     name: Unit tests
@@ -362,6 +405,7 @@ jobs:
       - check
       - hadolint
       - markdownlint
+      - mixin
       - unit
       - dist
       - puppet

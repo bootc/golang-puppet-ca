@@ -70,6 +70,8 @@ type Collector struct {
 	caReady        *prometheus.Desc
 
 	crlUpdateFailures *prometheus.Desc
+	crlSyncFailures   *prometheus.Desc
+	crlCachedNumber   *prometheus.Desc
 
 	caInfo      *prometheus.Desc
 	caNotBefore *prometheus.Desc
@@ -111,6 +113,18 @@ func NewCollector(c *ca.CA) *Collector {
 				"that could not be re-signed or written (across revoke, cleanup, reissue and refresh). "+
 				"A rising value means the CRL is not being maintained; for revocations it means a "+
 				"superseded certificate may still be a valid credential.",
+			nil, nil),
+		crlSyncFailures: prometheus.NewDesc(
+			prometheus.BuildFQName(namespace, "crl", "sync_failures_total"),
+			"Total failures to reload the stored CRL into the copy this replica's revocation checks "+
+				"read — an unreadable or unparseable CRL, or one this CA did not sign. While it is "+
+				"rising, a certificate revoked on another replica may still be accepted here.",
+			nil, nil),
+		crlCachedNumber: prometheus.NewDesc(
+			prometheus.BuildFQName(namespace, "crl", "cached_number"),
+			"CRL sequence number of the copy this replica is answering revocation checks from. "+
+				"Lags puppetca_crl_number by at most one sync interval; a persistent gap means this "+
+				"replica is enforcing an out-of-date revocation list.",
 			nil, nil),
 		caInfo: prometheus.NewDesc(
 			prometheus.BuildFQName(namespace, "ca_certificate", "info"),
@@ -171,6 +185,8 @@ func (c *Collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.scrapeDuration
 	ch <- c.caReady
 	ch <- c.crlUpdateFailures
+	ch <- c.crlSyncFailures
+	ch <- c.crlCachedNumber
 	ch <- c.caInfo
 	ch <- c.caNotBefore
 	ch <- c.caNotAfter
@@ -199,11 +215,20 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 
 	ch <- prometheus.MustNewConstMetric(c.scrapeDuration, prometheus.GaugeValue, duration.Seconds())
 
-	// This counter is an in-process event tally, independent of the storage
-	// gather, so emit it even when the gather below fails — an unreadable
-	// backend must not blind operators to CRL-maintenance failures.
+	// These are in-process tallies of the CA's own state, independent of the
+	// storage gather, so emit them even when the gather below fails — an
+	// unreadable backend must not blind operators to CRL-maintenance failures,
+	// nor to a replica enforcing an out-of-date revocation list. The cached CRL
+	// number in particular is most worth having when storage reads are the thing
+	// going wrong, since that is what makes a replica fall behind.
 	ch <- prometheus.MustNewConstMetric(c.crlUpdateFailures, prometheus.CounterValue,
 		float64(c.ca.CRLUpdateFailures()))
+	ch <- prometheus.MustNewConstMetric(c.crlSyncFailures, prometheus.CounterValue,
+		float64(c.ca.CRLSyncFailures()))
+	if cached, ok := c.ca.CachedCRLNumber(); ok {
+		num, _ := new(big.Float).SetInt(cached).Float64()
+		ch <- prometheus.MustNewConstMetric(c.crlCachedNumber, prometheus.GaugeValue, num)
+	}
 
 	if err != nil {
 		slog.Warn("Prometheus CA metrics scrape failed", "error", err)
@@ -384,7 +409,16 @@ func parseCert(pemData []byte) (*x509.Certificate, error) {
 	return x509.ParseCertificate(block.Bytes)
 }
 
-// parseCRL decodes a PEM-encoded X.509 CRL.
+// parseCRL decodes a PEM-encoded X.509 CRL, taking the first block.
+//
+// The cache reads whichever block this CA signed most recently (ca.selectOwnCRL)
+// rather than block 0, so puppetca_crl_number and puppetca_crl_cached_number
+// agree only while block 0 is that block — which it is on any CA whose chain was
+// written by import or a re-sign, both of which put ours first. On a
+// hand-assembled blob that leads with an ancestor the two describe different
+// issuers, and the mixin's lag alert would read the difference as a lag. Startup
+// warns about exactly that blob and every write path refuses it, so it is a
+// state to repair rather than one to monitor: see docs/metrics.md.
 func parseCRL(pemData []byte) (*x509.RevocationList, error) {
 	block, _ := pem.Decode(pemData)
 	if block == nil {

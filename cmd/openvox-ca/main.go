@@ -708,25 +708,12 @@ func newRootCmd() *cobra.Command {
 				slog.Info("TLS enabled", "cert", cfg.TLSCert)
 			}
 
-			// Background CRL refresh: keeps the CRL's NextUpdate from lapsing on a
-			// low-churn CA. Safe on every replica (serialised on the shared CRL
-			// lock). Bound to ctx so it stops on shutdown.
-			if !cfg.DisableCRLRefresh {
-				refreshBefore := myCA.DefaultCRLRefreshBefore()
-				if cfg.CRLRefreshBeforeSec > 0 {
-					refreshBefore = time.Duration(cfg.CRLRefreshBeforeSec) * time.Second
-				}
-				go runCRLRefresher(ctx, myCA, cfg.crlRefreshInterval(), refreshBefore)
-			} else {
-				slog.Info("CRL auto-refresh disabled by configuration")
-			}
-
-			// Background expired-certificate cleanup (opt-in): prunes certs that
-			// expired more than the retention grace period ago from the inventory
-			// and CRL. Safe on every replica (serialised on the shared CRL lock).
-			// Bound to ctx so it stops on shutdown.
-			if cfg.EnableExpiredCertCleanup {
-				go runCertCleaner(ctx, myCA, cfg.expiredCertCleanupInterval(), cfg.expiredCertRetention())
+			// Periodic upkeep. Which jobs a configuration runs is decided by
+			// backgroundJobs, so that it can be asserted rather than inferred
+			// from the shape of this block; each is bound to ctx and stops on
+			// shutdown.
+			for _, job := range backgroundJobs(cfg, myCA) {
+				go job.run(ctx)
 			}
 
 			// Optional Kubernetes export: publish the CA cert/CRL into the
