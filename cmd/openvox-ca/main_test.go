@@ -136,9 +136,9 @@ var _ = Describe("setupLogger handler selection", func() {
 		Entry("default is Info", 0,
 			[]slog.Level{slog.LevelInfo}, []slog.Level{slog.LevelDebug}),
 		Entry("-v is Debug", 1,
-			[]slog.Level{slog.LevelDebug}, []slog.Level{slog.Level(-8)}),
+			[]slog.Level{slog.LevelDebug}, []slog.Level{levelTrace}),
 		Entry("-vv is Trace", 2,
-			[]slog.Level{slog.LevelDebug, slog.Level(-8)}, nil),
+			[]slog.Level{slog.LevelDebug, levelTrace}, nil),
 	)
 
 	It("refuses to start when the log file cannot be opened", func() {

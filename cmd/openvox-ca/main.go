@@ -52,6 +52,12 @@ import (
 // setupLogger creates and sets the default slog logger based on config.
 // Returns the log file (if any) so the caller can close it on shutdown,
 // ensuring final log entries are flushed. Returns nil when logging to stderr.
+// levelTrace is the level -v -v selects: below slog.LevelDebug, for the
+// call-by-call detail that would drown a Debug run. Named here so the flag
+// help, the switch below and the spec that pins the mapping all mean the same
+// number.
+const levelTrace = slog.Level(-8)
+
 func setupLogger(cfg *serverConfig) (*os.File, error) {
 	var logLevel slog.Level
 	switch cfg.Verbosity {
@@ -60,7 +66,7 @@ func setupLogger(cfg *serverConfig) (*os.File, error) {
 	case 1:
 		logLevel = slog.LevelDebug
 	default:
-		logLevel = slog.Level(-8) // Trace
+		logLevel = levelTrace
 	}
 
 	opts := &slog.HandlerOptions{Level: logLevel}

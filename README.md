@@ -128,8 +128,11 @@ network, serve HTTPS as below.
 When `--tls-cert` and `--tls-key` are both set, the server:
 
 1. Presents those certs to connecting clients
-2. Requests (but does not require) a client certificate from every connection
-3. Enforces endpoint-level authorization (see [Authorization tiers](docs/api.md#authorization-tiers))
+2. Requests (but does not require) a client certificate from every connection,
+   and does not verify it at the TLS layer
+3. Enforces endpoint-level authorization, which is where a presented
+   certificate is verified against this CA and checked against the CRL (see
+   [Authorization tiers](docs/api.md#authorization-tiers))
 
 The complete flag, environment-variable, and config-file reference is in
 [configuring the server](docs/configuration.md).

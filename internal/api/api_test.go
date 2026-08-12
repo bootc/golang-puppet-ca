@@ -1440,8 +1440,9 @@ var _ = Describe("API Workflow", func() {
 				// filtering for one must not silently miss the other.
 				Expect(logBuf.String()).To(ContainSubstring("Auto-renewal rejected: certificate not eligible"))
 				Expect(logBuf.String()).To(ContainSubstring("subject=" + subject))
-				Expect(logBuf.String()).To(ContainSubstring("certificate is not a live certificate issued by this CA"),
-					"the guide promises the reason in error=, not merely the field")
+				Expect(logBuf.String()).To(ContainSubstring(`error="`+ca.ErrForeignCertificate.Error()),
+					"the guide promises the reason in error=, so pin the key and the sentinel "+
+						"the value opens with; the wrapped cause follows it")
 			})
 
 			It("refuses a CSR-based renewal with 403 from the handler", func() {
@@ -1457,8 +1458,9 @@ var _ = Describe("API Workflow", func() {
 
 				Expect(logBuf.String()).To(ContainSubstring("Renewal rejected: certificate not eligible"))
 				Expect(logBuf.String()).To(ContainSubstring("subject=" + subject))
-				Expect(logBuf.String()).To(ContainSubstring("certificate is not a live certificate issued by this CA"),
-					"the guide promises the reason in error=, not merely the field")
+				Expect(logBuf.String()).To(ContainSubstring(`error="`+ca.ErrForeignCertificate.Error()),
+					"the guide promises the reason in error=, so pin the key and the sentinel "+
+						"the value opens with; the wrapped cause follows it")
 			})
 
 			It("refuses a foreign certificate whose CN is not certname-shaped with 403, not 500", func() {
