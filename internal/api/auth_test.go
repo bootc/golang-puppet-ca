@@ -1108,10 +1108,29 @@ var _ = Describe("AuthConfig allow-list swapping", func() {
 			}()
 		}
 
+		// Reads counted from here are concurrent with the swapping below.
+		before := reads.Load()
+
 		for i := 0; i < 200; i++ {
 			cfg.SetAllowList(fresh)
 			cfg.SetAllowList(old)
 		}
+
+		// Those 200 swaps can complete before the scheduler has run a single
+		// reader, which used to leave reads at zero and fail the assertion
+		// below -- the spec was asserting that the goroutines had been started,
+		// not that anything overlapped. So keep swapping until a read lands
+		// between `before` and now: each poll performs another swap pair, so
+		// what this waits for is the overlap the spec claims, rather than
+		// waiting for the readers first and then swapping (which would only
+		// prove the reads preceded the swaps).
+		Eventually(func() int64 {
+			cfg.SetAllowList(fresh)
+			cfg.SetAllowList(old)
+			return reads.Load() - before
+		}).WithTimeout(30*time.Second).Should(BeNumerically(">", 0),
+			"no read landed while the allow list was being replaced")
+
 		cfg.SetAllowList(fresh)
 		close(stop)
 		wg.Wait()
