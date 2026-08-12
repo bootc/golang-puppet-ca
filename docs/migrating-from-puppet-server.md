@@ -412,12 +412,16 @@ escape hatch, not the way to restore agent access.
 
 `POST /certificate_renewal` additionally requires that the presented
 certificate is one this CA issued, has not revoked, and is for the subject being
-renewed. Today you will not see a distinct error for the first two: the
-authorisation middleware trusts exactly this CA's certificate, so a foreign or
-revoked certificate is refused earlier, on every mTLS route, with
-`403 access denied`. The CA's own `403 certificate not eligible for renewal`
-becomes reachable once a second issuer can be trusted for client
-authentication.
+renewed. The revocation requirement bites in ordinary operation: renewal
+re-reads the CRL from storage rather than trusting the copy the mTLS layer
+holds, so on a replica that has not yet synced a revoked certificate gets past
+the middleware and is refused here instead — `403 access denied` either way.
+That is deliberate, and it is why revoking cannot be outrun by renewing.
+
+The issuer requirement is not reachable yet: the middleware trusts exactly this
+CA's certificate, so a foreign one never reaches the handler. It starts earning
+its place once a second issuer can be trusted for client authentication, and
+answers `403 certificate not eligible for renewal` when it does.
 
 The third is a defence-in-depth invariant on the internal API rather than
 something a request can trip: the HTTP handler derives the subject from the

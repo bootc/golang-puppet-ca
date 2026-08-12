@@ -104,7 +104,11 @@ The re-read is best-effort in one direction: if the storage read itself fails, t
 
 ### Renewal eligibility
 
-The presented client certificate must be one **this CA** issued, must not be revoked, and must be the certificate for the subject being renewed. Today none of the three produces a distinct error: the authorisation middleware trusts exactly this CA's certificate, so it refuses a foreign or revoked certificate first with `403 access denied`, and the subject condition cannot be reached at all because the handler derives the subject from the presented certificate. The CA's own `403 certificate not eligible for renewal` becomes reachable for the first two once a second issuer can be trusted for client authentication; the third guards future callers of the internal API rather than any request path.
+The presented client certificate must be one **this CA** issued, must not be revoked, and must be the certificate for the subject being renewed.
+
+The revocation condition is reached in ordinary operation: the CA re-reads the CRL from storage before renewing, so a replica whose in-memory copy has not yet caught up — up to `crl_sync_interval_sec`, see [revocation across replicas](configuration.md#revocation-across-replicas) — admits the certificate at the middleware and then refuses it here, with `403 access denied`. That is what stops renewal being a way out of a lockout during the propagation window.
+
+The other two are not reachable today. The authorisation middleware trusts exactly this CA's certificate, so a foreign certificate is refused before the handler runs; that changes once a second issuer can be trusted for client authentication, which is when the issuer check starts earning its place and answers `403 certificate not eligible for renewal`. The subject condition cannot be reached from HTTP at all, because the handler derives the subject from the presented certificate; it guards future callers of the internal API.
 
 ## Bulk signing
 
