@@ -672,9 +672,10 @@ func (Test) Magefile() error {
 	return sh.RunV("go", "test", "-tags", "mage", ".")
 }
 
-// Unit runs the unit test suite with coverage, piping output through tparse
-// for a colorful per-package summary table. The package set is discovered
-// dynamically (see unitTestPackages); only unitTestExcludes is omitted.
+// Unit runs the unit test suite with coverage and the race detector, piping
+// output through tparse for a colourful per-package summary table. The package
+// set is discovered dynamically (see unitTestPackages); only unitTestExcludes
+// is omitted.
 func (Test) Unit() error {
 	fmt.Println("Running unit tests...")
 
@@ -686,10 +687,17 @@ func (Test) Unit() error {
 	// -race is not optional here: the notification path (internal/sdnotify) is
 	// driven concurrently by the heartbeat, the reload watcher, and a deferred
 	// Close, and its locking is only verified by specs that fail exclusively
-	// under the race detector. It costs roughly 15% on the slowest package.
-	// It needs cgo, which is the default everywhere this runs.
+	// under the race detector. The storage locks that serialise CA bootstrap
+	// and the CRL cache are in the same position: specs exist purely to prove
+	// those guarantees, and without -race they can pass by coincidence over a
+	// genuine data race that only shows up as a corrupt CA under load. It
+	// costs roughly 15% on the slowest package.
 	testArgs := append([]string{"test", "-race", "-json", "-cover", "-coverprofile=coverage.out"}, pkgs...)
 	testCmd := exec.Command("go", testArgs...)
+	// -race needs cgo, which is on by default everywhere this runs -- but a
+	// developer who has exported CGO_ENABLED=0 would get a build failure
+	// instead of a test run, so set it rather than inherit it.
+	testCmd.Env = append(os.Environ(), "CGO_ENABLED=1")
 	tparseCmd := exec.Command("go", "tool", "tparse", "-all")
 
 	pipe, err := testCmd.StdoutPipe()

@@ -18,7 +18,6 @@
 package ca
 
 import (
-	"bytes"
 	"context"
 	"crypto"
 	"crypto/x509"
@@ -27,6 +26,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
+	"time"
 
 	"github.com/voxpupuli/openvox-ca/internal/storage"
 )
@@ -45,43 +45,157 @@ import (
 // with a generated CRL unconditionally, which destroyed both the ancestor blocks
 // and every recorded revocation.
 //
+// This is a thin wrapper over ImportCAMaterial for the case where the CA's
+// private key is a local PEM blob. When the key lives at a provider (an OpenBao
+// Transit key, a PKCS#11 token) there is no blob to pass and callers use
+// ImportCAMaterial directly with a crypto.Signer.
+//
 // This is an offline operation; no CA daemon is required.
 func ImportCA(ctx context.Context, store *storage.StorageService, certBundlePEM, keyPEM, crlPEM []byte) error {
-	// --- Parse and validate cert ---
-	block, _ := pem.Decode(certBundlePEM)
-	if block == nil {
-		return fmt.Errorf("cert-bundle does not contain a valid PEM block")
-	}
-	caCert, err := x509.ParseCertificate(block.Bytes)
-	if err != nil {
-		return fmt.Errorf("failed to parse CA cert: %w", err)
-	}
-	if !caCert.IsCA {
-		return fmt.Errorf("certificate is not a CA certificate (IsCA=false)")
-	}
-
-	// --- Parse and validate private key ---
 	keyBlock, _ := pem.Decode(keyPEM)
 	if keyBlock == nil {
 		return fmt.Errorf("private-key does not contain a valid PEM block")
 	}
-
 	caKey, err := parsePrivateKeyDER(keyBlock.Type, keyBlock.Bytes)
 	if err != nil {
 		return fmt.Errorf("failed to parse CA private key: %w", err)
 	}
 
-	// --- Verify key matches cert (algorithm-agnostic) ---
-	certPubDER, err := x509.MarshalPKIXPublicKey(caCert.PublicKey)
+	return ImportCAMaterial(ctx, store, certBundlePEM, keyPEM, crlPEM, caKey, CRLValidity)
+}
+
+// ErrCACertExists reports that storage already holds a CA certificate and the
+// caller did not ask to replace it.
+var ErrCACertExists = errors.New("a CA certificate already exists")
+
+// ErrCACertWrite wraps a failure to write the CA certificate blob, so callers
+// can tell it apart from the validation and CRL failures that surround it.
+// Guidance about read-only mounts is only ever right for this one.
+var ErrCACertWrite = errors.New("writing the CA certificate")
+
+// retryHint is how a caller finishes an import that failed after the CA
+// certificate had already been written. It differs per entry point, and getting
+// it wrong is worst precisely here: the operator reads it while storage is
+// knowingly inconsistent, so a remedy their command rejects costs them a round
+// trip at the least convenient moment.
+type retryHint string
+
+const (
+	// retryWithForce suits ImportCACertificate, whose command has --force and
+	// whose existing-certificate check would otherwise refuse the re-run.
+	retryWithForce retryHint = "re-run this command with --force to finish the import"
+	// retryPlain suits ImportCA: openvox-ca-ctl import has no --force flag, and
+	// performs no existing-certificate check, so a plain re-run finishes the job.
+	retryPlain retryHint = "re-run this command to finish the import"
+)
+
+// incompleteImportError annotates a failure that happened after the CA
+// certificate was already written.
+//
+// Storage is then holding the new certificate beside a CRL — and possibly a
+// public key — belonging to whatever was there before, and nothing detects that
+// afterwards: loadCA compares the key to the certificate, and loadCRLCache
+// parses the CRL without checking who issued it. So a replica restarted in this
+// state comes up cleanly and serves a CRL no agent can verify against the CA
+// certificate it just fetched. The operator has to know to act, which means the
+// error has to say so.
+func incompleteImportError(err error, retry retryHint) error {
+	return fmt.Errorf("%w. The CA certificate has already been written, so storage is "+
+		"now inconsistent: %s, or run 'openvox-ca-ctl reissue-crl' to re-sign the CRL "+
+		"under the new certificate", err, retry)
+}
+
+// ImportCACertificate installs a CA certificate chain signed by an external
+// parent, for a CA whose private key is held elsewhere — a Transit key, a
+// PKCS#11 token, or a local blob this function never touches.
+//
+// signer proves the certificate binds this CA's key. When storage already holds
+// a certificate the import is refused unless force is set, in which case the
+// stored CRL is re-signed under the incoming certificate so it stays verifiable.
+//
+// The whole sequence runs under the bootstrap lock. Replacing a live CA
+// certificate is a read-modify-write spanning the certificate and the CRL, and
+// the documented procedure restarts replicas *after* the import — so replicas
+// are serving throughout. Without the lock a revocation landing mid-import
+// either overwrites the re-signed CRL with one nothing can verify, or is itself
+// lost. Reporting whether a certificate was replaced lets the caller name the
+// restart that must follow.
+func ImportCACertificate(ctx context.Context, store *storage.StorageService, certBundlePEM []byte, signer crypto.Signer, crlValidity time.Duration, force bool) (replaced bool, err error) {
+	certs, err := ParseCABundle(certBundlePEM)
 	if err != nil {
-		return fmt.Errorf("failed to marshal cert public key: %w", err)
+		return false, fmt.Errorf("cert-bundle: %w", err)
 	}
-	keyPubDER, err := x509.MarshalPKIXPublicKey(caKey.Public())
+	if err := ValidateCABundleOrder(certs); err != nil {
+		return false, fmt.Errorf("cert-bundle: %w", err)
+	}
+	if err := AssertSignerMatchesCert(certs[0], signer); err != nil {
+		return false, err
+	}
+
+	lockCtx, cancel := context.WithTimeout(ctx, LockTimeout)
+	defer cancel()
+	err = store.WithLock(lockCtx, lockNameBootstrap, func() error {
+		hasCert, err := store.HasCACert(ctx)
+		if err != nil {
+			return fmt.Errorf("checking for an existing CA certificate: %w", err)
+		}
+		if hasCert && !force {
+			return fmt.Errorf("%w: refusing to replace it, because every certificate issued under the "+
+				"current one stops verifying if the replacement does not chain to it. Pass --force if "+
+				"that is intended", ErrCACertExists)
+		}
+		replaced = hasCert
+
+		// The stored CRL was signed by the key being replaced and names the
+		// subject being replaced; whether this import is a re-key, a re-subject
+		// or both, nothing can verify it afterwards. Revocation entries are
+		// carried across.
+		var crlPEM []byte
+		if hasCert {
+			crlPEM, err = ResignStoredCRL(ctx, store, certs[0], signer, crlValidity)
+			if err != nil {
+				return err
+			}
+		}
+		return importCAMaterial(ctx, store, certBundlePEM, nil, crlPEM, signer, crlValidity, retryWithForce)
+	})
 	if err != nil {
-		return fmt.Errorf("failed to marshal private key's public component: %w", err)
+		return false, err
 	}
-	if !bytes.Equal(certPubDER, keyPubDER) {
-		return fmt.Errorf("private key does not match the certificate's public key")
+	return replaced, nil
+}
+
+// ImportCAMaterial writes an externally-issued CA certificate bundle and its
+// CRL into storage, after proving that signer holds the private key the leading
+// certificate binds.
+//
+// signer is the proof, not the payload: it establishes that this CA will be
+// able to sign under the certificate being imported. keyPEM is the payload and
+// may be nil — when the key lives at a provider there is no blob to persist,
+// and passing nil skips the key write entirely while leaving every other check
+// in place. Callers holding a local key pass both; the two are redundant by
+// construction in that case, and deliberately so, because the roles differ.
+//
+// crlPEM may be nil, in which case a fresh empty CRL is generated and signed
+// with signer, valid for crlValidity.
+func ImportCAMaterial(ctx context.Context, store *storage.StorageService, certBundlePEM, keyPEM, crlPEM []byte, signer crypto.Signer, crlValidity time.Duration) error {
+	return importCAMaterial(ctx, store, certBundlePEM, keyPEM, crlPEM, signer, crlValidity, retryPlain)
+}
+
+func importCAMaterial(ctx context.Context, store *storage.StorageService, certBundlePEM, keyPEM, crlPEM []byte, signer crypto.Signer, crlValidity time.Duration, retry retryHint) error {
+	// --- Parse and validate the certificate bundle ---
+	certs, err := ParseCABundle(certBundlePEM)
+	if err != nil {
+		return fmt.Errorf("cert-bundle: %w", err)
+	}
+	if err := ValidateCABundleOrder(certs); err != nil {
+		return fmt.Errorf("cert-bundle: %w", err)
+	}
+	caCert := certs[0]
+
+	// --- SECURITY: prove the signer holds the key this certificate binds ---
+	if err := AssertSignerMatchesCert(caCert, signer); err != nil {
+		return err
 	}
 
 	// --- Ensure directories exist ---
@@ -98,25 +212,44 @@ func ImportCA(ctx context.Context, store *storage.StorageService, certBundlePEM,
 	// the authoritative decision is taken again under the CRL lock below, so
 	// that the read it depends on and the write that follows are atomic with
 	// respect to a concurrent revocation.
-	if _, _, _, err := planCRLImport(ctx, store, crlPEM, caCert, caKey); err != nil {
+	if _, _, _, err := planCRLImport(ctx, store, crlPEM, caCert, signer); err != nil {
 		return err
 	}
 
-	// --- Write CA key ---
-	if err := store.SaveCAKey(ctx, keyPEM); err != nil {
-		return fmt.Errorf("failed to write CA key: %w", err)
+	// --- Write CA key, when there is one to write ---
+	//
+	// Nil when the key lives at a provider: import-ca-cert proves the
+	// certificate binds the provider's key and never sees key material, so
+	// there is no blob to store.
+	if keyPEM != nil {
+		if err := store.SaveCAKey(ctx, keyPEM); err != nil {
+			return fmt.Errorf("failed to write CA key: %w", err)
+		}
 	}
 
-	// --- Write CA cert ---
-	if err := store.SaveCACert(ctx, certBundlePEM); err != nil {
-		return fmt.Errorf("failed to write CA cert: %w", err)
+	// --- Write CA cert (the whole bundle, root last) ---
+	// Re-encoded from the parsed chain rather than passed through, so what is
+	// stored and served is exactly what was validated. The DER is unchanged.
+	//
+	// This is the point of no return. Everything after it can still fail, and a
+	// failure then leaves storage holding the new certificate beside material
+	// signed under the old one — a state nothing detects on the next start,
+	// because loadCA only checks key-against-certificate and loadCRLCache does
+	// not verify the CRL's issuer at all. So every later error is annotated
+	// with what already landed and what fixes it; see incompleteImportError.
+	if err := store.SaveCACert(ctx, EncodeCABundle(certs)); err != nil {
+		return fmt.Errorf("%w: %w", ErrCACertWrite, err)
 	}
 
 	// --- Write CA public key ---
-	pubKeyBytes, err := x509.MarshalPKIXPublicKey(caKey.Public())
-	if err == nil {
-		pubKeyPEM := pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: pubKeyBytes})
-		_ = store.SaveCAPubKey(ctx, pubKeyPEM)
+	// Past the point of no return: SaveCACert above has already replaced the
+	// certificate, so any failure here leaves storage inconsistent and takes
+	// the incompleteImportError annotation. That covers savePubKeyPEM's
+	// marshalling half too, which AssertSignerMatchesCert has already ruled out
+	// by marshalling this same public component to compare it with the
+	// certificate.
+	if err := savePubKeyPEM(ctx, store, signer.Public()); err != nil {
+		return incompleteImportError(fmt.Errorf("failed to write CA public key: %w", err), retry)
 	}
 
 	// --- Decide and write the CRL, both under the lock ---
@@ -139,7 +272,7 @@ func ImportCA(ctx context.Context, store *storage.StorageService, certBundlePEM,
 	lockCtx, cancel := context.WithTimeout(ctx, LockTimeout)
 	defer cancel()
 	if err := store.WithLock(lockCtx, lockNameCRL, func() error {
-		plan, superseded, changed, err := planCRLImport(ctx, store, crlPEM, caCert, caKey)
+		plan, superseded, changed, err := planCRLImport(ctx, store, crlPEM, caCert, signer)
 		if err != nil {
 			return err
 		}
@@ -169,17 +302,17 @@ func ImportCA(ctx context.Context, store *storage.StorageService, certBundlePEM,
 	// --- Initialise serial if absent ---
 	hasSerial, err := store.HasSerial(ctx)
 	if err != nil {
-		return fmt.Errorf("checking serial: %w", err)
+		return incompleteImportError(fmt.Errorf("checking serial: %w", err), retry)
 	}
 	if !hasSerial {
 		if err := store.WriteSerial(ctx, "0001"); err != nil {
-			return fmt.Errorf("failed to write serial: %w", err)
+			return incompleteImportError(fmt.Errorf("failed to write serial: %w", err), retry)
 		}
 	}
 
 	// --- Initialise inventory if absent ---
 	if err := store.TouchInventory(ctx); err != nil {
-		return fmt.Errorf("failed to create inventory: %w", err)
+		return incompleteImportError(fmt.Errorf("failed to create inventory: %w", err), retry)
 	}
 
 	return nil

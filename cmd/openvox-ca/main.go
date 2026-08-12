@@ -472,17 +472,30 @@ func newRootCmd() *cobra.Command {
 					"all endpoints are accessible without authentication in plain HTTP mode.")
 			}
 
-			// --- Storage & Directories ---
-			backendSpec, err := buildBackendSpec(cfg, absCADir)
-			if err != nil {
-				return fmt.Errorf("invalid storage backend config: %w", err)
+			// --- Storage, and the key provider when this role may reach the key ---
+			// The frontend role proxies every signature to the isolated signer
+			// process and must never construct a provider of its own: doing so
+			// would open a second authenticated session to the key backend for a
+			// key this process is specifically not allowed to use.
+			//
+			// The status is set before the open rather than after it: opening
+			// is the part that can block for a long time on a database or
+			// cluster backend, and naming the backend is what tells a systemd
+			// operator watching a hung start which one is not answering. The
+			// name is parsed authoritatively inside resolveRuntime, which
+			// reports an unusable one as an error; here it only decides
+			// whether the status can name the backend at all.
+			if kind, kindErr := storage.ParseBackendKind(cfg.StorageBackend); kindErr == nil {
+				notifier.Status(fmt.Sprintf("Opening the %s storage backend", kind))
+			} else {
+				notifier.Status("Opening the storage backend")
 			}
-			notifier.Status(fmt.Sprintf("Opening the %s storage backend", backendSpec.Kind))
-			store, err := storage.NewServiceFromSpec(backendSpec)
+			rt, err := resolveRuntimeForRole(ctx, cfg, role)
 			if err != nil {
-				return fmt.Errorf("failed to initialise storage backend: %w", err)
+				return err
 			}
-			defer func() { _ = store.Backend().Close() }()
+			defer func() { _ = rt.Close() }()
+			store := rt.Store
 			if err := store.EnsureDirs(ctx); err != nil {
 				return fmt.Errorf("failed to create CA directories: %w", err)
 			}
@@ -574,17 +587,12 @@ func newRootCmd() *cobra.Command {
 			// NIST 800-53: SC-3 (Security Function Isolation)
 			if remoteSigner != nil {
 				myCA.ExternalSigner = remoteSigner
-			} else if cfg.UsesOpenBao() {
+			} else if rt.KeyProvider != nil {
 				// Single-process mode (--single-process) with an OpenBao key
 				// provider: this is the one role, other than the isolated
 				// signer child, that ever reaches the CA key -- and here that
 				// "key" is a Transit key that never leaves OpenBao.
-				tm, provider, err := newOpenBaoKeyProvider(ctx, cfg)
-				if err != nil {
-					return fmt.Errorf("initialising OpenBao key provider: %w", err)
-				}
-				defer func() { _ = tm.Close() }()
-				myCA.KeyProvider = provider
+				myCA.KeyProvider = rt.KeyProvider
 			}
 
 			notifier.Status("Initialising the CA")
@@ -848,6 +856,12 @@ func newRootCmd() *cobra.Command {
 	f.StringVar(&caKeyFile, "ca-key-file", "", "Keep the CA private key at this local path regardless of storage backend")
 	registerOpenBaoFlags(f, &obFlags)
 
+	// Offline subcommands. Cobra dispatches a known subcommand before applying
+	// the root command's Args validator, so bare "openvox-ca" still means "run
+	// the server" and cobra.NoArgs above still rejects stray arguments.
+	cmd.AddCommand(newCSRCmd())
+	cmd.AddCommand(newImportCACertCmd())
+
 	return cmd
 }
 
@@ -969,37 +983,28 @@ func runSignerMode(ctx context.Context, cfg *serverConfig, absCADir string) erro
 		"pid", os.Getpid(),
 	)
 
-	backendSpec, err := buildBackendSpec(cfg, absCADir)
+	// The signer role always holds the CA key, so it resolves its runtime with
+	// the key provider enabled.
+	//
+	// SECURITY: when an OpenBao provider is configured the CA's own private key
+	// is never loaded here at all -- it lives in the Transit engine, and only a
+	// digest ever crosses the wire to sign it. That is the same security
+	// posture class as the local-key case (key confined to this isolated
+	// process), extended one step further: the key doesn't exist in this
+	// process either.
+	rt, err := resolveRuntime(ctx, cfg, true)
 	if err != nil {
-		return fmt.Errorf("invalid storage backend config: %w", err)
+		return err
 	}
-	store, err := storage.NewServiceFromSpec(backendSpec)
-	if err != nil {
-		return fmt.Errorf("initialising storage backend: %w", err)
-	}
-	defer func() { _ = store.Backend().Close() }()
+	defer func() { _ = rt.Close() }()
 
 	// Full CA initialization: handles bootstrap on first run, loads existing
 	// CA on subsequent runs. This writes ca_crt.pem, CRL, inventory, etc.
-	myCA := ca.New(store, ca.AutosignConfig{}, cfg.Hostname)
+	myCA := ca.New(rt.Store, ca.AutosignConfig{}, cfg.Hostname)
 	if err := applyCAConfig(myCA, cfg); err != nil {
 		return err
 	}
-
-	// SECURITY: when configured, the CA's own private key is never loaded
-	// here at all -- it lives in OpenBao's Transit engine, and only a digest
-	// ever crosses the wire to sign it. This is the same security posture
-	// class as the local-key case (key confined to this isolated process),
-	// extended one step further: the key doesn't exist in this process
-	// either.
-	if cfg.UsesOpenBao() {
-		tm, provider, err := newOpenBaoKeyProvider(ctx, cfg)
-		if err != nil {
-			return fmt.Errorf("initialising OpenBao key provider: %w", err)
-		}
-		defer func() { _ = tm.Close() }()
-		myCA.KeyProvider = provider
-	}
+	myCA.KeyProvider = rt.KeyProvider
 
 	if err := myCA.Init(ctx); err != nil {
 		return fmt.Errorf("CA initialization failed: %w", err)

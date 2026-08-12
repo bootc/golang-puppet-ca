@@ -13,11 +13,11 @@ interface. Every backend serves the following logical keys:
 | Logical key | Purpose | Writer |
 | --- | --- | --- |
 | `ca_cert` | CA certificate (PEM) | bootstrap / import |
-| `ca_pubkey` | CA public key (PEM, companion to `ca_cert`) | bootstrap |
+| `ca_pubkey` | CA public key (PEM, PKIX in a `PUBLIC KEY` block, companion to `ca_cert`) | bootstrap / import / seed |
 | `ca_key` | CA private key (PEM, optionally AES-256-GCM encrypted) | bootstrap / import |
-| `crl` | Certificate Revocation List (PEM). May hold several concatenated CRLs when a chain has been imported: this CA's own first, ancestors after it. The re-sign path (`readStoredCRL`) and every reader that parses a single CRL (`loadCRLCache`, the metrics collector, `/expirations`) take block 0; the whole-blob consumers are `GET`/`PUT /certificate_revocation_list/ca`, the Kubernetes exporter, and — to preserve ancestor blocks — `crlChainLocked` on the re-sign path and `storedCRLChain` on the import path. Revocation questions are answered from `cachedCRL`, which `loadCRLCache` fills with the block this CA signed — the newest block it signed, wherever it sits, so a stale copy of ours at block 0 is passed over as readily as an ancestor's | bootstrap, revoke, rotate, import |
-| `serial` | Next leaf certificate serial counter | sign |
-| `inventory` | Append-only log of issued/revoked certificates | sign / revoke |
+| `crl` | Certificate Revocation List (PEM). May hold several concatenated CRLs when a chain has been imported: this CA's own first, ancestors after it. The re-sign path (`readStoredCRL`) and every reader that parses a single CRL (`loadCRLCache`, the metrics collector, `/expirations`) take block 0; the whole-blob consumers are `GET`/`PUT /certificate_revocation_list/ca`, the Kubernetes exporter, and — to preserve ancestor blocks — `crlChainLocked` on the re-sign path and `storedCRLChain` on the import path. Revocation questions are answered from `cachedCRL`, which `loadCRLCache` fills with the block this CA signed — the newest block it signed, wherever it sits, so a stale copy of ours at block 0 is passed over as readily as an ancestor's | bootstrap, revoke, rotate, import, seed |
+| `serial` | Next leaf certificate serial counter | sign / seed |
+| `inventory` | Append-only log of issued/revoked certificates | sign / revoke / seed |
 | `inventory_hmac` | Inventory integrity head (blob HMAC or hash chain on SQL) | sign / revoke |
 | `hmac_key` | Integrity key for `inventory_hmac` | first run |
 | `csr/<subject>` | Pending certificate signing request (PEM), per subject | CSR submission |
@@ -25,6 +25,12 @@ interface. Every backend serves the following logical keys:
 
 `inventory` is the only key that supports atomic append semantics; all other
 keys are whole-blob read/write/delete.
+
+*seed* above is `seedSupportingState` (`internal/ca/init.go`): a start that
+finds a certificate and key but not the supporting state writes it then, rather
+than at bootstrap. It covers a CA mounted into an empty backend via an overlay,
+and a bootstrap that failed partway — including one that failed on `ca_pubkey`
+itself, which nothing else would write again.
 
 ## Filesystem layout (full)
 

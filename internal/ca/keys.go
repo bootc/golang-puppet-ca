@@ -18,6 +18,7 @@
 package ca
 
 import (
+	"context"
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -28,6 +29,8 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+
+	"github.com/voxpupuli/openvox-ca/internal/storage"
 )
 
 // ErrKeyPolicy is wrapped by validatePublicKey when a presented or submitted
@@ -236,4 +239,33 @@ func parsePrivateKeyDER(blockType string, der []byte) (crypto.Signer, error) {
 			return nil, fmt.Errorf("unrecognized PEM type %q (PKCS1: %v; PKCS8: %v)", blockType, err1, err8)
 		}
 	}
+}
+
+// savePubKeyPEM writes pub to storage as the CA public key blob, in the PEM
+// encoding docs/development/storage-internals.md describes (`ca_pub.pem`, block
+// type "PUBLIC KEY").
+//
+// One encoder for the three paths that write it — bootstrap, import, and the
+// backfill in seedSupportingState — because the encoding is a stored-format
+// contract the documentation makes promises about, and three copies would mean
+// three places to change it and two chances to miss one. The public component
+// itself differs per caller by design (a freshly generated key, the signer that
+// proved custody at import, the established certificate's own key), so it is a
+// parameter; so is the error context, which each caller wraps for itself.
+//
+// The marshalling half is defence in depth rather than a case any caller can
+// reach: each one has already had this same public component marshalled, and
+// the failure reported, before it gets here — by x509.CreateCertificate for
+// bootstrapCA, by AssertSignerMatchesCert for the import, and by loadCA's own
+// key-matching check for the backfill in seedSupportingState. loadCA skips that
+// check under an ExternalSigner, which costs nothing here because
+// finishLoadExisting returns before it can reach the backfill in that mode.
+// Callers therefore report a failure as a write failure, which is the only half
+// that can actually occur.
+func savePubKeyPEM(ctx context.Context, store *storage.StorageService, pub crypto.PublicKey) error {
+	der, err := x509.MarshalPKIXPublicKey(pub)
+	if err != nil {
+		return fmt.Errorf("marshalling the public key: %w", err)
+	}
+	return store.SaveCAPubKey(ctx, pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: der}))
 }
