@@ -52,6 +52,12 @@ import (
 // setupLogger creates and sets the default slog logger based on config.
 // Returns the log file (if any) so the caller can close it on shutdown,
 // ensuring final log entries are flushed. Returns nil when logging to stderr.
+// levelTrace is the level -v -v selects: below slog.LevelDebug, for the
+// call-by-call detail that would drown a Debug run. Named here so the flag
+// help, the switch below and the spec that pins the mapping all mean the same
+// number.
+const levelTrace = slog.Level(-8)
+
 func setupLogger(cfg *serverConfig) (*os.File, error) {
 	var logLevel slog.Level
 	switch cfg.Verbosity {
@@ -60,7 +66,7 @@ func setupLogger(cfg *serverConfig) (*os.File, error) {
 	case 1:
 		logLevel = slog.LevelDebug
 	default:
-		logLevel = slog.Level(-8) // Trace
+		logLevel = levelTrace
 	}
 
 	opts := &slog.HandlerOptions{Level: logLevel}
@@ -822,7 +828,7 @@ func newRootCmd() *cobra.Command {
 	f.StringVar(&puppetServerFile, "puppet-server-file", "", "Path to a file of puppet-server CNs allowed admin access (one per line; # comments and blank lines ignored)")
 	f.BoolVar(&noPpCliAuth, "no-pp-cli-auth", false, "Disable pp_cli_auth extension as an admin credential; require CN allow list only")
 	f.BoolVar(&noTLSRequired, "no-tls-required", false, "Allow plain HTTP on non-loopback addresses (use only behind a trusted TLS proxy or in test environments)")
-	f.BoolVar(&allowPublicStatus, "allow-public-status", false, "Allow unauthenticated GET /certificate_status (by default, requires a CA-signed client cert)")
+	f.BoolVar(&allowPublicStatus, "allow-public-status", false, "Allow unauthenticated GET /certificate_status (by default this route is admin-only)")
 	f.StringVar(&ocspURL, "ocsp-url", "", "OCSP responder URL to embed in issued certificates (e.g. http://openvox-ca:8140/ocsp)")
 	f.StringVar(&crlURL, "crl-url", "", "CRL distribution point URL to embed in issued certificates (e.g. http://openvox-ca:8140/puppet-ca/v1/certificate_revocation_list/ca)")
 	f.StringVar(&metricsListen, "metrics-listen", "", "Address for the Prometheus metrics exporter (e.g. 127.0.0.1:9140 or :9140); empty disables it. Serves /metrics over plain HTTP on a separate listener; restrict to a trusted network as it reveals node hostnames")

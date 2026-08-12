@@ -25,7 +25,9 @@ wire-compatible with your existing Puppet/OpenVox fleet.
 
 > **Migrating from OpenVox Server or Puppet Server?** See the
 > [migration guide](docs/migrating-from-puppet-server.md) for step-by-step
-> instructions, directory layout mapping, and CLI command translation.
+> instructions, directory layout mapping, and CLI command translation, and
+> [authorisation behaviour worth knowing](#authorisation-behaviour-worth-knowing)
+> for the two rules that differ from a relaxed `auth.conf`.
 
 ## Features
 
@@ -126,8 +128,11 @@ network, serve HTTPS as below.
 When `--tls-cert` and `--tls-key` are both set, the server:
 
 1. Presents those certs to connecting clients
-2. Requests (but does not require) a client certificate from every connection
-3. Enforces endpoint-level authorization (see [Authorization tiers](docs/api.md#authorization-tiers))
+2. Requests (but does not require) a client certificate from every connection,
+   and does not verify it at the TLS layer
+3. Enforces endpoint-level authorization, which is where a presented
+   certificate is verified against this CA and checked against the CRL (see
+   [Authorization tiers](docs/api.md#authorization-tiers))
 
 The complete flag, environment-variable, and config-file reference is in
 [configuring the server](docs/configuration.md).
@@ -147,6 +152,27 @@ The complete flag, environment-variable, and config-file reference is in
 | [Running under systemd](docs/systemd.md) | The `Type=notify` unit, status text, `systemctl reload`, watchdog, and hardening |
 | [Container images](docs/container-images.md) | Pulling and running the published images |
 | [Migration guide](docs/migrating-from-puppet-server.md) | Replacing an OpenVox/Puppet Server built-in CA |
+
+## Authorisation behaviour worth knowing
+
+Two rules catch operators out, neither of which changes a stock deployment.
+
+`GET /certificate_status/{subject}` is admin-only. That matches OpenVox/Puppet
+Server's shipped `auth.conf`, so only a configuration that had been relaxed to
+let ordinary agent certificates read statuses loses that access. It can be
+granted back two ways, both of which confer the whole admin tier — signing and
+revocation included — plus an escape hatch that makes the route public rather
+than authenticated. Denials are logged, with the string to grep for, in
+[authorisation parity](docs/migrating-from-puppet-server.md#authorisation-parity).
+
+`POST /certificate_renewal` accepts only certificates this CA issued and has not
+revoked. In the default single-issuer topology nothing reaches that check that
+the authorisation middleware had not already refused with `403 access denied`
+(TLS requests but does not verify a client certificate — see [HTTPS with
+mTLS](#https-with-mtls)). The gate becomes load-bearing once a second issuer can
+be trusted for client authentication. There is no opt-out: an agent holding a
+certificate from a replaced CA must re-enrol. See [renewal
+eligibility](docs/migrating-from-puppet-server.md#renewal-eligibility).
 
 ## Contributing
 

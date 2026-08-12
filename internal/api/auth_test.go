@@ -28,6 +28,7 @@ import (
 	"encoding/asn1"
 	"encoding/json"
 	"encoding/pem"
+	"log/slog"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
@@ -792,15 +793,79 @@ var _ = Describe("Auth Middleware", func() {
 		})
 	})
 
-	Context("public endpoint is reachable regardless of client cert", func() {
-		It("GET /certificate_status/{own-node} is not rejected with a valid client cert (anyClient tier)", func() {
+	Context("certificate_status is admin-only", func() {
+		// Matches Puppet Server's shipped auth.conf, which grants
+		// certificate_status to pp_cli_auth holders and to nothing else.
+		It("rejects an ordinary CA-signed client cert reading its own status", func() {
 			clientCert := issueClientCert("my-node", caCert, caKey)
 			req := httptest.NewRequest("GET", "/certificate_status/my-node", nil)
 			req = withClientCert(req, clientCert)
 			rr := httptest.NewRecorder()
 			mux.ServeHTTP(rr, req)
-			// 404 because the node does not exist, but not 403.
-			Expect(rr.Code).NotTo(Equal(http.StatusForbidden))
+			Expect(rr.Code).To(Equal(http.StatusForbidden))
+		})
+
+	})
+
+	// The denial log is the operator's only handle on a 403: the HTTP metrics
+	// carry no path label, so a tier change that breaks someone's tooling is
+	// otherwise a bare counter. docs/migrating-from-puppet-server.md tells them
+	// what to grep for, field by field, which makes these strings a contract
+	// rather than a convenience.
+	Context("denial logging", func() {
+		// captureLog installs a text handler over a buffer for the duration of
+		// the spec, as internal/ca/autosign_test.go does.
+		captureLog := func() *bytes.Buffer {
+			var buf bytes.Buffer
+			orig := slog.Default()
+			slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+			DeferCleanup(func() { slog.SetDefault(orig) })
+			return &buf
+		}
+
+		It("records who was refused what, and why, on an admin-only route", func() {
+			buf := captureLog()
+
+			clientCert := issueClientCert("my-node", caCert, caKey)
+			req := httptest.NewRequest("GET", "/certificate_status/my-node", nil)
+			req = withClientCert(req, clientCert)
+			rr := httptest.NewRecorder()
+			mux.ServeHTTP(rr, req)
+			Expect(rr.Code).To(Equal(http.StatusForbidden))
+
+			// The exact rendering the migration guide tells operators to grep
+			// for on stderr. The JSON form is the same fields through
+			// slog.NewJSONHandler, which cmd/openvox-ca selects when logfile is
+			// set; the spec below pins that selection.
+			Expect(buf.String()).To(ContainSubstring("Request denied by authorisation middleware"))
+			Expect(buf.String()).To(ContainSubstring(`reason="route requires admin access"`))
+			Expect(buf.String()).To(ContainSubstring("client_cn=my-node"))
+			Expect(buf.String()).To(ContainSubstring("path=/certificate_status/my-node"))
+			Expect(buf.String()).To(ContainSubstring("method=GET"))
+		})
+
+		It("distinguishes a self-or-admin denial from an admin-only one", func() {
+			// Different reasons, because they are different operator problems:
+			// one is a client reaching for another node's identity, the other a
+			// route it may not touch at all. A single string for both would
+			// make the log useless for telling them apart, which is what the
+			// migration guide's grep recipe depends on.
+			buf := captureLog()
+
+			// GET /certificate_request/{subject} is the self-or-admin route;
+			// asking for a subject that is not the client's own CN is the
+			// denial that belongs to it.
+			clientCert := issueClientCert("my-node", caCert, caKey)
+			req := httptest.NewRequest("GET", "/certificate_request/other-node", nil)
+			req = withClientCert(req, clientCert)
+			rr := httptest.NewRecorder()
+			mux.ServeHTTP(rr, req)
+			Expect(rr.Code).To(Equal(http.StatusForbidden))
+
+			Expect(buf.String()).To(ContainSubstring(
+				`reason="not an admin and not the subject of the request"`))
+			Expect(buf.String()).NotTo(ContainSubstring("route requires admin access"),
+				"a self-or-admin denial must not be logged as an admin-only one")
 		})
 	})
 
@@ -1138,8 +1203,9 @@ var _ = Describe("lookupTier classification", func() {
 		Entry("public CSR submission", "PUT", "/certificate_request/node1", "node1", "public"),
 		Entry("public CRL fetch", "GET", "/certificate_revocation_list/ca", "", "public"),
 		Entry("CRL reissue is admin-only", "PUT", "/certificate_revocation_list/ca", "", "adminOnly"),
-		// certificate_status defaults to any-CA-signed-client when not public.
-		Entry("status read requires any client", "GET", "/certificate_status/node1", "node1", "anyClient"),
+		// certificate_status is admin-only unless explicitly made public,
+		// matching Puppet Server's shipped auth.conf.
+		Entry("status read is admin-only", "GET", "/certificate_status/node1", "node1", "adminOnly"),
 		// Self-or-admin read of a pending CSR.
 		Entry("CSR read is self-or-admin", "GET", "/certificate_request/node1", "node1", "selfOrAdmin"),
 		// Default-deny: signing, mutation, and unknown paths are admin-only.

@@ -30,6 +30,7 @@ import (
 	"encoding/asn1"
 	"encoding/json"
 	"encoding/pem"
+	"log/slog"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
@@ -1359,6 +1360,169 @@ var _ = Describe("API Workflow", func() {
 			Expect(err).NotTo(HaveOccurred())
 		})
 
+		// The two handler branches that map ErrForeignCertificate to 403 are
+		// unreachable while the middleware's trust anchor and this CA's own
+		// certificate are the same object: the middleware rejects a foreign
+		// certificate before any handler runs. They become reachable exactly
+		// when those two diverge, which is the topology the intermediate-CA
+		// work introduces — so the fixture makes them diverge deliberately,
+		// trusting a second issuer for authentication while the CA still
+		// refuses to renew its certificates.
+		Context("when the middleware trusts an issuer the CA did not", func() {
+			var (
+				splitMux      http.Handler
+				logBuf        *bytes.Buffer
+				foreignCert   *x509.Certificate
+				foreignCACert *x509.Certificate
+				foreignCAPriv *rsa.PrivateKey
+			)
+
+			BeforeEach(func() {
+				foreignCAKey, err := rsa.GenerateKey(rand.Reader, 2048)
+				Expect(err).NotTo(HaveOccurred())
+				foreignCATmpl := &x509.Certificate{
+					SerialNumber:          big.NewInt(99),
+					Subject:               pkix.Name{CommonName: "Second Issuer"},
+					NotBefore:             time.Now().Add(-time.Hour),
+					NotAfter:              time.Now().Add(24 * time.Hour),
+					KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
+					BasicConstraintsValid: true,
+					IsCA:                  true,
+				}
+				foreignCADER, err := x509.CreateCertificate(rand.Reader, foreignCATmpl, foreignCATmpl,
+					&foreignCAKey.PublicKey, foreignCAKey)
+				Expect(err).NotTo(HaveOccurred())
+				foreignCA, err := x509.ParseCertificate(foreignCADER)
+				Expect(err).NotTo(HaveOccurred())
+				foreignCACert, foreignCAPriv = foreignCA, foreignCAKey
+
+				leafKey, err := rsa.GenerateKey(rand.Reader, 2048)
+				Expect(err).NotTo(HaveOccurred())
+				leafDER, err := x509.CreateCertificate(rand.Reader, &x509.Certificate{
+					SerialNumber: big.NewInt(100),
+					Subject:      pkix.Name{CommonName: subject},
+					NotBefore:    time.Now().Add(-time.Hour),
+					NotAfter:     time.Now().Add(time.Hour),
+					ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+				}, foreignCA, &leafKey.PublicKey, foreignCAKey)
+				Expect(err).NotTo(HaveOccurred())
+				foreignCert, err = x509.ParseCertificate(leafDER)
+				Expect(err).NotTo(HaveOccurred())
+
+				splitServer := api.New(myCA)
+				splitServer.AuthConfig = &api.AuthConfig{CACert: foreignCA}
+				splitMux = splitServer.Routes()
+
+				// The eligibility refusals are logged, and the migration guide
+				// tells operators to grep for them, so capture the default
+				// logger for these specs.
+				logBuf = &bytes.Buffer{}
+				orig := slog.Default()
+				slog.SetDefault(slog.New(slog.NewTextHandler(logBuf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+				DeferCleanup(func() { slog.SetDefault(orig) })
+			})
+
+			It("refuses an empty-body renewal with 403 from the handler", func() {
+				req := httptest.NewRequest("POST", "/certificate_renewal", bytes.NewReader(nil))
+				req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{foreignCert}}
+				rr := httptest.NewRecorder()
+				splitMux.ServeHTTP(rr, req)
+
+				Expect(rr.Code).To(Equal(http.StatusForbidden))
+				// Not the middleware's wording: this rejection came from the
+				// handler, and the authorisation oracle relies on telling them
+				// apart.
+				Expect(rr.Body.String()).To(ContainSubstring("not eligible for renewal"))
+
+				// The migration guide publishes this string as a grep target,
+				// which makes it a contract like the middleware's own denial
+				// log. The empty-body form has its own message: an operator
+				// filtering for one must not silently miss the other.
+				Expect(logBuf.String()).To(ContainSubstring("Auto-renewal rejected: certificate not eligible"))
+				Expect(logBuf.String()).To(ContainSubstring("subject=" + subject))
+				Expect(logBuf.String()).To(ContainSubstring(`error="`+ca.ErrForeignCertificate.Error()),
+					"the guide promises the reason in error=, so pin the key and the sentinel "+
+						"the value opens with; the wrapped cause follows it")
+			})
+
+			It("refuses a CSR-based renewal with 403 from the handler", func() {
+				renewCSR, err := testutil.GenerateCSR(subject)
+				Expect(err).NotTo(HaveOccurred())
+				req := httptest.NewRequest("POST", "/certificate_renewal", bytes.NewReader(renewCSR))
+				req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{foreignCert}}
+				rr := httptest.NewRecorder()
+				splitMux.ServeHTTP(rr, req)
+
+				Expect(rr.Code).To(Equal(http.StatusForbidden))
+				Expect(rr.Body.String()).To(ContainSubstring("not eligible for renewal"))
+
+				Expect(logBuf.String()).To(ContainSubstring("Renewal rejected: certificate not eligible"))
+				Expect(logBuf.String()).To(ContainSubstring("subject=" + subject))
+				Expect(logBuf.String()).To(ContainSubstring(`error="`+ca.ErrForeignCertificate.Error()),
+					"the guide promises the reason in error=, so pin the key and the sentinel "+
+						"the value opens with; the wrapped cause follows it")
+			})
+
+			It("refuses a foreign certificate whose CN is not certname-shaped with 403, not 500", func() {
+				// A second issuer's leaf need not respect this CA's lowercase
+				// certname grammar. ValidateSubject would reject "Monitoring
+				// Host" with an unsentinelled error the handler can only render
+				// as a 500 — so the gate has to answer provenance first for the
+				// documented 403 to be what an operator actually sees.
+				leafKey, err := rsa.GenerateKey(rand.Reader, 2048)
+				Expect(err).NotTo(HaveOccurred())
+				leafDER, err := x509.CreateCertificate(rand.Reader, &x509.Certificate{
+					SerialNumber: big.NewInt(101),
+					Subject:      pkix.Name{CommonName: "Monitoring Host"},
+					NotBefore:    time.Now().Add(-time.Hour),
+					NotAfter:     time.Now().Add(time.Hour),
+					ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+				}, foreignCACert, &leafKey.PublicKey, foreignCAPriv)
+				Expect(err).NotTo(HaveOccurred())
+				oddName, err := x509.ParseCertificate(leafDER)
+				Expect(err).NotTo(HaveOccurred())
+
+				req := httptest.NewRequest("POST", "/certificate_renewal", bytes.NewReader(nil))
+				req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{oddName}}
+				rr := httptest.NewRecorder()
+				splitMux.ServeHTTP(rr, req)
+
+				Expect(rr.Code).To(Equal(http.StatusForbidden))
+				Expect(rr.Body.String()).To(ContainSubstring("not eligible for renewal"))
+			})
+		})
+
+		Context("when the CA has not finished initialising", func() {
+			// The 503 mapping added alongside the gate's 403s. Its sibling is
+			// covered at this layer and so is the import path it copies, but
+			// this was pinned only at the CA boundary — delete either handler
+			// block and nothing failed.
+			var bareMux http.Handler
+
+			BeforeEach(func() {
+				bare := api.New(ca.New(storage.New(GinkgoT().TempDir()), ca.AutosignConfig{Mode: "off"}, "puppet.test"))
+				bareMux = bare.Routes()
+			})
+
+			It("answers 503 rather than 500 for an empty-body renewal", func() {
+				req := httptest.NewRequest("POST", "/certificate_renewal", bytes.NewReader(nil))
+				req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{clientCert}}
+				rr := httptest.NewRecorder()
+				bareMux.ServeHTTP(rr, req)
+				Expect(rr.Code).To(Equal(http.StatusServiceUnavailable))
+			})
+
+			It("answers 503 rather than 500 for a CSR-based renewal", func() {
+				renewCSR, err := testutil.GenerateCSR(subject)
+				Expect(err).NotTo(HaveOccurred())
+				req := httptest.NewRequest("POST", "/certificate_renewal", bytes.NewReader(renewCSR))
+				req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{clientCert}}
+				rr := httptest.NewRecorder()
+				bareMux.ServeHTTP(rr, req)
+				Expect(rr.Code).To(Equal(http.StatusServiceUnavailable))
+			})
+		})
+
 		It("should renew the certificate and return PEM", func() {
 			renewCSR, err := testutil.GenerateCSR(subject)
 			Expect(err).NotTo(HaveOccurred())
@@ -1498,7 +1662,12 @@ var _ = Describe("API Workflow", func() {
 				NotAfter:     time.Now().Add(time.Hour),
 				DNSNames:     []string{subject},
 			}
-			der, err := x509.CreateCertificate(rand.Reader, template, template, &weakKey.PublicKey, weakKey)
+			// Signed by this CA, not self-signed. The scenario is a node whose
+			// certificate we issued before the key-strength policy existed, so
+			// the renewal gate must pass and the policy check must be what
+			// rejects it. A self-signed fixture here only ever reached the
+			// policy check because nothing verified the issuer.
+			der, err := x509.CreateCertificate(rand.Reader, template, myCA.CACert, &weakKey.PublicKey, myCA.CAKey)
 			Expect(err).NotTo(HaveOccurred())
 			weakCert, err := x509.ParseCertificate(der)
 			Expect(err).NotTo(HaveOccurred())
