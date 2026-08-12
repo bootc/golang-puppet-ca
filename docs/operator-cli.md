@@ -7,13 +7,37 @@
 ```text
 --config       ""                       Path to YAML config file (auto-detected at /etc/puppet-ca/ctl.yaml)
 --server-url   https://localhost:8140   openvox-ca server URL
---ca-cert      ""                       CA cert PEM for TLS verification (omit to skip verify)
+--ca-cert      ""                       CA cert PEM for TLS verification (omit to use system trust store)
 --client-cert  ""                       Client certificate PEM for mTLS
 --client-key   ""                       Client private key PEM for mTLS
+--insecure                              Skip TLS server certificate verification (vulnerable to MITM; use only for testing)
 --verbose, -v                           Enable debug logging
 ```
 
 Global flags may be placed before or after the subcommand name.
+
+`--ca-cert` takes precedence over `--insecure`: if both are given, the server
+certificate is still verified, against the supplied CA certificate, and a `NOTE:`
+on stderr says `--insecure` was ignored. To override a `ca_cert` set in the config
+file or environment and reach `--insecure`, pass an empty `--ca-cert=""`
+alongside it.
+
+The file *replaces* the system trust store rather than adding to it, so a server
+whose certificate chains to a public CA stops verifying once `--ca-cert` is
+given. It may hold a bundle: every certificate in it that parses is loaded, so a
+root plus its intermediates can be passed as one file. A file holding no usable
+certificate (a DER export, a truncated download, the wrong file) is rejected
+before the connection is attempted rather than failing later in the handshake.
+
+`--client-cert` and `--client-key` must be supplied together; giving only one is
+an error.
+
+Subcommands that contact the server write at most one advisory line to
+**stderr**, not stdout: a `WARNING:` about MITM exposure when `--insecure` is in
+effect, a `NOTE:` when no `--ca-cert` is supplied, the override `NOTE:` above when
+both are, and nothing at all when only `--ca-cert` is. These are expected output,
+not failures. `setup`, `import` and `migrate` build no client, so they write no
+advisory line and never check `--ca-cert`.
 
 `openvox-ca-ctl --version` prints the version (including commit metadata when
 built from a git checkout) and exits. Unlike the global flags above,
@@ -37,6 +61,7 @@ server_url:  https://openvox-ca.example.com:8140
 ca_cert:     /etc/puppetlabs/puppet/ssl/ca/ca_crt.pem
 client_cert: /etc/puppetlabs/puppet/ssl/certs/puppet-master.pem
 client_key:  /etc/puppetlabs/puppet/ssl/private_keys/puppet-master.pem
+insecure:    false
 verbose:     false
 ```
 
@@ -48,6 +73,7 @@ verbose:     false
 | `--ca-cert` | `PUPPET_CA_CTL_CA_CERT` |
 | `--client-cert` | `PUPPET_CA_CTL_CLIENT_CERT` |
 | `--client-key` | `PUPPET_CA_CTL_CLIENT_KEY` |
+| `--insecure` | `PUPPET_CA_CTL_INSECURE` |
 | `--verbose` | `PUPPET_CA_CTL_VERBOSE` |
 
 ## Subcommands

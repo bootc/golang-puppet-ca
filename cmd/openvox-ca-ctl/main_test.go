@@ -23,11 +23,31 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	"github.com/spf13/cobra"
 
 	"github.com/voxpupuli/openvox-ca/internal/version"
 )
 
+// saveCtlGlobals registers a DeferCleanup restoring the package-level flag
+// globals. Both newRootCmd() (which re-registers the persistent flags against
+// them) and executing a command mutate these, so specs must not leak their
+// resolved values into later ones.
+func saveCtlGlobals() {
+	serverURL, caCert := globalServerURL, globalCACert
+	clientCert, clientKey := globalClientCert, globalClientKey
+	verbose, insecure, configFile := globalVerbose, globalInsecure, globalConfigFile
+	DeferCleanup(func() {
+		globalServerURL, globalCACert = serverURL, caCert
+		globalClientCert, globalClientKey = clientCert, clientKey
+		globalVerbose, globalInsecure, globalConfigFile = verbose, insecure, configFile
+	})
+}
+
 var _ = Describe("Root command", func() {
+	// Every spec here builds a root command, and newRootCmd() re-registers the
+	// persistent flags against the package globals, resetting them all.
+	BeforeEach(saveCtlGlobals)
+
 	It("prints the release version for --version", func() {
 		var out bytes.Buffer
 		cmd := newRootCmd()
@@ -55,7 +75,6 @@ var _ = Describe("Root command", func() {
 	// --version may not). --help returns before PersistentPreRunE, keeping
 	// the spec hermetic — no config loading or network.
 	It("accepts a persistent flag after the subcommand", func() {
-		DeferCleanup(func(orig bool) { globalVerbose = orig }, globalVerbose)
 		cmd := newRootCmd()
 		cmd.SetArgs([]string{"list", "-v", "--help"})
 		cmd.SetOut(io.Discard)
@@ -75,5 +94,142 @@ var _ = Describe("Root command", func() {
 		flag := cmd.PersistentFlags().ShorthandLookup("v")
 		Expect(flag).NotTo(BeNil())
 		Expect(flag.Name).To(Equal("verbose"))
+	})
+})
+
+// The precedence chain documented in docs/operator-cli.md (CLI flag → env var
+// → config file → built-in default) is only assembled in the root command's
+// PersistentPreRunE. config_test.go exercises loadCtlConfig/applyCtlEnv
+// directly and so never reaches the CLI-flag overlay; these specs run the
+// whole chain, with the TLS-relevant --insecure and --ca-cert as subjects.
+var _ = Describe("Global flag precedence", func() {
+	// runProbe executes a no-op subcommand so PersistentPreRunE resolves the
+	// configuration without any real subcommand touching storage or network.
+	runProbe := func(configFile string, args ...string) {
+		cmd := newRootCmd()
+		cmd.AddCommand(&cobra.Command{
+			Use:  "probe",
+			RunE: func(*cobra.Command, []string) error { return nil },
+		})
+		cmd.SetArgs(append([]string{"probe", "--config", configFile}, args...))
+		cmd.SetOut(io.Discard)
+		cmd.SetErr(io.Discard)
+		Expect(cmd.Execute()).To(Succeed())
+	}
+
+	BeforeEach(func() {
+		saveCtlGlobals()
+		clearCtlEnv()
+	})
+
+	It("prefers an explicit --insecure over the env var and config file", func() {
+		cfgFile := writeTempCtlConfig("insecure: true\n")
+		setCtlEnv("PUPPET_CA_CTL_INSECURE", "true")
+
+		runProbe(cfgFile, "--insecure=false")
+
+		Expect(globalInsecure).To(BeFalse(),
+			"Insecure = true; want the explicit --insecure=false to beat the env var and config file")
+	})
+
+	It("prefers an explicit --ca-cert over the env var and config file", func() {
+		cfgFile := writeTempCtlConfig("ca_cert: /from/file.pem\n")
+		setCtlEnv("PUPPET_CA_CTL_CA_CERT", "/from/env.pem")
+
+		runProbe(cfgFile, "--ca-cert", "/from/cli.pem")
+
+		Expect(globalCACert).To(Equal("/from/cli.pem"),
+			"CACert = %q; want the explicit --ca-cert to beat the env var and config file", globalCACert)
+	})
+
+	// The documented route to --insecure when a config file already sets
+	// ca_cert. It works only because an explicitly empty flag still counts as
+	// Changed, so the overlay assigns the empty value instead of skipping it.
+	It("lets an empty --ca-cert clear the config file value", func() {
+		cfgFile := writeTempCtlConfig("ca_cert: /from/file.pem\n")
+		setCtlEnv("PUPPET_CA_CTL_CA_CERT", "/from/env.pem")
+
+		runProbe(cfgFile, "--ca-cert=", "--insecure")
+
+		Expect(globalCACert).To(BeEmpty(),
+			"CACert = %q; want the empty --ca-cert to clear the config file and env values", globalCACert)
+		Expect(globalInsecure).To(BeTrue())
+
+		// Follow it through: with the trust anchor cleared, --insecure is now
+		// the branch that runs, which is the whole point of the route.
+		cfg, err := newTLSConfig(io.Discard)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(cfg.InsecureSkipVerify).To(BeTrue(),
+			"InsecureSkipVerify = false; want the documented --ca-cert=\"\" route to reach --insecure")
+	})
+
+	// The pf.Changed() gate is what makes this work: without it, every unset
+	// flag's zero value would clobber the env var and config file below.
+	It("falls back to the env var when the flag is unset", func() {
+		cfgFile := writeTempCtlConfig("insecure: false\nca_cert: /from/file.pem\n")
+		setCtlEnv("PUPPET_CA_CTL_INSECURE", "true")
+		setCtlEnv("PUPPET_CA_CTL_CA_CERT", "/from/env.pem")
+
+		runProbe(cfgFile)
+
+		Expect(globalInsecure).To(BeTrue(),
+			"Insecure = false; want the env var to win when --insecure is unset")
+		Expect(globalCACert).To(Equal("/from/env.pem"),
+			"CACert = %q; want the env var to win when --ca-cert is unset", globalCACert)
+	})
+
+	// The remaining four pf.Changed overlays. --client-cert/--client-key are
+	// the ones that matter: newTLSConfig rejects a half-resolved pair outright,
+	// so an overlay guarding one on the other's Changed flag would break every
+	// subcommand rather than quietly dropping mTLS.
+	It("prefers the other explicit flags over the env var and config file", func() {
+		cfgFile := writeTempCtlConfig(
+			"server_url: https://from-file:8140\nclient_cert: /from/file.pem\nclient_key: /from/file-key.pem\nverbose: true\n")
+		setCtlEnv("PUPPET_CA_CTL_SERVER_URL", "https://from-env:8140")
+		setCtlEnv("PUPPET_CA_CTL_CLIENT_CERT", "/from/env.pem")
+		setCtlEnv("PUPPET_CA_CTL_CLIENT_KEY", "/from/env-key.pem")
+		setCtlEnv("PUPPET_CA_CTL_VERBOSE", "true")
+
+		runProbe(cfgFile,
+			"--server-url", "https://from-cli:8140",
+			"--client-cert", "/from/cli.pem",
+			"--client-key", "/from/cli-key.pem",
+			"--verbose=false")
+
+		Expect(globalServerURL).To(Equal("https://from-cli:8140"),
+			"ServerURL = %q; want the explicit --server-url", globalServerURL)
+		Expect(globalClientCert).To(Equal("/from/cli.pem"),
+			"ClientCert = %q; want the explicit --client-cert", globalClientCert)
+		Expect(globalClientKey).To(Equal("/from/cli-key.pem"),
+			"ClientKey = %q; want the explicit --client-key", globalClientKey)
+		Expect(globalVerbose).To(BeFalse(),
+			"Verbose = true; want the explicit --verbose=false")
+	})
+
+	// The direction that matters most for security: an operator re-enabling
+	// verification from the environment must beat a config file that disabled
+	// it. applyCtlEnv assigns the parsed bool either way, and only this spec
+	// covers the false direction end to end.
+	It("lets the env var switch insecure back off over the config file", func() {
+		cfgFile := writeTempCtlConfig("insecure: true\n")
+		setCtlEnv("PUPPET_CA_CTL_INSECURE", "false")
+
+		runProbe(cfgFile)
+
+		Expect(globalInsecure).To(BeFalse(),
+			"Insecure = true; want PUPPET_CA_CTL_INSECURE=false to beat the config file")
+	})
+
+	It("falls back to the config file when neither the flag nor the env var is set", func() {
+		cfgFile := writeTempCtlConfig("insecure: true\nca_cert: /from/file.pem\n")
+
+		runProbe(cfgFile)
+
+		Expect(globalInsecure).To(BeTrue(),
+			"Insecure = false; want the config file value")
+		Expect(globalCACert).To(Equal("/from/file.pem"),
+			"CACert = %q; want the config file value", globalCACert)
+		Expect(globalServerURL).To(Equal("https://localhost:8140"),
+			"ServerURL = %q; want the built-in default", globalServerURL)
 	})
 })

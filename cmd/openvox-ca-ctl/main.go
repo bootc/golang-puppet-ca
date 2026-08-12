@@ -27,7 +27,6 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
-	"encoding/pem"
 	"fmt"
 	"io"
 	"log/slog"
@@ -62,9 +61,13 @@ type Client struct {
 	HTTPClient *http.Client
 }
 
-func newClient() (*Client, error) {
-	transport := &http.Transport{}
-
+// newTLSConfig builds the client TLS configuration from the resolved global
+// flags, writing the operator-facing notice about the chosen server
+// verification mode to notices.
+//
+// --ca-cert takes precedence over --insecure: an explicitly supplied trust
+// anchor is never downgraded to "verify nothing".
+func newTLSConfig(notices io.Writer) (*tls.Config, error) {
 	tlsCfg := &tls.Config{}
 
 	if globalCACert != "" {
@@ -72,20 +75,34 @@ func newClient() (*Client, error) {
 		if err != nil {
 			return nil, fmt.Errorf("reading --ca-cert %s: %w", globalCACert, err)
 		}
+		// SECURITY: AppendCertsFromPEM loads every certificate in the file, so
+		// a bundle (root plus intermediates, as Puppet's ca_crt.pem often is)
+		// is trusted in full, and it reports whether anything was loaded at
+		// all. Decoding only the first block instead would silently produce an
+		// empty or partial trust anchor whose only symptom is an opaque
+		// handshake failure much later. It returns false for two causes — no
+		// PEM certificate block, and none that parses — so the message names
+		// both rather than sending the operator after the wrong one.
+		// NIST 800-53: SC-8 (Transmission Confidentiality and Integrity)
 		pool := x509.NewCertPool()
-		block, _ := pem.Decode(caCertPEM)
-		if block != nil {
-			cert, err := x509.ParseCertificate(block.Bytes)
-			if err != nil {
-				return nil, fmt.Errorf("parsing --ca-cert: %w", err)
-			}
-			pool.AddCert(cert)
+		if !pool.AppendCertsFromPEM(caCertPEM) {
+			return nil, fmt.Errorf("parsing --ca-cert %s: contains no usable certificates "+
+				"(no PEM certificate block, or none that parses)", globalCACert)
 		}
 		tlsCfg.RootCAs = pool
+		if globalInsecure {
+			// The operator asked for both. Say which one won, since the
+			// losing flag was typed deliberately and its absence of effect is
+			// otherwise invisible.
+			_, _ = fmt.Fprintln(notices, "NOTE: --ca-cert supplied; --insecure ignored and the server "+
+				`certificate will still be verified (pass --ca-cert="" to drop a configured trust anchor)`)
+		}
 	} else if globalInsecure {
 		// SECURITY: Operator explicitly opted in to skip TLS verification.
 		// NIST 800-53: SC-8 (Transmission Confidentiality and Integrity)
-		fmt.Fprintln(os.Stderr, "WARNING: --insecure specified; TLS server certificate will NOT be verified (vulnerable to MITM)")
+		// The notice is advisory; a failed write to stderr must not stop the
+		// command, and the slog line below carries the same warning.
+		_, _ = fmt.Fprintln(notices, "WARNING: --insecure specified; TLS server certificate will NOT be verified (vulnerable to MITM)")
 		slog.Warn("TLS server verification disabled", "server", globalServerURL)
 		tlsCfg.InsecureSkipVerify = true
 	} else {
@@ -94,7 +111,8 @@ func newClient() (*Client, error) {
 		// not in the system store, the connection will fail with a clear error,
 		// which is the safe default.
 		// NIST 800-53: SC-8 (Transmission Confidentiality and Integrity)
-		fmt.Fprintln(os.Stderr, "NOTE: --ca-cert not provided; using system trust store for TLS verification. "+
+		// Advisory notice; a failed write to stderr must not stop the command.
+		_, _ = fmt.Fprintln(notices, "NOTE: --ca-cert not provided; using system trust store for TLS verification. "+
 			"If the server uses a self-signed CA certificate, provide --ca-cert or use --insecure.")
 	}
 
@@ -102,20 +120,44 @@ func newClient() (*Client, error) {
 	// NIST 800-53: SC-8 (Transmission Confidentiality and Integrity)
 	tlsCfg.MinVersion = tls.VersionTLS13
 
-	if globalClientCert != "" && globalClientKey != "" {
+	switch {
+	case globalClientCert != "" && globalClientKey != "":
 		cert, err := tls.LoadX509KeyPair(globalClientCert, globalClientKey)
 		if err != nil {
 			return nil, fmt.Errorf("loading --client-cert/--client-key: %w", err)
 		}
 		tlsCfg.Certificates = []tls.Certificate{cert}
+	case globalClientCert != "":
+		// SECURITY: Half a key pair cannot authenticate. Say so now rather
+		// than presenting no client certificate and leaving the operator to
+		// diagnose a server-side mTLS rejection. Name the half that arrived
+		// and every source it could have come from: after an upgrade the
+		// operator most often typed neither flag, and the value came from
+		// ctl.yaml or the environment.
+		return nil, fmt.Errorf("--client-cert %s given without --client-key "+
+			"(also settable as client_cert/client_key in the config file, or "+
+			"PUPPET_CA_CTL_CLIENT_CERT/PUPPET_CA_CTL_CLIENT_KEY); both are required for mTLS",
+			globalClientCert)
+	case globalClientKey != "":
+		return nil, fmt.Errorf("--client-key %s given without --client-cert "+
+			"(also settable as client_cert/client_key in the config file, or "+
+			"PUPPET_CA_CTL_CLIENT_CERT/PUPPET_CA_CTL_CLIENT_KEY); both are required for mTLS",
+			globalClientKey)
 	}
 
-	transport.TLSClientConfig = tlsCfg
+	return tlsCfg, nil
+}
+
+func newClient() (*Client, error) {
+	tlsCfg, err := newTLSConfig(os.Stderr)
+	if err != nil {
+		return nil, err
+	}
 
 	return &Client{
 		BaseURL: strings.TrimRight(globalServerURL, "/"),
 		HTTPClient: &http.Client{
-			Transport: transport,
+			Transport: &http.Transport{TLSClientConfig: tlsCfg},
 			Timeout:   30 * time.Second,
 		},
 	}, nil
