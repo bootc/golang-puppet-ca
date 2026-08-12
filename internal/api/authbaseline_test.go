@@ -302,10 +302,7 @@ var _ = Describe("Authorisation baseline", Ordered, ContinueOnFailure, func() {
 		Expect(err).NotTo(HaveOccurred())
 
 		server := api.New(myCA)
-		server.AuthConfig = &api.AuthConfig{
-			CACert:    caCert,
-			AllowList: adminAllowList,
-		}
+		server.AuthConfig = api.NewAuthConfig(caCert, adminAllowList)
 		mux = server.Routes()
 
 		// Fresh certificates per route, not one shared set.
@@ -752,10 +749,7 @@ var _ = Describe("Authorisation baseline", Ordered, ContinueOnFailure, func() {
 		Expect(scratchCA.Init(ctx)).To(Succeed())
 
 		scratch := api.New(scratchCA)
-		scratch.AuthConfig = &api.AuthConfig{
-			CACert:    caCert,
-			AllowList: adminAllowList,
-		}
+		scratch.AuthConfig = api.NewAuthConfig(caCert, adminAllowList)
 		scratchMux := scratch.Routes()
 		// A fresh admin certificate per route, for the reason the class fixtures
 		// give: POST /certificate_renewal succeeds here and, with
@@ -1400,7 +1394,7 @@ var _ = Describe("Authorisation baseline: configuration axes", func() {
 
 	Describe("allow_public_status", func() {
 		It("denies a client with no certificate when unset", func() {
-			handler := muxWith(&api.AuthConfig{CACert: caCert, AllowList: adminAllowList})
+			handler := muxWith(api.NewAuthConfig(caCert, adminAllowList))
 			Expect(probe(handler, "GET", "/certificate_status/somenode", nil)).To(BeTrue())
 		})
 
@@ -1410,18 +1404,16 @@ var _ = Describe("Authorisation baseline: configuration axes", func() {
 			// changes must not silently cancel out: an operator with this flag
 			// set should still get public status afterwards, or be told plainly
 			// that the flag no longer does anything.
-			handler := muxWith(&api.AuthConfig{
-				CACert:            caCert,
-				AllowList:         adminAllowList,
-				AllowPublicStatus: true,
-			})
+			cfg := api.NewAuthConfig(caCert, adminAllowList)
+			cfg.AllowPublicStatus = true
+			handler := muxWith(cfg)
 			Expect(probe(handler, "GET", "/certificate_status/somenode", nil)).To(BeFalse())
 		})
 	})
 
 	Describe("no_pp_cli_auth", func() {
 		It("grants admin on the pp_cli_auth extension when unset", func() {
-			handler := muxWith(&api.AuthConfig{CACert: caCert, AllowList: adminAllowList})
+			handler := muxWith(api.NewAuthConfig(caCert, adminAllowList))
 			cert := issueClientCertWithPpCliAuth("cli-user", caCert, caKey)
 			Expect(probe(handler, "PUT", "/certificate_revocation_list/ca", cert)).To(BeFalse())
 		})
@@ -1430,11 +1422,9 @@ var _ = Describe("Authorisation baseline: configuration axes", func() {
 			// The one input that narrows admin authority. Every cell in the main
 			// table is computed with this false, so without this pair a change
 			// that dropped the flag would move nothing the oracle watches.
-			handler := muxWith(&api.AuthConfig{
-				CACert:      caCert,
-				AllowList:   adminAllowList,
-				NoPpCliAuth: true,
-			})
+			cfg := api.NewAuthConfig(caCert, adminAllowList)
+			cfg.NoPpCliAuth = true
+			handler := muxWith(cfg)
 			byExtension := issueClientCertWithPpCliAuth("cli-user", caCert, caKey)
 			Expect(probe(handler, "PUT", "/certificate_revocation_list/ca", byExtension)).To(BeTrue())
 

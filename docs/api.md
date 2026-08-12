@@ -230,8 +230,9 @@ certificate goes away:
 - `PUT /certificate_status/{subject}` with `{"desired_state":"revoked"}` adds
   the serial to the CRL and leaves the certificate in storage until a later CSR
   displaces it. Eviction reads the same per-process CRL cache as the admission
-  check described below, so on the HA backends a peer that has not yet seen the
-  revocation instead answers `200 OK` and silently discards the CSR.
+  check described below, so on the HA backends a peer that has not yet synced
+  answers `200 OK` and silently discards the CSR instead — for at most
+  `crl_sync_interval_sec`, see below.
 - `DELETE /certificate_status/{subject}` revokes, then deletes the certificate
   and any pending request, all against shared storage, so no step depends on a
   replica's cache. All three are best-effort: each failure is logged and the
@@ -258,49 +259,51 @@ When containing a compromised agent, apply the levers that hold, in this order:
 1. Close off issuance: disable autosign, or use an autosign policy that
    excludes the subject, and block the agent at the network layer.
 2. Revoke the certificate.
-3. Force a CRL re-sign on every replica — `openvox-ca-ctl reissue-crl`, or
-   `PUT /certificate_revocation_list/ca` — so no peer keeps admitting the old
-   certificate from a stale cache. Each call refreshes only the replica that
-   serves it, so address the replicas individually: sent through a load
-   balancer it refreshes whichever one the VIP picked, and the rest stay stale
-   while the call reports success. The re-sign refreshes the cache in the
-   process that served it, so a success from a replica's own address confirms
-   that replica.
+3. Wait one sync interval, or force it. Each replica re-reads the stored CRL
+   every `crl_sync_interval_sec` (60s by default) and installs it once it has
+   advanced, so that interval is the worst case for a replica that did not
+   perform the revocation — see [revocation across
+   replicas](configuration.md#revocation-across-replicas). To not wait, force a
+   re-sign against a replica's own address (`openvox-ca-ctl reissue-crl`, or
+   `PUT /certificate_revocation_list/ca`); each call refreshes only the replica
+   that serves it, so through a load balancer it refreshes whichever one the
+   VIP picked.
 
-   To check independently, ask that same address. `GET
+   To confirm a given replica, ask that address. `GET
    /certificate_status/{subject}` reports `revoked` from the very cache the
    admission check reads, and an `/ocsp` query carrying a nonce (`openssl ocsp`
-   sends one unless you pass `-no_nonce`) resolves status from it too. Both are
+   sends one unless you pass `-no_nonce`) resolves status from it too; the
+   `puppetca_crl_cached_number` gauge is the same answer as a number. Each is
    reliable only while issuance stays closed off, per step 1, since the status
    answer describes whatever certificate is in storage for that subject now.
-   The status probe needs that certificate to still be there, so it suits the
-   `PUT` route: after a `DELETE` — what `openvox-ca-ctl clean` sends — every
+   The status probe also needs that certificate to still be there, so it suits
+   the `PUT` route: after a `DELETE` — what `openvox-ca-ctl clean` sends — every
    replica answers `404` and it distinguishes nothing, so record the serial
-   beforehand and use OCSP, or restart. OCSP additionally answers `Unknown` for a serial a peer issued since this
-   replica started, and a nonce-free query may be served from a pre-signed
-   cache the re-sign does not clear. What cannot answer it at all is anything
-   reading shared storage: `GET /certificate_revocation_list/ca`,
-   `puppetca_crl_number` and `puppetca_crl_revoked_certificates` all read the
-   same on a stale replica as on a fresh one. Restarting a replica is the
-   fallback when it cannot be reached.
+   beforehand and use OCSP or the gauge. OCSP additionally answers `Unknown` for
+   a serial a peer issued since this replica started, and a nonce-free query may
+   be served from a pre-signed cache the sync does not clear for serials it did
+   not just revoke. What cannot answer it at all is anything reading shared
+   storage: `GET /certificate_revocation_list/ca`, `puppetca_crl_number` and
+   `puppetca_crl_revoked_certificates` all read the same on a stale replica as
+   on a fresh one.
 
 The order matters. Step 3 is also what makes a stale replica willing to evict
-the revoked certificate and issue a replacement, so running it while autosign
-is still open hands whoever holds the compromised key a fresh, valid
+the revoked certificate and issue a replacement, so letting the sync land while
+autosign is still open hands whoever holds the compromised key a fresh, valid
 certificate.
 
-> **Revocation is not enforced cluster-wide straight away.** The check reads an
-> in-memory copy of the CRL that each process loads at startup and thereafter
-> refreshes only when *that* process re-signs the CRL — on revocation, reissue,
-> or the periodic refresh once the CRL is near expiry. On the HA backends, a
-> revocation performed against one replica reaches shared storage immediately,
-> and `GET /certificate_revocation_list/ca` serves it from there, but a peer
-> replica keeps admitting the revoked certificate until it re-signs or restarts.
-> The periodic refresh does not bound this: it re-signs on only whichever
-> replica wins the shared CRL lock, and the peers then observe a fresh CRL and
-> do nothing, so a peer can stay stale well past the refresh interval. Restart
-> the fleet, or force a re-sign on each replica, when locking out a compromised
-> agent promptly matters.
+> **Revocation is not enforced cluster-wide instantly.** Every admission
+> decision reads an in-memory copy of the CRL, not storage: the hot path of an
+> authenticated request cannot afford a storage round trip. A revocation reaches
+> shared storage at once and `GET /certificate_revocation_list/ca` serves it
+> from there immediately, but the replica that performed it is the only one that
+> rewrites its own copy on the spot. The rest pick it up on the
+> `crl_sync_interval_sec` poll, which is what bounds the window — 60 seconds by
+> default. Two things it does not cover: OCSP responses already handed out
+> (signed with four hours of validity, and a client's cache cannot be recalled),
+> and other live certificates the same subject already holds. Both are set out
+> under [revocation across
+> replicas](configuration.md#revocation-across-replicas).
 
 In plain HTTP mode (no TLS), all endpoints are accessible without authentication:
 the authorisation middleware is only installed when `--tls-cert`/`--tls-key`

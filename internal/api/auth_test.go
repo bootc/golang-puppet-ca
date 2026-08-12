@@ -343,10 +343,7 @@ var _ = Describe("Auth Middleware", func() {
 			peerCA := ca.New(storage.New(tmpDir), ca.AutosignConfig{Mode: "off"}, "puppet.test")
 			Expect(peerCA.Init(ctx)).To(Succeed())
 			peerServer := api.New(peerCA)
-			peerServer.AuthConfig = &api.AuthConfig{
-				CACert:    caCert,
-				AllowList: map[string]bool{"puppet-server": true},
-			}
+			peerServer.AuthConfig = api.NewAuthConfig(caCert, map[string]bool{"puppet-server": true})
 			peerMux := peerServer.Routes()
 
 			Expect(myCA.Revoke(ctx, "peer-revoked-client")).To(Succeed())
@@ -394,10 +391,7 @@ var _ = Describe("Auth Middleware", func() {
 			peerCA := ca.New(storage.New(tmpDir), ca.AutosignConfig{Mode: "off"}, "puppet.test")
 			Expect(peerCA.Init(ctx)).To(Succeed())
 			peerServer := api.New(peerCA)
-			peerServer.AuthConfig = &api.AuthConfig{
-				CACert:    caCert,
-				AllowList: map[string]bool{"puppet-server": true},
-			}
+			peerServer.AuthConfig = api.NewAuthConfig(caCert, map[string]bool{"puppet-server": true})
 			peerMux := peerServer.Routes()
 
 			Expect(myCA.Revoke(ctx, "peer-renew-client")).To(Succeed())
