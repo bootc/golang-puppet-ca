@@ -18,6 +18,7 @@
 package main
 
 import (
+	"context"
 	"io"
 	"log/slog"
 	"os"
@@ -98,6 +99,7 @@ var _ = Describe("setupLogger handler selection", func() {
 		r, w, err := os.Pipe()
 		Expect(err).NotTo(HaveOccurred())
 		origStderr := os.Stderr
+		defer func() { os.Stderr = origStderr }()
 		os.Stderr = w
 		f, err := setupLogger(&serverConfig{})
 		os.Stderr = origStderr
@@ -115,10 +117,35 @@ var _ = Describe("setupLogger handler selection", func() {
 		Expect(string(out)).To(ContainSubstring(`reason="route requires admin access"`))
 	})
 
+	// The other half of what setupLogger decides. Nothing else observes it:
+	// the config suite checks only that the field parses, so transposing the
+	// Debug and Trace arms would break -v with every spec green.
+	DescribeTable("maps verbosity to a level",
+		func(verbosity int, enabled, notEnabled []slog.Level) {
+			_, err := setupLogger(&serverConfig{Verbosity: verbosity})
+			Expect(err).NotTo(HaveOccurred())
+			for _, lvl := range enabled {
+				Expect(slog.Default().Enabled(context.Background(), lvl)).To(BeTrue(),
+					"level %v should be enabled at verbosity %d", lvl, verbosity)
+			}
+			for _, lvl := range notEnabled {
+				Expect(slog.Default().Enabled(context.Background(), lvl)).To(BeFalse(),
+					"level %v should be disabled at verbosity %d", lvl, verbosity)
+			}
+		},
+		Entry("default is Info", 0,
+			[]slog.Level{slog.LevelInfo}, []slog.Level{slog.LevelDebug}),
+		Entry("-v is Debug", 1,
+			[]slog.Level{slog.LevelDebug}, []slog.Level{slog.Level(-8)}),
+		Entry("-vv is Trace", 2,
+			[]slog.Level{slog.LevelDebug, slog.Level(-8)}, nil),
+	)
+
 	It("refuses to start when the log file cannot be opened", func() {
-		// Both callers return this straight out of the command, so a bad
-		// logfile is a startup failure; the path is what an operator needs to
-		// see in it.
+		// What the two callers do with this differs — the server command
+		// returns it and refuses to start, while runSignerMode logs it and
+		// falls back to stderr — so what is pinned here is the contract they
+		// both depend on: an error that names the path, and no file handle.
 		missing := filepath.Join(GinkgoT().TempDir(), "no-such-dir", "ca.log")
 		f, err := setupLogger(&serverConfig{LogFile: missing})
 		Expect(err).To(MatchError(ContainSubstring("failed to open log file")))
