@@ -18,7 +18,6 @@
 package main
 
 import (
-	"bytes"
 	"io"
 	"log/slog"
 	"os"
@@ -81,6 +80,8 @@ var _ = Describe("setupLogger handler selection", func() {
 		Expect(f).NotTo(BeNil())
 		DeferCleanup(func() { Expect(f.Close()).To(Succeed()) })
 
+		Expect(slog.Default().Handler()).To(BeAssignableToTypeOf(&slog.JSONHandler{}))
+
 		slog.Warn("Request denied by authorisation middleware",
 			"reason", "route requires admin access")
 
@@ -94,13 +95,11 @@ var _ = Describe("setupLogger handler selection", func() {
 		Expect(err).NotTo(HaveOccurred())
 		Expect(f).To(BeNil(), "nothing to close when logging to stderr")
 
-		// The handler is the text one, so the same call renders key=value
-		// rather than JSON. Asserted through a buffer of our own rather than
-		// by capturing stderr, which the suite shares.
-		var buf bytes.Buffer
-		slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
-		slog.Warn("Request denied by authorisation middleware",
-			"reason", "route requires admin access")
-		Expect(buf.String()).To(ContainSubstring(`reason="route requires admin access"`))
+		// The handler this installed, not one the spec supplies: the rendering
+		// the migration guide promises follows from the type, and asserting a
+		// buffer we wired ourselves would pass just as well if main.go picked
+		// JSON here. Its destination is the process's stderr, which the suite
+		// shares, so the type is what can be checked.
+		Expect(slog.Default().Handler()).To(BeAssignableToTypeOf(&slog.TextHandler{}))
 	})
 })

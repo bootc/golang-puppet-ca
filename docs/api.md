@@ -86,10 +86,6 @@ All endpoints are served under both the bare path and `/puppet-ca/v1/<path>`, so
 
 Requires a valid CA-signed client certificate. The new certificate is issued immediately without entering the pending-CSR queue or autosign evaluation, and the certificate it replaces is revoked once the new one is safely stored (see `revoke_on_auto_renew` below for the auto-renewal case).
 
-### Renewal eligibility
-
-The presented client certificate must be one **this CA** issued, must not be revoked, and must be the certificate for the subject being renewed. Today none of the three produces a distinct error: the authorisation middleware trusts exactly this CA's certificate, so it refuses a foreign or revoked certificate first with `403 access denied`, and the subject condition cannot be reached at all because the handler derives the subject from the presented certificate. The CA's own `403 certificate not eligible for renewal` becomes reachable for the first two once a second issuer can be trusted for client authentication; the third guards future callers of the internal API rather than any request path.
-
 - **CSR body (re-key):** the CSR Common Name must match the authenticated client CN — an agent can only renew its own certificate, not another's. Issues a certificate for the new key in the CSR. Puppet OID extensions are copied from the CSR **except** authorization-arc OIDs (`1.3.6.1.4.1.34380.1.3.*`, such as `pp_cli_auth`), which are stripped so a submitted CSR cannot request elevated privileges.
 
 - **Empty body (wire-compatible auto-renewal):** matches the request real OpenVox/Puppet agents send by default (`hostcert_renewal_interval`, and the `puppet ssl renew_cert` CLI action). Identity and key possession come solely from the mTLS-presented client certificate; the same public key is reissued with a fresh serial and validity, carrying forward the original certificate's SANs and Puppet OID extensions unchanged. Unlike the CSR path, this **preserves authorization-arc OIDs** (e.g. `pp_cli_auth`): they were already vetted when the presented certificate was issued, so a cert that legitimately holds them keeps them across renewal.
@@ -105,6 +101,10 @@ The re-read is best-effort in one direction: if the storage read itself fails, t
 `revoke_on_auto_renew` (env `PUPPET_CA_REVOKE_ON_AUTO_RENEW`, default `true`) controls whether the certificate replaced by an auto-renewal (empty body) is revoked. The default keeps only the newest serial per subject valid. Set to `false` to match OpenVox Server's own (Clojure) CA exactly, which leaves the replaced certificate valid — for the same key — until it naturally expires. This setting has no effect on the CSR-body (re-key) path, which always revokes the certificate it replaces.
 
 > **CRL growth:** with the default `true`, every auto-renewal appends the retired serial to the CRL, and the entry stays there until the certificate expires. Entries are only pruned by the expired-certificate cleanup job, which is off by default — enable `enable_expired_cert_cleanup` to bound CRL size on busy CAs, and watch `puppetca_crl_revoked_certificates` to keep an eye on it. Revocation is best-effort (a failure never fails the renewal); the `puppetca_crl_update_failures_total` metric counts a CRL that could not be read, re-signed or written, so it catches most — but not all — of a superseded certificate that could not be revoked. A CRL lock the renewal could not take is logged only. See [Authorization tiers](#authorization-tiers) for the same distinction on the clean path.
+
+### Renewal eligibility
+
+The presented client certificate must be one **this CA** issued, must not be revoked, and must be the certificate for the subject being renewed. Today none of the three produces a distinct error: the authorisation middleware trusts exactly this CA's certificate, so it refuses a foreign or revoked certificate first with `403 access denied`, and the subject condition cannot be reached at all because the handler derives the subject from the presented certificate. The CA's own `403 certificate not eligible for renewal` becomes reachable for the first two once a second issuer can be trusted for client authentication; the third guards future callers of the internal API rather than any request path.
 
 ## Bulk signing
 

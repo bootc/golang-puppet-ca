@@ -440,6 +440,13 @@ that such a certificate already fails the middleware's own chain check, so it
 was locked out of every mTLS route before this change too, not just renewal.
 Those agents must re-enrol.
 
+**There is no opt-out**, and none is planned: the gate is what stops this CA
+reissuing under its own authority for a name it never assigned, so re-enrolment
+is the resolution. When the CA's own refusal is reached — which takes a second
+trusted issuer, as above — it logs `Renewal rejected: certificate not eligible`,
+or `Auto-renewal rejected: certificate not eligible` for the empty-body form,
+each with the `subject` and the reason in `error`.
+
 ## CLI command mapping
 
 | Puppet / puppetserver ca | openvox-ca-ctl | Notes |

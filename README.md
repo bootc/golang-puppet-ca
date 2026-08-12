@@ -25,7 +25,9 @@ wire-compatible with your existing Puppet/OpenVox fleet.
 
 > **Migrating from OpenVox Server or Puppet Server?** See the
 > [migration guide](docs/migrating-from-puppet-server.md) for step-by-step
-> instructions, directory layout mapping, and CLI command translation.
+> instructions, directory layout mapping, and CLI command translation, and
+> [authorisation behaviour worth knowing](#authorisation-behaviour-worth-knowing)
+> for the two rules that differ from a relaxed `auth.conf`.
 
 ## Features
 
@@ -148,13 +150,21 @@ The complete flag, environment-variable, and config-file reference is in
 | [Container images](docs/container-images.md) | Pulling and running the published images |
 | [Migration guide](docs/migrating-from-puppet-server.md) | Replacing an OpenVox/Puppet Server built-in CA |
 
-Two behaviours differ from what an OpenVox/Puppet Server operator will expect,
-and both refuse a request that used to succeed: `GET
-/certificate_status/{subject}` is admin-only rather than readable by any agent,
-and `POST /certificate_renewal` accepts only certificates this CA issued and has
-not revoked. Each is described with its symptom, its denial log line and the
-opt-out, under [authorisation
-parity](docs/migrating-from-puppet-server.md#authorisation-parity) and [renewal
+## Authorisation behaviour worth knowing
+
+Two rules catch operators out, neither of which changes a stock deployment.
+
+`GET /certificate_status/{subject}` is admin-only. That matches OpenVox/Puppet
+Server's shipped `auth.conf`, so only a configuration that had been relaxed to
+let ordinary agent certificates read statuses loses that access — and there are
+three ways to grant it back. Denials are logged, with the string to grep for, in
+[authorisation parity](docs/migrating-from-puppet-server.md#authorisation-parity).
+
+`POST /certificate_renewal` accepts only certificates this CA issued and has not
+revoked. In the default single-issuer topology nothing reaches that check that
+was not already refused at the TLS layer; it becomes load-bearing once a second
+issuer can be trusted for client authentication. There is no opt-out: an agent
+holding a certificate from a replaced CA must re-enrol. See [renewal
 eligibility](docs/migrating-from-puppet-server.md#renewal-eligibility).
 
 ## Contributing
