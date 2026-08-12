@@ -192,13 +192,23 @@ var _ = Describe("ImportCA: what a bundle and a CRL chain must look like", func(
 		Expect(err).To(MatchError(ContainSubstring("PRIVATE KEY")))
 	})
 
-	It("accepts several CRLs and stores them all", func() {
+	It("keeps only the newest of several copies of our own CRL", func() {
+		// crlFor signs with this CA's own key, so both blocks are ours rather
+		// than an ancestor's. Superseded copies of our own are discarded — the
+		// chain carries at most one — which is what stops a re-import with an
+		// older export resurrecting a CRL the CA has already moved past.
 		twoCRLs := append(crlFor(1), crlFor(2)...)
 		Expect(ca.ImportCA(ctx, store, chain.Bundle, chain.InterKeyPEM, twoCRLs)).To(Succeed())
 
 		stored, err := store.GetCRL(ctx)
 		Expect(err).NotTo(HaveOccurred())
-		Expect(countPEMBlocks(stored, "X509 CRL")).To(Equal(2))
+		Expect(countPEMBlocks(stored, "X509 CRL")).To(Equal(1))
+
+		block, _ := pem.Decode(stored)
+		Expect(block).NotTo(BeNil())
+		kept, err := x509.ParseRevocationList(block.Bytes)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(kept.Number.Int64()).To(Equal(int64(2)), "the newer of the two must be the one kept")
 	})
 
 	It("reports which CRL in the chain failed to parse, not merely that one did", func() {
@@ -212,19 +222,24 @@ var _ = Describe("ImportCA: what a bundle and a CRL chain must look like", func(
 
 	It("refuses a CRL file that contains no CRL at all", func() {
 		err := ca.ImportCA(ctx, store, chain.Bundle, chain.InterKeyPEM, chain.RootPEM)
-		Expect(err).To(MatchError(ContainSubstring("supply only CRLs")))
+		Expect(err).To(MatchError(ContainSubstring("does not contain a valid X509 CRL PEM block")))
 	})
 
 	// SECURITY: the stored CRL blob is world-readable and is served to every
 	// agent on a route that requires no client certificate. A file assembled by
-	// the obvious `cat key.pem crl.pem` mistake must not publish the key.
-	It("refuses a CRL file with a private key concatenated into it", func() {
+	// the obvious `cat key.pem crl.pem` mistake must not publish the key. The
+	// import does not refuse it — what is stored is re-encoded from the CRLs
+	// that parsed, so every other block is dropped on the way through, and the
+	// property holds by construction rather than by rejection.
+	It("never publishes a private key concatenated into a CRL file", func() {
 		withKey := append(append([]byte{}, chain.InterKeyPEM...), crlFor(1)...)
-		err := ca.ImportCA(ctx, store, chain.Bundle, chain.InterKeyPEM, withKey)
-		Expect(err).To(MatchError(ContainSubstring("served to every agent")))
+		Expect(ca.ImportCA(ctx, store, chain.Bundle, chain.InterKeyPEM, withKey)).To(Succeed())
 
-		_, err = store.GetCRL(ctx)
-		Expect(err).To(HaveOccurred(), "nothing may be published from a file we refused")
+		stored, err := store.GetCRL(ctx)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(string(stored)).NotTo(ContainSubstring("PRIVATE KEY"),
+			"the blob served to every agent must carry no key material")
+		Expect(countPEMBlocks(stored, "X509 CRL")).To(Equal(1))
 	})
 
 	It("stores only what it validated, never the operator's file verbatim", func() {
