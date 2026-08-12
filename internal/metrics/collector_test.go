@@ -238,6 +238,30 @@ var _ = Describe("Collector", func() {
 		Expect(gaugeValue(g.findByLabels("puppetca_ca_ready", nil))).To(Equal(0.0))
 	})
 
+	It("drops the CRL gauges and still reports a successful scrape when the CRL is unreadable", func() {
+		// The degradation docs/metrics.md warns about: a CRL the exporter
+		// cannot parse takes the four CRL gauges out of the output without
+		// failing the scrape, so an expiry alert comparing
+		// puppetca_crl_next_update_timestamp_seconds against time() matches
+		// nothing rather than firing. That is why the note tells operators to
+		// pair it with a presence check.
+		Expect(store.UpdateCRL(ctx, []byte("not a valid CRL"))).To(Succeed())
+
+		g := gather(metrics.NewCollector(myCA))
+
+		Expect(gaugeValue(g.findByLabels("puppetca_collector_scrape_success", nil))).To(Equal(1.0))
+		for _, name := range []string{
+			"puppetca_crl_number",
+			"puppetca_crl_this_update_timestamp_seconds",
+			"puppetca_crl_next_update_timestamp_seconds",
+			"puppetca_crl_revoked_certificates",
+		} {
+			Expect(g.findByLabels(name, nil)).To(BeNil(), "%s must be absent, not stale", name)
+		}
+		Expect(g.findByLabels("puppetca_crl_update_failures_total", nil)).NotTo(BeNil(),
+			"the failure counter is exported regardless")
+	})
+
 	It("reports per-leaf metrics with issuance state", func() {
 		signCert("signed-node")
 		signCert("revoked-node")

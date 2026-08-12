@@ -11,7 +11,7 @@ All endpoints are served under both the bare path and `/puppet-ca/v1/<path>`, so
 | --- | --- | --- |
 | `GET` | `/certificate_status/{subject}` | Get status: `signed`, `requested`, or `revoked` |
 | `PUT` | `/certificate_status/{subject}` | Change state (`signed` or `revoked`); supports `cert_ttl` (seconds). `revoked` returns `409 Conflict` when the stored CRL was not signed by the CA certificate this process loaded — see the note below |
-| `DELETE` | `/certificate_status/{subject}` | Revoke + delete cert and CSR (`puppet cert clean`). The delete happens even if the revocation fails — see the note below |
+| `DELETE` | `/certificate_status/{subject}` | Revoke + delete cert and CSR (`puppet cert clean`). The delete happens even if the revocation fails, as does the deletion of any pending request — see the note below and [Authorization tiers](#authorization-tiers) |
 
 `PUT` body:
 
@@ -97,7 +97,7 @@ The re-read is best-effort in one direction: if the storage read itself fails, t
 
 `revoke_on_auto_renew` (env `PUPPET_CA_REVOKE_ON_AUTO_RENEW`, default `true`) controls whether the certificate replaced by an auto-renewal (empty body) is revoked. The default keeps only the newest serial per subject valid. Set to `false` to match OpenVox Server's own (Clojure) CA exactly, which leaves the replaced certificate valid — for the same key — until it naturally expires. This setting has no effect on the CSR-body (re-key) path, which always revokes the certificate it replaces.
 
-> **CRL growth:** with the default `true`, every auto-renewal appends the retired serial to the CRL, and the entry stays there until the certificate expires. Entries are only pruned by the expired-certificate cleanup job, which is off by default — enable `enable_expired_cert_cleanup` to bound CRL size on busy CAs, and watch `puppetca_crl_revoked_certificates` to keep an eye on it. Revocation is best-effort (a failure never fails the renewal); the `puppetca_crl_update_failures_total` metric counts any failure to amend the CRL, including a superseded certificate that could not be revoked.
+> **CRL growth:** with the default `true`, every auto-renewal appends the retired serial to the CRL, and the entry stays there until the certificate expires. Entries are only pruned by the expired-certificate cleanup job, which is off by default — enable `enable_expired_cert_cleanup` to bound CRL size on busy CAs, and watch `puppetca_crl_revoked_certificates` to keep an eye on it. Revocation is best-effort (a failure never fails the renewal); the `puppetca_crl_update_failures_total` metric counts a CRL that could not be read, re-signed or written, so it catches most — but not all — of a superseded certificate that could not be revoked. A CRL lock the renewal could not take is logged only. See [Authorization tiers](#authorization-tiers) for the same distinction on the clean path.
 
 ## Bulk signing
 
@@ -117,6 +117,12 @@ Response:
 ```json
 { "cleaned": ["a.example.com"], "not-found": ["missing.example.com"], "clean-errors": [] }
 ```
+
+Each subject goes through the same path as `DELETE
+/certificate_status/{subject}`, with the same best-effort revoke and deletes, so
+`clean-errors` does not capture any of them: a subject whose revocation or
+deletion failed is reported under `cleaned`. The CRL is the authority for what
+was actually revoked — see [Authorization tiers](#authorization-tiers).
 
 ## CRL
 
@@ -199,11 +205,109 @@ When mTLS is enabled (both `--tls-cert` and `--tls-key` set), each endpoint requ
 | Tier | Required client cert | Endpoints |
 | --- | --- | --- |
 | **Public** | None | `GET /healthz/*`, `GET /certificate/{subject}`, `GET /certificate_revocation_list/ca`, `PUT /certificate_request/{subject}`, `GET /expirations`, `POST /ocsp`, `GET /ocsp/{request}` |
-| **Any client** | Any CA-signed cert | `GET /certificate_status/{subject}` (public with `--allow-public-status`), `POST /certificate_renewal` |
+| **Any client** | Any CA-signed cert with `clientAuth` EKU | `GET /certificate_status/{subject}` (public with `--allow-public-status`), `POST /certificate_renewal` |
 | **Self or admin** | Cert CN matches path subject, OR cert is admin | `GET /certificate_request/{subject}` |
 | **Admin** | Cert is admin (see below) | `PUT /certificate_status/{subject}`, `DELETE /certificate_status/{subject}`, `DELETE /certificate_request/{subject}`, `GET /certificate_statuses/*`, `POST /sign`, `POST /sign/all`, `POST /generate/{subject}`, `PUT /clean`, `PUT /certificate_revocation_list/ca`, `PUT /certificate/{subject}` |
 
-In plain HTTP mode (no TLS), all endpoints are accessible without authentication.
+Above the public tier, a presented certificate must also be **currently valid,
+not revoked, and carry the `clientAuth` extended key usage**: an expired
+certificate, one listed in the CRL, or one issued for `serverAuth` only is
+refused at every tier above public — including `POST /certificate_renewal`, so
+revoking an agent's certificate cuts off its access to every *authenticated*
+endpoint, not merely its next renewal.
+
+The public tier is unaffected, because it examines no client certificate at
+all. A revoked agent can still fetch the CA certificate and the CRL, read
+`/expirations`, query OCSP, and submit a CSR to
+`PUT /certificate_request/{subject}`.
+
+**Neither form of revocation prevents re-enrolment under the same subject.**
+Submitting a CSR evicts a revoked certificate for that subject (see
+[Certificate import](#certificate-import) for the same rule on the import
+path), so the difference between the two verbs is only *when* the stored
+certificate goes away:
+
+- `PUT /certificate_status/{subject}` with `{"desired_state":"revoked"}` adds
+  the serial to the CRL and leaves the certificate in storage until a later CSR
+  displaces it. Eviction reads the same per-process CRL cache as the admission
+  check described below, so on the HA backends a peer that has not yet synced
+  answers `200 OK` and silently discards the CSR instead — for at most
+  `crl_sync_interval_sec`, see below.
+- `DELETE /certificate_status/{subject}` revokes, then deletes the certificate
+  and any pending request, all against shared storage, so no step depends on a
+  replica's cache. All three are best-effort: each failure is logged and the
+  handler carries on, and the endpoint answers `204` regardless — so a `204`
+  records that the subject existed, not that it was revoked or removed. Since
+  admission reads the CRL rather than storage, the dangerous combination is a
+  delete whose revocation failed: the file is gone and the certificate still
+  works. Confirm the serial in `GET /certificate_revocation_list/ca`. The
+  server's `Clean: revoke failed`, `Clean: delete cert failed` and
+  `Clean: delete CSR failed` warnings are the complete signal;
+  `puppetca_crl_update_failures_total` covers most of the first — a CRL that
+  could not be read, signed or written all count — but not a revocation that
+  never reached the CRL (a lock it could not take, or a subject whose serial the
+  inventory could not resolve), and not a failed delete at all.
+
+Otherwise the next CSR is accepted: with autosign enabled it is signed at once
+and the agent is back with a fresh, unrevoked certificate; with autosign off it
+queues for manual signing. The CRL entry for the old serial persists in both
+cases, so the old certificate stays refused — but that is not the same as
+locking the *agent* out.
+
+When containing a compromised agent, apply the levers that hold, in this order:
+
+1. Close off issuance: disable autosign, or use an autosign policy that
+   excludes the subject, and block the agent at the network layer.
+2. Revoke the certificate.
+3. Wait one sync interval, or force it. Each replica re-reads the stored CRL
+   every `crl_sync_interval_sec` (60s by default) and installs it once it has
+   advanced, so that interval is the worst case for a replica that did not
+   perform the revocation — see [revocation across
+   replicas](configuration.md#revocation-across-replicas). To not wait, force a
+   re-sign against a replica's own address (`openvox-ca-ctl reissue-crl`, or
+   `PUT /certificate_revocation_list/ca`); each call refreshes only the replica
+   that serves it, so through a load balancer it refreshes whichever one the
+   VIP picked.
+
+   To confirm a given replica, ask that address. `GET
+   /certificate_status/{subject}` reports `revoked` from the very cache the
+   admission check reads, and an `/ocsp` query carrying a nonce (`openssl ocsp`
+   sends one unless you pass `-no_nonce`) resolves status from it too; the
+   `puppetca_crl_cached_number` gauge is the same answer as a number. Each is
+   reliable only while issuance stays closed off, per step 1, since the status
+   answer describes whatever certificate is in storage for that subject now.
+   The status probe also needs that certificate to still be there, so it suits
+   the `PUT` route: after a `DELETE` — what `openvox-ca-ctl clean` sends — every
+   replica answers `404` and it distinguishes nothing, so record the serial
+   beforehand and use OCSP or the gauge. OCSP additionally answers `Unknown` for
+   a serial a peer issued since this replica started, and a nonce-free query may
+   be served from a pre-signed cache the sync does not clear for serials it did
+   not just revoke. What cannot answer it at all is anything reading shared
+   storage: `GET /certificate_revocation_list/ca`, `puppetca_crl_number` and
+   `puppetca_crl_revoked_certificates` all read the same on a stale replica as
+   on a fresh one.
+
+The order matters. Step 3 is also what makes a stale replica willing to evict
+the revoked certificate and issue a replacement, so letting the sync land while
+autosign is still open hands whoever holds the compromised key a fresh, valid
+certificate.
+
+> **Revocation is not enforced cluster-wide instantly.** Every admission
+> decision reads an in-memory copy of the CRL, not storage: the hot path of an
+> authenticated request cannot afford a storage round trip. A revocation reaches
+> shared storage at once and `GET /certificate_revocation_list/ca` serves it
+> from there immediately, but the replica that performed it is the only one that
+> rewrites its own copy on the spot. The rest pick it up on the
+> `crl_sync_interval_sec` poll, which is what bounds the window — 60 seconds by
+> default. Two things it does not cover: OCSP responses already handed out
+> (signed with four hours of validity, and a client's cache cannot be recalled),
+> and other live certificates the same subject already holds. Both are set out
+> under [revocation across
+> replicas](configuration.md#revocation-across-replicas).
+
+In plain HTTP mode (no TLS), all endpoints are accessible without authentication:
+the authorisation middleware is only installed when `--tls-cert`/`--tls-key`
+(`tls_cert`/`tls_key` in the config file) are both set.
 
 > **Note:** `GET /certificate_status/{subject}` requires a CA-signed client certificate by default. Use `--allow-public-status` to make it public for environments where bootstrapping agents need to poll status before obtaining a client certificate. The response exposes state, fingerprint, serial number, and authorization extensions.
 
