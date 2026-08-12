@@ -18,6 +18,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"log/slog"
