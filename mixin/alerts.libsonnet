@@ -179,12 +179,14 @@
         rules: [
           {
             alert: 'PuppetCACRLUpdateFailing',
-            // The CA failed to amend the CRL — a revocation it could not record,
-            // or a CRL it could not re-sign or write (revoke, cleanup, reissue or
-            // refresh). Some callers swallow this (e.g. the best-effort revoke of
-            // a superseded cert on renewal), so a revoked/superseded certificate
-            // may remain valid. The counter resets on restart, so alert on
-            // increase() over a window rather than a raw value.
+            // The CA failed to amend the CRL — a CRL it could not re-sign or
+            // write (revoke, reissue, refresh or expired-cert cleanup), or one
+            // it could not read on the revoke path. Some callers swallow this
+            // (e.g. the best-effort revoke of a superseded cert on renewal), so
+            // a revoked/superseded certificate may remain valid. A revocation
+            // that never reached the CRL is logged only and does not appear
+            // here. The counter resets on restart, so alert on increase() over
+            // a window rather than a raw value.
             expr: 'increase(puppetca_crl_update_failures_total{%(selector)s}[%(window)s]) > 0' % {
               selector: $._config.puppetCASelector,
               window: $._config.crlUpdateWindow,

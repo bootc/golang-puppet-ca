@@ -87,7 +87,7 @@ the Unix epoch, the Prometheus convention for `*_timestamp_seconds` gauges.
 | `puppetca_crl_this_update_timestamp_seconds` | CRL `ThisUpdate` time. |
 | `puppetca_crl_next_update_timestamp_seconds` | CRL `NextUpdate` (expiry) time. |
 | `puppetca_crl_revoked_certificates` | Number of certificates currently listed in the CRL. |
-| `puppetca_crl_update_failures_total` | Counter of failures to amend the CRL: a CRL that could not be re-signed or written, on any of the revoke, cleanup, reissue and refresh paths, plus — on the revoke path only — a CRL that could not be read, and a malformed serial. A rising value means the CRL is not being maintained; for revocations it means a superseded certificate may still be a valid credential. Treat it as a lower bound. Uncounted, and logged only: a revocation that failed before reaching the CRL (a lock it could not take, or a subject whose serial the inventory could not resolve — though `PUT /certificate_status` also answers its caller `409`), a CRL that could not be read during reissue, refresh or cleanup, and a malformed serial met by the cleanup job. A background refresh that cannot read the CRL is therefore invisible here, and invisible to `puppetca_collector_scrape_success` too — the exporter drops the CRL gauges and reports a successful scrape — so alert on `puppetca_crl_next_update_timestamp_seconds` approaching now as well. Resets to `0` on process restart. |
+| `puppetca_crl_update_failures_total` | Counter of failures to amend the CRL. A lower bound — see the note below. Resets to `0` on process restart. |
 | `puppetca_crl_cached_number` | CRL number of the copy **this replica** is answering revocation checks from. `number`, `this_update`, `next_update` and `revoked_certificates` above are read from storage and so are identical on every replica; this one and both `*_failures_total` counters are per-process and have to be checked on each. |
 | `puppetca_crl_sync_failures_total` | Counter of failures to reload the stored CRL into that in-memory copy — an unreadable or unparseable CRL, or one this CA did not sign. While it rises the replica keeps enforcing whichever CRL it already held. Resets to `0` on process restart. |
 
@@ -97,6 +97,33 @@ revocation it briefly trails `puppetca_crl_number`. A gap that persists is a
 replica still admitting certificates the rest of the fleet has revoked — see
 [watching revocation propagate](#watching-revocation-propagate) below for the
 query, and `puppetca_crl_sync_failures_total` for why it is stuck.
+> **What the failure counter does and does not see.** It counts a CRL that
+> could not be re-signed or written, on any of the four paths that write one
+> (revoke, CRL reissue, background refresh, expired-cert cleanup), and — on the
+> revoke path only — a CRL that could not be read, or a malformed serial. The
+> revoke path is the shared revoke-by-serial code, so it also covers
+> `DELETE /certificate_status` (`puppet cert clean`) and the best-effort
+> revocation of a superseded certificate on renewal, which on a busy fleet is
+> the likeliest source of a rising count: grep for `Renew:` /
+> `AutoRenew: failed to revoke replaced certificate` alongside the `Clean:`
+> warnings.
+>
+> Uncounted, and logged only: a revocation that failed before reaching the CRL
+> (a lock it could not take, or a subject whose serial the inventory could not
+> resolve — though `PUT /certificate_status` also answers its caller `409`), a
+> CRL that could not be read during reissue, refresh or cleanup, and a
+> malformed serial met by the cleanup job.
+>
+> A background refresh that cannot read the CRL is therefore invisible here,
+> and to `puppetca_collector_scrape_success` as well: the exporter drops the
+> CRL gauges and still reports a successful scrape. It does not show up as an
+> expiring CRL either, because the gauge is *absent* rather than stale — the
+> shipped `PuppetCACRLExpiringSoon` and `PuppetCACRLExpired` rules compare
+> `puppetca_crl_next_update_timestamp_seconds` against `time()` and match
+> nothing when the series is missing. Pair them with a per-instance presence
+> check, e.g. `puppetca_ca_ready == 1 unless on(instance)
+> puppetca_crl_next_update_timestamp_seconds`; bare `absent()` will not fire
+> while any other replica still reports the series.
 
 The four CRL gauges above describe the **first block of the stored blob**, which
 is normally this CA's own CRL and not always: a hand-assembled blob can lead with

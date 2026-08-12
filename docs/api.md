@@ -119,8 +119,8 @@ Response:
 ```
 
 Each subject goes through the same path as `DELETE
-/certificate_status/{subject}`, with the same best-effort revoke and delete, so
-`clean-errors` does not capture either failure: a subject whose revocation or
+/certificate_status/{subject}`, with the same best-effort revoke and deletes, so
+`clean-errors` does not capture any of them: a subject whose revocation or
 deletion failed is reported under `cleaned`. The CRL is the authority for what
 was actually revoked — see [Authorization tiers](#authorization-tiers).
 
@@ -272,8 +272,11 @@ When containing a compromised agent, apply the levers that hold, in this order:
    admission check reads, and an `/ocsp` query carrying a nonce (`openssl ocsp`
    sends one unless you pass `-no_nonce`) resolves status from it too. Both are
    reliable only while issuance stays closed off, per step 1, since the status
-   answer describes whatever certificate is in storage for that subject now;
-   OCSP additionally answers `Unknown` for a serial a peer issued since this
+   answer describes whatever certificate is in storage for that subject now.
+   The status probe needs that certificate to still be there, so it suits the
+   `PUT` route: after a `DELETE` — what `openvox-ca-ctl clean` sends — every
+   replica answers `404` and it distinguishes nothing, so record the serial
+   beforehand and use OCSP, or restart. OCSP additionally answers `Unknown` for a serial a peer issued since this
    replica started, and a nonce-free query may be served from a pre-signed
    cache the re-sign does not clear. What cannot answer it at all is anything
    reading shared storage: `GET /certificate_revocation_list/ca`,

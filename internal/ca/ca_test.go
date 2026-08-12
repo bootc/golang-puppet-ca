@@ -633,6 +633,26 @@ var _ = Describe("CA Revocation", func() {
 		Expect(err).NotTo(HaveOccurred())
 		Expect(revoked).To(BeFalse())
 	})
+
+	It("IsRevoked answers from the in-memory cache, not the stored CRL", func() {
+		// docs/api.md tells operators to verify a replica's own CRL state with
+		// GET /certificate_status/{subject}, which reports "revoked" through
+		// this function. That recipe only works because the read is the
+		// per-process cache: on a stale replica the cache and storage disagree,
+		// which is the whole premise of the containment step. Replacing the
+		// stored blob is how a peer's CRL is made to differ from ours.
+		csrPEM, err := testutil.GenerateCSR("cache-source-node")
+		Expect(err).NotTo(HaveOccurred())
+		_, err = myCA.SaveRequest(context.Background(), "cache-source-node", csrPEM)
+		Expect(err).NotTo(HaveOccurred())
+		_, err = myCA.Sign(context.Background(), "cache-source-node")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(myCA.Revoke(context.Background(), "cache-source-node")).To(Succeed())
+
+		Expect(store.Backend().Delete(context.Background(), storage.KeyCRL)).To(Succeed())
+		Expect(myCA.IsRevoked(context.Background(), "cache-source-node")).To(BeTrue(),
+			"the status path must answer from the cache the admission check reads")
+	})
 })
 
 // --- SaveRequest edge cases ---
@@ -1640,7 +1660,7 @@ var _ = Describe("Concurrent SaveRequest", func() {
 })
 
 // cleanFailBackend wraps a real filesystem backend and can be armed to fail one
-// key's write or delete, which is what either half of Clean failing part-way
+// key's write or delete, which is what any one step of Clean failing part-way
 // looks like from storage.
 type cleanFailBackend struct {
 	storage.Backend
@@ -1666,9 +1686,9 @@ var _ = Describe("CA Clean when part of it fails", func() {
 	// docs/api.md publishes this as the contract operators have to guard
 	// against: DELETE /certificate_status answers 204 whichever step failed, so
 	// a 204 records that the subject existed and nothing more. Nothing else
-	// pins it — every other Clean spec runs the path where both halves succeed,
-	// so a change that turned either warning into an early return would move no
-	// assertion while making the published guidance wrong.
+	// pins it — every other Clean spec runs the path where every step succeeds,
+	// so a change that turned any of the three warnings into an early return
+	// would move no assertion while making the published guidance wrong.
 	//
 	// Recorded, not endorsed — the same contract as the authorisation baseline
 	// this branch adds. A change that makes Clean surface these failures is an
@@ -1721,6 +1741,11 @@ var _ = Describe("CA Clean when part of it fails", func() {
 			"Clean swallows the revoke failure; the handler turns this into 204")
 		Expect(store.HasCert(ctx, "doomed-node")).To(BeFalse(),
 			"the delete proceeds regardless of the failed revocation")
+		// The counted half of the contract docs/metrics.md publishes: a CRL
+		// that could not be written does move the counter, unlike the revoke
+		// that never reached it, asserted at zero elsewhere in this file.
+		Expect(myCA.CRLUpdateFailures()).To(BeNumerically("==", 1),
+			"a CRL that could not be written must be counted")
 
 		// Both views operators are pointed at: the in-process CRL admission
 		// reads, and the published CRL the guidance says to confirm the serial
