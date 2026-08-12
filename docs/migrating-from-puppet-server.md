@@ -210,6 +210,12 @@ openvox-ca \
 If migrating in-place (same hostname and port), agents will connect to the
 new CA without any reconfiguration.
 
+For a permanent installation, run it as a service rather than from a shell —
+see [running under systemd](systemd.md), which ships a hardened unit. One thing
+to watch for a migrated CA: `cadir` here is under `/etc/puppetlabs`, and the
+unit's `ProtectSystem=strict` makes that read-only until you uncomment its
+`ReadWritePaths=` line and point it at your `cadir`.
+
 ## Step 8: Verify
 
 ```bash

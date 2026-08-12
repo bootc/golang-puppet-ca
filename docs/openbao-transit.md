@@ -174,6 +174,8 @@ prefix instead, since there's no flat-file nesting for those).
 
 ### AppRole auth (VM / systemd deployments)
 
+> Running as a systemd service? See [running under systemd](systemd.md) for the shipped unit; the `role_id` and `secret_id` files below are re-read on every login, so rotating them needs neither a reload nor a restart.
+
 | Config key | Environment variable | CLI flag | Description |
 | --- | --- | --- | --- |
 | `openbao.approle_mount` | `PUPPET_CA_OPENBAO_APPROLE_MOUNT` | `--openbao-approle-mount` | AppRole mount path (default `approle`) |

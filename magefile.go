@@ -357,11 +357,33 @@ func distVariants() []distVariantSpec {
 	}
 }
 
+// distUnitFile is the systemd unit shipped in every release archive, so a VM
+// install has a unit that matches this build's notification behaviour (see
+// docs/systemd.md). Named once: the same string is the name under
+// packaging/systemd/ and the name inside the tarball.
+const distUnitFile = "openvox-ca.service"
+
+// distArchiveFiles lists a release archive's contents with the mode each entry
+// must extract as. Stating the modes here rather than reading them back off the
+// staged files keeps the tarball identical whatever umask the release is built
+// under; deriving the executables from bins keeps the archive in step with what
+// is built. Separate from buildDistVariant so the manifest can be asserted
+// without cross-compiling four variants -- the CI job that used to unpack every
+// tarball and grep its listing cost a full release build to check a list.
+func distArchiveFiles(bins []string) []archiveEntry {
+	files := make([]archiveEntry, 0, len(bins)+1)
+	for _, b := range bins {
+		files = append(files, archiveEntry{name: b, mode: 0755})
+	}
+	return append(files, archiveEntry{name: distUnitFile, mode: 0644})
+}
+
 // buildDistVariant builds one variant's tarball into distDir and returns its
 // SHA-256 checksum. The artefact is named openvox-ca_VER_NAME.tar.gz and
-// contains both binaries.
+// contains both binaries plus the systemd unit.
 func buildDistVariant(distDir, ver string, v distVariantSpec) (string, error) {
 	bins := []string{"openvox-ca", "openvox-ca-ctl"}
+	unitSrc := filepath.Join("packaging", "systemd", distUnitFile)
 	archive := filepath.Join(distDir, fmt.Sprintf("openvox-ca_%s_%s.tar.gz", ver, v.name))
 
 	tmpDir, err := os.MkdirTemp("", "openvox-ca-dist-*")
@@ -380,15 +402,20 @@ func buildDistVariant(distDir, ver string, v distVariantSpec) (string, error) {
 		}
 	}
 
-	if err := createTarGz(archive, tmpDir, bins); err != nil {
+	if err := sh.Copy(filepath.Join(tmpDir, distUnitFile), unitSrc); err != nil {
+		return "", fmt.Errorf("stage %s for %s: %w", distUnitFile, v.name, err)
+	}
+
+	if err := createTarGz(archive, tmpDir, distArchiveFiles(bins)); err != nil {
 		return "", fmt.Errorf("archive %s: %w", v.name, err)
 	}
 	return sha256File(archive)
 }
 
 // Dist cross-compiles release artifacts for all supported platforms and writes
-// them to dist/. Each artifact is a .tar.gz containing openvox-ca and
-// openvox-ca-ctl. A SHA-256 checksums.txt is also written to dist/.
+// them to dist/. Each artifact is a .tar.gz containing openvox-ca,
+// openvox-ca-ctl, and the systemd unit openvox-ca.service (see
+// docs/systemd.md). A SHA-256 checksums.txt is also written to dist/.
 //
 // Artifacts produced (VERSION is the internal/version constant):
 //
@@ -656,7 +683,12 @@ func (Test) Unit() error {
 		return err
 	}
 
-	testArgs := append([]string{"test", "-json", "-cover", "-coverprofile=coverage.out"}, pkgs...)
+	// -race is not optional here: the notification path (internal/sdnotify) is
+	// driven concurrently by the heartbeat, the reload watcher, and a deferred
+	// Close, and its locking is only verified by specs that fail exclusively
+	// under the race detector. It costs roughly 15% on the slowest package.
+	// It needs cgo, which is the default everywhere this runs.
+	testArgs := append([]string{"test", "-race", "-json", "-cover", "-coverprofile=coverage.out"}, pkgs...)
 	testCmd := exec.Command("go", testArgs...)
 	tparseCmd := exec.Command("go", "tool", "tparse", "-all")
 
@@ -1119,6 +1151,19 @@ func (Dev) Check() error {
 	if err := verifyDistVariants(); err != nil {
 		return err
 	}
+	// Vet the one package with a non-Linux build-tagged file. Every CI check
+	// runs on Linux, so internal/sdnotify/monotonic_other.go is otherwise
+	// never compiled and can rot unnoticed — while the comment in that file
+	// names developer workstations as the audience it serves. Scoped to that
+	// package rather than ./...: a module-wide cross-vet would make "every
+	// dependency must type-check on darwin" a standing constraint on future
+	// dependency choices, which is a much bigger commitment than this file
+	// needs.
+	fmt.Println("Vetting the non-Linux build of internal/sdnotify...")
+	if err := sh.RunWith(map[string]string{"GOOS": "darwin", "GOARCH": "arm64"},
+		"go", "vet", "./internal/sdnotify/..."); err != nil {
+		return fmt.Errorf("go vet failed for GOOS=darwin: %w", err)
+	}
 	return Dev{}.Lint()
 }
 
@@ -1359,12 +1404,28 @@ func runComposeWithSpinner(extraEnv map[string]string, spinMsg string, args ...s
 	return cmdErr
 }
 
-func createTarGz(dst, srcDir string, files []string) (retErr error) {
+// archiveEntry is one file in a release tarball, with the permissions it must
+// extract as. The archive mixes executables with plain data (the systemd unit),
+// and neither the build host's umask nor a single hard-coded mode gets both
+// right.
+type archiveEntry struct {
+	name string
+	mode int64
+}
+
+func createTarGz(dst, srcDir string, files []archiveEntry) (retErr error) {
 	f, err := os.Create(dst)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	// Closed with the same care as the writers below: a failure surfacing here
+	// (ENOSPC on a deferred allocation, say) would otherwise be dropped, and
+	// the caller would checksum and publish a truncated release artefact.
+	defer func() {
+		if err := f.Close(); err != nil && retErr == nil {
+			retErr = err
+		}
+	}()
 
 	gz := gzip.NewWriter(f)
 	defer func() {
@@ -1379,13 +1440,17 @@ func createTarGz(dst, srcDir string, files []string) (retErr error) {
 		}
 	}()
 
-	for _, name := range files {
-		src := filepath.Join(srcDir, name)
+	for _, entry := range files {
+		src := filepath.Join(srcDir, entry.name)
 		fi, err := os.Stat(src)
 		if err != nil {
 			return err
 		}
-		if err := tw.WriteHeader(&tar.Header{Name: name, Mode: 0755, Size: fi.Size()}); err != nil {
+		if err := tw.WriteHeader(&tar.Header{
+			Name: entry.name,
+			Mode: entry.mode,
+			Size: fi.Size(),
+		}); err != nil {
 			return err
 		}
 		rf, err := os.Open(src)

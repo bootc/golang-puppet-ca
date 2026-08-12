@@ -47,6 +47,8 @@ wire-compatible with your existing Puppet/OpenVox fleet.
 - **Prometheus exporter:** optional `/metrics` listener (`--metrics-listen`) exposing Go runtime/process and HTTP metrics plus CA certificate, CRL, and per–leaf-certificate expiry and issuance-status series; ships with a [Jsonnet alerting mixin](mixin/). See [metrics & monitoring](docs/metrics.md)
 - **Kubernetes export (opt-in):** publish the CA certificate and/or CRL into any number of Kubernetes Secrets and ConfigMaps via in-cluster server-side apply, with configurable names, namespaces, data keys, labels, annotations, and Secret `type`; CRL-bearing objects are refreshed whenever the CRL changes. See [Kubernetes export](docs/kubernetes-export.md)
 - **Graceful shutdown:** `SIGTERM`/`SIGINT` drains in-flight requests with a configurable window (25s default) before exiting; deferred storage and signer cleanup always runs
+- **Configuration reload:** `SIGHUP` (or `systemctl reload`) re-reads the TLS keypair and the admin allow list without dropping connections, so renewing the CA's server certificate or decommissioning a compile server needs no restart. See [reloading configuration](docs/configuration.md#reloading-configuration)
+- **systemd integration:** `Type=notify` readiness (`systemctl start` returns once the listener is actually accepting), a live status line covering the listener, CA expiry and CRL freshness, watchdog keep-alives, and `systemctl reload` for TLS certificate renewal and admin allow-list changes; ships a hardened [unit file](packaging/systemd/openvox-ca.service). See [running under systemd](docs/systemd.md)
 - **FIPS-compatible:** the core CA uses the standard library only (`crypto/x509`, `net/http`); no CGO by default; FIPS build available via `GOEXPERIMENT=boringcrypto` (the optional Kubernetes export adds the `client-go` dependency)
 - **`openvox-ca-ctl`:** operator CLI matching `puppetserver ca` subcommands. See the [operator CLI reference](docs/operator-cli.md)
 
@@ -64,6 +66,24 @@ $ docker pull ghcr.io/voxpupuli/openvox-ca:latest
 See [container images](docs/container-images.md) for the available tags and a
 `docker run` example, or use the [compose.yml](compose.yml) at the repository
 root for a Docker/Podman Compose deployment.
+
+### Release tarballs
+
+Each release publishes four tarballs — `linux_amd64` and `linux_arm64`, each in a standard and a
+FIPS (`_fips`) build — plus `checksums.txt`. Every archive contains both binaries (`openvox-ca`,
+`openvox-ca-ctl`) and the systemd unit `openvox-ca.service`. Asset names carry the release version,
+so set `VERSION` to the release you want (the newest is on the
+[releases page](https://github.com/voxpupuli/openvox-ca/releases/latest)) and download by tag:
+
+```console
+$ VERSION=0.9.0
+$ curl -fLO https://github.com/voxpupuli/openvox-ca/releases/download/v${VERSION}/openvox-ca_${VERSION}_linux_amd64.tar.gz
+$ curl -fLO https://github.com/voxpupuli/openvox-ca/releases/download/v${VERSION}/checksums.txt
+$ sha256sum --ignore-missing -c checksums.txt
+$ tar xzf openvox-ca_${VERSION}_linux_amd64.tar.gz
+```
+
+See [running under systemd](docs/systemd.md) for the rest of a VM install.
 
 ### Building from source
 
@@ -115,7 +135,7 @@ The complete flag, environment-variable, and config-file reference is in
 
 | Guide | What it covers |
 | --- | --- |
-| [Configuring the server](docs/configuration.md) | Every flag, environment variable, config-file key; autosigning; directory layout; graceful shutdown |
+| [Configuring the server](docs/configuration.md) | Every flag, environment variable, config-file key; autosigning; directory layout; graceful shutdown; reloading configuration |
 | [HTTP API reference](docs/api.md) | All endpoints, authorization tiers, and admin credential resolution |
 | [Operator CLI (`openvox-ca-ctl`)](docs/operator-cli.md) | The `openvox-ca-ctl` command reference |
 | [Storage backends](docs/storage-backends.md) | filesystem, SQLite, PostgreSQL, MySQL, etcd, Redis/Valkey; migrating between them |
@@ -123,6 +143,7 @@ The complete flag, environment-variable, and config-file reference is in
 | [OpenBao Transit-engine CA key](docs/openbao-transit.md) | Delegating CA key custody to OpenBao |
 | [Kubernetes export](docs/kubernetes-export.md) | Publishing the CA cert/CRL into Secrets and ConfigMaps |
 | [Metrics & monitoring](docs/metrics.md) | The Prometheus exporter and the alerting [mixin](mixin/) |
+| [Running under systemd](docs/systemd.md) | The `Type=notify` unit, status text, `systemctl reload`, watchdog, and hardening |
 | [Container images](docs/container-images.md) | Pulling and running the published images |
 | [Migration guide](docs/migrating-from-puppet-server.md) | Replacing an OpenVox/Puppet Server built-in CA |
 

@@ -136,7 +136,7 @@ func ImportCA(ctx context.Context, store *storage.StorageService, certBundlePEM,
 	// so nothing is written — re-taking the lock to rewrite identical bytes
 	// would still bump the stored modification time, and every agent would
 	// re-download a CRL that had not changed.
-	lockCtx, cancel := context.WithTimeout(ctx, lockTimeout)
+	lockCtx, cancel := context.WithTimeout(ctx, LockTimeout)
 	defer cancel()
 	if err := store.WithLock(lockCtx, lockNameCRL, func() error {
 		plan, superseded, changed, err := planCRLImport(ctx, store, crlPEM, caCert, caKey)

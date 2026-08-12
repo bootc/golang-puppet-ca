@@ -20,8 +20,12 @@
 package main
 
 import (
+	"archive/tar"
 	"bytes"
+	"compress/gzip"
+	"io"
 	"os"
+	"path/filepath"
 	"runtime"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -150,6 +154,95 @@ var _ = Describe("distVariants", func() {
 		}
 	})
 })
+
+var _ = Describe("release archive contents", func() {
+	// These replace a CI job that built all four variants, unpacked each
+	// tarball and grepped `tar -tvz` for the entries and their modes. The
+	// properties it checked are properties of the manifest and of the archive
+	// writer, neither of which needs a release build to exercise.
+	Describe("distArchiveFiles", func() {
+		files := distArchiveFiles([]string{"openvox-ca", "openvox-ca-ctl"})
+
+		It("ships both binaries executable and the unit not", func() {
+			Expect(files).To(Equal([]archiveEntry{
+				{name: "openvox-ca", mode: 0755},
+				{name: "openvox-ca-ctl", mode: 0755},
+				{name: "openvox-ca.service", mode: 0644},
+			}))
+		})
+
+		It("names a unit that is actually in the repository", func() {
+			// The manifest names a file that is copied in at build time; a
+			// rename under packaging/ would otherwise break nothing until a
+			// tag is pushed, at which point the tag exists and no artefacts do.
+			Expect(filepath.Join("packaging", "systemd", distUnitFile)).To(BeAnExistingFile())
+		})
+	})
+
+	Describe("createTarGz", func() {
+		It("writes each entry with the mode the manifest asked for", func() {
+			// Not the mode of the staged file: the release must extract the
+			// same way whatever umask it was built under.
+			srcDir := GinkgoT().TempDir()
+			for _, name := range []string{"openvox-ca", "openvox-ca.service"} {
+				Expect(os.WriteFile(filepath.Join(srcDir, name), []byte(name), 0600)).To(Succeed())
+			}
+			archive := filepath.Join(GinkgoT().TempDir(), "out.tar.gz")
+
+			Expect(createTarGz(archive, srcDir, []archiveEntry{
+				{name: "openvox-ca", mode: 0755},
+				{name: "openvox-ca.service", mode: 0644},
+			})).To(Succeed())
+
+			Expect(tarEntries(archive)).To(Equal(map[string]tarEntry{
+				"openvox-ca":         {mode: 0755, body: "openvox-ca"},
+				"openvox-ca.service": {mode: 0644, body: "openvox-ca.service"},
+			}))
+		})
+
+		It("reports a source file that is not there", func() {
+			archive := filepath.Join(GinkgoT().TempDir(), "out.tar.gz")
+			err := createTarGz(archive, GinkgoT().TempDir(), []archiveEntry{{name: "absent", mode: 0755}})
+			Expect(err).To(MatchError(os.ErrNotExist))
+		})
+	})
+})
+
+// tarEntry is one unpacked archive member: the mode it would extract as and
+// its contents.
+type tarEntry struct {
+	mode int64
+	body string
+}
+
+// tarEntries reads a gzipped tarball back into a name-keyed map, so a spec can
+// assert the whole archive in one comparison rather than walking it.
+func tarEntries(path string) map[string]tarEntry {
+	GinkgoHelper()
+
+	f, err := os.Open(path)
+	Expect(err).NotTo(HaveOccurred())
+	defer f.Close()
+
+	gz, err := gzip.NewReader(f)
+	Expect(err).NotTo(HaveOccurred())
+	defer gz.Close()
+
+	entries := map[string]tarEntry{}
+	tr := tar.NewReader(gz)
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		Expect(err).NotTo(HaveOccurred())
+
+		body, err := io.ReadAll(tr)
+		Expect(err).NotTo(HaveOccurred())
+		entries[hdr.Name] = tarEntry{mode: hdr.Mode, body: string(body)}
+	}
+	return entries
+}
 
 var _ = Describe("Release.Prepare", func() {
 	// The bare-semver guard is Prepare's first statement, returning before

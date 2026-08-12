@@ -29,9 +29,11 @@ mislabelled artefacts.
 | `ghcr.io/voxpupuli/openvox-ca:{X.Y.Z,X.Y,latest}` | *Container images* workflow | GHCR |
 | `…:{X.Y.Z,X.Y,latest}-alpine` | *Container images* workflow | GHCR |
 
-Each tarball contains both binaries, `openvox-ca` and `openvox-ca-ctl`. Only
-Linux is built: there are no macOS or Windows release artefacts. To build the
-same set (plus `checksums.txt`) locally in one go, run `mage build:dist`.
+Each tarball contains both binaries, `openvox-ca` and `openvox-ca-ctl` (mode
+0755), and the systemd unit `openvox-ca.service` (mode 0644) — see [running
+under systemd](../systemd.md). Only Linux is built: there are no macOS or
+Windows release artefacts. To build the same set (plus `checksums.txt`) locally
+in one go, run `mage build:dist`.
 
 The major-only container tag (`:1`, `:2`) is deliberately suppressed while the
 version is `v0.*`, because a `0.x` major carries no compatibility promise.
@@ -313,6 +315,8 @@ Worth checking specifically:
 - All four tarballs are present and the checksums verify.
 - Each tarball contains both `openvox-ca` and `openvox-ca-ctl`, and both
   report the rehearsal version (with commit metadata) via `--version`.
+- Each tarball also contains `openvox-ca.service`, and `tar tvzf` shows it as
+  `-rw-r--r--` while the two binaries are `-rwxr-xr-x`.
 - The FIPS binaries are genuinely boringcrypto builds:
 
   ```console

@@ -43,11 +43,17 @@ const (
 	lockSubjectPrefix = "subject:"
 )
 
-// lockTimeout bounds how long Init/Sign/Revoke will wait to acquire a
+// LockTimeout bounds how long Init/Sign/Revoke will wait to acquire a
 // distributed lock before giving up. Long enough to ride out a brief
 // leader election, short enough that a stuck lease on a crashed replica
 // does not hang startup past the lease TTL on the etcd backend.
-const lockTimeout = 60 * time.Second
+//
+// Exported because the shipped systemd unit's WatchdogSec has to exceed it:
+// the status line the heartbeat sends takes the CA's read lock, so a storage
+// operation holding the write lock blocks the heartbeat for up to this long.
+// A watchdog shorter than this budget would have systemd kill a healthy CA
+// that is merely waiting on a slow backend. cmd/openvox-ca asserts that.
+const LockTimeout = 60 * time.Second
 
 // subjectLockName returns the distributed-lock name used to serialise
 // operations on a single subject (CSR submission, signing, cleaning).
@@ -93,7 +99,7 @@ func (c *CA) Init(ctx context.Context) error {
 	// bootstrap lock before deciding whether to generate a fresh CA, and
 	// re-check the keyspace after winning the lock so we don't race two
 	// replicas into writing different CAs.
-	ctx, cancel := context.WithTimeout(ctx, lockTimeout)
+	ctx, cancel := context.WithTimeout(ctx, LockTimeout)
 	defer cancel()
 	return c.Storage.WithLock(ctx, lockNameBootstrap, func() error {
 		if err := c.loadCA(ctx); err == nil {
@@ -170,7 +176,7 @@ func (c *CA) finishLoadExisting(ctx context.Context) error {
 // exist (e.g. mounted via an overlay against an empty backend). Runs under
 // the bootstrap lock so concurrent replicas don't race to seed.
 func (c *CA) seedSupportingState(ctx context.Context) error {
-	ctx, cancel := context.WithTimeout(ctx, lockTimeout)
+	ctx, cancel := context.WithTimeout(ctx, LockTimeout)
 	defer cancel()
 	return c.Storage.WithLock(ctx, lockNameBootstrap, func() error {
 		// Another replica may have seeded between our initial check and the

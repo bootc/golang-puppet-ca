@@ -26,11 +26,15 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -38,6 +42,8 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
+	"github.com/voxpupuli/openvox-ca/internal/ca"
+	"github.com/voxpupuli/openvox-ca/internal/sdnotify"
 	"github.com/voxpupuli/openvox-ca/internal/signer"
 )
 
@@ -89,6 +95,18 @@ func runPSKChild(role string) int {
 			return 1
 		}
 		fmt.Println("SIGN-OK")
+		return 0
+	case "sighup-ignored":
+		// The signer's disposition, then a SIGHUP at this very process.
+		// SIGHUP's default action is termination and kill(2) delivers to self
+		// before it returns, so reaching the print at all is the assertion:
+		// without the disposition this child dies inside the Kill call.
+		ignoreReloadSignal()
+		if err := syscall.Kill(os.Getpid(), syscall.SIGHUP); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+		fmt.Println("ALIVE")
 		return 0
 	default:
 		fmt.Fprintf(os.Stderr, "unknown %s role %q\n", pskChildEnv, role)
@@ -419,5 +437,406 @@ var _ = Describe("pskPipe", func() {
 		data, err := io.ReadAll(r)
 		Expect(err).NotTo(HaveOccurred(), "reading PSK pipe")
 		Expect(string(data)).To(Equal(pskHex), "pipe contents should be the hex PSK")
+	})
+})
+
+// fakeChild records the signals the supervisor sends it, standing in for a
+// spawned child so the supervisor loop can be driven without forking.
+type fakeChild struct {
+	mu      sync.Mutex
+	signals []os.Signal
+	kills   int
+	err     error // returned from Signal, to exercise the failure path
+}
+
+func (f *fakeChild) Signal(sig os.Signal) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.signals = append(f.signals, sig)
+	return f.err
+}
+
+func (f *fakeChild) Kill() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.kills++
+	return nil
+}
+
+// syncBuffer is a log sink that is safe to read while another goroutine
+// writes. bytes.Buffer is not, and the supervisor logs from its own goroutine.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// got returns the signals received so far.
+func (f *fakeChild) got() []os.Signal {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]os.Signal(nil), f.signals...)
+}
+
+// killed reports how many times the child was hard-killed.
+func (f *fakeChild) killed() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.kills
+}
+
+var _ = Describe("Launcher supervisor loop", func() {
+	var (
+		signer   *fakeChild
+		frontend *fakeChild
+		hupCh    chan os.Signal
+		sigCh    chan os.Signal
+		exitCh   chan childResult
+		rec      *notifyRecorder
+		sup      *supervisor
+	)
+
+	BeforeEach(func() {
+		signer = &fakeChild{}
+		frontend = &fakeChild{}
+		hupCh = make(chan os.Signal, 1)
+		sigCh = make(chan os.Signal, 1)
+		exitCh = make(chan childResult, 2)
+
+		rec = startNotifyRecorder(nil)
+		notifier := sdnotify.New()
+		DeferCleanup(func() { Expect(notifier.Close()).To(Succeed()) })
+
+		sup = &supervisor{
+			signer:   signer,
+			frontend: frontend,
+			notify:   notifier,
+			hupCh:    hupCh,
+			sigCh:    sigCh,
+			exitCh:   exitCh,
+			drain:    time.Minute,
+			crash:    time.Minute,
+		}
+	})
+
+	// run drives the loop on its own goroutine and returns a channel carrying
+	// its result, so a spec can assert on behaviour before it returns.
+	run := func() chan error {
+		done := make(chan error, 1)
+		go func() {
+			defer GinkgoRecover()
+			done <- sup.run()
+		}()
+		return done
+	}
+
+	// terminate drives the SIGTERM path to completion. The waits are
+	// load-bearing: both arms of the loop's select become ready if exitCh is
+	// fed before the signal has been taken, and Go picks between ready arms at
+	// random, so a spec that skipped them would fail intermittently down the
+	// crash path instead.
+	terminate := func(done chan error) {
+		GinkgoHelper()
+		sigCh <- syscall.SIGTERM
+		Eventually(signer.got).Should(ContainElement(syscall.SIGTERM))
+		Eventually(frontend.got).Should(ContainElement(syscall.SIGTERM))
+		exitCh <- childResult{"signer", nil}
+		exitCh <- childResult{"frontend", nil}
+		Eventually(done).Should(Receive(BeNil()))
+	}
+
+	Describe("reload forwarding", func() {
+		It("forwards SIGHUP to the frontend and to nobody else", func() {
+			// This hop is the entire delivery path for `systemctl reload` in
+			// the default topology: systemd signals the launcher, and only
+			// this forward reaches the process that owns the configuration.
+			done := run()
+			hupCh <- syscall.SIGHUP
+
+			Eventually(frontend.got).Should(ConsistOf(syscall.SIGHUP))
+			Consistently(signer.got).Should(BeEmpty(), "the signer holds nothing reloadable")
+
+			Consistently(done).ShouldNot(Receive(), "a reload must not end the launcher")
+
+			terminate(done)
+		})
+
+		It("keeps supervising after several reloads", func() {
+			done := run()
+			for i := 0; i < 3; i++ {
+				hupCh <- syscall.SIGHUP
+				Eventually(frontend.got).Should(HaveLen(i + 1))
+			}
+
+			terminate(done)
+		})
+
+		It("reports a signal it could not deliver", func() {
+			// os.Process.Signal returns ErrProcessDone for a child that has
+			// already exited. Dropping that silently would leave the operator
+			// believing a rotated certificate was live.
+			var buf syncBuffer
+			orig := slog.Default()
+			slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelError})))
+			defer slog.SetDefault(orig)
+
+			frontend.err = errors.New("os: process already finished")
+			done := run()
+			hupCh <- syscall.SIGHUP
+			Eventually(frontend.got).Should(HaveLen(1))
+			Eventually(buf.String).Should(ContainSubstring("Failed to forward the reload signal"))
+
+			terminate(done)
+		})
+	})
+
+	Describe("the hard-kill fallback", func() {
+		BeforeEach(func() {
+			// Budgets short enough for the timer to fire inside a spec. In
+			// production these are the drain budget and the shorter crash
+			// budget; what matters is that a child which ignores SIGTERM is
+			// eventually killed rather than left running — the signer holds
+			// the CA private key.
+			sup.drain = 10 * time.Millisecond
+			sup.crash = 10 * time.Millisecond
+		})
+
+		It("kills both children when they do not exit within the drain budget", func() {
+			done := run()
+			sigCh <- syscall.SIGTERM
+
+			// Withhold the exit reports: this is a child that has taken the
+			// SIGTERM and not gone.
+			Eventually(signer.killed).Should(BeNumerically(">", 0))
+			Eventually(frontend.killed).Should(BeNumerically(">", 0))
+
+			exitCh <- childResult{"signer", nil}
+			exitCh <- childResult{"frontend", nil}
+			Eventually(done).Should(Receive(BeNil()))
+		})
+
+		It("kills the survivor when one child has already crashed", func() {
+			done := run()
+			exitCh <- childResult{"signer", errors.New("boom")}
+
+			Eventually(frontend.killed).Should(BeNumerically(">", 0))
+
+			exitCh <- childResult{"frontend", nil}
+			Eventually(done).Should(Receive(HaveOccurred()))
+		})
+
+		It("does not kill children that exit in time", func() {
+			sup.drain = time.Minute
+			done := run()
+			terminate(done)
+
+			Consistently(signer.killed).Should(BeZero())
+			Consistently(frontend.killed).Should(BeZero())
+		})
+	})
+
+	Describe("termination", func() {
+		It("tells the service manager it is stopping, then stops both children", func() {
+			done := run()
+			sigCh <- syscall.SIGTERM
+
+			Eventually(rec.msgs).Should(Receive(SatisfyAll(
+				HavePrefix("STOPPING=1"),
+				ContainSubstring("Shutting down on terminated"),
+			)))
+			Eventually(signer.got).Should(ConsistOf(syscall.SIGTERM))
+			Eventually(frontend.got).Should(ConsistOf(syscall.SIGTERM))
+
+			exitCh <- childResult{"signer", nil}
+			exitCh <- childResult{"frontend", nil}
+			Eventually(done).Should(Receive(BeNil()))
+		})
+	})
+
+	Describe("an unexpected child exit", func() {
+		It("names the failed process and returns its error", func() {
+			done := run()
+			exitCh <- childResult{"signer", errors.New("boom")}
+
+			Eventually(rec.msgs).Should(Receive(ContainSubstring("The signer process exited unexpectedly")))
+			Eventually(frontend.got).Should(ConsistOf(syscall.SIGTERM))
+
+			exitCh <- childResult{"frontend", nil}
+
+			var err error
+			Eventually(done).Should(Receive(&err))
+			Expect(err).To(MatchError(ContainSubstring("signer process exited unexpectedly")))
+		})
+
+		It("re-sends the cause so the surviving child's drain text does not bury it", func() {
+			// The frontend publishes its own "draining connections" status on
+			// the way out. Without the second send that generic line is the
+			// last thing on the socket, and `systemctl status` shows it
+			// instead of the named failure.
+			done := run()
+			exitCh <- childResult{"signer", errors.New("boom")}
+			exitCh <- childResult{"frontend", nil}
+			Eventually(done).Should(Receive())
+
+			var seen []string
+			for {
+				select {
+				case m := <-rec.msgs:
+					seen = append(seen, m)
+					continue
+				default:
+				}
+				break
+			}
+			Expect(seen).NotTo(BeEmpty())
+			Expect(seen[len(seen)-1]).To(ContainSubstring("The signer process exited unexpectedly"),
+				"the cause must be the last status the service manager sees")
+		})
+	})
+})
+
+// SECURITY: the signer is the process holding the CA private key. A reload
+// signal that reaches the process group rather than the launcher alone must not
+// take it down -- the launcher would read the exit as a crash and tear the
+// whole unit down with it.
+var _ = Describe("the signer's SIGHUP disposition", func() {
+	It("survives a SIGHUP delivered to itself", func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		var out bytes.Buffer
+		cmd := pskChildCmd(ctx, "sighup-ignored", nil, &out)
+
+		Expect(cmd.Run()).To(Succeed(), "the child died on SIGHUP: %s", out.String())
+		Expect(out.String()).To(ContainSubstring("ALIVE"))
+	})
+})
+
+// SECURITY: what each child is and is not handed is a boundary, not a detail --
+// the signer holds the CA private key. These drive the two functions the
+// launcher and the --daemon re-exec actually call, so removing either strip
+// fails a spec rather than passing silently.
+var _ = Describe("the environments the launcher builds", func() {
+	base := []string{
+		"PATH=/usr/bin",
+		"NOTIFY_SOCKET=/run/systemd/notify",
+		"WATCHDOG_USEC=30000000",
+		"PUPPET_CA_CADIR=/var/lib/puppet-ca",
+	}
+
+	It("withholds the notification socket from the signer, and nothing else", func() {
+		Expect(signerEnv(base)).To(Equal([]string{
+			"PATH=/usr/bin",
+			"WATCHDOG_USEC=30000000",
+			"PUPPET_CA_CADIR=/var/lib/puppet-ca",
+		}))
+	})
+
+	It("withholds the socket and every internal variable from the daemon child", func() {
+		// A stale role would make the child adopt a role it was not spawned
+		// for; the socket would make it report readiness for a unit whose main
+		// process has just exited.
+		parent := append([]string{"PUPPET_CA_ROLE=signer", "PUPPET_CA_SIGNER_PSK=stale"}, base...)
+
+		Expect(daemonEnv(parent)).To(Equal([]string{
+			"PATH=/usr/bin",
+			"WATCHDOG_USEC=30000000",
+			"PUPPET_CA_CADIR=/var/lib/puppet-ca",
+		}))
+	})
+
+	It("does not write through the shared internalEnvKeys slice", func() {
+		// daemonEnv appends the socket to a copy; appending to internalEnvKeys
+		// itself would corrupt the list every other caller reads.
+		before := append([]string(nil), internalEnvKeys...)
+		daemonEnv(base)
+
+		Expect(internalEnvKeys).To(Equal(before))
+	})
+})
+
+// The shipped unit encodes numbers derived from constants in this package.
+// Nothing else notices when they drift apart, and the failure mode is systemd
+// killing the CA part-way through a drain it was asked to wait for.
+var _ = Describe("The shipped systemd unit", func() {
+	var unit map[string]string
+
+	BeforeEach(func() {
+		raw, err := os.ReadFile("../../packaging/systemd/openvox-ca.service")
+		Expect(err).NotTo(HaveOccurred(), "the unit staged into every release tarball must exist")
+
+		unit = map[string]string{}
+		for _, line := range strings.Split(string(raw), "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, "[") {
+				continue
+			}
+			if key, value, ok := strings.Cut(line, "="); ok {
+				unit[key] = value
+			}
+		}
+	})
+
+	It("gives the drain more time than the launcher will take", func() {
+		stop, err := time.ParseDuration(unit["TimeoutStopSec"])
+		Expect(err).NotTo(HaveOccurred())
+		Expect(stop).To(BeNumerically(">", defaultShutdownDrain+launcherShutdownHeadroom),
+			"TimeoutStopSec must outlast the drain budget plus the supervisor's headroom")
+	})
+
+	It("asks for notifications from every process that sends them", func() {
+		// READY=1 comes from the frontend child, not the unit's main PID, so
+		// NotifyAccess=main would discard it and the start job would time out.
+		Expect(unit["Type"]).To(Equal("notify"))
+		Expect(unit["NotifyAccess"]).To(Equal("all"))
+	})
+
+	It("sets a watchdog the heartbeat can honour", func() {
+		watchdog, err := time.ParseDuration(unit["WatchdogSec"])
+		Expect(err).NotTo(HaveOccurred())
+
+		// The binding constraint, and the reason the unit says 90s rather than
+		// 60s: the status line the heartbeat sends takes the CA's read lock, so
+		// a storage operation holding the write lock stalls the heartbeat for
+		// up to the cluster-lock budget. A watchdog inside that budget has
+		// systemd kill a healthy CA that is waiting on a slow backend.
+		Expect(watchdog).To(BeNumerically(">", ca.LockTimeout),
+			"WatchdogSec must outlast internal/ca's cluster-lock timeout")
+
+		// Secondary, and far looser: below this the CA warns on every start.
+		Expect(watchdog).To(BeNumerically(">=", 2*shortWatchdogWarnBelow))
+	})
+
+	It("does not pin --config, which would disable PUPPET_CA_CONFIG", func() {
+		Expect(unit["ExecStart"]).NotTo(ContainSubstring("--config"))
+	})
+
+	It("keeps the CA key out of core dumps", func() {
+		Expect(unit["LimitCORE"]).To(Equal("0"))
+	})
+
+	It("does not daemonise, which a notify unit cannot survive", func() {
+		Expect(unit["ExecStart"]).NotTo(ContainSubstring("--daemon"))
+	})
+
+	It("keeps AF_UNIX, which both the notify socket and the signer socketpair need", func() {
+		Expect(unit["RestrictAddressFamilies"]).To(ContainSubstring("AF_UNIX"))
+	})
+
+	It("declares a start timeout long enough to bootstrap a CA key", func() {
+		start, err := time.ParseDuration(unit["TimeoutStartSec"])
+		Expect(err).NotTo(HaveOccurred())
+		Expect(start).To(BeNumerically(">=", time.Minute))
 	})
 })

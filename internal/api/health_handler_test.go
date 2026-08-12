@@ -77,10 +77,7 @@ var _ = Describe("Health Endpoints", func() {
 		Expect(store.TouchInventory(context.Background())).To(Succeed())
 		Expect(myCA.Init(context.Background())).To(Succeed())
 		srv := api.New(myCA)
-		srv.AuthConfig = &api.AuthConfig{
-			CACert:    myCA.CACert,
-			AllowList: map[string]bool{"puppet-server": true},
-		}
+		srv.AuthConfig = api.NewAuthConfig(myCA.CACert, map[string]bool{"puppet-server": true})
 		return srv.Routes()
 	}
 

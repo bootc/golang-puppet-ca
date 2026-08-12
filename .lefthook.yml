@@ -7,7 +7,7 @@
 #
 # Hooks degrade gracefully: if a tool is missing the command prints a SKIP
 # notice and exits 0 rather than blocking the commit/push. Run the same checks
-# manually via `mage dev:check` (lint), `go test ./...`, and
+# manually via `mage dev:check` (lint), `go test -race ./...`, and
 # `mage test:magefile` (the build-tagged magefile suite); the pre-push hook
 # additionally refuses v* tags that do not match internal/version (see
 # .lefthook/pre-push/verify-tags.sh).
@@ -44,6 +44,9 @@ pre-push:
       use_stdin: true  # git feeds the pushed refs to the pre-push hook on stdin
   commands:
     go-test:
-      # The second invocation covers the build-tagged magefile suite, which
+      # -race matches the CI gate (mage test:unit): without it the specs that
+      # only fail under the detector -- the notifier's locking, the admin
+      # allow-list swap -- pass locally and fail after the push. The second
+      # invocation covers the build-tagged magefile suite, which
       # `go test ./...` cannot see (same suite CI runs via `mage test:magefile`).
-      run: go test ./... && go test -tags mage .
+      run: go test -race ./... && go test -tags mage .

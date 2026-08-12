@@ -154,7 +154,7 @@ func newEmptyCRL(cert *x509.Certificate, key crypto.Signer, validity time.Durati
 // replica (and concurrently with Revoke) against shared storage; the last
 // writer under the lock wins and bumps the CRL number monotonically.
 func (c *CA) ReissueCRL(ctx context.Context) error {
-	ctx, cancel := context.WithTimeout(ctx, lockTimeout)
+	ctx, cancel := context.WithTimeout(ctx, LockTimeout)
 	defer cancel()
 	return c.Storage.WithLock(ctx, lockNameCRL, func() error {
 		c.mu.Lock()
@@ -280,7 +280,7 @@ func (c *CA) parseStoredCRL(ctx context.Context) (*storedCRL, error) {
 // and the rest observe a fresh CRL and return (false, nil). This makes the
 // background refresh job safe to run on any number of replicas sharing storage.
 func (c *CA) RefreshCRLIfDue(ctx context.Context, refreshBefore time.Duration) (bool, error) {
-	ctx, cancel := context.WithTimeout(ctx, lockTimeout)
+	ctx, cancel := context.WithTimeout(ctx, LockTimeout)
 	defer cancel()
 	var reissued bool
 	err := c.Storage.WithLock(ctx, lockNameCRL, func() error {
@@ -292,6 +292,17 @@ func (c *CA) RefreshCRLIfDue(ctx context.Context, refreshBefore time.Duration) (
 			return err
 		}
 		if time.Until(stored.own.NextUpdate) > refreshBefore {
+			// Adopt the CRL another replica re-signed. Without this a replica
+			// that never wins the re-sign race keeps the copy it cached at
+			// startup, and once that window lapses everything reading the
+			// cache — CRLSnapshot, and through it the service manager's status
+			// text — reports a lapsed CRL indefinitely while storage holds a
+			// fresh one. The parse is already paid for and c.mu is held, so
+			// this costs only the comparison.
+			if stored.own.Number != nil && (c.cachedCRL == nil || c.cachedCRL.Number == nil ||
+				stored.own.Number.Cmp(c.cachedCRL.Number) > 0) {
+				c.cachedCRL = stored.own
+			}
 			return nil
 		}
 		if err := c.signCRLLocked(ctx, stored, stored.own.RevokedCertificateEntries); err != nil {
@@ -301,6 +312,45 @@ func (c *CA) RefreshCRLIfDue(ctx context.Context, refreshBefore time.Duration) (
 		return nil
 	})
 	return reissued, err
+}
+
+// CRLSnapshot describes the CRL the CA holds in memory. It is a value copy of
+// the fields worth reporting, so a caller can inspect the CRL's freshness
+// without holding a lock, touching storage, or being handed the live
+// *x509.RevocationList the auth path reads.
+type CRLSnapshot struct {
+	// Number is the CRL number (RFC 5280 §5.2.3), which increases by one on
+	// every re-sign.
+	Number *big.Int
+	// NextUpdate bounds the validity window of the CRL this process has cached.
+	// Requests are answered from storage rather than from this cache, so a
+	// NextUpdate in the past means this replica has not observed a re-sign
+	// since the window lapsed — which RefreshCRLIfDue corrects on its next
+	// pass. ThisUpdate is deliberately not carried: no caller needs it, and
+	// the Prometheus collector reads its own copy straight from storage.
+	NextUpdate time.Time
+	// Revoked is the number of certificates listed on the CRL.
+	Revoked int
+}
+
+// CRLSnapshot returns the in-memory CRL's metadata, and whether a CRL has been
+// loaded at all. It reads the same cache the authentication path uses, so it
+// costs a read lock and no storage round-trip — cheap enough to call on a
+// timer (e.g. to refresh the service manager's status text).
+func (c *CA) CRLSnapshot() (CRLSnapshot, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.cachedCRL == nil {
+		return CRLSnapshot{}, false
+	}
+	snap := CRLSnapshot{
+		NextUpdate: c.cachedCRL.NextUpdate,
+		Revoked:    len(c.cachedCRL.RevokedCertificateEntries),
+	}
+	if c.cachedCRL.Number != nil {
+		snap.Number = new(big.Int).Set(c.cachedCRL.Number)
+	}
+	return snap, true
 }
 
 // DefaultCRLRefreshBefore returns the default refresh window: the CRL is

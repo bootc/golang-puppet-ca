@@ -29,6 +29,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/voxpupuli/openvox-ca/internal/sdnotify"
 	"github.com/voxpupuli/openvox-ca/internal/signer"
 )
 
@@ -70,8 +71,19 @@ const (
 // for both children to exit after forwarding SIGTERM before hard-killing them,
 // so the frontend always gets its full drain even though the launcher's timer
 // starts first.
+//
+// notify carries the launcher's own service-manager notifications: the status
+// text while the children come up, and STOPPING=1 once teardown begins. READY=1
+// deliberately comes from the frontend child instead, since only it knows when
+// the listener is actually accepting — which is why units must set
+// NotifyAccess=all (see docs/systemd.md).
+//
+// hupCh delivers reload requests, which the service manager sends to this
+// process because it is the unit's main PID. It is registered by the caller
+// before any startup work begins, so a reload arriving early is queued rather
+// than fatal — SIGHUP's default disposition would otherwise kill the launcher.
 // NIST 800-53: SC-3 (Security Function Isolation), SC-4 (Information in Shared System Resources)
-func runLauncher(drain time.Duration) error {
+func runLauncher(drain time.Duration, notify *sdnotify.Notifier, hupCh <-chan os.Signal) error {
 	gracefulShutdownTimeout := drain + launcherShutdownHeadroom
 
 	// Create the socketpair for signer ↔ frontend communication.
@@ -107,6 +119,7 @@ func runLauncher(drain time.Duration) error {
 	}
 
 	slog.Info("Starting isolated CA processes")
+	notify.Status("Starting the isolated signer and frontend processes")
 
 	// Build base environment: strip role/daemon vars to prevent inheritance
 	// loops. PUPPET_CA_SIGNER_PSK is stripped defensively: the PSK travels
@@ -115,7 +128,9 @@ func runLauncher(drain time.Duration) error {
 	// share a backing array.
 	baseEnv := filterEnv(os.Environ(), internalEnvKeys...)
 
-	signerCmd, err := spawnChild(exe, baseEnv, "signer", signerSock, pskHex)
+	// The frontend gets baseEnv untouched: it is the process that knows when
+	// the listener is accepting, so it is the one that reports READY=1.
+	signerCmd, err := spawnChild(exe, signerEnv(baseEnv), "signer", signerSock, pskHex)
 	if err != nil {
 		return err
 	}
@@ -134,6 +149,9 @@ func runLauncher(drain time.Duration) error {
 		"signer_pid", signerCmd.Process.Pid,
 		"frontend_pid", frontendCmd.Process.Pid,
 	)
+	// The frontend takes it from here: it reports readiness once its listener
+	// is up, and owns the status text from that point on.
+	notify.Status("Waiting for the frontend process to become ready")
 
 	// Forward termination signals to children. The buffer matches the
 	// number of registered signals so a coincident SIGTERM+SIGINT (e.g.
@@ -143,45 +161,146 @@ func runLauncher(drain time.Duration) error {
 	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
 
 	// Wait for either child to exit.
-	type childResult struct {
-		name string
-		err  error
-	}
 	exitCh := make(chan childResult, 2)
 	go func() { exitCh <- childResult{"signer", signerCmd.Wait()} }()
 	go func() { exitCh <- childResult{"frontend", frontendCmd.Wait()} }()
 
-	shutdown := func() {
-		frontendCmd.Process.Signal(syscall.SIGTERM)
-		signerCmd.Process.Signal(syscall.SIGTERM)
-		timer := time.AfterFunc(gracefulShutdownTimeout, func() {
-			frontendCmd.Process.Kill()
-			signerCmd.Process.Kill()
-		})
-		<-exitCh
-		<-exitCh
-		timer.Stop()
-	}
+	return (&supervisor{
+		signer:   signerCmd.Process,
+		frontend: frontendCmd.Process,
+		notify:   notify,
+		hupCh:    hupCh,
+		sigCh:    sigCh,
+		exitCh:   exitCh,
+		drain:    gracefulShutdownTimeout,
+		crash:    crashShutdownTimeout,
+	}).run()
+}
 
-	select {
-	case sig := <-sigCh:
-		slog.Info("Received signal, shutting down CA processes", "signal", sig)
-		shutdown()
-		return nil
+// childResult reports which child exited and why.
+type childResult struct {
+	name string
+	err  error
+}
 
-	case result := <-exitCh:
-		slog.Error("CA child process exited unexpectedly", "process", result.name, "error", result.err)
-		// Shut down the surviving child.
-		frontendCmd.Process.Signal(syscall.SIGTERM)
-		signerCmd.Process.Signal(syscall.SIGTERM)
-		timer := time.AfterFunc(crashShutdownTimeout, func() {
-			frontendCmd.Process.Kill()
-			signerCmd.Process.Kill()
-		})
-		<-exitCh // wait for the other child
-		timer.Stop()
-		return fmt.Errorf("%s process exited unexpectedly: %w", result.name, result.err)
+// childProcess is the slice of *os.Process the supervisor loop actually uses.
+// Naming it lets the loop — which owns reload forwarding and every status
+// notification the operator sees — be exercised without spawning children.
+type childProcess interface {
+	Signal(os.Signal) error
+	Kill() error
+}
+
+// supervisor is runLauncher's steady state: forward reloads, propagate
+// termination, and report whichever comes first to the service manager.
+type supervisor struct {
+	signer   childProcess
+	frontend childProcess
+	notify   *sdnotify.Notifier
+	hupCh    <-chan os.Signal
+	sigCh    <-chan os.Signal
+	exitCh   <-chan childResult
+
+	// drain is how long both children get to exit after a termination signal;
+	// crash is the shorter budget for tearing down the survivor when one child
+	// has already gone.
+	drain time.Duration
+	crash time.Duration
+}
+
+// run blocks until a termination signal arrives or a child exits, and returns
+// the launcher's exit status.
+func (s *supervisor) run() error {
+	for {
+		select {
+		case <-s.hupCh:
+			// The configuration a reload affects (the TLS keypair, the admin
+			// allow list) belongs to the frontend, so the signal is forwarded
+			// there rather than acted on here.
+			slog.Info("Forwarding reload signal to the frontend process")
+			if err := s.frontend.Signal(syscall.SIGHUP); err != nil {
+				// Not teardown: the launcher keeps running, so a dropped
+				// signal would otherwise leave the operator believing a
+				// certificate or allow-list change had taken effect.
+				slog.Error("Failed to forward the reload signal; the running configuration is unchanged",
+					"error", err)
+			}
+			continue
+
+		case sig := <-s.sigCh:
+			slog.Info("Received signal, shutting down CA processes", "signal", sig)
+			s.notify.Stopping(fmt.Sprintf("Shutting down on %s (up to %s for the children to exit)",
+				sig, s.drain))
+			timer := s.stopBoth(s.drain)
+			<-s.exitCh
+			<-s.exitCh
+			timer.Stop()
+			return nil
+
+		case result := <-s.exitCh:
+			slog.Error("CA child process exited unexpectedly", "process", result.name, "error", result.err)
+			crashStatus := fmt.Sprintf("The %s process exited unexpectedly (%v); stopping", result.name, result.err)
+			s.notify.Stopping(crashStatus)
+			timer := s.stopBoth(s.crash)
+			<-s.exitCh // wait for the other child
+			timer.Stop()
+			// Re-send the cause: the surviving child publishes its own drain
+			// status on the way out, which would otherwise be the last thing
+			// on the socket and would replace the named failure in
+			// `systemctl status` at exactly the moment an operator looks.
+			s.notify.Stopping(crashStatus)
+			return fmt.Errorf("%s process exited unexpectedly: %w", result.name, result.err)
+		}
 	}
+}
+
+// stopBoth asks both children to exit and arms a hard kill after budget,
+// returning the timer so the caller can stop it once both have gone.
+func (s *supervisor) stopBoth(budget time.Duration) *time.Timer {
+	// Best-effort teardown: a child that has already exited returns
+	// os.ErrProcessDone, and the hard-kill timer below covers one that does
+	// not go quietly. Unlike the reload forward, there is nothing an operator
+	// could do with these errors — the launcher is on its way out either way.
+	_ = s.frontend.Signal(syscall.SIGTERM)
+	_ = s.signer.Signal(syscall.SIGTERM)
+	return time.AfterFunc(budget, func() {
+		_ = s.frontend.Kill()
+		_ = s.signer.Kill()
+	})
+}
+
+// daemonEnv is the environment the --daemon re-exec child is given: the
+// parent's own, less the internal role/PSK variables and the notification
+// socket.
+//
+// The role and PSK variables go because a stale value from a previous run
+// would make the daemon child adopt a role it was not spawned for.
+// $NOTIFY_SOCKET goes because the child would otherwise report readiness for a
+// unit whose main process -- the parent, which returns as soon as it has
+// forked -- has just exited. The parent's slice is copied rather than appended
+// to in place, so the shared internalEnvKeys backing array is never written
+// through.
+//
+// Named for the same reason as signerEnv: so a spec can drive it.
+func daemonEnv(parent []string) []string {
+	return filterEnv(parent, append(append([]string{}, internalEnvKeys...), "NOTIFY_SOCKET")...)
+}
+
+// signerEnv is the environment the signer child is given: the launcher's own,
+// less the service-manager notification socket.
+//
+// SECURITY: the signer holds the CA key and talks to nothing but the frontend,
+// so it has no state a service manager wants to hear about. Withholding
+// $NOTIFY_SOCKET keeps the notification channel to exactly the two processes
+// that use it (this launcher and the frontend) even under NotifyAccess=all.
+//
+// Named rather than inlined at the call site so the boundary has something a
+// spec can drive. As one argument among five it was a one-token edit away from
+// passing baseEnv straight through, and no assertion would have noticed.
+//
+// NIST 800-53: SC-3 (Security Function Isolation)
+func signerEnv(baseEnv []string) []string {
+	return filterEnv(baseEnv, "NOTIFY_SOCKET")
 }
 
 // internalEnvKeys are the variables the launcher and the --daemon re-exec strip

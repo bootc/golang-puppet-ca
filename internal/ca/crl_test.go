@@ -176,6 +176,137 @@ var _ = Describe("CA CRL reissuance", func() {
 		})
 	})
 
+	Describe("CRLSnapshot", func() {
+		It("reports the cached CRL's number, window and entry count", func() {
+			stored := parseStoredCRL(store)
+
+			snap, ok := myCA.CRLSnapshot()
+			Expect(ok).To(BeTrue())
+			Expect(snap.Number).To(Equal(stored.Number))
+			Expect(snap.NextUpdate).To(BeTemporally("==", stored.NextUpdate))
+			Expect(snap.Revoked).To(Equal(len(stored.RevokedCertificateEntries)))
+		})
+
+		It("counts the certificates actually on the CRL", func() {
+			// The seeded CRL is empty, so asserting against a length read back
+			// from the same CRL compares 0 with 0 — an implementation that
+			// returned a constant would pass. Revoke something and assert the
+			// literal count, since this is the number the service manager's
+			// status line renders.
+			csrPEM, err := testutil.GenerateCSR("crl-snapshot-node")
+			Expect(err).NotTo(HaveOccurred())
+			_, err = myCA.SaveRequest(context.Background(), "crl-snapshot-node", csrPEM)
+			Expect(err).NotTo(HaveOccurred())
+			_, err = myCA.Sign(context.Background(), "crl-snapshot-node")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(myCA.Revoke(context.Background(), "crl-snapshot-node")).To(Succeed())
+
+			snap, ok := myCA.CRLSnapshot()
+			Expect(ok).To(BeTrue())
+			Expect(snap.Revoked).To(Equal(1))
+		})
+
+		It("adopts a CRL another replica re-signed", func() {
+			// A replica that never wins the re-sign race would otherwise serve
+			// the window it cached at startup forever, and report EXPIRED in
+			// the status line while storage holds a fresh CRL.
+			before, ok := myCA.CRLSnapshot()
+			Expect(ok).To(BeTrue())
+
+			// Stand in for the other replica: re-sign through a second CA
+			// instance over the same storage, leaving this one's cache stale.
+			other := ca.New(store, ca.AutosignConfig{Mode: "off"}, "puppet.test")
+			Expect(other.Init(context.Background())).To(Succeed())
+			Expect(other.ReissueCRL(context.Background())).To(Succeed())
+
+			stale, _ := myCA.CRLSnapshot()
+			Expect(stale.Number).To(Equal(before.Number), "this replica has not noticed yet")
+
+			// A due-check that finds the CRL fresh must still adopt it.
+			reissued, err := myCA.RefreshCRLIfDue(context.Background(), time.Hour)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(reissued).To(BeFalse(), "another replica already re-signed it")
+
+			after, ok := myCA.CRLSnapshot()
+			Expect(ok).To(BeTrue())
+			Expect(after.Number.Cmp(before.Number)).To(Equal(1))
+			Expect(after.NextUpdate).To(BeTemporally(">", before.NextUpdate))
+		})
+
+		It("populates an empty cache from a CRL that is not due", func() {
+			// The c.cachedCRL == nil arm of the adoption guard: a CA whose
+			// cache was never seeded still has to pick up what storage holds,
+			// which is the shape of the failure the guard exists to close.
+			fresh := ca.New(store, ca.AutosignConfig{Mode: "off"}, "puppet.test")
+			_, ok := fresh.CRLSnapshot()
+			Expect(ok).To(BeFalse(), "nothing cached yet")
+
+			// LoadKey reads the key and cert without the rest of Init, so the
+			// CRL cache stays empty — the state a replica is in before its
+			// first refresh pass.
+			_, err := fresh.LoadKey(context.Background())
+			Expect(err).NotTo(HaveOccurred())
+
+			reissued, err := fresh.RefreshCRLIfDue(context.Background(), time.Hour)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(reissued).To(BeFalse(), "the stored CRL is still well within its window")
+
+			snap, ok := fresh.CRLSnapshot()
+			Expect(ok).To(BeTrue(), "the not-due branch must still populate the cache")
+			Expect(snap.Number).NotTo(BeNil())
+		})
+
+		It("does not adopt a CRL older than the one already cached", func() {
+			// The guard is a comparison, not an assignment: an unconditional
+			// c.cachedCRL = crl would pass every other spec here. What that
+			// would cost is the CRL number going backwards on a replica whose
+			// storage read raced a re-sign.
+			Expect(myCA.ReissueCRL(context.Background())).To(Succeed())
+			ahead, ok := myCA.CRLSnapshot()
+			Expect(ok).To(BeTrue())
+
+			// Put an older CRL back into storage behind the CA's back, then
+			// let a not-due refresh read it.
+			Expect(store.UpdateCRL(context.Background(), cachedCrlPEM)).To(Succeed())
+			stored := parseStoredCRL(store)
+			Expect(stored.Number.Cmp(ahead.Number)).To(Equal(-1), "storage is now behind the cache")
+
+			reissued, err := myCA.RefreshCRLIfDue(context.Background(), time.Hour)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(reissued).To(BeFalse())
+
+			after, ok := myCA.CRLSnapshot()
+			Expect(ok).To(BeTrue())
+			Expect(after.Number).To(Equal(ahead.Number), "the cache must not go backwards")
+		})
+
+		It("tracks re-signs of the CRL", func() {
+			before, ok := myCA.CRLSnapshot()
+			Expect(ok).To(BeTrue())
+
+			Expect(myCA.ReissueCRL(context.Background())).To(Succeed())
+
+			after, ok := myCA.CRLSnapshot()
+			Expect(ok).To(BeTrue())
+			Expect(after.Number.Cmp(before.Number)).To(Equal(1))
+			Expect(after.NextUpdate).To(BeTemporally(">", before.NextUpdate))
+		})
+
+		It("hands back a copy, so callers cannot mutate the cached CRL", func() {
+			snap, ok := myCA.CRLSnapshot()
+			Expect(ok).To(BeTrue())
+			snap.Number.SetInt64(9999)
+
+			again, _ := myCA.CRLSnapshot()
+			Expect(again.Number.Int64()).NotTo(Equal(int64(9999)))
+		})
+
+		It("reports no CRL before the CA is initialised", func() {
+			_, ok := ca.New(store, ca.AutosignConfig{Mode: "off"}, "puppet.test").CRLSnapshot()
+			Expect(ok).To(BeFalse())
+		})
+	})
+
 	Describe("DefaultCRLRefreshBefore", func() {
 		It("defaults to a third of the CRL validity window", func() {
 			// Default validity is 30 days; a third is 10 days.

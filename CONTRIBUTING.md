@@ -15,6 +15,10 @@ guide is the human-friendly entry point; where the two overlap, AGENTS.md wins.
 - [Mage](https://magefile.org/), the build tool this repo uses instead of Make:
   `go install github.com/magefile/mage@latest` (or run targets with
   `go run mage.go <Target>`)
+- A C compiler (gcc or clang), because `mage test:unit` runs the suite under
+  the race detector, which needs cgo. Present by default on most systems; a
+  slim container image may not have one. The product build is unaffected — it
+  is still `CGO_ENABLED=0`.
 - Docker or Podman with the Compose plugin, for the integration and stack tests
 
 ## Building
@@ -43,7 +47,7 @@ mage build:fips   # → bin/openvox-ca + bin/openvox-ca-ctl  (GOEXPERIMENT=borin
 ## Testing
 
 ```bash
-# Run all unit tests
+# Run all unit tests (under -race; needs cgo and a C compiler)
 mage test:unit
 
 # Format, vet, tidy modules, and lint (the CI gate)
