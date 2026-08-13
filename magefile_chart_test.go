@@ -523,6 +523,18 @@ var _ = Describe("checkModuleTidy", func() {
 		Expect(read("go.mod")).To(Equal("rewritten\n"))
 	})
 
+	// The message names the files from the argument list; with only go.mod/go.sum
+	// callers, reverting that to a hardcoded prefix went unnoticed.
+	It("names the files it was given, not go.mod/go.sum", func() {
+		Expect(os.WriteFile(filepath.Join(dir, "a.mod"), []byte("one\n"), 0o644)).To(Succeed())
+
+		err := checkModuleTidy(dir, []string{"a.mod"}, func() error {
+			return os.WriteFile(filepath.Join(dir, "a.mod"), []byte("two\n"), 0o644)
+		})
+		Expect(err).To(MatchError(ContainSubstring("a.mod are not tidy")))
+		Expect(err).NotTo(MatchError(ContainSubstring("go.mod")))
+	})
+
 	It("fails when a named file does not exist", func() {
 		Expect(checkModuleTidy(dir, []string{"absent.mod"}, func() error { return nil })).To(
 			MatchError(ContainSubstring("before the tidy check")))

@@ -1288,6 +1288,28 @@ func (Chart) Test() error {
 			notWants: []string{"kind: ClusterRole"},
 		},
 		{
+			// The other half of exportRBACRendered, which nothing pinned: both
+			// dropping the rbac.create conjunct and making the helper always true
+			// left every assertion green. rbac.create: false is the remedy the
+			// NOTES warning itself recommends, so an install that took that advice
+			// would have had a Role rendered anyway, and the default-ServiceAccount
+			// refusal would start firing on installs that create none.
+			name: "rbac.create: false renders no export Role at all",
+			sets: []string{tls, "kubernetesExport.enabled=true", "kubernetesExport.rbac.create=false",
+				"kubernetesExport.targets[0].kind=Secret", "kubernetesExport.targets[0].metadata.name=t",
+				"kubernetesExport.targets[0].cert=true"},
+			wants:    []string{"kind: Deployment"},
+			notWants: []string{"kind: Role\n", "kind: RoleBinding\n", "kind: ClusterRole"},
+		},
+		{
+			// And the export-off baseline, so a helper hardwired to true fails
+			// here rather than only in the case above.
+			name:     "no export configured renders no Role",
+			sets:     []string{tls},
+			wants:    []string{"kind: Deployment"},
+			notWants: []string{"kind: Role\n", "kind: RoleBinding\n"},
+		},
+		{
 			name:     "rbac.scope: ClusterRole selects the cluster-scoped kinds",
 			sets:     []string{tls, "kubernetesExport.enabled=true", "kubernetesExport.rbac.scope=ClusterRole", "kubernetesExport.targets[0].kind=Secret", "kubernetesExport.targets[0].metadata.name=t", "kubernetesExport.targets[0].cert=true"},
 			wants:    []string{"kind: ClusterRole\n", "kind: ClusterRoleBinding\n"},
@@ -1639,12 +1661,27 @@ func (Chart) Test() error {
 			wants: []string{"puppet-server: |", "compiler.example.com"},
 		},
 		{
+			// The other arm's negative direction: with no autosign.patterns the
+			// chart emits no autosign.conf, so supplying it by hand and pointing
+			// config.autosign_config at it is a working configuration. Removing
+			// the condition on this arm re-refuses it, silently, without this.
+			name: "an autosign.conf supplied by hand renders when the chart emits none",
+			valuesYAML: "tls:\n  existingSecret: s\nconfig:\n  autosign_config: /etc/puppet-ca/autosign.conf\n" +
+				"extraConfigFiles:\n  autosign.conf: |\n    *.agent.example.com\n",
+			wants: []string{"autosign.conf: |", "*.agent.example.com"},
+		},
+		{
 			// existingConfigMap renders no ConfigMap at all, so extraConfigFiles
 			// is inert and nothing can be displaced. Refusing here was an
 			// over-refusal that told the operator to set the value they had set.
+			//
+			// notWants pins the premise the exemption rests on: the operator's body
+			// reaches no manifest. "kind: Deployment" alone is emitted by every
+			// successful render, so it asserted nothing the error check did not.
 			name:       "a reserved key is inert, not refused, under existingConfigMap",
 			valuesYAML: "tls:\n  existingSecret: s\nexistingConfigMap: mine\nextraConfigFiles:\n  config.yaml: |\n    host: 127.0.0.1\n",
 			wants:      []string{"kind: Deployment"},
+			notWants:   []string{"host: 127.0.0.1"},
 		},
 		{
 			name: "envFrom stops the TLS precondition firing",
