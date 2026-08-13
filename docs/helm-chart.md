@@ -152,9 +152,10 @@ the kubelet has to speak whatever the server speaks. Set `httpGet.scheme` on a
 probe explicitly to override that.
 
 **The check only runs when the chart can see the whole configuration.**
-`existingConfigMap`, `args` and `envFrom` each put settings somewhere the chart
-does not read — someone else's ConfigMap, a replaced argv, a Secret — so it
-stops asserting rather than refusing an install it cannot judge. In those modes
+`existingConfigMap`, `args`, `envFrom` and a `--config` in `extraArgs` each put
+settings somewhere the chart does not read — someone else's ConfigMap, a replaced
+argv, a Secret, a config file it never rendered — so it stops asserting rather
+than refusing an install it cannot judge. In those modes
 the probes assume HTTPS, and it is on you to set `httpGet.scheme` if the server
 is actually serving cleartext.
 
@@ -532,19 +533,38 @@ including the default. It already covers Kubernetes: a one-shot Job carrying the
 same ServiceAccount, image and mounts as the Deployment, and the three details
 that are easy to get wrong there. Use it rather than improvising from this page.
 
-Three things about it are worth knowing before you start, because the chart's
-defaults decide them:
+What that guide cannot know is what this chart names things, and the rest of this
+section is only that:
 
-- **The default backend is `filesystem`**, and that procedure requires the CA to
-  be stopped for an import on `filesystem` or `sqlite` — the bootstrap lock is
-  process-local there, so a revocation landing mid-import is discarded silently.
-  Only the shared backends can take the import against a live CA.
+- **Substitute the chart's names into its Job.** Its example mounts
+  `configMap: { name: openvox-ca-config }` and puts `cadir` at
+  `/etc/puppetlabs/puppet/ssl/ca`; the chart renders the ConfigMap, the
+  ServiceAccount and the PVC all as `openvox-ca.fullname` — `<release>-openvox-ca`,
+  or just `openvox-ca` when the release name already contains it — and takes
+  `cadir` from `persistence.mountPath`, `/var/lib/puppet-ca` by default. The cadir
+  one matters most: the Job reads the chart's own `config.yaml`, so a mount at the
+  example's path leaves the command looking somewhere else and quietly reproducing
+  the wrong CA rather than failing.
+- **The server refuses to start between the two steps**, which under a Deployment
+  is a crash-loop, so do not begin a rollout inside that window — see
+  [the server will not start between steps 1 and 3](openbao-transit.md#the-server-will-not-start-between-steps-1-and-3).
+  Scaling to zero is the obvious answer and is wrong under OpenBao Kubernetes auth,
+  where the pod's own token is the credential; that guide's Job route exists for
+  exactly this.
 - **A restart is required, not a signal.** `SIGHUP` covers the TLS keypair and the
   admin allow list; the CA certificate is read at startup, so a signalled process
   carries on issuing under the certificate you just replaced.
+- **Re-issuing later on `filesystem` or `sqlite` needs the CA stopped.** The
+  `--force` re-issuance is a read-modify-write across the certificate and the CRL,
+  and the bootstrap lock is process-local on those backends, so a revocation
+  landing mid-import is discarded silently. This is the chart's default backend.
+  Only the shared backends can take it against a live CA.
 - **With `ca.existingSecret` the CA certificate is mounted read-only**, so the
   import cannot write it back. That is the `--out` route in the procedure, which
-  cannot be combined with `--force`.
+  cannot be combined with `--force`, and which ends in `openvox-ca-ctl
+  reissue-crl` — an admin API call needing a client certificate whose CN is in
+  `puppetServers`. The chart neither mounts one nor documents obtaining one, so
+  plan that credential before you start.
 
 Everything else about the resulting CA — storage, TLS, export — is unchanged; only
 the certificate's issuer differs.

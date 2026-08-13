@@ -185,8 +185,10 @@ autosign.conf: |
 {{- end }}
 {{- end }}
 {{- range $name, $body := .Values.extraConfigFiles }}
-{{/* Quoted so a key can never contribute YAML structure, whatever the guard in
-     openvox-ca.validate lets through. */}}
+{{- /* Quoted so a key can never contribute YAML structure, whatever the guard in
+       openvox-ca.validate lets through. Left-trimmed only: trimming both sides
+       eats the newline before the key, and trimming neither emits a blank line
+       into the rendered ConfigMap once per entry. */}}
 {{ $name | quote }}: |
 {{ $body | trimSuffix "\n" | indent 2 }}
 {{- end }}
@@ -206,8 +208,9 @@ what openvox-ca.tlsConfigured does with the same uncertainty: an unnecessary
 projected token costs nothing, whereas a missing one makes the export or the
 key provider fail while readiness still reports healthy.
 
-That covers all three of configFullyKnown's inputs deliberately, not just
-existingConfigMap. Every one of them can carry the settings this decision turns
+That covers all four of configFullyKnown's inputs deliberately, not just
+existingConfigMap — the fourth being a `--config` in `extraArgs`, which points
+the server at a file the chart never rendered. Every one of them can carry the settings this decision turns
 on, because they all outrank or replace the config file the chart renders:
 `--openbao-auth-method=kubernetes` through `args`, and
 PUPPET_CA_OPENBAO_AUTH_METHOD through a ConfigMap or Secret named in `envFrom`
@@ -281,6 +284,15 @@ deliberate for the token and the Role, which fail open, but it means a
 config-derived export reason in the NOTE may name inert values —
 exportTargetNames takes the stricter view and reports "unknown" there.
 */}}
+{{- define "openvox-ca.exportConfigured" -}}
+{{- $config := include "openvox-ca.config" . | fromYaml -}}
+{{- if or .Values.kubernetesExport.enabled (dig "kubernetes_export" "targets" list $config) -}}
+true
+{{- else -}}
+false
+{{- end -}}
+{{- end -}}
+
 {{/*
 Whether the export Role and its bindings are rendered — export configured *and*
 rbac.create.
@@ -295,15 +307,6 @@ mistake: one side of a coupling moved.
 */}}
 {{- define "openvox-ca.exportRBACRendered" -}}
 {{- if and (eq (include "openvox-ca.exportConfigured" .) "true") .Values.kubernetesExport.rbac.create -}}
-true
-{{- else -}}
-false
-{{- end -}}
-{{- end -}}
-
-{{- define "openvox-ca.exportConfigured" -}}
-{{- $config := include "openvox-ca.config" . | fromYaml -}}
-{{- if or .Values.kubernetesExport.enabled (dig "kubernetes_export" "targets" list $config) -}}
 true
 {{- else -}}
 false
@@ -466,6 +469,42 @@ CrashLoopBackOff or a Service that silently routes nowhere.
 {{- $config := include "openvox-ca.config" . | fromYaml -}}
 
 {{/*
+  Three settings decide one thing each in two places: the convenience value
+  shapes the Kubernetes object, and the merged config tells the server. `config`
+  wins by contract, so overriding one of these there moves the server and leaves
+  the Service, the container port or the volume mount behind — and two of the
+  three fail silently. A wrong `port` never becomes ready; a wrong
+  `metrics_listen` leaves the Service and any ServiceMonitor scraping a port
+  nothing listens on while readiness stays green; a wrong `cadir` points the CA
+  at a path outside its volume, which readOnlyRootFilesystem then makes
+  unwritable.
+
+  Only checked when the chart can read the whole configuration, and only when
+  the two disagree — the convenience values are what the chart writes into
+  config in the first place, so they agree unless someone overrode one.
+*/}}
+{{- if eq (include "openvox-ca.configFullyKnown" .) "true" -}}
+{{- $cfgPort := dig "port" (.Values.listen.port | int) $config | int -}}
+{{- if ne $cfgPort (.Values.listen.port | int) -}}
+{{- fail (printf "config.port is %d but listen.port is %d, and listen.port is what the container port, the Service and the probes use — so the server would listen where nothing reaches it and the pod would never become ready. Set listen.port to %d as well, or drop the config override." $cfgPort (.Values.listen.port | int) $cfgPort) -}}
+{{- end -}}
+{{- $cfgCadir := dig "cadir" "" $config -}}
+{{- if and .Values.persistence.enabled $cfgCadir (ne $cfgCadir .Values.persistence.mountPath) -}}
+{{- fail (printf "config.cadir is %q but the PersistentVolumeClaim is mounted at %q, so the CA would write outside its volume — and the root filesystem is read-only by default, so it could not write at all. Set persistence.mountPath to %q as well, or drop the config override." $cfgCadir .Values.persistence.mountPath $cfgCadir) -}}
+{{- end -}}
+{{- if .Values.metrics.enabled -}}
+{{- $listen := dig "metrics_listen" "" $config -}}
+{{- if $listen -}}
+{{- $parts := splitList ":" $listen -}}
+{{- $cfgMetricsPort := last $parts | int -}}
+{{- if and $cfgMetricsPort (ne $cfgMetricsPort (.Values.metrics.port | int)) -}}
+{{- fail (printf "config.metrics_listen is %q but metrics.port is %d, and metrics.port is what the container port, the Service and any ServiceMonitor use — so they would scrape a port nothing listens on, silently, while readiness stayed green. Set metrics.port to %d as well, or drop the config override." $listen (.Values.metrics.port | int) $cfgMetricsPort) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
   The server refuses to serve plain HTTP on a non-loopback address, because an
   on-path host could then inject forged certificates. Reproduce its condition
   so the operator is told at install time, with the same remedies, instead of
@@ -535,10 +574,14 @@ CrashLoopBackOff or a Service that silently routes nowhere.
   key parses back to the trimmed name, a key wrapped in quotes parses to the
   unquoted name, and a key containing a newline injects a whole extra entry
   because the block is re-indented. Two attempts at enumerating those spellings
-  were both bypassed. So the key must look like a ConfigMap key — the character
-  set Kubernetes actually permits — and it is quoted where it is emitted, so a
-  hostile key cannot contribute YAML structure even if this guard is edited badly
-  later.
+  were both bypassed. So the key must look like a ConfigMap key, and it is quoted
+  where it is emitted, so a hostile key cannot contribute YAML structure even if
+  this guard is edited badly later.
+
+  The rule is Kubernetes' own IsConfigMapKey: the character set, a 253-character
+  cap, and three exclusions a bare character class misses — ".", ".." and any
+  name beginning "..". Those pass a character-class check and render a manifest
+  the API server then refuses.
 */}}
 {{- $rendered := dict -}}
 {{- if not .Values.existingConfigMap -}}
@@ -547,8 +590,8 @@ CrashLoopBackOff or a Service that silently routes nowhere.
 {{- if .Values.autosign.patterns -}}{{- $_ := set $rendered "autosign.conf" true -}}{{- end -}}
 {{- end -}}
 {{- range $name, $body := .Values.extraConfigFiles -}}
-{{- if not (regexMatch "^[-._a-zA-Z0-9]+$" $name) -}}
-{{- fail (printf "extraConfigFiles key %q is not a valid ConfigMap key: only letters, digits, '-', '_' and '.' are allowed. Whitespace, quotes and newlines are refused outright because YAML folds such a key onto a different one, which is how a name that looked distinct came to replace a file the chart renders." $name) -}}
+{{- if or (not (regexMatch "^[-._a-zA-Z0-9]{1,253}$" $name)) (eq $name ".") (eq $name "..") (hasPrefix ".." $name) -}}
+{{- fail (printf "extraConfigFiles key %q is not a valid ConfigMap key: at most 253 of letters, digits, '-', '_' and '.', and not '.', '..' or a name beginning '..'. Whitespace, quotes and newlines are refused outright because YAML folds such a key onto a different one, which is how a name that looked distinct came to replace a file the chart renders." $name) -}}
 {{- end -}}
 {{- if hasKey $rendered $name -}}
 {{- fail (printf "extraConfigFiles key %q is one the chart renders into the same ConfigMap, and yours would silently take its place. Use existingConfigMap for a config.yaml of your own, puppetServers for the admin allow list, or autosign.patterns for autosign.conf." $name) -}}
@@ -599,7 +642,17 @@ anything that is not an object, so the caller has to test before decoding
 anyway.
 */}}
 {{- define "openvox-ca.exportTargetNames" -}}
-{{- if .Values.existingConfigMap -}}
+{{- /*
+  Keyed on configFullyKnown, not existingConfigMap alone. All four of its inputs
+  mean the same thing here — the chart cannot read the export config — but only
+  existingConfigMap was tested, so `args`, `envFrom` and a --config in extraArgs
+  produced a create-only Role with no patch rule and no NOTES disclosure. If the
+  real config carries kubernetes_export.targets, the exporter is refused on its
+  first patch of an existing object while readiness stays green, which is the
+  failure this file's header says it fixed. needsAPIAccess already routes through
+  configFullyKnown for exactly this reason.
+*/ -}}
+{{- if ne (include "openvox-ca.configFullyKnown" .) "true" -}}
 unknown
 {{- else -}}
 {{- $config := include "openvox-ca.config" . | fromYaml -}}

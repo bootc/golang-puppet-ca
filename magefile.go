@@ -1310,6 +1310,17 @@ func (Chart) Test() error {
 			notWants: []string{"kind: Role\n", "kind: RoleBinding\n"},
 		},
 		{
+			// The third consumer of the predicate. With no Role rendered there is
+			// nothing to bind, so the default-ServiceAccount refusal must stay
+			// silent — re-splitting rbac.create off it would refuse this valid
+			// install, and the two existing reject cases would not notice.
+			name: "no Role means no default-ServiceAccount refusal",
+			sets: []string{tls, "kubernetesExport.enabled=true",
+				"kubernetesExport.rbac.create=false", "serviceAccount.create=false"},
+			wants:    []string{"kind: Deployment"},
+			notWants: []string{"kind: Role\n"},
+		},
+		{
 			name:     "rbac.scope: ClusterRole selects the cluster-scoped kinds",
 			sets:     []string{tls, "kubernetesExport.enabled=true", "kubernetesExport.rbac.scope=ClusterRole", "kubernetesExport.targets[0].kind=Secret", "kubernetesExport.targets[0].metadata.name=t", "kubernetesExport.targets[0].cert=true"},
 			wants:    []string{"kind: ClusterRole\n", "kind: ClusterRoleBinding\n"},
@@ -1463,7 +1474,27 @@ func (Chart) Test() error {
 			name:  "NOTES warns when export RBAC cannot be narrowed",
 			notes: true,
 			sets:  []string{"existingConfigMap=mine", "kubernetesExport.enabled=true"},
-			wants: []string{"patch on every"},
+			// The scope word carries the meaning: inverting the conditional would
+			// understate a cluster-wide grant as namespace-wide, and "patch on
+			// every" alone is common to both branches.
+			wants: []string{"namespace-wide patch on every"},
+		},
+		{
+			name:  "NOTES names the cluster-wide scope when that is what was created",
+			notes: true,
+			sets: []string{"existingConfigMap=mine", "kubernetesExport.enabled=true",
+				"kubernetesExport.rbac.scope=ClusterRole"},
+			wants: []string{"cluster-wide patch on every"},
+		},
+		{
+			// rbac.create off means no Role, so there is nothing to disclose. The
+			// conjunct is pinned at rbac.yaml; this pins it at the disclosure,
+			// where re-splitting it would announce a grant that was never created.
+			name:  "NOTES discloses nothing when no Role was created",
+			notes: true,
+			sets: []string{"existingConfigMap=mine", "kubernetesExport.enabled=true",
+				"kubernetesExport.rbac.create=false"},
+			notWants: []string{"patch on every"},
 		},
 		{
 			// The same disclosure by the config route. This warning is the
@@ -1661,6 +1692,10 @@ func (Chart) Test() error {
 			// Quoted, because configMapData quotes every extraConfigFiles key so a
 			// hostile one cannot contribute YAML structure. Same parsed key.
 			wants: []string{"\"puppet-server\": |", "compiler.example.com"},
+			// And the premise the case is named for: the chart emits none. Without
+			// this, changing configMapData's own condition — the other site that
+			// decides the same thing — renders both entries and this still passes.
+			notWants: []string{"\n  puppet-server: |"},
 		},
 		{
 			// The other arm's negative direction: with no autosign.patterns the
@@ -1670,7 +1705,8 @@ func (Chart) Test() error {
 			name: "an autosign.conf supplied by hand renders when the chart emits none",
 			valuesYAML: "tls:\n  existingSecret: s\nconfig:\n  autosign_config: /etc/puppet-ca/autosign.conf\n" +
 				"extraConfigFiles:\n  autosign.conf: |\n    *.agent.example.com\n",
-			wants: []string{"\"autosign.conf\": |", "*.agent.example.com"},
+			wants:    []string{"\"autosign.conf\": |", "*.agent.example.com"},
+			notWants: []string{"\n  autosign.conf: |"},
 		},
 		{
 			// existingConfigMap renders no ConfigMap at all, so extraConfigFiles
@@ -1743,6 +1779,28 @@ func (Chart) Test() error {
 			// Unrestricted, because the chart cannot know the target names —
 			// but emitted as its own rule rather than an empty resourceNames
 			// list, which RBAC would read as "every resource" anyway.
+			wants:    []string{`verbs: ["patch"]`},
+			notWants: []string{"resourceNames:\n"},
+		},
+		{
+			// The other three routes to an unreadable config. Keyed on
+			// existingConfigMap alone, these emitted a create-only Role with no
+			// patch rule and no NOTES disclosure, so an exporter whose real config
+			// carries targets is refused on its first patch with readiness green.
+			name:     "a replaced argv also grants patch unrestricted",
+			sets:     []string{"kubernetesExport.enabled=true", "args[0]=--config=/other.yaml"},
+			wants:    []string{`verbs: ["patch"]`},
+			notWants: []string{"resourceNames:\n"},
+		},
+		{
+			name:     "a --config in extraArgs also grants patch unrestricted",
+			sets:     []string{tls, "kubernetesExport.enabled=true", "extraArgs[0]=--config=/other.yaml"},
+			wants:    []string{`verbs: ["patch"]`},
+			notWants: []string{"resourceNames:\n"},
+		},
+		{
+			name:     "envFrom also grants patch unrestricted",
+			sets:     []string{"kubernetesExport.enabled=true", "envFrom[0].secretRef.name=env"},
 			wants:    []string{`verbs: ["patch"]`},
 			notWants: []string{"resourceNames:\n"},
 		},
@@ -1906,6 +1964,38 @@ func (Chart) Test() error {
 			valuesYAML: "tls:\n  existingSecret: s\npuppetServers:\n  - compiler.example.com\n" +
 				"extraConfigFiles:\n  \"harmless.txt: x\\npuppet-server\": |\n    attacker.example.com\n",
 			wantErr: "not a valid ConfigMap key",
+		},
+		{
+			// config wins by contract, so overriding one of the three settings the
+			// chart also uses to shape a Kubernetes object moves the server and
+			// leaves the object behind. The port case never becomes ready.
+			name:    "config.port overriding listen.port, which the objects follow",
+			sets:    []string{tls, "config.port=9999"},
+			wantErr: "listen.port is what the container port",
+		},
+		{
+			// This one is silent: the Service and any ServiceMonitor scrape a port
+			// nothing listens on while readiness stays green.
+			name:    "config.metrics_listen overriding metrics.port",
+			sets:    []string{tls, "metrics.enabled=true", "config.metrics_listen=0.0.0.0:9999"},
+			wantErr: "metrics.port is what the container port",
+		},
+		{
+			name:    "config.cadir pointing outside the mounted volume",
+			sets:    []string{tls, "config.cadir=/srv/ca"},
+			wantErr: "PersistentVolumeClaim is mounted at",
+		},
+		{
+			// Kubernetes refuses these three, and a bare character class admits
+			// them — they rendered a manifest the API server would reject.
+			name:       "an extraConfigFiles key Kubernetes reserves",
+			valuesYAML: "tls:\n  existingSecret: s\nextraConfigFiles:\n  \"..data\": |\n    x\n",
+			wantErr:    "not a valid ConfigMap key",
+		},
+		{
+			name:       "an extraConfigFiles key of a single dot",
+			valuesYAML: "tls:\n  existingSecret: s\nextraConfigFiles:\n  \".\": |\n    x\n",
+			wantErr:    "not a valid ConfigMap key",
 		},
 		{
 			name:    "a mistyped value the schema should catch",

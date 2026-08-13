@@ -101,13 +101,16 @@ configMount: /etc/puppet-ca
 # at. They land in <configMount>/<filename>.
 #
 # A key is refused when the chart is itself rendering that file, because yours is
-# written last and would take its place: config.yaml unless existingConfigMap is
-# set, puppet-server when puppetServers is set, autosign.conf when
-# autosign.patterns is set. Use existingConfigMap, puppetServers or
-# autosign.patterns instead in those cases. Where the chart renders none of them
-# — the allow list supplied by hand, say — supplying it here is fine. Keys must
-# also look like ConfigMap keys (letters, digits, '-', '_', '.'); a padded or
-# quoted name would fold onto a different one.
+# written last and would take its place. With existingConfigMap set the chart
+# renders no ConfigMap at all, so nothing here is refused — and nothing here is
+# written either, per the note above. Otherwise: config.yaml always,
+# puppet-server when puppetServers is set, autosign.conf when autosign.patterns
+# is set. Use existingConfigMap, puppetServers or autosign.patterns instead in
+# those cases; where the chart renders none of them — the allow list supplied by
+# hand, say — supplying it here is fine.
+#
+# Keys must also look like ConfigMap keys (letters, digits, '-', '_', '.'); a
+# padded or quoted name would fold onto a different one.
 extraConfigFiles: {}
 
 # Listen address and port for the Puppet CA API.
@@ -168,8 +171,10 @@ tls:
 #
 # A third route needs no value here: running under an external root, via the
 # offline `openvox-ca csr` and `openvox-ca import-ca-cert` subcommands. The
-# server refuses to start between the two, so see "Running under an external
-# root" in docs/helm-chart.md before starting a rollout in that window.
+# server refuses to start between the two — a crash-loop under a Deployment — so
+# read "Running under an external root" in docs/helm-chart.md for what the
+# chart's names and defaults substitute into the procedure, and don't begin a
+# rollout inside that window.
 ca:
   existingSecret: ""
   certKey: tls.crt

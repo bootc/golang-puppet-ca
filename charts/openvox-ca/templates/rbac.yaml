@@ -1,10 +1,12 @@
 {{/*
-Gated on exportConfigured, not on kubernetesExport.enabled alone: targets set
+Gated on exportRBACRendered — export configured by either route the server
+honours, and rbac.create. Not on kubernetesExport.enabled alone: targets set
 straight into config.kubernetes_export configure the exporter just as well, and
 gating on the flag left that route with a mounted token, a NOTE naming export as
 the reason, and no Role at all — the exporter refused by RBAC while readiness
-stayed green. The rules below already take their names from the merged config,
-so the two now agree on what "export is configured" means.
+stayed green. The default-ServiceAccount refusal and the NOTES disclosure of an
+unnarrowable grant read the same helper, so all three agree on when this file
+renders.
 */}}
 {{- if eq (include "openvox-ca.exportRBACRendered" .) "true" }}
 {{- $fullName := include "openvox-ca.fullname" . }}
