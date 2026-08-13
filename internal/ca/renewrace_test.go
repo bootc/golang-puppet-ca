@@ -206,7 +206,17 @@ var _ = Describe("A revocation racing a renewal", func() {
 			// above the lock fails. Such a check answers before blocking: either
 			// it has already seen the revocation and refuses here, or it has not
 			// and the renewal succeeds once the lock is free.
-			Consistently(renewed, 100*time.Millisecond).ShouldNot(Receive())
+			//
+			// This does assume the renewal reached its pre-lock gate before the
+			// revocation above committed, which nothing enforces — the main
+			// goroutine does far more work first (a second CA's Init, then a CRL
+			// read-modify-write and re-sign) than the renewal's signature check,
+			// so it holds comfortably, but say so in the message rather than let
+			// a scheduling upset read as the defect.
+			Consistently(renewed, 100*time.Millisecond).ShouldNot(Receive(),
+				"the renewal must still be parked on the subject lock: receiving here means "+
+					"either the re-check was hoisted back above the lock, or the revocation "+
+					"beat the renewal to its pre-lock gate")
 
 			releaseOnce.Do(func() { close(release) })
 			Expect(<-held).To(Succeed())
