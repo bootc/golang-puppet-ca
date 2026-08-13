@@ -6,7 +6,10 @@
 # value of its own for each one. The blocks below it (tls, ca, puppetServers,
 # metrics, kubernetesExport, …) are conveniences that wire up the Kubernetes
 # side — volumes, RBAC, ports — *and* set the matching config keys for you.
-# Anything you set in `config` wins over what those blocks compute.
+# Anything you set in `config` wins over what those blocks compute — except
+# `port`, `cadir` and `metrics_listen`, which also shape a Kubernetes object; the
+# install is refused rather than left to diverge. Use listen.port,
+# persistence.mountPath and metrics.port for those.
 
 # -- Image ---------------------------------------------------------------------
 

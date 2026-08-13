@@ -40,7 +40,11 @@ mirror it key by key. Instead:
   side of a feature — mount the Secret, open the port, create the RBAC — *and*
   set the config keys that point at what they mounted.
 - **`config` always wins.** The two are deep-merged with your `config` on top,
-  so you can override anything a convenience block computed.
+  so you can override anything a convenience block computed — with three
+  exceptions the install refuses rather than lets diverge, because they also
+  shape a Kubernetes object: `port`, `cadir` and `metrics_listen`. Set those
+  through `listen.port`, `persistence.mountPath` and `metrics.port`, or set both
+  sides to agree.
 - **`env`, `extraEnv` and `envFrom`** are the escape hatch for settings that
   must come from a Secret at runtime, such as a database DSN.
 
@@ -83,7 +87,7 @@ Helm 3.21 or 4.2; both are exercised in CI.
 | Key | Default | Description |
 | --- | --- | --- |
 | `config` | `{}` | Written verbatim to `config.yaml`; the full [configuration reference](https://github.com/voxpupuli/openvox-ca/blob/main/docs/configuration.md) applies |
-| `existingConfigMap` | `""` | Use a ConfigMap you manage instead of rendering one. The chart cannot checksum what it did not render, so `configChecksumAnnotation` has no effect and editing that ConfigMap will **not** restart the pods. `config.yaml` is fixed at startup, so roll them yourself. Of this ConfigMap's contents a `SIGHUP` re-reads only the allow-list file, and only if your own config sets `puppet_server_file` at a path in it. `config`, `puppetServers`, `autosign`, `extraConfigFiles` and `kubernetesExport.targets` stop being written anywhere in this mode |
+| `existingConfigMap` | `""` | Use a ConfigMap you manage instead of rendering one. The chart cannot checksum what it did not render, so `configChecksumAnnotation` has no effect and editing that ConfigMap will **not** restart the pods. `config.yaml` is fixed at startup, so roll them yourself. Of this ConfigMap's contents a `SIGHUP` re-reads only the allow-list file, and only if your own config sets `puppet_server_file` at a path in it. `config`, `verbosity`, `listen.host`, `puppetServers`, `autosign`, `extraConfigFiles` and `kubernetesExport.targets` stop being written anywhere in this mode — carry the ones you need into your own ConfigMap, `listen.host` included, or a dual-stack Service will front an IPv4-only socket |
 | `configMount` | `/etc/puppet-ca` | Where the config ConfigMap is mounted |
 | `extraConfigFiles` | `{}` | Extra `filename: contents` entries placed alongside `config.yaml`. Refused when the chart is rendering that file itself, since yours would take its place: `config.yaml` always, `puppet-server` with `puppetServers`, `autosign.conf` with `autosign.patterns` — none of them under `existingConfigMap`, where the chart renders no ConfigMap and these entries go nowhere. Keys must look like ConfigMap keys (letters, digits, `-`, `_`, `.`) |
 | `listen.host` | `0.0.0.0` | API listen address; use `[::]` for a dual-stack Service |

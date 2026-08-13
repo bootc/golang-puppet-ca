@@ -1480,6 +1480,16 @@ func (Chart) Test() error {
 			wants: []string{"namespace-wide patch on every"},
 		},
 		{
+			// exportTargetNames now returns "unknown" on all four routes, so the
+			// disclosure had to stop naming existingConfigMap as the cause and
+			// offering a remedy — moving targets into kubernetesExport.targets —
+			// that cannot work while the config stays unreadable.
+			name:  "NOTES names the right cause when the config is unreadable another way",
+			notes: true,
+			sets:  []string{tls, "kubernetesExport.enabled=true", "extraArgs[0]=--config=/other.yaml"},
+			wants: []string{"args, envFrom, or a --config in extraArgs", "will not help"},
+		},
+		{
 			name:  "NOTES names the cluster-wide scope when that is what was created",
 			notes: true,
 			sets: []string{"existingConfigMap=mine", "kubernetesExport.enabled=true",
@@ -1722,6 +1732,20 @@ func (Chart) Test() error {
 			notWants:   []string{"host: 127.0.0.1"},
 		},
 		{
+			// Containment, not equality. The mount point itself and anything under
+			// it are writable — the server creates what it needs — so an equality
+			// test refused a trailing slash and the conventional <mount>/ca, with a
+			// message asserting they were outside the volume they were in.
+			name:  "a cadir inside the mounted volume renders",
+			sets:  []string{tls, "config.cadir=/var/lib/puppet-ca/ca"},
+			wants: []string{"cadir: /var/lib/puppet-ca/ca"},
+		},
+		{
+			name:  "a cadir equal to the mount point with a trailing slash renders",
+			sets:  []string{tls, "config.cadir=/var/lib/puppet-ca/"},
+			wants: []string{"kind: Deployment"},
+		},
+		{
 			name: "envFrom stops the TLS precondition firing",
 			// envFrom can carry PUPPET_CA_TLS_CERT/KEY from a Secret the chart
 			// never reads, so the guard has to stand down — with no tls block
@@ -1799,10 +1823,16 @@ func (Chart) Test() error {
 			notWants: []string{"resourceNames:\n"},
 		},
 		{
-			name:     "envFrom also grants patch unrestricted",
-			sets:     []string{"kubernetesExport.enabled=true", "envFrom[0].secretRef.name=env"},
-			wants:    []string{`verbs: ["patch"]`},
-			notWants: []string{"resourceNames:\n"},
+			// envFrom is the exception, and inverting this case is the point: it
+			// cannot carry export targets, so the names the chart can see are still
+			// the real ones. Keying the width on configFullyKnown widened patch to
+			// every Secret in scope here — a privilege escalation dressed as a
+			// fail-open, on the chart's own documented way to supply a DSN.
+			name: "envFrom keeps the grant narrowed to the configured names",
+			sets: []string{tls, "kubernetesExport.enabled=true", "envFrom[0].secretRef.name=env",
+				"kubernetesExport.targets[0].kind=Secret", "kubernetesExport.targets[0].metadata.name=mycert",
+				"kubernetesExport.targets[0].cert=true"},
+			wants: []string{"resourceNames:", "- mycert"},
 		},
 		{
 			name: "a falsy config value still overrides what the chart computed",
@@ -1983,7 +2013,24 @@ func (Chart) Test() error {
 		{
 			name:    "config.cadir pointing outside the mounted volume",
 			sets:    []string{tls, "config.cadir=/srv/ca"},
-			wantErr: "PersistentVolumeClaim is mounted at",
+			wantErr: "outside the volume mounted at",
+		},
+		{
+			// The same shape without a PVC: the volume is an emptyDir but it is
+			// still mounted at mountPath, and the root filesystem is still
+			// read-only, so gating the check on persistence.enabled let the
+			// identical failure through on three of the six fixture shapes.
+			name:    "config.cadir outside the volume with persistence disabled",
+			sets:    []string{tls, "persistence.enabled=false", "config.cadir=/srv/ca"},
+			wantErr: "outside the volume mounted at",
+		},
+		{
+			// The server starts the exporter on any non-empty metrics_listen
+			// whatever the chart's flag says, while every object that would make it
+			// reachable is gated on the flag.
+			name:    "config.metrics_listen with the exporter switched off",
+			sets:    []string{tls, "config.metrics_listen=0.0.0.0:9140"},
+			wantErr: "which starts the exporter, but metrics.enabled is false",
 		},
 		{
 			// Kubernetes refuses these three, and a bare character class admits
@@ -1996,6 +2043,32 @@ func (Chart) Test() error {
 			name:       "an extraConfigFiles key of a single dot",
 			valuesYAML: "tls:\n  existingSecret: s\nextraConfigFiles:\n  \".\": |\n    x\n",
 			wantErr:    "not a valid ConfigMap key",
+		},
+		{
+			// The cap is the third part of the rule and the only one nothing
+			// asserted: reverting {1,253} to + left every case green while a
+			// 254-character key rendered a manifest the API server refuses.
+			// Pinned on the bound, not the shared prefix.
+			name:       "an extraConfigFiles key past the 253-character cap",
+			valuesYAML: "tls:\n  existingSecret: s\nextraConfigFiles:\n  " + strings.Repeat("a", 254) + ": |\n    x\n",
+			wantErr:    "at most 253",
+		},
+		{
+			// Bypass four, via the body rather than the key: sprig's indent splits
+			// on "\n" only, while YAML also breaks on CR, so the text after one is
+			// not re-indented, lands at the data-key column and took the place of
+			// the admin allow list outright.
+			name:       "an extraConfigFiles body carrying a carriage return",
+			valuesYAML: "tls:\n  existingSecret: s\npuppetServers:\n  - compiler.example.com\nextraConfigFiles:\n  harmless.txt: \"x\\r  puppet-server: |\\r    attacker.example.com\\n\"\n",
+			wantErr:    "carriage return or a Unicode line separator",
+		},
+		{
+			// The same against the allow-list entry check, which was also "\n"
+			// only. U+2028 is a YAML line break that survives go-yaml's
+			// normalisation.
+			name:       "a puppetServers entry carrying a Unicode line separator",
+			valuesYAML: "tls:\n  existingSecret: s\npuppetServers:\n  - \"compiler.example.com       config.yaml: |         no_tls_required: true\"\n",
+			wantErr:    "no carriage return or Unicode line separator",
 		},
 		{
 			name:    "a mistyped value the schema should catch",

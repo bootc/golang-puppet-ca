@@ -59,7 +59,12 @@ openvox-ca has a large configuration surface, and the chart deliberately does
   `autosign`, `metrics`, `kubernetesExport`, `persistence` — do the Kubernetes
   half of a feature (mount the Secret, open the port, create the RBAC) *and*
   set the config keys pointing at whatever they mounted.
-- **`config` always wins.** The two are deep-merged with your `config` on top.
+- **`config` always wins**, with three exceptions. The two are deep-merged with
+  your `config` on top — except `port`, `cadir` and `metrics_listen`, which also
+  shape a Kubernetes object (the container port and Service, the volume mount,
+  the exporter's port and any ServiceMonitor). Overriding one of those in `config`
+  alone would move the server and leave the object behind, so the chart refuses
+  the install and names the value to set instead.
   This is why `verbosity` is written into the config file rather than passed as
   `--verbosity`: a flag would outrank the file unconditionally, leaving
   `config.verbosity` silently ineffective. The only argument the chart passes is

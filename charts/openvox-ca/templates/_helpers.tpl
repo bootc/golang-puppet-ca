@@ -118,7 +118,9 @@ The server's config.yaml.
 
 Starts from what the chart's convenience blocks imply — cadir, listen address,
 mounted TLS/CA paths, the metrics listener, the export targets — then merges
-.Values.config over the top, so an explicit config key always wins.
+.Values.config over the top, so an explicit config key always wins — except
+port, cadir and metrics_listen, which openvox-ca.validate refuses when they
+disagree with the values that shape the matching Kubernetes object.
 */}}
 {{- define "openvox-ca.config" -}}
 {{- $c := dict -}}
@@ -391,6 +393,34 @@ a file the chart never saw — while the ConfigMap it did render goes unread.
 Both spellings are caught: --config=/path, and the bare --config whose value
 sits in the following element.
 */}}
+{{/*
+Whether the config file the server reads is the one the chart rendered.
+
+Narrower than configFullyKnown on purpose. That one asks whether the chart can
+see every setting, so it counts envFrom — a Secret can carry any PUPPET_CA_*
+variable. This one asks only whether the *file* is the chart's, which envFrom
+cannot change: the chart always passes its own --config, and a flag outranks
+PUPPET_CA_CONFIG.
+
+The distinction matters where a decision is about the file's contents rather than
+the configuration as a whole. exportTargetNames is the case: keying it on
+configFullyKnown widened the export patch grant from the configured target names
+to every Secret in scope whenever envFrom was used, which is a privilege
+escalation dressed as a fail-open.
+*/}}
+{{- define "openvox-ca.configFileKnown" -}}
+{{- $configOverridden := false -}}
+{{- range .Values.extraArgs -}}
+{{- $arg := . | toString -}}
+{{- if or (eq $arg "--config") (hasPrefix "--config=" $arg) }}{{ $configOverridden = true }}{{ end -}}
+{{- end -}}
+{{- if or .Values.existingConfigMap .Values.args $configOverridden -}}
+false
+{{- else -}}
+true
+{{- end -}}
+{{- end -}}
+
 {{- define "openvox-ca.configFullyKnown" -}}
 {{- $configOverridden := false -}}
 {{- range .Values.extraArgs -}}
@@ -488,12 +518,34 @@ CrashLoopBackOff or a Service that silently routes nowhere.
 {{- if ne $cfgPort (.Values.listen.port | int) -}}
 {{- fail (printf "config.port is %d but listen.port is %d, and listen.port is what the container port, the Service and the probes use — so the server would listen where nothing reaches it and the pod would never become ready. Set listen.port to %d as well, or drop the config override." $cfgPort (.Values.listen.port | int) $cfgPort) -}}
 {{- end -}}
-{{- $cfgCadir := dig "cadir" "" $config -}}
-{{- if and .Values.persistence.enabled $cfgCadir (ne $cfgCadir .Values.persistence.mountPath) -}}
-{{- fail (printf "config.cadir is %q but the PersistentVolumeClaim is mounted at %q, so the CA would write outside its volume — and the root filesystem is read-only by default, so it could not write at all. Set persistence.mountPath to %q as well, or drop the config override." $cfgCadir .Values.persistence.mountPath $cfgCadir) -}}
+{{- /*
+  Containment, not equality: the mount point itself and any directory under it
+  are fine — the server creates what it needs — so only a cadir outside the
+  volume is a problem. Equality refused a trailing slash and refused the
+  conventional `<mount>/ca` subdirectory, with a message asserting they were
+  outside the volume they were in.
+
+  Not gated on persistence.enabled, because deployment.yaml mounts something at
+  mountPath either way (an emptyDir when persistence is off), so the same
+  read-only-root failure applies.
+*/ -}}
+{{- $mount := trimSuffix "/" .Values.persistence.mountPath -}}
+{{- $cfgCadir := dig "cadir" "" $config | toString | trimSuffix "/" -}}
+{{- if and $cfgCadir (ne $cfgCadir $mount) (not (hasPrefix (printf "%s/" $mount) $cfgCadir)) -}}
+{{- fail (printf "config.cadir is %q, which is outside the volume mounted at %q, and the root filesystem is read-only by default so the CA could not write there. Point cadir inside the mount, or set persistence.mountPath to a parent of it." $cfgCadir $mount) -}}
+{{- end -}}
+{{- $listen := dig "metrics_listen" "" $config -}}
+{{- if and $listen (not .Values.metrics.enabled) -}}
+{{- /*
+  The server starts the exporter on any non-empty metrics_listen, whatever the
+  chart's flag says — config outranks it, as everywhere else. But the container
+  port, the Service port, the ServiceMonitor and the NetworkPolicy ingress rule
+  are all gated on the flag, so this renders a pod exporting metrics that nothing
+  can reach, with readiness green.
+*/ -}}
+{{- fail (printf "config.metrics_listen is %q, which starts the exporter, but metrics.enabled is false — so the chart renders no container port, no Service port, no ServiceMonitor and no NetworkPolicy rule for it, and nothing could scrape it. Set metrics.enabled: true (with metrics.host/metrics.port), or drop the config override." $listen) -}}
 {{- end -}}
 {{- if .Values.metrics.enabled -}}
-{{- $listen := dig "metrics_listen" "" $config -}}
 {{- if $listen -}}
 {{- $parts := splitList ":" $listen -}}
 {{- $cfgMetricsPort := last $parts | int -}}
@@ -617,15 +669,31 @@ CrashLoopBackOff or a Service that silently routes nowhere.
 
 {{/*
   puppetServers and autosign.patterns are written one per line into the config
-  ConfigMap. An entry containing a newline would end that block scalar early
-  and inject a key of its own — and these two lists are the mTLS admin
-  allow list and the autosign allow list, so a mangled one fails open.
+  ConfigMap, and extraConfigFiles bodies are indented into it. Anything YAML
+  treats as a line break ends the block scalar early and injects a key of its
+  own — and the entries in question are the mTLS admin allow list and the
+  autosign allow list, so a mangled one fails open.
+
+  Checking for "\n" alone is not enough, which is how this was got round a
+  fourth time. sprig's indent/nindent split on "\n" only, while every YAML
+  parser in the path also breaks on CR, NEL (U+0085), LS (U+2028) and PS
+  (U+2029) — see is_break in the go-yaml the server itself uses. So an
+  unindented continuation lands at the data-key column and wins by
+  last-key-wins: a body carrying a bare CR replaced the admin allow list
+  outright, with every chart decision still computed from the config.yaml the
+  pod no longer reads.
 */}}
+{{- $yamlBreaks := "[\\r\\x{0085}\\x{2028}\\x{2029}]" -}}
 {{- range $list := list .Values.puppetServers .Values.autosign.patterns -}}
 {{- range $entry := $list -}}
-{{- if or (contains "\n" ($entry | toString)) (not (trim ($entry | toString))) -}}
-{{- fail (printf "puppetServers and autosign.patterns entries must each be a single non-empty line; got %q" $entry) -}}
+{{- if or (contains "\n" ($entry | toString)) (regexMatch $yamlBreaks ($entry | toString)) (not (trim ($entry | toString))) -}}
+{{- fail (printf "puppetServers and autosign.patterns entries must each be a single non-empty line, with no carriage return or Unicode line separator; got %q" $entry) -}}
 {{- end -}}
+{{- end -}}
+{{- end -}}
+{{- range $name, $body := .Values.extraConfigFiles -}}
+{{- if regexMatch $yamlBreaks ($body | toString) -}}
+{{- fail (printf "extraConfigFiles %q contains a carriage return or a Unicode line separator. Those are not re-indented into the ConfigMap, so the text after one would land at the data-key column and could take the place of a file the chart renders. Use plain newlines." $name) -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}
@@ -643,16 +711,21 @@ anyway.
 */}}
 {{- define "openvox-ca.exportTargetNames" -}}
 {{- /*
-  Keyed on configFullyKnown, not existingConfigMap alone. All four of its inputs
-  mean the same thing here — the chart cannot read the export config — but only
-  existingConfigMap was tested, so `args`, `envFrom` and a --config in extraArgs
-  produced a create-only Role with no patch rule and no NOTES disclosure. If the
-  real config carries kubernetes_export.targets, the exporter is refused on its
-  first patch of an existing object while readiness stays green, which is the
-  failure this file's header says it fixed. needsAPIAccess already routes through
-  configFullyKnown for exactly this reason.
+  Keyed on configFileKnown, not existingConfigMap alone and not configFullyKnown.
+  Testing existingConfigMap alone left `args` and a --config in extraArgs with a
+  create-only Role, so an exporter whose real config carries targets was refused
+  on its first patch with readiness green. But widening to configFullyKnown
+  over-corrected: it counts envFrom, which cannot carry export targets —
+  kubernetes_export exists only as a YAML key, applyServerEnv has no variable for
+  it, and the chart always passes its own --config, which outranks
+  PUPPET_CA_CONFIG. So envFrom would have widened patch from the configured names
+  to every Secret and ConfigMap in scope, including the TLS and CA-key Secrets,
+  on the chart's own documented way to feed a DSN in from a Secret.
+
+  The question here is narrower than configFullyKnown's: not "can the chart read
+  the configuration" but "might the server be reading a different file".
 */ -}}
-{{- if ne (include "openvox-ca.configFullyKnown" .) "true" -}}
+{{- if ne (include "openvox-ca.configFileKnown" .) "true" -}}
 unknown
 {{- else -}}
 {{- $config := include "openvox-ca.config" . | fromYaml -}}
@@ -738,11 +811,18 @@ and keep the HTTPRoute for the anonymous endpoints (CRL, OCSP, health) only.
 {{- if and (eq (include "openvox-ca.exportRBACRendered" .) "true") (eq (include "openvox-ca.exportTargetNames" .) "unknown") }}
 
 WARNING: Kubernetes export RBAC was created with {{ if eq .Values.kubernetesExport.rbac.scope "ClusterRole" }}cluster-wide{{ else }}namespace-wide{{ end }} patch on every
-Secret and ConfigMap in scope. The export targets live in a ConfigMap the chart
-does not render (existingConfigMap), so it cannot narrow the grant to their
-names. To restrict it, move the targets into kubernetesExport.targets, or drop
+Secret and ConfigMap in scope. The chart cannot read the configuration that names
+the export targets{{ if .Values.existingConfigMap }} (existingConfigMap){{ else }} (args, envFrom, or a --config in extraArgs){{ end }}, so it
+cannot narrow the grant to their names.
+{{- if .Values.existingConfigMap }}
+To restrict it, move the targets into kubernetesExport.targets, or drop
 kubernetesExport.rbac.create and manage the Role yourself with an explicit
 resourceNames list.
+{{- else }}
+Moving the targets into kubernetesExport.targets will not help while the config
+stays unreadable — drop kubernetesExport.rbac.create and manage the Role yourself
+with an explicit resourceNames list.
+{{- end }}
 {{- end }}
 {{- if and .Values.metrics.enabled (not .Values.networkPolicy.enabled) }}
 
