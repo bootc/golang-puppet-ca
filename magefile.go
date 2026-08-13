@@ -1776,6 +1776,26 @@ func (Chart) Test() error {
 			wantErr: "default ServiceAccount",
 		},
 		{
+			// The same escalation by the other route. rbac.yaml renders the Role
+			// for config-supplied targets too, so a guard keyed on the chart's
+			// flag alone bound it to the shared identity in silence.
+			name: "export RBAC bound to the default ServiceAccount by the config route",
+			sets: []string{tls, "serviceAccount.create=false",
+				"config.kubernetes_export.targets[0].kind=Secret",
+				"config.kubernetes_export.targets[0].metadata.name=ca-bundle"},
+			wantErr: "default ServiceAccount",
+		},
+		{
+			name:       "an extraConfigFiles key colliding with the chart's own config.yaml",
+			valuesYAML: "tls:\n  existingSecret: s\nextraConfigFiles:\n  config.yaml: |\n    host: 127.0.0.1\n",
+			wantErr:    "collides with a file the chart renders",
+		},
+		{
+			name:       "an extraConfigFiles key colliding with the admin allow list",
+			valuesYAML: "tls:\n  existingSecret: s\nextraConfigFiles:\n  puppet-server: |\n    compiler.example.com\n",
+			wantErr:    "collides with a file the chart renders",
+		},
+		{
 			name:    "a mistyped value the schema should catch",
 			sets:    []string{tls, "metric.enabled=true"},
 			wantErr: "additional properties",
@@ -2420,6 +2440,68 @@ func (Test) PuppetFIPS() error {
 
 // -- dev:* --------------------------------------------------------------------─
 
+// checkModuleTidy reports whether tidy leaves the named files unchanged, and
+// puts back exactly what it found either way.
+//
+// The bytes are snapshotted rather than restored with `git checkout --`, which
+// cannot tell this function's edit from the developer's own uncommitted one:
+// running Check mid dependency-bump used to discard the bump silently. The
+// restore also runs when tidy itself fails — a tidy that rewrote one file and
+// then errored would otherwise leave that rewrite behind, which is the one path
+// the snapshot did not originally cover.
+//
+// Takes the directory and the tidy command so the behaviour can be asserted
+// over synthetic files, the way verifyChartPinsIn and verifyDistVariantsIn are.
+func checkModuleTidy(dir string, files []string, tidy func() error) error {
+	before := map[string][]byte{}
+	for _, f := range files {
+		body, err := os.ReadFile(filepath.Join(dir, f))
+		if err != nil {
+			return fmt.Errorf("reading %s before the tidy check: %w", f, err)
+		}
+		before[f] = body
+	}
+
+	tidyErr := tidy()
+
+	var untidy []string
+	var restoreErrs []error
+	for _, f := range files {
+		path := filepath.Join(dir, f)
+		after, err := os.ReadFile(path)
+		if err != nil {
+			restoreErrs = append(restoreErrs, fmt.Errorf("reading %s after the tidy check: %w", f, err))
+			continue
+		}
+		if bytes.Equal(after, before[f]) {
+			continue
+		}
+		untidy = append(untidy, f)
+		if werr := os.WriteFile(path, before[f], 0o644); werr != nil {
+			restoreErrs = append(restoreErrs, fmt.Errorf("restoring %s: %w", f, werr))
+		}
+	}
+
+	// tidy's own failure outranks untidiness — it means the check never ran —
+	// but the files have been put back regardless.
+	if tidyErr != nil {
+		if len(restoreErrs) > 0 {
+			return errors.Join(tidyErr, errors.Join(restoreErrs...))
+		}
+		return tidyErr
+	}
+	if len(untidy) > 0 {
+		if len(restoreErrs) > 0 {
+			return fmt.Errorf("go.mod/go.sum are not tidy (%s); run 'mage dev:tidy' and commit. "+
+				"Additionally failed to restore them: %w",
+				strings.Join(untidy, ", "), errors.Join(restoreErrs...))
+		}
+		return fmt.Errorf("go.mod/go.sum are not tidy (%s); run 'mage dev:tidy' and commit",
+			strings.Join(untidy, ", "))
+	}
+	return nil
+}
+
 // Check verifies formatting, module tidiness, go vet, and the golangci-lint
 // gate. Unlike `mage dev:tidy`, it is a non-mutating verifier: it reports drift
 // as a failure instead of silently fixing it, so CI catches untidy code and
@@ -2436,45 +2518,10 @@ func (Dev) Check() error {
 		return fmt.Errorf("these files need formatting (run 'mage dev:tidy'):\n%s", out)
 	}
 	fmt.Println("Checking go mod tidy...")
-	// Snapshot the bytes rather than restoring with `git checkout --`, which
-	// cannot tell this function's edit from the developer's own uncommitted one:
-	// running Check mid dependency-bump used to discard the bump silently. Only
-	// what tidy changed is put back.
-	const goModFile, goSumFile = "go.mod", "go.sum"
-	before := map[string][]byte{}
-	for _, f := range []string{goModFile, goSumFile} {
-		body, err := os.ReadFile(f)
-		if err != nil {
-			return fmt.Errorf("reading %s before the tidy check: %w", f, err)
-		}
-		before[f] = body
-	}
-	if err := sh.Run("go", "mod", "tidy"); err != nil {
+	if err := checkModuleTidy(".", []string{"go.mod", "go.sum"}, func() error {
+		return sh.Run("go", "mod", "tidy")
+	}); err != nil {
 		return err
-	}
-	var untidy []string
-	var restoreErrs []error
-	for _, f := range []string{goModFile, goSumFile} {
-		after, err := os.ReadFile(f)
-		if err != nil {
-			return fmt.Errorf("reading %s after the tidy check: %w", f, err)
-		}
-		if bytes.Equal(after, before[f]) {
-			continue
-		}
-		untidy = append(untidy, f)
-		if werr := os.WriteFile(f, before[f], 0o644); werr != nil {
-			restoreErrs = append(restoreErrs, fmt.Errorf("restoring %s: %w", f, werr))
-		}
-	}
-	if len(untidy) > 0 {
-		if len(restoreErrs) > 0 {
-			return fmt.Errorf("go.mod/go.sum are not tidy (%s); run 'mage dev:tidy' and commit. "+
-				"Additionally failed to restore them: %w",
-				strings.Join(untidy, ", "), errors.Join(restoreErrs...))
-		}
-		return fmt.Errorf("go.mod/go.sum are not tidy (%s); run 'mage dev:tidy' and commit",
-			strings.Join(untidy, ", "))
 	}
 	if err := sh.Run("go", "vet", "./..."); err != nil {
 		return err

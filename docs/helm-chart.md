@@ -158,15 +158,27 @@ stops asserting rather than refusing an install it cannot judge. In those modes
 the probes assume HTTPS, and it is on you to set `httpGet.scheme` if the server
 is actually serving cleartext.
 
-**A renewed certificate needs a pod restart.** openvox-ca reads the keypair once
-at startup and has no reload path, so when cert-manager rotates the Secret the
-running pods keep serving the old certificate. The probes talk to that same
-listener, so readiness stays green right up to expiry, at which point every
-agent fails at once. Restart on renewal with `kubectl rollout restart`, or let a
-controller do it: `ci/postgres-ha-values.yaml` sets
-`reloader.stakater.com/auto: "true"` under `podAnnotations`, which has
-[Reloader](https://github.com/stakater/Reloader) watch every Secret and
-ConfigMap the pod mounts.
+**A renewed certificate needs a signal or a restart — nothing sends one.**
+openvox-ca re-reads the keypair on `SIGHUP` and serves it to new handshakes
+without dropping connections in flight (see
+[reloading configuration](configuration.md#reloading-configuration)), and the
+chart mounts `tls.existingSecret` as an ordinary Secret volume with no
+`subPath`, so the kubelet refreshes the files in place when cert-manager rotates
+them. What nothing does is signal the pod, so the running process keeps serving
+the old certificate until something acts. The probes talk to that same listener,
+so readiness stays green right up to expiry, at which point every agent fails at
+once.
+
+Three ways to act, cheapest first:
+
+- `kubectl exec <pod> -- kill -HUP 1` — PID 1 is the supervisor, which forwards
+  the signal to the frontend. No restart, no dropped connections.
+- `kubectl rollout restart deployment/<release>-openvox-ca`.
+- Let a controller restart it: `ci/postgres-ha-values.yaml` sets
+  `reloader.stakater.com/auto: "true"` under `podAnnotations`, which has
+  [Reloader](https://github.com/stakater/Reloader) watch every Secret and
+  ConfigMap the pod mounts. Note that Reloader restarts the pod; neither it nor
+  the chart sends `SIGHUP`.
 
 Two further consequences follow from the CA terminating its own TLS:
 
@@ -196,7 +208,11 @@ genuinely want it removed with the release.
 
 To run more than one replica, move the state into a shared backend — see
 [storage backends](storage-backends.md) — and turn persistence off, because
-`cadir` then holds nothing durable:
+`cadir` then holds nothing durable. Worth knowing before you scale out: a
+revocation reaches the other replicas within `crl_sync_interval_sec` (60s by
+default) rather than instantly, since each answers revocation checks from its own
+copy of the CRL — see
+[revocation across replicas](configuration.md#revocation-across-replicas).
 
 ```yaml
 replicaCount: 2
@@ -503,6 +519,40 @@ because it cannot see far enough to rule it out:
 
 `automountServiceAccountToken` forces the decision either way.
 
+## Running under an external root
+
+openvox-ca can run as an intermediate CA under a parent root, with
+`openvox-ca csr` emitting the signing request and `openvox-ca import-ca-cert`
+installing the signed chain (see the
+[operator CLI reference](operator-cli.md#offline-subcommands-on-the-server-binary)).
+No chart value
+enables this — both are offline subcommands that read the server's own config,
+which under the chart lives inside the pod.
+
+**Mind the window.** Between `csr --create-key` and `import-ca-cert` the CA has
+a key but no certificate, and the server *refuses to start* rather than
+bootstrap over a key the parent is in the middle of signing. Under a Deployment
+that is a crash-loop, so do not start a rollout in the middle of it. Two ways
+that hold:
+
+- **Into a running pod**, if you are converting an existing self-bootstrapped
+  CA. `kubectl exec` for both steps, then signal or restart:
+
+  ```console
+  $ kubectl exec -it deploy/openvox-ca -- openvox-ca csr --create-key > ca.csr
+  # ...have the parent CA sign ca.csr...
+  $ kubectl cp ca-chain.pem openvox-ca-0:/tmp/ca-chain.pem
+  $ kubectl exec -it deploy/openvox-ca -- openvox-ca import-ca-cert /tmp/ca-chain.pem
+  ```
+
+- **Before the Deployment exists**, for a fresh install: run both steps in a
+  Job (or an `initContainers` pair) mounting the same `cadir` PVC and the same
+  rendered `config.yaml`, and install the chart afterwards. Scale the Deployment
+  to zero if you are retrofitting, so nothing tries to start inside the window.
+
+Everything else about the resulting CA — storage, TLS, export — is unchanged;
+only the certificate's issuer differs.
+
 ## OpenBao CA key custody
 
 Keeping the CA private key in an OpenBao Transit engine (see
@@ -592,10 +642,14 @@ Three things worth knowing:
   unchanged. Set `configChecksumAnnotation: false` if you would rather manage
   restarts yourself (with Reloader, say).
 - **`existingConfigMap` turns that off**, necessarily: the chart cannot
-  checksum a ConfigMap it did not render. openvox-ca has no reload path, so
-  editing your own ConfigMap leaves the running pods on the old config until
-  you restart them — `kubectl rollout restart`, or an annotation-based reloader
-  watching that ConfigMap.
+  checksum a ConfigMap it did not render. openvox-ca does not re-read
+  `config.yaml`, so editing your own ConfigMap leaves the running pods on the
+  old config until you restart them — `kubectl rollout restart`, or an
+  annotation-based reloader watching that ConfigMap. The exception is the
+  `puppet-server` admin allow list in that same ConfigMap, which *is* re-read on
+  `SIGHUP` (see
+  [reloading configuration](configuration.md#reloading-configuration)), so
+  withdrawing a compiler's admin access needs only a signal.
 
 ## Uninstalling
 
@@ -612,8 +666,17 @@ $ kubectl delete pvc openvox-ca --namespace puppet
 
 Objects created by [Kubernetes export](kubernetes-export.md) also survive —
 openvox-ca does not delete what it exported. They carry
-`app.kubernetes.io/managed-by=openvox-ca`:
+`app.kubernetes.io/managed-by=openvox-ca` — and *only* that: the exporter sets no
+per-release label, so the selector cannot tell one CA's exports from another's.
+Find them cluster-wide, but delete by namespace:
 
 ```console
-$ kubectl delete secret,configmap -A -l app.kubernetes.io/managed-by=openvox-ca
+$ kubectl get secret,configmap -A -l app.kubernetes.io/managed-by=openvox-ca
+$ kubectl delete secret,configmap --namespace puppet \
+    -l app.kubernetes.io/managed-by=openvox-ca
 ```
+
+If you run more than one openvox-ca and export into shared namespaces, add a
+label of your own under `kubernetesExport.targets[].metadata.labels` and select
+on that as well — otherwise a cluster-wide delete takes the other CA's
+certificate and CRL with it.

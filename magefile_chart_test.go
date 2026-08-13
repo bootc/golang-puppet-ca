@@ -21,6 +21,7 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -35,10 +36,15 @@ import (
 
 var _ = Describe("chartVersions", func() {
 	// go test runs from the repository root, so this parses the real
-	// Chart.yaml. It pins the textual shape that the pre-push hook, the
-	// verify-release-tag action and the publish workflow all re-parse with sed:
-	// reformat either line (or unquote appVersion) and this fails alongside
-	// them rather than after them.
+	// Chart.yaml, pinning its textual shape against the Go regexes: reformat
+	// either line, or unquote appVersion, and this fails.
+	//
+	// One direction only. Three other parsers read the same two lines with sed —
+	// the pre-push hook (covered by its own specs below), the verify-release-tag
+	// action and the publish workflow (neither covered) — and this spec reads
+	// none of their expressions, so a divergence in one of those is not caught
+	// here. Both uncovered ones fail closed on an empty parse, so a defect there
+	// surfaces loudly at release time rather than passing silently.
 	It("parses the real Chart.yaml and agrees with internal/version", func() {
 		version, appVersion, err := chartVersions()
 		Expect(err).NotTo(HaveOccurred())
@@ -398,6 +404,95 @@ func (r *tagGateRepo) pushWithEnv(remoteRef, localSHA string, env []string) (str
 	out, err := cmd.CombinedOutput()
 	return string(out), err
 }
+
+// -- module tidiness ------------------------------------------------------------
+
+var _ = Describe("checkModuleTidy", func() {
+	// The behaviour under test is a data-loss fix: dev:check mutates go.mod to
+	// see whether tidy changes it, and used to restore with `git checkout --`,
+	// which discarded a developer's uncommitted dependency bump. Nothing caught
+	// that, and nothing would have caught a revert to it.
+	var (
+		dir   string
+		files []string
+	)
+
+	BeforeEach(func() {
+		dir = GinkgoT().TempDir()
+		files = []string{"go.mod", "go.sum"}
+		Expect(os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module x\n"), 0o644)).To(Succeed())
+		Expect(os.WriteFile(filepath.Join(dir, "go.sum"), []byte("sum\n"), 0o644)).To(Succeed())
+	})
+
+	read := func(name string) string {
+		GinkgoHelper()
+		body, err := os.ReadFile(filepath.Join(dir, name))
+		Expect(err).NotTo(HaveOccurred())
+		return string(body)
+	}
+
+	It("passes and leaves the files alone when tidy changes nothing", func() {
+		Expect(checkModuleTidy(dir, files, func() error { return nil })).To(Succeed())
+		Expect(read("go.mod")).To(Equal("module x\n"))
+		Expect(read("go.sum")).To(Equal("sum\n"))
+	})
+
+	// The regression that shipped once: the contents restored must be the ones
+	// the caller had, not whatever is committed. Nothing here is a git
+	// repository, so a `git checkout --` implementation cannot even run.
+	It("restores the caller's own contents, not a committed state", func() {
+		Expect(os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module x\n\nrequire y v1.2.3\n"), 0o644)).To(Succeed())
+
+		err := checkModuleTidy(dir, files, func() error {
+			return os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module x\n"), 0o644)
+		})
+		Expect(err).To(MatchError(ContainSubstring("not tidy (go.mod)")))
+		Expect(read("go.mod")).To(Equal("module x\n\nrequire y v1.2.3\n"),
+			"the uncommitted require line was discarded")
+	})
+
+	It("names only the file that actually changed", func() {
+		err := checkModuleTidy(dir, files, func() error {
+			return os.WriteFile(filepath.Join(dir, "go.sum"), []byte("different\n"), 0o644)
+		})
+		// The message's fixed prefix names both files, so the parenthesised list
+		// is what carries the finding — assert on that, not on the whole string.
+		Expect(err).To(MatchError(ContainSubstring("not tidy (go.sum)")))
+		Expect(err).NotTo(MatchError(ContainSubstring("(go.mod")))
+	})
+
+	// The path the original fix missed: tidy rewrites a file and then fails, so
+	// the comparison never ran and the rewrite stayed in the developer's tree.
+	It("restores even when tidy itself fails", func() {
+		err := checkModuleTidy(dir, files, func() error {
+			Expect(os.WriteFile(filepath.Join(dir, "go.mod"), []byte("mangled\n"), 0o644)).To(Succeed())
+			return errors.New("tidy exploded")
+		})
+		Expect(err).To(MatchError(ContainSubstring("tidy exploded")))
+		Expect(read("go.mod")).To(Equal("module x\n"), "tidy's write was left behind")
+	})
+
+	// A failed restore must not replace the finding: the developer needs to know
+	// both that the module is untidy and that their file was left rewritten.
+	It("reports a restore failure alongside the untidiness, not instead of it", func() {
+		target := filepath.Join(dir, "go.mod")
+		err := checkModuleTidy(dir, files, func() error {
+			Expect(os.WriteFile(target, []byte("rewritten\n"), 0o644)).To(Succeed())
+			// Read-only, so putting the snapshot back fails.
+			Expect(os.Chmod(target, 0o400)).To(Succeed())
+			DeferCleanup(func() { Expect(os.Chmod(target, 0o600)).To(Succeed()) })
+			return nil
+		})
+		Expect(err).To(MatchError(ContainSubstring("not tidy (go.mod)")))
+		Expect(err).To(MatchError(ContainSubstring("failed to restore")))
+		Expect(err).To(MatchError(ContainSubstring("restoring go.mod")))
+	})
+
+	It("fails when a named file does not exist", func() {
+		Expect(checkModuleTidy(dir, []string{"absent.mod"}, func() error { return nil })).To(
+			MatchError(ContainSubstring("before the tidy check")))
+	})
+})
 
 var _ = Describe("fixtureEnv", func() {
 	// Pins the strip directly, rather than only through its consequences. The

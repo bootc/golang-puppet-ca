@@ -66,5 +66,13 @@ pre-push:
           echo "SKIP: go not found on PATH"
           exit 0
         fi
-        unset $(git rev-parse --local-env-vars) 2>/dev/null || true
+        # Captured first, so a failure is visible instead of silently leaving
+        # GIT_DIR in place: the 2>/dev/null on an `unset $(...)` would redirect
+        # unset's own stderr, not the substitution's, since expansion happens
+        # before redirection.
+        if local_env="$(git rev-parse --local-env-vars)"; then
+          [ -n "$local_env" ] && unset $local_env
+        else
+          echo "WARNING: could not enumerate git's local env vars; not stripping them"
+        fi
         go test -race ./... && go test -tags mage .

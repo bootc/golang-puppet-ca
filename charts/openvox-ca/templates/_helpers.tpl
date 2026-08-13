@@ -484,9 +484,33 @@ CrashLoopBackOff or a Service that silently routes nowhere.
   Binding the export Role to the namespace's default ServiceAccount would
   hand create/patch on every Secret in the namespace to every pod in it.
 */}}
-{{- if and .Values.kubernetesExport.enabled .Values.kubernetesExport.rbac.create -}}
+{{- /*
+  Keyed on exportConfigured, the same predicate rbac.yaml renders on. Gating
+  this on kubernetesExport.enabled alone left the config.kubernetes_export
+  route binding the Role to the default ServiceAccount with the guard silent —
+  the hole opened by moving rbac.yaml onto exportConfigured and leaving this
+  behind, which is worse than the drift it replaced.
+*/ -}}
+{{- if and (eq (include "openvox-ca.exportConfigured" .) "true") .Values.kubernetesExport.rbac.create -}}
 {{- if eq (include "openvox-ca.serviceAccountName" .) "default" -}}
 {{- fail "kubernetesExport.rbac.create would bind the export Role to the namespace's default ServiceAccount, granting create/patch on Secrets to every pod in the namespace. Set serviceAccount.create: true, or serviceAccount.name to a dedicated account." -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+  extraConfigFiles is emitted into the same ConfigMap `data` map as the three
+  files the chart renders, so a colliding key produces two entries of one name
+  and one of them is silently dropped. Either loss is bad: the operator's file,
+  or the chart's config.yaml and the mTLS admin allow list. And if the
+  operator's wins, every decision the chart made — the TLS precondition, the
+  probe scheme, the token, export RBAC — was computed from a config.yaml the
+  pod never reads, which is the failure existingConfigMap and a --config in
+  extraArgs are both treated as unknown to avoid. Refused rather than ranked,
+  since existingConfigMap is the supported way to bring your own config.yaml.
+*/}}
+{{- range $name, $body := .Values.extraConfigFiles -}}
+{{- if or (eq $name "config.yaml") (eq $name "puppet-server") (eq $name "autosign.conf") -}}
+{{- fail (printf "extraConfigFiles key %q collides with a file the chart renders into the same ConfigMap, and one of the two would be silently discarded. Use existingConfigMap to supply your own config.yaml, puppetServers for the admin allow list, or autosign.patterns for autosign.conf." $name) -}}
 {{- end -}}
 {{- end -}}
 

@@ -137,13 +137,15 @@ autosign:
 # Secret issued by cert-manager. When set, the Secret is mounted read-only and
 # tls_cert/tls_key are pointed at it.
 #
-# IMPORTANT: openvox-ca reads the keypair once, at startup, and has no reload
-# path. When cert-manager renews the Secret the running pods keep serving the
-# old certificate until they restart — and the probes speak to that same
-# listener, so readiness stays green until it expires and every agent fails at
-# once. Restart on renewal: `kubectl rollout restart`, a Reloader annotation on
-# the pod template (`reloader.stakater.com/auto: "true"` watches every mounted
-# Secret and ConfigMap; ci/postgres-ha-values.yaml sets it under
+# IMPORTANT: openvox-ca re-reads the keypair on SIGHUP, but nothing here sends
+# one. The kubelet refreshes the mounted files when cert-manager renews the
+# Secret, and the running process keeps serving the old certificate until it is
+# signalled or restarted — while the probes speak to that same listener, so
+# readiness stays green until it expires and every agent fails at once. Act on
+# renewal: `kubectl exec <pod> -- kill -HUP 1` (PID 1 forwards it, no restart),
+# `kubectl rollout restart`, a Reloader annotation on the pod template
+# (`reloader.stakater.com/auto: "true"` watches every mounted Secret and
+# ConfigMap and restarts the pod; ci/postgres-ha-values.yaml sets it under
 # podAnnotations), or your own controller.
 tls:
   existingSecret: ""
@@ -154,6 +156,11 @@ tls:
 # CA certificate and private key held in a Secret, kept at a local path
 # regardless of the storage backend (ca_cert_file / ca_key_file). Leave
 # existingSecret empty to let openvox-ca bootstrap its own CA into cadir.
+#
+# A third route needs no value here: running under an external root, via the
+# offline `openvox-ca csr` and `openvox-ca import-ca-cert` subcommands. The
+# server refuses to start between the two, so see "Running under an external
+# root" in docs/helm-chart.md before starting a rollout in that window.
 ca:
   existingSecret: ""
   certKey: tls.crt

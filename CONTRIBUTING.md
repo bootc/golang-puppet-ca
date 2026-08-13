@@ -96,14 +96,18 @@ See [`AGENTS.md`](AGENTS.md) for the details. The essentials:
   committing.
 - Make sure `mage dev:check`, `mage test:unit`, `mage test:magefile`, and
   `markdownlint-cli2` pass.
-- `lefthook install` wires these up as git hooks: pre-commit runs gofmt and
-  golangci-lint, and pre-push runs both test invocations (`go test -race ./...`
-  plus the build-tagged `go test -tags mage .`) and refuses a `v*` tag whose version
-  does not match the tree. Each check prints a SKIP and stands aside rather than
-  blocking when its tool is missing. Worth knowing that the pre-push run is a
-  *different environment* from a bare `mage test:magefile` — git exports
-  `GIT_DIR` and friends to its hooks — which is a hazard for any test that
-  shells out to git; see the testing conventions in [AGENTS.md](AGENTS.md).
+- `lefthook install` adds git hooks that cover *part* of the above: pre-commit
+  runs gofmt and golangci-lint, and pre-push runs `go test -race ./...`, the
+  build-tagged `go test -tags mage .`, and a refusal of any `v*` tag whose
+  version does not match the tree. An untidy `go.mod`, a drifted chart pin or a
+  markdownlint violation is not among them — those stay with `mage dev:check`,
+  `markdownlint-cli2` and CI. Each hook check stands aside with a SKIP when the
+  tool it drives is absent from `PATH`, but the test run still needs a C compiler
+  for `-race` and fails rather than skipping without one.
+- The pre-push run is a *different environment* from a bare `mage test:magefile`:
+  git exports `GIT_DIR` and friends to the hooks it runs, which is a hazard for
+  any test that shells out to git. See the testing conventions in
+  [AGENTS.md](AGENTS.md).
 - Changed the Helm chart? `mage chart:validate` and `mage chart:test` are
   required checks too. A new template branch needs a fixture under
   `charts/openvox-ca/ci/`, and anything a reader has to trust needs a case in

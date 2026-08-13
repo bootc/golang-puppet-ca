@@ -83,7 +83,7 @@ Helm 3.21 or 4.2; both are exercised in CI.
 | Key | Default | Description |
 | --- | --- | --- |
 | `config` | `{}` | Written verbatim to `config.yaml`; the full [configuration reference](https://github.com/voxpupuli/openvox-ca/blob/main/docs/configuration.md) applies |
-| `existingConfigMap` | `""` | Use a ConfigMap you manage instead of rendering one. The chart cannot checksum what it did not render, so `configChecksumAnnotation` has no effect and editing that ConfigMap will **not** restart the pods — the server has no reload path, so roll them yourself |
+| `existingConfigMap` | `""` | Use a ConfigMap you manage instead of rendering one. The chart cannot checksum what it did not render, so `configChecksumAnnotation` has no effect and editing that ConfigMap will **not** restart the pods. `config.yaml` is fixed at startup, so roll them yourself; the `puppet-server` allow-list file in the same ConfigMap is re-read on `SIGHUP`, which a signal alone will pick up |
 | `configMount` | `/etc/puppet-ca` | Where the config ConfigMap is mounted |
 | `extraConfigFiles` | `{}` | Extra `filename: contents` entries placed alongside `config.yaml` |
 | `listen.host` | `0.0.0.0` | API listen address; use `[::]` for a dual-stack Service |
@@ -97,7 +97,7 @@ Helm 3.21 or 4.2; both are exercised in CI.
 
 | Key | Default | Description |
 | --- | --- | --- |
-| `tls.existingSecret` | `""` | Secret holding the server certificate; sets `tls_cert`/`tls_key`. The server reads it once at startup, so a renewal needs a pod restart |
+| `tls.existingSecret` | `""` | Secret holding the server certificate; sets `tls_cert`/`tls_key`. The server re-reads the keypair on `SIGHUP`, but nothing sends one, so a renewal needs a signal (`kubectl exec <pod> -- kill -HUP 1`) or a restart — see [the guide](https://github.com/voxpupuli/openvox-ca/blob/main/docs/helm-chart.md) |
 | `tls.certKey` / `tls.keyKey` | `tls.crt` / `tls.key` | Data keys within that Secret |
 | `tls.mountPath` | `/run/secrets/openvox-ca-tls` | |
 | `ca.existingSecret` | `""` | Secret holding the CA certificate and key; sets `ca_cert_file`/`ca_key_file` |
