@@ -22,7 +22,22 @@ ENV PATH=/opt/puppetlabs/server/bin:/opt/puppetlabs/puppet/bin:${PATH}
 
 # Give puppet ownership of config and SSL dirs so the entrypoint can write
 # puppet.conf, webserver.conf, ca.cfg, etc. as non-root.
-RUN mkdir -p /etc/puppetlabs/puppet/ssl && \
+#
+# The `puppet` user here is created by the openvox-server package, not by us,
+# so we cannot choose its ids -- but `USER` below has to be numeric for the
+# host to resolve it.  Assert the package's allocation instead, so that a
+# future openvox-server which moves it fails the build here rather than
+# silently running the server under an identity that owns none of these
+# directories.  Supplementary groups are part of the assertion because the
+# numeric `USER` form does not carry them the way the name form does: the
+# runtime collects them by walking /etc/group for the named user, and a
+# uid:gid pair skips that walk.
+RUN expected="52:52:52"; actual="$(id -u puppet):$(id -g puppet):$(id -G puppet)"; \
+    [ "$actual" = "$expected" ] || { \
+        echo "openvox-server puppet uid:gid:groups is $actual, not $expected; update expected above and USER below to match" >&2; \
+        exit 1; \
+    } && \
+    mkdir -p /etc/puppetlabs/puppet/ssl && \
     chown -R puppet:puppet \
         /etc/puppetlabs/puppet \
         /etc/puppetlabs/puppetserver/conf.d \
@@ -36,6 +51,8 @@ EXPOSE 8140
 
 # SECURITY: Run as non-root to limit blast radius of container escape.
 # NIST 800-53: AC-6 (Least Privilege), CM-7 (Least Functionality)
-USER puppet
+#
+# 52:52 is the openvox-server package's `puppet` user, asserted above.
+USER 52:52
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
