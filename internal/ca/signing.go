@@ -924,6 +924,16 @@ func (c *CA) Renew(ctx context.Context, subject string, csrPEM []byte, presented
 		// landing inside the window would otherwise be outrun: the gate has
 		// already decided, and nothing between it and the signing below looks
 		// again.
+		//
+		// This is deliberately the second storage read of the CRL on this path:
+		// refuseIfRevoked syncs the cache unconditionally, so a renewal pays two
+		// GetCRLs and two signature checks rather than one, and this one is
+		// inside the critical section. Both earn their place. The gate above
+		// turns a revoked agent away before it queues on a lock this change
+		// makes slower to get, and only this one is authoritative, because only
+		// this one runs where nothing can revoke behind it. Renewals are rare
+		// (see refuseIfRevoked's godoc), so the extra parse under a contended
+		// lock is the cheaper of the two costs.
 		// NIST 800-53: IA-5(2) (PKI-Based Authentication), AC-3 (Access Enforcement)
 		if err := c.refuseIfRevoked(ctx, presentedCert, subject); err != nil {
 			return err
