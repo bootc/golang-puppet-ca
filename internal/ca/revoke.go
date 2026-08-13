@@ -57,8 +57,12 @@ import (
 // revocation that does fail is safe to retry: revokeSerialLocked short-circuits
 // a serial already listed, so revocation is idempotent.
 //
-// One issuance path it does not wait for: Generate takes no distributed lock at
-// all, so a server-side key generation is not serialised against a revocation.
+// One issuance path it does not wait on this lock for: Generate takes no
+// distributed lock at all, so a server-side key generation on another replica
+// is not serialised against a revocation here. Within one process the two do
+// still serialise, but only on c.mu — which Generate holds across evict, save
+// and sign, and which this takes inside the CRL lock — so the ordering holds on
+// a single node and is lost as soon as there is a second one.
 //
 // Lock ordering: subject-lock (distributed) → CRL-lock (distributed) → c.mu,
 // matching Clean, and no path takes those two in the other order. Callers must

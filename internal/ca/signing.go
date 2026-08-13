@@ -919,10 +919,11 @@ func (c *CA) Renew(ctx context.Context, subject string, csrPEM []byte, presented
 	err = c.Storage.WithLock(ctx, subjectLockName(subject), func() error {
 		// SECURITY: ask the revocation question again, now the lock is held.
 		// The gate above answered it before this Storage.WithLock, and
-		// acquiring that lock can take a while — see refuseIfRevoked's godoc
-		// for what the wait is bounded by. A revocation landing inside the
-		// window would otherwise be outrun: the gate has already decided, and
-		// nothing between it and the signing below looks again.
+		// acquiring that lock can take a while — see StorageService.WithLock's
+		// godoc for what that wait is, and is not, bounded by. A revocation
+		// landing inside the window would otherwise be outrun: the gate has
+		// already decided, and nothing between it and the signing below looks
+		// again.
 		// NIST 800-53: IA-5(2) (PKI-Based Authentication), AC-3 (Access Enforcement)
 		if err := c.refuseIfRevoked(ctx, presentedCert, subject); err != nil {
 			return err
