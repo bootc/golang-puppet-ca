@@ -8,7 +8,7 @@ require (
 	github.com/go-sql-driver/mysql v1.10.0
 	github.com/google/go-containerregistry v0.21.9
 	github.com/magefile/mage v1.17.2
-	github.com/onsi/ginkgo/v2 v2.32.0
+	github.com/onsi/ginkgo/v2 v2.32.1
 	github.com/onsi/gomega v1.42.1
 	github.com/openbao/openbao/api/auth/approle/v2 v2.6.0
 	github.com/openbao/openbao/api/auth/kubernetes/v2 v2.6.0
