@@ -97,8 +97,8 @@ See [`AGENTS.md`](AGENTS.md) for the details. The essentials:
 - Make sure `mage dev:check`, `mage test:unit`, `mage test:magefile`, and
   `markdownlint-cli2` pass.
 - `lefthook install` wires these up as git hooks: pre-commit runs gofmt and
-  golangci-lint, and pre-push runs both test invocations (`go test ./...` plus
-  the build-tagged `go test -tags mage .`) and refuses a `v*` tag whose version
+  golangci-lint, and pre-push runs both test invocations (`go test -race ./...`
+  plus the build-tagged `go test -tags mage .`) and refuses a `v*` tag whose version
   does not match the tree. Each check prints a SKIP and stands aside rather than
   blocking when its tool is missing. Worth knowing that the pre-push run is a
   *different environment* from a bare `mage test:magefile` — git exports
