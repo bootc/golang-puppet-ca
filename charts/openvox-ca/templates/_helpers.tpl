@@ -185,7 +185,9 @@ autosign.conf: |
 {{- end }}
 {{- end }}
 {{- range $name, $body := .Values.extraConfigFiles }}
-{{ $name }}: |
+{{/* Quoted so a key can never contribute YAML structure, whatever the guard in
+     openvox-ca.validate lets through. */}}
+{{ $name | quote }}: |
 {{ $body | trimSuffix "\n" | indent 2 }}
 {{- end }}
 {{- end -}}
@@ -527,9 +529,16 @@ CrashLoopBackOff or a Service that silently routes nowhere.
   pushed the operator toward existingConfigMap, which is a worse posture (no
   config checksum, and the export grant widens to unnarrowed patch).
 
-  Whitespace is checked separately because YAML strips it from a plain scalar
-  key: "puppet-server " is not equal to any name, renders as a second entry, and
-  parses back to the same key. A ConfigMap key is never validly padded anyway.
+  The shape is checked first, and that is the load-bearing half. Comparing the
+  key against a name set is comparing a Go string to something that gets
+  interpolated raw into YAML, so equality here is not YAML's equality: a padded
+  key parses back to the trimmed name, a key wrapped in quotes parses to the
+  unquoted name, and a key containing a newline injects a whole extra entry
+  because the block is re-indented. Two attempts at enumerating those spellings
+  were both bypassed. So the key must look like a ConfigMap key — the character
+  set Kubernetes actually permits — and it is quoted where it is emitted, so a
+  hostile key cannot contribute YAML structure even if this guard is edited badly
+  later.
 */}}
 {{- $rendered := dict -}}
 {{- if not .Values.existingConfigMap -}}
@@ -538,8 +547,8 @@ CrashLoopBackOff or a Service that silently routes nowhere.
 {{- if .Values.autosign.patterns -}}{{- $_ := set $rendered "autosign.conf" true -}}{{- end -}}
 {{- end -}}
 {{- range $name, $body := .Values.extraConfigFiles -}}
-{{- if ne $name (trim $name) -}}
-{{- fail (printf "extraConfigFiles key %q has leading or trailing whitespace. That is never a valid ConfigMap key, and YAML strips it, so the entry would silently take the place of %q." $name (trim $name)) -}}
+{{- if not (regexMatch "^[-._a-zA-Z0-9]+$" $name) -}}
+{{- fail (printf "extraConfigFiles key %q is not a valid ConfigMap key: only letters, digits, '-', '_' and '.' are allowed. Whitespace, quotes and newlines are refused outright because YAML folds such a key onto a different one, which is how a name that looked distinct came to replace a file the chart renders." $name) -}}
 {{- end -}}
 {{- if hasKey $rendered $name -}}
 {{- fail (printf "extraConfigFiles key %q is one the chart renders into the same ConfigMap, and yours would silently take its place. Use existingConfigMap for a config.yaml of your own, puppetServers for the admin allow list, or autosign.patterns for autosign.conf." $name) -}}

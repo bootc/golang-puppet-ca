@@ -522,48 +522,32 @@ because it cannot see far enough to rule it out:
 ## Running under an external root
 
 openvox-ca can run as an intermediate CA under a parent root, using the offline
-`openvox-ca csr` and `openvox-ca import-ca-cert` subcommands. The procedure
-itself — flags, the signing request, re-issuing later — is documented in
-[running under an external root CA](openbao-transit.md#running-under-an-external-root-ca)
-and applies unchanged here; it is not OpenBao-specific despite living in that
-guide. No chart value enables it. What follows is only what Kubernetes adds.
+`openvox-ca csr` and `openvox-ca import-ca-cert` subcommands. No chart value
+enables it.
 
-**Both subcommands read the server's own config**, which under the chart exists
-only inside the pod. So run them there (`kubectl exec`), or run them somewhere
-that mounts the same `cadir` and the same rendered `config.yaml` — a Job or an
-`initContainers` pair — before the Deployment starts.
+**Follow [running under an external root CA](openbao-transit.md#running-under-an-external-root-ca).**
+That is the canonical procedure — the flags, the ordering, the re-issuance case —
+and despite living in the OpenBao guide it applies to every `ca_key_provider`,
+including the default. It already covers Kubernetes: a one-shot Job carrying the
+same ServiceAccount, image and mounts as the Deployment, and the three details
+that are easy to get wrong there. Use it rather than improvising from this page.
 
-**Mind the window.** Between `csr --create-key` and `import-ca-cert` the CA has a
-key but no certificate, and the server *refuses to start* rather than bootstrap
-over a key the parent is in the middle of signing. Under a Deployment that is a
-crash-loop, so either keep both steps inside one `kubectl exec` session on a
-running pod, or scale to zero for the duration. Do not begin a rollout in it.
+Three things about it are worth knowing before you start, because the chart's
+defaults decide them:
 
-**A restart is required, not a signal.** `SIGHUP` covers the TLS keypair and the
-admin allow list only; the CA certificate is read at startup, so a signalled
-process carries on issuing under the certificate you just replaced. Restart every
-replica, then `openvox-ca-ctl reissue-crl`.
+- **The default backend is `filesystem`**, and that procedure requires the CA to
+  be stopped for an import on `filesystem` or `sqlite` — the bootstrap lock is
+  process-local there, so a revocation landing mid-import is discarded silently.
+  Only the shared backends can take the import against a live CA.
+- **A restart is required, not a signal.** `SIGHUP` covers the TLS keypair and the
+  admin allow list; the CA certificate is read at startup, so a signalled process
+  carries on issuing under the certificate you just replaced.
+- **With `ca.existingSecret` the CA certificate is mounted read-only**, so the
+  import cannot write it back. That is the `--out` route in the procedure, which
+  cannot be combined with `--force`.
 
-**The root filesystem is read-only** by default (`securityContext`), and nothing
-is mounted at `/tmp`, so a signed bundle has to be written somewhere writable —
-`persistence.mountPath` (`/var/lib/puppet-ca` by default) — or piped in:
-
-```console
-$ POD=$(kubectl get pod -l app.kubernetes.io/name=openvox-ca \
-    -o jsonpath='{.items[0].metadata.name}' --namespace puppet)
-$ kubectl exec "$POD" --namespace puppet -- openvox-ca csr --create-key > ca.csr
-# ...have the parent CA sign ca.csr, producing ca-chain.pem...
-$ kubectl exec -i "$POD" --namespace puppet -- \
-    sh -c 'cat > /var/lib/puppet-ca/ca-chain.pem' < ca-chain.pem
-$ kubectl exec "$POD" --namespace puppet -- \
-    openvox-ca import-ca-cert --cert-bundle /var/lib/puppet-ca/ca-chain.pem --force
-$ kubectl rollout restart deployment/<release>-openvox-ca --namespace puppet
-```
-
-No `-t`: `csr` writes the PEM to stdout and its diagnostics to stderr, and a TTY
-would merge them into `ca.csr`. `--force` belongs here because this replaces the
-self-signed certificate an existing install bootstrapped — omit it on a fresh CA
-that has a key but no certificate yet, where there is nothing to replace.
+Everything else about the resulting CA — storage, TLS, export — is unchanged; only
+the certificate's issuer differs.
 
 Everything else about the resulting CA — storage, TLS, export — is unchanged;
 only the certificate's issuer differs.

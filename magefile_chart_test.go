@@ -484,7 +484,7 @@ var _ = Describe("checkModuleTidy", func() {
 			return nil
 		})
 		Expect(err).To(MatchError(ContainSubstring("not tidy (go.mod)")))
-		Expect(err).To(MatchError(ContainSubstring("failed to restore")))
+		Expect(err).To(MatchError(ContainSubstring("while putting them back")))
 		Expect(err).To(MatchError(ContainSubstring("restoring go.mod")))
 	})
 

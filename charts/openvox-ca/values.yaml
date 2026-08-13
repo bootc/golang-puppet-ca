@@ -100,10 +100,14 @@ configMount: /etc/puppet-ca
 # filename. Useful for an autosign allowlist or any file a config key points
 # at. They land in <configMount>/<filename>.
 #
-# config.yaml, puppet-server and autosign.conf are reserved: the chart renders
-# them into the same ConfigMap, so a key of one of those names would leave two
-# entries of one name with one silently discarded. The install is refused
-# instead. Use existingConfigMap, puppetServers and autosign.patterns for those.
+# A key is refused when the chart is itself rendering that file, because yours is
+# written last and would take its place: config.yaml unless existingConfigMap is
+# set, puppet-server when puppetServers is set, autosign.conf when
+# autosign.patterns is set. Use existingConfigMap, puppetServers or
+# autosign.patterns instead in those cases. Where the chart renders none of them
+# — the allow list supplied by hand, say — supplying it here is fine. Keys must
+# also look like ConfigMap keys (letters, digits, '-', '_', '.'); a padded or
+# quoted name would fold onto a different one.
 extraConfigFiles: {}
 
 # Listen address and port for the Puppet CA API.

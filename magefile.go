@@ -1658,7 +1658,9 @@ func (Chart) Test() error {
 			name: "a puppet-server file supplied by hand renders when the chart emits none",
 			valuesYAML: "tls:\n  existingSecret: s\nconfig:\n  puppet_server_file: /etc/puppet-ca/puppet-server\n" +
 				"extraConfigFiles:\n  puppet-server: |\n    compiler.example.com\n",
-			wants: []string{"puppet-server: |", "compiler.example.com"},
+			// Quoted, because configMapData quotes every extraConfigFiles key so a
+			// hostile one cannot contribute YAML structure. Same parsed key.
+			wants: []string{"\"puppet-server\": |", "compiler.example.com"},
 		},
 		{
 			// The other arm's negative direction: with no autosign.patterns the
@@ -1668,7 +1670,7 @@ func (Chart) Test() error {
 			name: "an autosign.conf supplied by hand renders when the chart emits none",
 			valuesYAML: "tls:\n  existingSecret: s\nconfig:\n  autosign_config: /etc/puppet-ca/autosign.conf\n" +
 				"extraConfigFiles:\n  autosign.conf: |\n    *.agent.example.com\n",
-			wants: []string{"autosign.conf: |", "*.agent.example.com"},
+			wants: []string{"\"autosign.conf\": |", "*.agent.example.com"},
 		},
 		{
 			// existingConfigMap renders no ConfigMap at all, so extraConfigFiles
@@ -1885,7 +1887,25 @@ func (Chart) Test() error {
 			name: "an extraConfigFiles key padded with whitespace",
 			valuesYAML: "tls:\n  existingSecret: s\npuppetServers:\n  - compiler.example.com\n" +
 				"extraConfigFiles:\n  \"puppet-server \": |\n    attacker.example.com\n",
-			wantErr: "leading or trailing whitespace",
+			wantErr: "not a valid ConfigMap key",
+		},
+		{
+			// The second bypass: quotes are YAML syntax, so this rendered as a
+			// distinct key and parsed back to puppet-server, replacing the admin
+			// allow list. Enumerating spellings lost twice; the guard checks the
+			// shape now, and configMapData quotes the key it emits.
+			name: "an extraConfigFiles key wrapped in quotes",
+			valuesYAML: "tls:\n  existingSecret: s\npuppetServers:\n  - compiler.example.com\n" +
+				"extraConfigFiles:\n  '\"puppet-server\"': |\n    attacker.example.com\n",
+			wantErr: "not a valid ConfigMap key",
+		},
+		{
+			// The third: an interior newline is re-indented by nindent, injecting
+			// a whole extra entry.
+			name: "an extraConfigFiles key containing a newline",
+			valuesYAML: "tls:\n  existingSecret: s\npuppetServers:\n  - compiler.example.com\n" +
+				"extraConfigFiles:\n  \"harmless.txt: x\\npuppet-server\": |\n    attacker.example.com\n",
+			wantErr: "not a valid ConfigMap key",
 		},
 		{
 			name:    "a mistyped value the schema should catch",
@@ -2601,7 +2621,7 @@ func checkModuleTidy(dir string, files []string, tidy func() error) error {
 		subject := strings.Join(files, "/")
 		if len(restoreErrs) > 0 {
 			return fmt.Errorf("%s are not tidy (%s); run 'mage dev:tidy' and commit. "+
-				"Additionally failed to restore them: %w",
+				"Additionally, while putting them back: %w",
 				subject, strings.Join(untidy, ", "), errors.Join(restoreErrs...))
 		}
 		return fmt.Errorf("%s are not tidy (%s); run 'mage dev:tidy' and commit",

@@ -83,9 +83,9 @@ Helm 3.21 or 4.2; both are exercised in CI.
 | Key | Default | Description |
 | --- | --- | --- |
 | `config` | `{}` | Written verbatim to `config.yaml`; the full [configuration reference](https://github.com/voxpupuli/openvox-ca/blob/main/docs/configuration.md) applies |
-| `existingConfigMap` | `""` | Use a ConfigMap you manage instead of rendering one. The chart cannot checksum what it did not render, so `configChecksumAnnotation` has no effect and editing that ConfigMap will **not** restart the pods. `config.yaml` is fixed at startup, so roll them yourself. A `SIGHUP` re-reads only the allow-list file, and only if your own config sets `puppet_server_file` at a path in that ConfigMap |
+| `existingConfigMap` | `""` | Use a ConfigMap you manage instead of rendering one. The chart cannot checksum what it did not render, so `configChecksumAnnotation` has no effect and editing that ConfigMap will **not** restart the pods. `config.yaml` is fixed at startup, so roll them yourself. Of this ConfigMap's contents a `SIGHUP` re-reads only the allow-list file, and only if your own config sets `puppet_server_file` at a path in it |
 | `configMount` | `/etc/puppet-ca` | Where the config ConfigMap is mounted |
-| `extraConfigFiles` | `{}` | Extra `filename: contents` entries placed alongside `config.yaml`. `config.yaml`, `puppet-server` and `autosign.conf` are reserved — the chart renders those itself and refuses the install rather than let one silently win; use `existingConfigMap`, `puppetServers` and `autosign.patterns` |
+| `extraConfigFiles` | `{}` | Extra `filename: contents` entries placed alongside `config.yaml`. Refused when the chart is rendering that file itself (`config.yaml` unless `existingConfigMap` is set, `puppet-server` with `puppetServers`, `autosign.conf` with `autosign.patterns`), since yours would take its place; fine when it renders none of them. Keys must look like ConfigMap keys |
 | `listen.host` | `0.0.0.0` | API listen address; use `[::]` for a dual-stack Service |
 | `listen.port` | `8140` | API listen port |
 | `verbosity` | `0` | `0`=Info, `1`=Debug, `2`=Trace. Written into `config.yaml`, so `config.verbosity` overrides it |
