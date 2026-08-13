@@ -20,6 +20,8 @@ All endpoints are served under both the bare path and `/puppet-ca/v1/<path>`, so
 { "desired_state": "signed", "cert_ttl": 86400 }
 ```
 
+A revocation takes the per-subject lock that signing and [renewal](#certificate-renewal) take, so it waits for an issuance already under way for that subject instead of overlapping it — that is what stops an in-flight renewal minting a replacement from the credential being withdrawn. Two consequences worth knowing. The wait is not short: a renewal holds that lock across its own wait for the CRL lock, so a busy CA can keep a revocation queued, and `openvox-ca-ctl` gives up before the server does. And `POST /generate/{subject}` takes no such lock, so a server-side key generation is the one issuance a revocation does not wait for — close off issuance before revoking when you are containing an agent.
+
 > **Note:** revoking amends this CA's own CRL, so it fails with `409 Conflict`
 > when the stored CRL was not signed by the CA certificate this process loaded —
 > re-signing it would destroy a list this CA cannot reproduce. The usual cause is
@@ -165,6 +167,8 @@ If the CA has not finished initialising, the request returns `503 Service Unavai
 If the presented certificate's (or CSR's) key falls below the CA key-strength policy — for example an RSA-1024 key imported from a legacy CA — the request is rejected with `422 Unprocessable Entity` rather than renewed; the agent must re-key via the CSR path with a compliant key.
 
 If the presented certificate has been revoked, both paths reject the request with `403 Forbidden`. That check re-reads the CRL from storage rather than trusting the in-memory copy the mTLS layer uses, so it holds even on a replica that has not yet picked up a revocation performed elsewhere — renewal does not become a way out of a lockout during the propagation window.
+
+It is also asked *again* once the per-subject lock is held, immediately before the replacement is issued. Acquiring that lock can wait behind an issuance already under way for the subject, and a revocation landing inside that window would otherwise be outrun: the first answer has already been given, and nothing between it and the signing looks again. Revoking takes the same lock, so a revocation cannot slip into the gap between the second answer and the issuance either — see [Certificate status](#certificate-status).
 
 The re-read is best-effort in one direction: if the storage read itself fails, the check falls back to the CRL already in memory rather than refusing every renewal in the fleet over a storage blip. A renewal in that window is then bounded by the same propagation window as everything else, not by the stronger guarantee above. `puppetca_crl_sync_failures_total` counts those failures — see [metrics](metrics.md#crl). See also [Revocation across replicas](configuration.md#revocation-across-replicas).
 

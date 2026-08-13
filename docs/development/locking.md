@@ -46,7 +46,7 @@ less protocol for it.
 | --- | --- | --- |
 | `bootstrap` | First-run CA generation; seeding supporting state (CRL/inventory/serial) for a mounted cert+key; whole-store migration | `CA.Init`, `CA.seedSupportingState`, `storage.MigrateService` (which reuses the name deliberately so a migration and a bootstrapping server exclude each other) |
 | `crl` | Every CRL read-modify-write (read entries → re-sign → write) | `Revoke`, `RevokeSerial`, `ReissueCRL`, `RefreshCRLIfDue`, `CleanupExpiredCerts`, and the revoke step inside `Clean`, `Renew`, `AutoRenew` |
-| `subject:<name>` | The whole lifecycle of one subject: evict/save CSR/sign/import/clean | `SaveRequest`, `Sign`, `SignWithTTL`, `Renew`, `AutoRenew`, `Clean`, `ImportCertificate` — but currently **not** `Generate` (see known gaps below) |
+| `subject:<name>` | The whole lifecycle of one subject: evict/save CSR/sign/import/clean/revoke | `SaveRequest`, `Sign`, `SignWithTTL`, `Renew`, `AutoRenew`, `Clean`, `ImportCertificate`, `Revoke` — but currently **not** `Generate` (see known gaps below) |
 | `inventory-decompose` | One-time legacy inventory blob conversion (etcd backend only) on the first start after upgrading | `EtcdBackend.decomposeLegacyInventory`, from `EnsureReady` |
 
 How each backend provides the distributed lock (a summary — the full per-backend
@@ -350,12 +350,13 @@ state when the document was last updated and is not guaranteed exhaustive.
   `serialIndex` is built once at startup, so certificates issued on another
   replica answer `unknown`; the `ocspCache` half can even keep serving a
   pre-signed `good` for a certificate revoked elsewhere.
-- [#173](https://github.com/voxpupuli/openvox-ca/issues/173) — renewal
-  re-checked revocation before acquiring the subject lock.
-  [PR #186](https://github.com/voxpupuli/openvox-ca/pull/186) fixes it
-  (re-check from *storage* under the subject lock) and also moves `Revoke`
-  itself under `subject:<name>` → `crl`; the Tier 1 lock table describes
-  current `main`, and that PR carries its own update to the table when it lands.
+- ~~[#173](https://github.com/voxpupuli/openvox-ca/issues/173) — renewal
+  re-checked revocation before acquiring the subject lock.~~ Fixed: both
+  renewal paths now call `refuseIfRevoked` again as the first statement inside
+  the subject lock, and `Revoke` takes `subject:<name>` → `crl` so nothing can
+  revoke in the gap between that answer and the issuance it guards. The one
+  issuance path a revocation still cannot wait for is `Generate`, which takes
+  no distributed lock — see the `Generate` gap above.
 - On blob backends (filesystem/redis), an inventory append and its HMAC
   update are two writes, not one atomic unit; the failure window is documented
   at the write site in `AppendInventory` and the structured (SQL, etcd)
@@ -369,7 +370,15 @@ state when the document was last updated and is not guaranteed exhaustive.
 unlock-error handling are covered in
 [withlock_test.go](../../internal/storage/withlock_test.go); each distributed
 implementation's mutual exclusion is exercised in its backend integration
-suite (build-tagged; see [testing](testing.md)). The nested lock-ordering
-invariant and a race-detector run over the concurrency tests are not yet
-automated — tracked as
+suite (build-tagged; see [testing](testing.md)).
+
+The nested lock-ordering invariant *is* now automated, in
+[renewrace_test.go](../../internal/ca/renewrace_test.go): for each caller that
+holds both locks — `Revoke`, `Clean`, `Renew`, `AutoRenew` — it parks the
+operation on a held subject lock and requires `crl` to still be grantable while
+it waits. An inverted nesting therefore fails on an assertion rather than
+deadlocking the suite to its timeout, which is how an inversion otherwise
+presents: every backend serialises same-process callers on a mutex that ignores
+the context deadline. A race-detector run over the concurrency tests is still
+not automated — tracked as
 [#205](https://github.com/voxpupuli/openvox-ca/issues/205).
