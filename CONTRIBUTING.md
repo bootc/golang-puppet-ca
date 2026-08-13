@@ -102,8 +102,9 @@ See [`AGENTS.md`](AGENTS.md) for the details. The essentials:
   version does not match the tree. An untidy `go.mod`, a drifted chart pin or a
   markdownlint violation is not among them — those stay with `mage dev:check`,
   `markdownlint-cli2` and CI. Each hook check stands aside with a SKIP when the
-  tool it drives is absent from `PATH`, but the test run still needs a C compiler
-  for `-race` and fails rather than skipping without one.
+  tool it drives is absent from `PATH`. On Linux the test run additionally needs a
+  C compiler, since `-race` requires cgo there, and fails rather than skipping
+  without one; macOS builds `-race` without cgo.
 - The pre-push run is a *different environment* from a bare `mage test:magefile`:
   git exports `GIT_DIR` and friends to the hooks it runs, which is a hazard for
   any test that shells out to git. See the testing conventions in

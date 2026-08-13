@@ -549,9 +549,6 @@ defaults decide them:
 Everything else about the resulting CA — storage, TLS, export — is unchanged; only
 the certificate's issuer differs.
 
-Everything else about the resulting CA — storage, TLS, export — is unchanged;
-only the certificate's issuer differs.
-
 ## OpenBao CA key custody
 
 Keeping the CA private key in an OpenBao Transit engine (see
