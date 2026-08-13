@@ -6,7 +6,7 @@ the reason, and no Role at all — the exporter refused by RBAC while readiness
 stayed green. The rules below already take their names from the merged config,
 so the two now agree on what "export is configured" means.
 */}}
-{{- if and (eq (include "openvox-ca.exportConfigured" .) "true") .Values.kubernetesExport.rbac.create }}
+{{- if eq (include "openvox-ca.exportRBACRendered" .) "true" }}
 {{- $fullName := include "openvox-ca.fullname" . }}
 {{- $namespace := include "openvox-ca.namespace" . }}
 {{- $labels := include "openvox-ca.labels" . }}

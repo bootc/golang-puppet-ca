@@ -488,6 +488,41 @@ var _ = Describe("checkModuleTidy", func() {
 		Expect(err).To(MatchError(ContainSubstring("restoring go.mod")))
 	})
 
+	// The path the round-eight extraction regressed: the pre-extraction code
+	// returned a hard error when a file could not be read back, and collecting it
+	// instead let a successful tidy that removed go.sum report success with the
+	// snapshot dropped.
+	It("fails, and restores, when tidy removes one of the files", func() {
+		err := checkModuleTidy(dir, files, func() error {
+			return os.Remove(filepath.Join(dir, "go.sum"))
+		})
+		Expect(err).To(MatchError(ContainSubstring("could not be read back after the tidy check")))
+		Expect(err).To(MatchError(ContainSubstring("go.sum")))
+		// Reported as module drift with a remedy, not as a bare I/O fault.
+		Expect(err).To(MatchError(ContainSubstring("mage dev:tidy")))
+		Expect(read("go.sum")).To(Equal("sum\n"), "the removed file was not put back")
+		Expect(read("go.mod")).To(Equal("module x\n"))
+	})
+
+	// The errors.Join branch: tidy fails *and* the restore fails. The
+	// untidiness-plus-restore-failure spec above cannot reach it, because its
+	// callback succeeds — so without this, collapsing that branch to a bare
+	// `return tidyErr` passed everything.
+	It("reports a failed tidy and a failed restore together", func() {
+		target := filepath.Join(dir, "go.mod")
+		err := checkModuleTidy(dir, files, func() error {
+			Expect(os.WriteFile(target, []byte("rewritten\n"), 0o644)).To(Succeed())
+			Expect(os.Chmod(target, 0o400)).To(Succeed())
+			DeferCleanup(func() { Expect(os.Chmod(target, 0o600)).To(Succeed()) })
+			return errors.New("tidy exploded")
+		})
+		Expect(err).To(MatchError(ContainSubstring("tidy exploded")))
+		Expect(err).To(MatchError(ContainSubstring("restoring go.mod")))
+		// And the consequence, not just the strings: the rewrite is still there,
+		// which is what the joined error is warning about.
+		Expect(read("go.mod")).To(Equal("rewritten\n"))
+	})
+
 	It("fails when a named file does not exist", func() {
 		Expect(checkModuleTidy(dir, []string{"absent.mod"}, func() error { return nil })).To(
 			MatchError(ContainSubstring("before the tidy check")))

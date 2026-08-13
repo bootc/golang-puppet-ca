@@ -5,9 +5,11 @@
 # lefthook on PATH) and it generates the pre-commit/pre-push shims that call
 # `lefthook run <hook>`, which then drives the commands below.
 #
-# Hooks degrade gracefully: if a tool is missing the command prints a SKIP
-# notice and exits 0 rather than blocking the commit/push. Run the same checks
-# manually via `mage dev:check` (lint), `go test -race ./...`, and
+# Hooks degrade gracefully where they can: a command whose tool is missing from
+# PATH prints a SKIP notice and exits 0 rather than blocking. Two exceptions —
+# `-race` needs a C compiler and fails rather than skipping without one, and the
+# verify-tags.sh script has no tool to be missing, so it always runs. Run the
+# same checks manually via `mage dev:check` (lint), `go test -race ./...`, and
 # `mage test:magefile` (the build-tagged magefile suite); the pre-push hook
 # additionally refuses v* tags that do not match internal/version (see
 # .lefthook/pre-push/verify-tags.sh).

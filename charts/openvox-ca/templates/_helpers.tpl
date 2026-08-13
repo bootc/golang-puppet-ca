@@ -279,6 +279,26 @@ deliberate for the token and the Role, which fail open, but it means a
 config-derived export reason in the NOTE may name inert values —
 exportTargetNames takes the stricter view and reports "unknown" there.
 */}}
+{{/*
+Whether the export Role and its bindings are rendered — export configured *and*
+rbac.create.
+
+One definition because three places need it and they have twice drifted apart:
+rbac.yaml renders on it, the default-ServiceAccount refusal guards it, and the
+NOTES warning discloses the unnarrowed patch grant it produces. Moving rbac.yaml
+onto exportConfigured while leaving the refusal on kubernetesExport.enabled
+opened a privilege escalation; fixing the refusal while leaving the NOTES warning
+behind then hid the residual over-grant on the same route. Both were the same
+mistake: one side of a coupling moved.
+*/}}
+{{- define "openvox-ca.exportRBACRendered" -}}
+{{- if and (eq (include "openvox-ca.exportConfigured" .) "true") .Values.kubernetesExport.rbac.create -}}
+true
+{{- else -}}
+false
+{{- end -}}
+{{- end -}}
+
 {{- define "openvox-ca.exportConfigured" -}}
 {{- $config := include "openvox-ca.config" . | fromYaml -}}
 {{- if or .Values.kubernetesExport.enabled (dig "kubernetes_export" "targets" list $config) -}}
@@ -484,33 +504,45 @@ CrashLoopBackOff or a Service that silently routes nowhere.
   Binding the export Role to the namespace's default ServiceAccount would
   hand create/patch on every Secret in the namespace to every pod in it.
 */}}
-{{- /*
-  Keyed on exportConfigured, the same predicate rbac.yaml renders on. Gating
-  this on kubernetesExport.enabled alone left the config.kubernetes_export
-  route binding the Role to the default ServiceAccount with the guard silent —
-  the hole opened by moving rbac.yaml onto exportConfigured and leaving this
-  behind, which is worse than the drift it replaced.
-*/ -}}
-{{- if and (eq (include "openvox-ca.exportConfigured" .) "true") .Values.kubernetesExport.rbac.create -}}
+{{- if eq (include "openvox-ca.exportRBACRendered" .) "true" -}}
 {{- if eq (include "openvox-ca.serviceAccountName" .) "default" -}}
 {{- fail "kubernetesExport.rbac.create would bind the export Role to the namespace's default ServiceAccount, granting create/patch on Secrets to every pod in the namespace. Set serviceAccount.create: true, or serviceAccount.name to a dedicated account." -}}
 {{- end -}}
 {{- end -}}
 
 {{/*
-  extraConfigFiles is emitted into the same ConfigMap `data` map as the three
-  files the chart renders, so a colliding key produces two entries of one name
-  and one of them is silently dropped. Either loss is bad: the operator's file,
-  or the chart's config.yaml and the mTLS admin allow list. And if the
-  operator's wins, every decision the chart made — the TLS precondition, the
-  probe scheme, the token, export RBAC — was computed from a config.yaml the
-  pod never reads, which is the failure existingConfigMap and a --config in
-  extraArgs are both treated as unknown to avoid. Refused rather than ranked,
-  since existingConfigMap is the supported way to bring your own config.yaml.
+  extraConfigFiles is emitted into the same ConfigMap `data` map as the files the
+  chart renders, and it is ranged last, so a colliding key produces two entries
+  of one name and the operator's wins. Then every decision the chart made — the
+  TLS precondition, the probe scheme, the token, export RBAC — was computed from
+  a config.yaml the pod never reads, which is the failure existingConfigMap and a
+  --config in extraArgs are both treated as unknown to avoid. For puppet-server
+  the substituted file is the mTLS admin allow list, and it escapes the
+  entry-by-entry validation applied to puppetServers below.
+
+  The set is derived from what configMapData will actually emit, not hardcoded:
+  puppet-server and autosign.conf are conditional, and existingConfigMap renders
+  no ConfigMap at all, so a fixed list refused working configurations —
+  puppetServers left empty with the allow list supplied by hand, say — and
+  pushed the operator toward existingConfigMap, which is a worse posture (no
+  config checksum, and the export grant widens to unnarrowed patch).
+
+  Whitespace is checked separately because YAML strips it from a plain scalar
+  key: "puppet-server " is not equal to any name, renders as a second entry, and
+  parses back to the same key. A ConfigMap key is never validly padded anyway.
 */}}
+{{- $rendered := dict -}}
+{{- if not .Values.existingConfigMap -}}
+{{- $_ := set $rendered "config.yaml" true -}}
+{{- if .Values.puppetServers -}}{{- $_ := set $rendered "puppet-server" true -}}{{- end -}}
+{{- if .Values.autosign.patterns -}}{{- $_ := set $rendered "autosign.conf" true -}}{{- end -}}
+{{- end -}}
 {{- range $name, $body := .Values.extraConfigFiles -}}
-{{- if or (eq $name "config.yaml") (eq $name "puppet-server") (eq $name "autosign.conf") -}}
-{{- fail (printf "extraConfigFiles key %q collides with a file the chart renders into the same ConfigMap, and one of the two would be silently discarded. Use existingConfigMap to supply your own config.yaml, puppetServers for the admin allow list, or autosign.patterns for autosign.conf." $name) -}}
+{{- if ne $name (trim $name) -}}
+{{- fail (printf "extraConfigFiles key %q has leading or trailing whitespace. That is never a valid ConfigMap key, and YAML strips it, so the entry would silently take the place of %q." $name (trim $name)) -}}
+{{- end -}}
+{{- if hasKey $rendered $name -}}
+{{- fail (printf "extraConfigFiles key %q is one the chart renders into the same ConfigMap, and yours would silently take its place. Use existingConfigMap for a config.yaml of your own, puppetServers for the admin allow list, or autosign.patterns for autosign.conf." $name) -}}
 {{- end -}}
 {{- end -}}
 
@@ -641,7 +673,7 @@ authenticated by one — signing, revoking, listing — stops authenticating. Us
 gateway.tlsRoute for agent traffic, which passes the connection through intact,
 and keep the HTTPRoute for the anonymous endpoints (CRL, OCSP, health) only.
 {{- end }}
-{{- if and .Values.kubernetesExport.enabled .Values.kubernetesExport.rbac.create (eq (include "openvox-ca.exportTargetNames" .) "unknown") }}
+{{- if and (eq (include "openvox-ca.exportRBACRendered" .) "true") (eq (include "openvox-ca.exportTargetNames" .) "unknown") }}
 
 WARNING: Kubernetes export RBAC was created with {{ if eq .Values.kubernetesExport.rbac.scope "ClusterRole" }}cluster-wide{{ else }}namespace-wide{{ end }} patch on every
 Secret and ConfigMap in scope. The export targets live in a ConfigMap the chart

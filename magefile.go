@@ -1081,9 +1081,12 @@ type chartRenderCase struct {
 	// template` never evaluates NOTES.txt, and `helm install --dry-run`
 	// reaches for a cluster on Helm 3, so this renders the openvox-ca.notes
 	// template through a probe manifest instead — offline, on both majors.
-	notes    bool
-	wants    []string
-	notWants []string
+	notes bool
+	// valuesYAML supplies values a --set cannot express, as on chartRejectCase:
+	// a key containing a dot, or one that has to keep surrounding whitespace.
+	valuesYAML string
+	wants      []string
+	notWants   []string
 }
 
 // chartRejectCase is one assertion that the chart refuses a configuration:
@@ -1441,6 +1444,19 @@ func (Chart) Test() error {
 			wants: []string{"patch on every"},
 		},
 		{
+			// The same disclosure by the config route. This warning is the
+			// compensating control that makes an unnarrowable patch grant
+			// acceptable — rbac.yaml emits it "visibly" — so gating it on the
+			// chart's flag while the Role rendered on exportConfigured left the
+			// grant in place with nothing telling the operator.
+			name:  "NOTES warns about an unnarrowable grant by the config route too",
+			notes: true,
+			sets: []string{"existingConfigMap=mine",
+				"config.kubernetes_export.targets[0].kind=Secret",
+				"config.kubernetes_export.targets[0].metadata.name=ca-bundle"},
+			wants: []string{"patch on every"},
+		},
+		{
 			name:  "NOTES warns that an ephemeral cadir throws the CA away",
 			notes: true,
 			// The most consequential of the nine warnings: the filesystem
@@ -1610,6 +1626,25 @@ func (Chart) Test() error {
 			// untouched rather than normalise it.
 			sets:  []string{tls, "kubernetesExport.enabled=true", "kubernetesExport.targets[0].kind=secret", "kubernetesExport.targets[0].metadata.name=trust", "kubernetesExport.targets[0].cert=true"},
 			wants: []string{"kind: secret"},
+		},
+		{
+			// The reserved names are conditional, because configMapData only
+			// emits puppet-server when puppetServers is set. Supplying the allow
+			// list by hand and pointing config at it is a working configuration
+			// that a fixed list of names refused — and the remedy that error
+			// offered, existingConfigMap, is a worse posture than what it blocked.
+			name: "a puppet-server file supplied by hand renders when the chart emits none",
+			valuesYAML: "tls:\n  existingSecret: s\nconfig:\n  puppet_server_file: /etc/puppet-ca/puppet-server\n" +
+				"extraConfigFiles:\n  puppet-server: |\n    compiler.example.com\n",
+			wants: []string{"puppet-server: |", "compiler.example.com"},
+		},
+		{
+			// existingConfigMap renders no ConfigMap at all, so extraConfigFiles
+			// is inert and nothing can be displaced. Refusing here was an
+			// over-refusal that told the operator to set the value they had set.
+			name:       "a reserved key is inert, not refused, under existingConfigMap",
+			valuesYAML: "tls:\n  existingSecret: s\nexistingConfigMap: mine\nextraConfigFiles:\n  config.yaml: |\n    host: 127.0.0.1\n",
+			wants:      []string{"kind: Deployment"},
 		},
 		{
 			name: "envFrom stops the TLS precondition firing",
@@ -1786,14 +1821,34 @@ func (Chart) Test() error {
 			wantErr: "default ServiceAccount",
 		},
 		{
-			name:       "an extraConfigFiles key colliding with the chart's own config.yaml",
+			name:       "an extraConfigFiles key taking the place of the chart's config.yaml",
 			valuesYAML: "tls:\n  existingSecret: s\nextraConfigFiles:\n  config.yaml: |\n    host: 127.0.0.1\n",
-			wantErr:    "collides with a file the chart renders",
+			wantErr:    "is one the chart renders",
 		},
 		{
-			name:       "an extraConfigFiles key colliding with the admin allow list",
-			valuesYAML: "tls:\n  existingSecret: s\nextraConfigFiles:\n  puppet-server: |\n    compiler.example.com\n",
-			wantErr:    "collides with a file the chart renders",
+			// puppetServers set, so the chart really does render puppet-server and
+			// the collision is real. Without it there is nothing to collide with,
+			// which is the case below.
+			name: "an extraConfigFiles key taking the place of the admin allow list",
+			valuesYAML: "tls:\n  existingSecret: s\npuppetServers:\n  - compiler.example.com\n" +
+				"extraConfigFiles:\n  puppet-server: |\n    attacker.example.com\n",
+			wantErr: "is one the chart renders",
+		},
+		{
+			name: "an extraConfigFiles key taking the place of the autosign allow list",
+			valuesYAML: "tls:\n  existingSecret: s\nautosign:\n  patterns:\n    - \"*.a.example.com\"\n" +
+				"extraConfigFiles:\n  autosign.conf: |\n    *.b.example.com\n",
+			wantErr: "is one the chart renders",
+		},
+		{
+			// The bypass a literal comparison could not see: YAML strips trailing
+			// whitespace from a plain scalar key, so this rendered a second entry
+			// that parsed back to the same name and replaced the chart's admin
+			// allow list outright.
+			name: "an extraConfigFiles key padded with whitespace",
+			valuesYAML: "tls:\n  existingSecret: s\npuppetServers:\n  - compiler.example.com\n" +
+				"extraConfigFiles:\n  \"puppet-server \": |\n    attacker.example.com\n",
+			wantErr: "leading or trailing whitespace",
 		},
 		{
 			name:    "a mistyped value the schema should catch",
@@ -1828,7 +1883,7 @@ func (Chart) Test() error {
 	}
 
 	for _, tc := range renders {
-		out, err := helmRender(tc.notes, tc.sets, "")
+		out, err := helmRender(tc.notes, tc.sets, tc.valuesYAML)
 		if err != nil {
 			fmt.Printf("FAIL  %s\n      render failed: %v\n", tc.name, err)
 			failures++
@@ -2470,7 +2525,19 @@ func checkModuleTidy(dir string, files []string, tidy func() error) error {
 		path := filepath.Join(dir, f)
 		after, err := os.ReadFile(path)
 		if err != nil {
-			restoreErrs = append(restoreErrs, fmt.Errorf("reading %s after the tidy check: %w", f, err))
+			// Unreadable or gone: exactly what the snapshot is for, so put it
+			// back rather than only noting the failure. Collected, not returned,
+			// so the other file is still restored — but surfaced unconditionally
+			// below, because a tidy that deletes go.sum while leaving go.mod
+			// alone must not report success.
+			// Named as module drift rather than as a bare I/O fault, because that
+			// is what it is: tidy removes go.sum outright when nothing needs it.
+			restoreErrs = append(restoreErrs, fmt.Errorf(
+				"%s could not be read back after the tidy check (tidy may have removed it); "+
+					"run 'mage dev:tidy' and commit: %w", f, err))
+			if werr := os.WriteFile(path, before[f], 0o644); werr != nil {
+				restoreErrs = append(restoreErrs, fmt.Errorf("restoring %s: %w", f, werr))
+			}
 			continue
 		}
 		if bytes.Equal(after, before[f]) {
@@ -2491,13 +2558,20 @@ func checkModuleTidy(dir string, files []string, tidy func() error) error {
 		return tidyErr
 	}
 	if len(untidy) > 0 {
+		// Named from the arguments, not hardcoded: the function is generic over
+		// the file list, and a message naming files the caller never passed sent
+		// its own spec looking for a substring it could not rely on.
+		subject := strings.Join(files, "/")
 		if len(restoreErrs) > 0 {
-			return fmt.Errorf("go.mod/go.sum are not tidy (%s); run 'mage dev:tidy' and commit. "+
+			return fmt.Errorf("%s are not tidy (%s); run 'mage dev:tidy' and commit. "+
 				"Additionally failed to restore them: %w",
-				strings.Join(untidy, ", "), errors.Join(restoreErrs...))
+				subject, strings.Join(untidy, ", "), errors.Join(restoreErrs...))
 		}
-		return fmt.Errorf("go.mod/go.sum are not tidy (%s); run 'mage dev:tidy' and commit",
-			strings.Join(untidy, ", "))
+		return fmt.Errorf("%s are not tidy (%s); run 'mage dev:tidy' and commit",
+			subject, strings.Join(untidy, ", "))
+	}
+	if len(restoreErrs) > 0 {
+		return errors.Join(restoreErrs...)
 	}
 	return nil
 }

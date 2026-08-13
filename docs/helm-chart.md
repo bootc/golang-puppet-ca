@@ -521,34 +521,49 @@ because it cannot see far enough to rule it out:
 
 ## Running under an external root
 
-openvox-ca can run as an intermediate CA under a parent root, with
-`openvox-ca csr` emitting the signing request and `openvox-ca import-ca-cert`
-installing the signed chain (see the
-[operator CLI reference](operator-cli.md#offline-subcommands-on-the-server-binary)).
-No chart value
-enables this — both are offline subcommands that read the server's own config,
-which under the chart lives inside the pod.
+openvox-ca can run as an intermediate CA under a parent root, using the offline
+`openvox-ca csr` and `openvox-ca import-ca-cert` subcommands. The procedure
+itself — flags, the signing request, re-issuing later — is documented in
+[running under an external root CA](openbao-transit.md#running-under-an-external-root-ca)
+and applies unchanged here; it is not OpenBao-specific despite living in that
+guide. No chart value enables it. What follows is only what Kubernetes adds.
 
-**Mind the window.** Between `csr --create-key` and `import-ca-cert` the CA has
-a key but no certificate, and the server *refuses to start* rather than
-bootstrap over a key the parent is in the middle of signing. Under a Deployment
-that is a crash-loop, so do not start a rollout in the middle of it. Two ways
-that hold:
+**Both subcommands read the server's own config**, which under the chart exists
+only inside the pod. So run them there (`kubectl exec`), or run them somewhere
+that mounts the same `cadir` and the same rendered `config.yaml` — a Job or an
+`initContainers` pair — before the Deployment starts.
 
-- **Into a running pod**, if you are converting an existing self-bootstrapped
-  CA. `kubectl exec` for both steps, then signal or restart:
+**Mind the window.** Between `csr --create-key` and `import-ca-cert` the CA has a
+key but no certificate, and the server *refuses to start* rather than bootstrap
+over a key the parent is in the middle of signing. Under a Deployment that is a
+crash-loop, so either keep both steps inside one `kubectl exec` session on a
+running pod, or scale to zero for the duration. Do not begin a rollout in it.
 
-  ```console
-  $ kubectl exec -it deploy/openvox-ca -- openvox-ca csr --create-key > ca.csr
-  # ...have the parent CA sign ca.csr...
-  $ kubectl cp ca-chain.pem openvox-ca-0:/tmp/ca-chain.pem
-  $ kubectl exec -it deploy/openvox-ca -- openvox-ca import-ca-cert /tmp/ca-chain.pem
-  ```
+**A restart is required, not a signal.** `SIGHUP` covers the TLS keypair and the
+admin allow list only; the CA certificate is read at startup, so a signalled
+process carries on issuing under the certificate you just replaced. Restart every
+replica, then `openvox-ca-ctl reissue-crl`.
 
-- **Before the Deployment exists**, for a fresh install: run both steps in a
-  Job (or an `initContainers` pair) mounting the same `cadir` PVC and the same
-  rendered `config.yaml`, and install the chart afterwards. Scale the Deployment
-  to zero if you are retrofitting, so nothing tries to start inside the window.
+**The root filesystem is read-only** by default (`securityContext`), and nothing
+is mounted at `/tmp`, so a signed bundle has to be written somewhere writable —
+`persistence.mountPath` (`/var/lib/puppet-ca` by default) — or piped in:
+
+```console
+$ POD=$(kubectl get pod -l app.kubernetes.io/name=openvox-ca \
+    -o jsonpath='{.items[0].metadata.name}' --namespace puppet)
+$ kubectl exec "$POD" --namespace puppet -- openvox-ca csr --create-key > ca.csr
+# ...have the parent CA sign ca.csr, producing ca-chain.pem...
+$ kubectl exec -i "$POD" --namespace puppet -- \
+    sh -c 'cat > /var/lib/puppet-ca/ca-chain.pem' < ca-chain.pem
+$ kubectl exec "$POD" --namespace puppet -- \
+    openvox-ca import-ca-cert --cert-bundle /var/lib/puppet-ca/ca-chain.pem --force
+$ kubectl rollout restart deployment/<release>-openvox-ca --namespace puppet
+```
+
+No `-t`: `csr` writes the PEM to stdout and its diagnostics to stderr, and a TTY
+would merge them into `ca.csr`. `--force` belongs here because this replaces the
+self-signed certificate an existing install bootstrapped — omit it on a fresh CA
+that has a key but no certificate yet, where there is nothing to replace.
 
 Everything else about the resulting CA — storage, TLS, export — is unchanged;
 only the certificate's issuer differs.
@@ -645,11 +660,15 @@ Three things worth knowing:
   checksum a ConfigMap it did not render. openvox-ca does not re-read
   `config.yaml`, so editing your own ConfigMap leaves the running pods on the
   old config until you restart them — `kubectl rollout restart`, or an
-  annotation-based reloader watching that ConfigMap. The exception is the
-  `puppet-server` admin allow list in that same ConfigMap, which *is* re-read on
+  annotation-based reloader watching that ConfigMap. There is one exception, and
+  it is narrower than it looks: *if your own config.yaml sets
+  `puppet_server_file`* at a path in that ConfigMap, that file is re-read on
   `SIGHUP` (see
-  [reloading configuration](configuration.md#reloading-configuration)), so
-  withdrawing a compiler's admin access needs only a signal.
+  [reloading configuration](configuration.md#reloading-configuration)) — the
+  chart renders neither the file nor the setting in this mode, so it depends
+  entirely on your config. Even then a signal only withdraws CNs that came from
+  the file: one listed in `puppet_server` is frozen at startup, and a certificate
+  carrying `pp_cli_auth` is an admin regardless of the allow list.
 
 ## Uninstalling
 
