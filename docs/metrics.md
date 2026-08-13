@@ -100,7 +100,12 @@ query, and `puppetca_crl_sync_failures_total` for why it is stuck.
 > **What the failure counter does and does not see.** It counts a CRL that
 > could not be re-signed or written, on any of the four paths that write one
 > (revoke, CRL reissue, background refresh, expired-cert cleanup), and — on the
-> revoke path only — a CRL that could not be read, or a malformed serial. The
+> revoke path only — a CRL that could not be read, a malformed serial, or an
+> inventory read that failed while resolving the subject's serial. That last one
+> includes a revocation whose wait for the per-subject lock spent the 60-second
+> budget on the single-node backends, which reach the read with the deadline
+> already gone; see [revocation cost](api.md#certificate-status). So a queued
+> revocation is a benign cause of this alert on filesystem and SQLite. The
 > revoke path is the shared revoke-by-serial code, so it also covers
 > `DELETE /certificate_status` (`puppet cert clean`) and the best-effort
 > revocation of a superseded certificate on renewal, which on a busy fleet is
@@ -115,9 +120,12 @@ query, and `puppetca_crl_sync_failures_total` for why it is stuck.
 > the CRL, and the certificate they leave behind is still reachable by subject
 > until a replacement is issued.
 >
-> Uncounted, and logged only: a revocation that failed before reaching the CRL
-> (a lock it could not take, or a subject whose serial the inventory could not
-> resolve — though `PUT /certificate_status` also answers its caller `409`), a
+> Uncounted, and logged only: a revocation refused at a cross-node lock
+> acquisition, which fails ahead of any CRL work (this is the `409` a spent
+> budget produces on PostgreSQL, MySQL, etcd and Redis — the single-node
+> backends take the lock and fail later, which *is* counted, as above), a
+> subject that was simply never issued — though `PUT /certificate_status` also
+> answers its caller `409` in both cases — a
 > CRL that could not be read during reissue, refresh or cleanup, and a
 > malformed serial met by the cleanup job.
 >

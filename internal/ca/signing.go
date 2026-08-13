@@ -926,9 +926,11 @@ func (c *CA) Renew(ctx context.Context, subject string, csrPEM []byte, presented
 		// again.
 		//
 		// This is deliberately the second storage read of the CRL on this path:
-		// refuseIfRevoked syncs the cache unconditionally, so a renewal pays two
-		// GetCRLs and two signature checks rather than one, and this one is
-		// inside the critical section. Both earn their place. The gate above
+		// refuseIfRevoked syncs the cache unconditionally, so the gate now costs
+		// two GetCRLs and two signature checks rather than one, and this one is
+		// inside the critical section. (The revoke step below adds a third of
+		// each whenever it retires a predecessor, which is the ordinary case.)
+		// Both earn their place. The gate above
 		// turns a revoked agent away before it queues on a lock this change
 		// makes slower to get, and only this one is authoritative, because only
 		// this one runs where nothing can revoke behind it. Renewals are rare

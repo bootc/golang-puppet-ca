@@ -47,6 +47,17 @@ import (
 // re-check refuses the renewal, or the renewal completes and the revocation
 // then retires the serial that renewal issued.
 //
+// The second ordering leaves the agent nothing usable only where the renewal
+// retired the certificate it replaced, because this retires the subject's
+// latest serial and no other. That is the default rather than a guarantee:
+// under revoke_on_auto_renew=false AutoRenew keeps the predecessor
+// deliberately, and on both paths the post-issue revoke is best-effort and only
+// warns when it fails. A predecessor left behind stays valid for its own key
+// and still authenticates, since admission tests the serial presented rather
+// than whatever certificate is on disk. Retiring every unexpired serial a
+// subject holds would close that; it is a change to what revocation means, not
+// to when it happens, so it is not this one's business.
+//
 // The cost is that a revocation now waits for an issuance already under way for
 // that subject — the same trade Clean has always made, so DELETE
 // /certificate_status has always paid it. Do not read that wait as short: a

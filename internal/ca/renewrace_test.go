@@ -51,13 +51,16 @@ import (
 // visible to it, and crlsync_test.go owns that property. What is left, and what
 // these pin, is the window between the gate's answer and the issuance it guards.
 //
-// The other two specs cover the far side of the same lock, where Revoke takes it
-// too: one that a revocation waits for an issuance already under way rather than
-// stepping past it, and takes the subject lock without holding the CRL lock —
-// the ordering every other nested acquisition in the package uses, and an
-// inversion of it deadlocks rather than failing. The other pins what happens
-// when the renewal wins that race instead: the revocation behind it must retire
-// the serial the renewal issued. Between them the two orderings Revoke's godoc
+// The other three blocks cover the far side of the same lock, where Revoke
+// takes it too. One pins that a revocation waits for an issuance already under
+// way rather than stepping past it, and takes the subject lock without holding
+// the CRL lock. A table then makes that ordering an assertion for every caller
+// that holds both locks — Clean, Renew, AutoRenew — which is the block
+// docs/development/locking.md points at as the automation of the nested
+// invariant; an inversion of it deadlocks rather than failing, so the check is
+// that the CRL lock stays grantable while each one waits. The last pins what
+// happens when the renewal wins that race instead: the revocation behind it
+// must retire the serial the renewal issued. Between them the two orderings Revoke's godoc
 // rests on are both answers rather than races, which is the claim that makes the
 // re-check worth its lock.
 var _ = Describe("A revocation racing a renewal", func() {
@@ -166,8 +169,10 @@ var _ = Describe("A revocation racing a renewal", func() {
 			// Registered before the goroutine exists, so the holder unblocks on
 			// every exit path. Without it a failed assertion below aborts the
 			// spec before the explicit close, leaving the holder parked and the
-			// renewal blocked for the full LockTimeout — a minute of noise at
-			// exactly the moment the failure output matters.
+			// renewal blocked indefinitely: store is filesystem-backed, so that
+			// wait is on a process-local mutex, which no deadline ends (see
+			// StorageService.WithLock's godoc). That leaks a goroutine into
+			// TempDir cleanup at exactly the moment the failure output matters.
 			var releaseOnce sync.Once
 			DeferCleanup(func() { releaseOnce.Do(func() { close(release) }) })
 			go func() {

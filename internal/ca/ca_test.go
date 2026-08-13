@@ -596,6 +596,35 @@ var _ = Describe("CA Revocation", func() {
 			"a failed CRL amendment must be counted regardless of the caller")
 	})
 
+	It("counts a revocation whose lock wait outlived the deadline", func() {
+		// docs/api.md and Revoke's godoc both tell operators that on the
+		// single-node backends a revocation queued past LockTimeout does not
+		// commit late: it takes the lock and then fails on the first storage
+		// read, and unlike the cross-node rejection that failure IS counted, so
+		// a merely queued revocation can raise the mixin's alert. The whole
+		// claim turns on a spent deadline not being fs.ErrNotExist, which is
+		// the one branch of revokeLocked's split nothing else exercises -- the
+		// two specs above pin never-issued (uncounted) and a corrupt CRL
+		// (counted). An expired context reproduces it without the wait.
+		csrPEM, err := testutil.GenerateCSR("revoke-deadline-node")
+		Expect(err).NotTo(HaveOccurred())
+		_, err = myCA.SaveRequest(context.Background(), "revoke-deadline-node", csrPEM)
+		Expect(err).NotTo(HaveOccurred())
+		_, err = myCA.Sign(context.Background(), "revoke-deadline-node")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(myCA.CRLUpdateFailures()).To(BeNumerically("==", 0))
+
+		expired, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+		defer cancel()
+
+		Expect(myCA.Revoke(expired, "revoke-deadline-node")).To(MatchError(context.DeadlineExceeded),
+			"a spent deadline must fail the revocation rather than commit it late")
+		Expect(myCA.IsRevoked(context.Background(), "revoke-deadline-node")).To(BeFalse(),
+			"nothing may be written when the deadline is already gone")
+		Expect(myCA.CRLUpdateFailures()).To(BeNumerically("==", 1),
+			"the docs promise this failure is counted, so the alert can fire on a queued revocation")
+	})
+
 	It("IsRevokedSerial returns true for a revoked certificate's serial", func() {
 		csrPEM, err := testutil.GenerateCSR("serial-revoke-node")
 		Expect(err).NotTo(HaveOccurred())

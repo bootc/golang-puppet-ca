@@ -179,7 +179,8 @@ subject:<name>  →  crl  →  c.mu  →  (StorageService internal mutexes)
   it against an issuance already under way for that subject.
 - No code path acquires `subject:<name>` while holding `crl`, and none acquires
   either while holding `c.mu`. Keep it that way; the comments in
-  [signing.go](../../internal/ca/signing.go) record this invariant at each
+  [signing.go](../../internal/ca/signing.go) and
+  [revoke.go](../../internal/ca/revoke.go) record this invariant at each
   nesting site.
 - Two *different* subject locks are never held at once (bulk operations like
   `SignMultiple` loop, taking one at a time).
