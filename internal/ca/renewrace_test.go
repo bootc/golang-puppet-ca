@@ -328,6 +328,19 @@ var _ = Describe("A revocation racing a renewal", func() {
 			releaseOnce.Do(func() { close(release) })
 			Expect(<-held).To(Succeed())
 			Eventually(done).Should(Receive(BeNil()))
+
+			// The crlFree check above is one-sided: it proves the operation was
+			// not *holding* the CRL lock, which is equally true of one that
+			// never takes it. All three swallow a failed revoke step and still
+			// return nil, so without this the entry would go on passing if that
+			// step were dropped — and locking.md advertises this table as the
+			// automation of the ordering invariant. Assert the CRL-locked work
+			// actually ran: each of the three retires ownCrt's serial, Clean as
+			// the subject's latest and the two renewals as the one they replace.
+			isRevoked, err := myCA.IsRevokedSerial(ctx, ownCrt.SerialNumber)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(isRevoked).To(BeTrue(),
+				"the operation must have reached the CRL lock it is being checked for")
 		},
 		Entry("Clean", func() error { return myCA.Clean(ctx, "node1.test") }),
 		Entry("Renew", func() error { _, err := myCA.Renew(ctx, "node1.test", csrPEM, ownCrt); return err }),
@@ -338,15 +351,18 @@ var _ = Describe("A revocation racing a renewal", func() {
 	// renewal wins the lock instead, the revocation that follows must retire the
 	// serial that renewal just issued, not the one it replaced. That holds
 	// because issueLeafLocked appends the new inventory row before the subject
-	// lock is released, so findSerialForSubject resolves to it. Move the serial
-	// capture ahead of the lock and PUT /certificate_status answers 204 while
-	// the fresh certificate stays live, which is this change's own failure mode
-	// reached from the other side.
+	// lock is released, so findSerialForSubject resolves to it.
 	//
 	// Exercised sequentially, deliberately: with both waiters on one mutex,
 	// which is granted first is not deterministic, so a concurrent form would be
-	// a flaky spec. The observable claim is pinned; the in-lock append that
-	// produces it is relied upon rather than guarded.
+	// a flaky spec. Be clear about what that costs. What this pins is that a
+	// revocation following a renewal retires the *newest* serial — it would
+	// catch one that retired the replaced serial instead. What it does not
+	// discriminate is the position of Revoke's own serial capture: with no
+	// renewal in flight, findSerialForSubject resolves to the renewed serial
+	// whether it is called inside the subject lock or ahead of it. The in-lock
+	// append that makes the concurrent case work is relied upon here, not
+	// guarded.
 	It("retires the certificate a renewal issued when the revocation follows it", func() {
 		_, err := myCA.AutoRenew(ctx, ownCrt)
 		Expect(err).NotTo(HaveOccurred())

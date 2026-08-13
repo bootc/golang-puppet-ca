@@ -169,10 +169,14 @@ Nested acquisition always follows one global order:
 subject:<name>  →  crl  →  c.mu  →  (StorageService internal mutexes)
 ```
 
-- `Clean`, `Renew`, and `AutoRenew` are the paths that take all three: the
-  subject lock around the whole operation, then the `crl` lock + `c.mu` for the
-  revocation step. Note both release and re-acquire `c.mu` between the signing
-  and revocation steps — `c.mu` is not held across a `WithLock` acquisition.
+- `Revoke`, `Clean`, `Renew`, and `AutoRenew` are the paths that take all
+  three. For the three issuance paths it is the subject lock around the whole
+  operation, then the `crl` lock + `c.mu` for the revocation step; note they
+  release and re-acquire `c.mu` between the signing and revocation steps —
+  `c.mu` is not held across a `WithLock` acquisition. `Revoke` has the same
+  nesting for a different reason: the `crl` lock + `c.mu` cover the revocation
+  that is the whole operation, and the subject lock is there only to serialise
+  it against an issuance already under way for that subject.
 - No code path acquires `subject:<name>` while holding `crl`, and none acquires
   either while holding `c.mu`. Keep it that way; the comments in
   [signing.go](../../internal/ca/signing.go) record this invariant at each
@@ -281,11 +285,15 @@ path — still provides no cross-replica guarantee anyway.
    could collide with `crl`/`bootstrap`
    ([#203](https://github.com/voxpupuli/openvox-ca/issues/203)).
 8. **SQL pool sizing:** on PostgreSQL/MySQL every *held* distributed lock pins
-   one pooled connection. A single in-flight `Clean`/`Renew`/`AutoRenew` needs
-   at least three connections at once — one for the `subject:<name>` lock, a
-   second for the nested `crl` lock, and a third for the reads/writes inside
+   one pooled connection. A single in-flight `Revoke`/`Clean`/`Renew`/`AutoRenew`
+   needs at least three connections at once — one for the `subject:<name>` lock,
+   a second for the nested `crl` lock, and a third for the reads/writes inside
    the revocation step — so `sql_max_open_conns` must be at least 3 per
-   concurrently mutating request. Set below that and a single request
+   concurrently mutating request. `Revoke` joined that list when it took the
+   subject lock: revoking many *distinct* subjects at once used to queue on the
+   single `crl` gate and hold one lock connection between them, whereas each
+   concurrent revocation now pins its own `subject:<name>` connection while it
+   waits for `crl`. Set below that and a single request
    hard-stalls (not only under load), bounded only by the 60 s `lockTimeout`.
    See the `sql_max_open_conns` knob in
    [storage backends](../storage-backends.md).
@@ -379,6 +387,8 @@ operation on a held subject lock and requires `crl` to still be grantable while
 it waits. An inverted nesting therefore fails on an assertion rather than
 deadlocking the suite to its timeout, which is how an inversion otherwise
 presents: every backend serialises same-process callers on a mutex that ignores
-the context deadline. A race-detector run over the concurrency tests is still
-not automated — tracked as
+the context deadline. These run under the race detector on every unit
+run: `mage test:unit` passes `-race` over every unit package, `internal/ca`
+included. What is still unraced is the build-tagged backend integration
+suites — tracked as
 [#205](https://github.com/voxpupuli/openvox-ca/issues/205).
