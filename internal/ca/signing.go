@@ -163,15 +163,7 @@ func (c *CA) evictRevokedLocked(ctx context.Context, subject string) error {
 		return fmt.Errorf("certificate already exists for %s: %w", subject, ErrCertExists)
 	}
 
-	revoked := false
-	if c.cachedCRL != nil {
-		for _, entry := range c.cachedCRL.RevokedCertificateEntries {
-			if entry.SerialNumber.Cmp(cert.SerialNumber) == 0 {
-				revoked = true
-				break
-			}
-		}
-	}
+	revoked := c.cachedCRL != nil && serialInCRL(c.cachedCRL, cert.SerialNumber)
 
 	if !revoked {
 		return fmt.Errorf("certificate already exists for %s: %w", subject, ErrCertExists)

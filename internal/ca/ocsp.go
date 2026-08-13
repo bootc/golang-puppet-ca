@@ -211,6 +211,12 @@ func (c *CA) OCSPResponse(ctx context.Context, reqDER []byte) ([]byte, error) {
 }
 
 // isRevokedSerial checks the in-memory CRL cache for the given serial number.
+//
+// The deliberate twin of serialInCRL in revoke.go, which every caller needing
+// only a yes or no uses: this one exists because OCSP must return the entry's
+// RevocationTime, which a bool cannot carry. Change the predicate there and
+// change it here too.
+//
 // Returns (true, revocationTime, nil) if found, (false, zero, nil) if not,
 // or (false, zero, error) if the CRL is not loaded.
 // Must be called while c.mu is already held by the caller.

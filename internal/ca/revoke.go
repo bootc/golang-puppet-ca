@@ -356,12 +356,29 @@ func (c *CA) IsRevokedSerial(ctx context.Context, serial *big.Int) (bool, error)
 	if c.cachedCRL == nil {
 		return false, fmt.Errorf("CRL not loaded")
 	}
-	for _, entry := range c.cachedCRL.RevokedCertificateEntries {
+	return serialInCRL(c.cachedCRL, serial), nil
+}
+
+// serialInCRL reports whether serial appears among crl's revoked entries. The
+// one definition of "is this certificate revoked according to this CRL" for
+// every caller that needs only the yes or no — against the cached CRL or one
+// freshly read from storage.
+//
+// Two callers deliberately keep their own loop, because a bool cannot carry
+// what they need from the matched entry: ocsp.go's isRevokedSerial wants the
+// RevocationTime for the OCSP response, and revokeSerialLocked wants it to
+// project into the certificate index. Change the predicate here and check
+// those two.
+//
+// crl may not be nil; every caller guards that first, since a missing CRL is
+// not "nothing is revoked" and each has its own answer for it.
+func serialInCRL(crl *x509.RevocationList, serial *big.Int) bool {
+	for _, entry := range crl.RevokedCertificateEntries {
 		if entry.SerialNumber.Cmp(serial) == 0 {
-			return true, nil
+			return true
 		}
 	}
-	return false, nil
+	return false
 }
 
 // IsRevoked checks whether the certificate for subject appears in the CRL.
@@ -393,10 +410,5 @@ func (c *CA) IsRevoked(ctx context.Context, subject string) bool {
 		return false
 	}
 
-	for _, entry := range crl.RevokedCertificateEntries {
-		if entry.SerialNumber.Cmp(cert.SerialNumber) == 0 {
-			return true
-		}
-	}
-	return false
+	return serialInCRL(crl, cert.SerialNumber)
 }
