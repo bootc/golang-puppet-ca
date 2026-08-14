@@ -18,9 +18,11 @@
 package ca_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/x509"
 	"encoding/pem"
+	"log/slog"
 	"math/big"
 	"os"
 	"strings"
@@ -88,6 +90,18 @@ var _ = Describe("CA RevokeSerial", func() {
 		return superseded, live
 	}
 
+	// captureLogs runs fn with the default logger redirected to a buffer and
+	// returns what was written, at Info and above so the success record is
+	// visible alongside the Warn lines.
+	captureLogs := func(fn func()) string {
+		var buf bytes.Buffer
+		orig := slog.Default()
+		slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})))
+		defer slog.SetDefault(orig)
+		fn()
+		return buf.String()
+	}
+
 	// crlSerials reports the serials currently on the CRL, canonically rendered.
 	crlSerials := func() []string {
 		crl := parseStoredCRL(store)
@@ -149,8 +163,29 @@ var _ = Describe("CA RevokeSerial", func() {
 		It("revokes it anyway when forced", func() {
 			serial := issue("live-forced")
 
-			Expect(myCA.RevokeSerial(ctx, serial, true)).To(Succeed())
+			logged := captureLogs(func() {
+				Expect(myCA.RevokeSerial(ctx, serial, true)).To(Succeed())
+			})
 			Expect(crlSerials()).To(ConsistOf(serial))
+
+			// The audit trail is the whole reason force is on the Info line: a
+			// forced revocation and one the guards cleared are otherwise
+			// indistinguishable at the default level, and this is the path that
+			// deliberately takes a live credential out of circulation.
+			Expect(logged).To(ContainSubstring("Revoking the certificate currently stored for a subject"))
+			Expect(logged).To(ContainSubstring("Certificate revoked by serial"))
+			Expect(logged).To(ContainSubstring("force=true"))
+		})
+
+		It("records an unforced revocation as unforced", func() {
+			superseded, _ := orphan("unforced-logged")
+
+			logged := captureLogs(func() {
+				Expect(myCA.RevokeSerial(ctx, superseded, false)).To(Succeed())
+			})
+
+			Expect(logged).To(ContainSubstring("force=false"))
+			Expect(logged).NotTo(ContainSubstring("Revoking the certificate currently stored"))
 		})
 
 		It("does not fire for a subject whose certificate has been deleted", func() {
@@ -185,8 +220,14 @@ var _ = Describe("CA RevokeSerial", func() {
 			Expect(err.Error()).To(ContainSubstring("unreadable-node"))
 			Expect(err.Error()).To(ContainSubstring("--force"))
 
-			Expect(myCA.RevokeSerial(ctx, serial, true)).To(Succeed())
+			logged := captureLogs(func() {
+				Expect(myCA.RevokeSerial(ctx, serial, true)).To(Succeed())
+			})
 			Expect(crlSerials()).To(ConsistOf(serial))
+
+			// Forcing past a guard that could not run is its own event: the
+			// revocation happened with the check never having been made.
+			Expect(logged).To(ContainSubstring("without confirming the stored certificate"))
 		})
 	})
 

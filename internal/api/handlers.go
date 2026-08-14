@@ -391,16 +391,28 @@ func (s *Server) handlePutStatusBySerial(w http.ResponseWriter, r *http.Request)
 			// be taken. Its message may name storage paths, so it stays in the log
 			// above rather than the response.
 			//
-			// 503, not 409: nothing about the request conflicts with the CA's
-			// state, and the two 409s this route does return both document
-			// --force as their way forward. An operator who met a transient
-			// storage fault as "409 conflict", read the published table and
-			// applied the documented remedy would disarm the live-certificate
-			// guard for a reason that was never that guard.
+			// 503, not 409: a transient CA-side fault is not a conflict with the
+			// request, which is what separates this from the subject-keyed
+			// route's blanket 409 for the same class of failure. Two of this
+			// route's three 409s — ErrSerialIsCurrent and ErrSerialStateUnknown
+			// — name force as the way forward; the foreign-CRL one does not. So
+			// answering a storage fault with 409 as well would leave force the
+			// likeliest thing an operator reaches for, disarming the
+			// live-certificate guard for a reason that was never that guard.
 			http.Error(w, "the CA could not service this request; see the server log",
 				http.StatusServiceUnavailable)
 		}
 		return
+	}
+
+	// Client identity is a Debug-level detail on every other route, and that
+	// convention is left alone — except here, where force has just disarmed the
+	// guard that stops a working credential being taken out of circulation. The
+	// CA layer logs the revocation but cannot see who asked for it, so without
+	// this the one act on this route worth reconstructing afterwards has no
+	// attribution at the default level.
+	if body.Force {
+		slog.Info("Forced revocation by serial", "serial", serial, "client", clientCN(r))
 	}
 
 	if cn := clientCN(r); cn != "" && s.destructiveOps != nil && s.destructiveOps.Record(cn) {

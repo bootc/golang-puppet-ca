@@ -95,9 +95,10 @@ any other value is a `400` rather than a revocation. Responses:
 | `409 Conflict` | The serial is the certificate currently stored for its subject; the stored certificate could not be read, so that could not be determined; or the stored CRL was not signed by this process's CA certificate (see the note above). Each returns a body naming which, and what to do about it |
 | `503 Service Unavailable` | The CA could not service the request — an inventory read (including an integrity failure), a CRL read/sign/write, or a lock it could not take. The cause is in the server log, not the response, because the message can name storage paths |
 
-A `409` always carries a descriptive body. `--force` is the documented way past
-the first two causes and **only** those two; it is not a remedy for a `503`, and
-re-running with it would revoke without the live-certificate guard having run.
+A `409` always carries a descriptive body. `"force": true` is the documented way
+past the first two causes and **only** those two — not the foreign CRL, and not a
+`503`; re-running with it would revoke without the live-certificate guard having
+run.
 
 Two refusals are deliberate:
 
@@ -314,9 +315,12 @@ certificate goes away:
   admission reads the CRL rather than storage, the dangerous combination is a
   delete whose revocation failed: the file is gone and the certificate still
   works. Confirm the serial in `GET /certificate_revocation_list/ca`; one that is
-  missing there can still be retired with
-  [revocation by serial](#revocation-by-serial), which is the only route to it
-  once the certificate is gone from storage. The
+  missing there can still be retired. The inventory row outlives the delete, so
+  `PUT /certificate_status/{subject}` still resolves to it and is enough on its
+  own — unless a replacement has since been issued for the same subject, which
+  makes it resolve to the replacement instead and leaves
+  [revocation by serial](#revocation-by-serial) the only way back to the
+  original. The
   server's `Clean: revoke failed`, `Clean: delete cert failed` and
   `Clean: delete CSR failed` warnings are the complete signal;
   `puppetca_crl_update_failures_total` covers most of the first — a CRL that

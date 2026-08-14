@@ -316,8 +316,16 @@ func (s *StorageService) SerialExists(ctx context.Context, serial string) (bool,
 // zero-padded sequential one from an older inventory be looked up the same way.
 //
 // Integrity matches LatestSerialForSubject, the by-subject lookup this is the
-// twin of: on a blob backend the HMAC is verified before the scan, so a tampered
-// inventory surfaces ErrInventoryTampered rather than answering from it. That
+// twin of: on a blob backend the HMAC is verified before the scan, so an
+// inventory whose rows were altered surfaces ErrInventoryTampered rather than
+// answering from it. The guarantee is exactly as strong as the stored MAC's
+// presence — verifyInventoryHMACLocked treats an absent one as first-run and
+// re-baselines over whatever is there, so deleting the MAC blob alongside the
+// edit still verifies clean. That is a property of the shared verifier, not of
+// this path (LatestSerialForSubject inherits it too), and closing it would mean
+// a read-only verify mode for every caller. It is left alone here rather than
+// papered over: the barrier stops an edited inventory, not an edited inventory
+// whose sibling MAC was also removed. That
 // matters more here than for a plain read — the answer decides whether a serial
 // may be revoked at all, and which subject's stored certificate the live
 // certificate guard compares against, so an unverified row could both admit a
@@ -362,7 +370,17 @@ func (s *StorageService) SubjectForSerial(ctx context.Context, serial string) (s
 	// migrated inventory can carry many, and this runs under the cluster CRL
 	// lock while an operator watches the log for the outcome of one revocation.
 	// latestSerialFromBlob aggregates the same condition the same way.
+	//
+	// Deferred so every return path reports the same way and the count means one
+	// thing: rows skipped before the scan stopped. Emitting at each return
+	// instead made the number silently depend on where the match landed.
 	skipped := 0
+	defer func() {
+		if skipped > 0 {
+			slog.Warn("Inventory contains entries with unparseable serials", "count", skipped)
+		}
+	}()
+
 	for _, e := range entries {
 		got, err := NormaliseSerial(e.Serial)
 		if err != nil {
@@ -370,14 +388,8 @@ func (s *StorageService) SubjectForSerial(ctx context.Context, serial string) (s
 			continue
 		}
 		if got == want {
-			if skipped > 0 {
-				slog.Warn("Inventory contains entries with unparseable serials", "count", skipped)
-			}
 			return e.Subject, nil
 		}
-	}
-	if skipped > 0 {
-		slog.Warn("Inventory contains entries with unparseable serials", "count", skipped)
 	}
 	return "", fmt.Errorf("serial %s not found in inventory: %w", want, fs.ErrNotExist)
 }

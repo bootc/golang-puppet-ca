@@ -18,9 +18,12 @@
 package storage_test
 
 import (
+	"bytes"
 	"context"
 	"io/fs"
+	"log/slog"
 	"os"
+	"strings"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -56,6 +59,8 @@ var _ = Describe("StorageService SubjectForSerial", func() {
 		Expect(store.AppendInventory(ctx,
 			"NOTHEX 2026-01-04T00:00:00UTC 2027-01-04T00:00:00UTC /CN=malformed")).To(Succeed())
 		Expect(store.AppendInventory(ctx,
+			"ZZZZ 2026-01-05T00:00:00UTC 2027-01-05T00:00:00UTC /CN=malformed-two")).To(Succeed())
+		Expect(store.AppendInventory(ctx,
 			"1b 2026-01-03T00:00:00UTC 2027-01-03T00:00:00UTC /CN=third")).To(Succeed())
 	})
 
@@ -63,6 +68,23 @@ var _ = Describe("StorageService SubjectForSerial", func() {
 		// If the skip were an abort, one bad row would make every serial after
 		// it unresolvable — and so unrevokable — with nothing to say why.
 		Expect(store.SubjectForSerial(ctx, "1B")).To(Equal("CN=third"))
+	})
+
+	It("reports the unparseable rows once, with a count", func() {
+		// One line per bad row would be unbounded in inventory size, emitted
+		// under the cluster CRL lock while an operator watches the log for the
+		// outcome of a single revocation. The count is what makes the one line
+		// useful, and it is why both emission sites were collapsed into one.
+		var buf bytes.Buffer
+		orig := slog.Default()
+		slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+		defer slog.SetDefault(orig)
+
+		_, err := store.SubjectForSerial(ctx, "BEEF")
+		Expect(err).To(MatchError(fs.ErrNotExist))
+
+		Expect(strings.Count(buf.String(), "unparseable serials")).To(Equal(1))
+		Expect(buf.String()).To(ContainSubstring("count=2"))
 	})
 
 	It("resolves a serial to the subject that holds it", func() {

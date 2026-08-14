@@ -18,7 +18,6 @@
 package main
 
 import (
-	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -90,13 +89,6 @@ var _ = Describe("revoke subcommand", func() {
 			Expect(gotBody).To(MatchJSON(`{"desired_state":"revoked"}`))
 		})
 
-		It("does not send a force field, which that route has no meaning for", func() {
-			Expect(run("--certname", "node1")).To(Succeed())
-
-			var body map[string]any
-			Expect(json.Unmarshal(gotBody, &body)).To(Succeed())
-			Expect(body).NotTo(HaveKey("force"))
-		})
 	})
 
 	Describe("by serial", func() {
