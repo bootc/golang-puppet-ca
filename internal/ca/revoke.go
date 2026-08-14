@@ -106,6 +106,17 @@ var ErrSerialUnknown = errors.New("serial number not found in inventory")
 // node loses its certificate) is the expensive direction to be wrong in.
 var ErrSerialIsCurrent = errors.New("serial belongs to the certificate currently in use")
 
+// ErrSerialStateUnknown is returned by RevokeSerial when the certificate stored
+// for the serial's subject cannot be read, so it cannot be shown that revoking
+// the serial would not take a working credential out of circulation.
+//
+// It is separate from ErrSerialIsCurrent because the remedy differs and the
+// operator cannot tell them apart otherwise: this one may clear on its own once
+// storage is healthy, and forcing past it revokes without the guard ever having
+// run. It carries no wrapped storage error — those name paths, and this value
+// reaches the API response.
+var ErrSerialStateUnknown = errors.New("cannot determine whether the serial is the certificate currently in use")
+
 // RevokeSerial revokes one specific serial number, rather than whatever serial
 // is currently newest for a subject.
 //
@@ -148,8 +159,8 @@ func (c *CA) revokeSerialCheckedLocked(ctx context.Context, serial string, force
 		// operator error and is not counted, but an inventory read that *failed*
 		// is a revocation that could not be recorded, which is what
 		// crlUpdateFailures means. On a blob backend that includes an HMAC
-		// verification failure — a tamper signal — since the read goes through
-		// ReadInventory.
+		// verification failure — a tamper signal — because SubjectForSerial
+		// verifies before scanning, as its by-subject twin does.
 		if errors.Is(err, fs.ErrNotExist) {
 			return fmt.Errorf("%w: %s", ErrSerialUnknown, serial)
 		}
@@ -168,8 +179,15 @@ func (c *CA) revokeSerialCheckedLocked(ctx context.Context, serial string, force
 		// let the guard evaporate exactly when storage is unhealthy.
 		if !errors.Is(err, fs.ErrNotExist) {
 			if !force {
-				return fmt.Errorf("cannot confirm whether serial %s is the certificate currently stored for %s: %w",
-					serial, subject, err)
+				// The underlying error names a storage path, and this value is
+				// rendered into the API response, so it is logged rather than
+				// wrapped. The message still has to be actionable on its own.
+				slog.Warn("Refusing to revoke by serial: the stored certificate could not be read",
+					"serial", serial, "subject", subject, "error", err)
+				return fmt.Errorf("%w: the certificate stored for %s could not be read, so it cannot be "+
+					"shown that serial %s is not the one in use; retry once storage is healthy, or pass "+
+					"--force to revoke it without that check (see the server log for the cause)",
+					ErrSerialStateUnknown, subject, serial)
 			}
 			slog.Warn("Revoking by serial without confirming the stored certificate",
 				"serial", serial, "subject", subject, "error", err)
@@ -187,7 +205,11 @@ func (c *CA) revokeSerialCheckedLocked(ctx context.Context, serial string, force
 	if err := c.revokeSerialLocked(ctx, serial); err != nil {
 		return err
 	}
-	slog.Info("Certificate revoked by serial", "serial", serial, "subject", subject)
+	// force is on the durable record, not only the Debug line: it is the
+	// difference between a revocation the guards cleared and one that overrode
+	// them, and for a subject with no stored certificate the guard is a silent
+	// no-op, so nothing else in the log would distinguish the two.
+	slog.Info("Certificate revoked by serial", "serial", serial, "subject", subject, "force", force)
 	return nil
 }
 

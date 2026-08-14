@@ -110,8 +110,10 @@ var _ = Describe("CA RevokeSerial", func() {
 
 			Expect(myCA.RevokeSerial(ctx, superseded, false)).To(Succeed())
 
-			Expect(crlSerials()).To(ConsistOf(superseded))
-			Expect(crlSerials()).NotTo(ContainElement(live))
+			// ConsistOf is exact, so this states both halves at once: the
+			// superseded serial is on the CRL and the live replacement is not.
+			Expect(crlSerials()).To(ConsistOf(superseded),
+				"expected exactly the superseded serial; the live replacement must survive")
 		})
 
 		It("leaves the live certificate usable", func() {
@@ -170,9 +172,18 @@ var _ = Describe("CA RevokeSerial", func() {
 				[]byte("not a certificate"), 0o644)).To(Succeed())
 
 			err := myCA.RevokeSerial(ctx, serial, false)
-			Expect(err).To(HaveOccurred())
-			Expect(err.Error()).To(ContainSubstring("cannot confirm"))
+			Expect(err).To(MatchError(ca.ErrSerialStateUnknown))
 			Expect(crlSerials()).To(BeEmpty())
+
+			// Distinct from ErrSerialIsCurrent: the guard did not fire, it could
+			// not run, and the remedy is to retry rather than to decide the live
+			// certificate should go.
+			Expect(err).NotTo(MatchError(ca.ErrSerialIsCurrent))
+			// The storage error names a path; it must not ride out on the
+			// message, which the API renders into a response body.
+			Expect(err.Error()).NotTo(ContainSubstring(tmpDir))
+			Expect(err.Error()).To(ContainSubstring("unreadable-node"))
+			Expect(err.Error()).To(ContainSubstring("--force"))
 
 			Expect(myCA.RevokeSerial(ctx, serial, true)).To(Succeed())
 			Expect(crlSerials()).To(ConsistOf(serial))
@@ -183,6 +194,45 @@ var _ = Describe("CA RevokeSerial", func() {
 		It("rejects a serial this CA has no record of issuing", func() {
 			err := myCA.RevokeSerial(ctx, "DEADBEEF", false)
 			Expect(err).To(MatchError(ca.ErrSerialUnknown))
+			Expect(crlSerials()).To(BeEmpty())
+
+			// The other half of the deliberate split in revokeSerialCheckedLocked:
+			// a serial that was never issued is operator error, not a revocation
+			// the CA failed to record, so it must not page anyone.
+			Expect(myCA.CRLUpdateFailures()).To(BeZero(),
+				"a typo'd serial must not count as a failed revocation")
+		})
+
+		It("counts an inventory read that failed, unlike one that simply found nothing", func() {
+			// The inventory HMAC is verified before the scan, so tampering makes
+			// the lookup fail rather than answer — the tamper signal the metric's
+			// documented meaning ("a revocation that could not be recorded")
+			// covers, and the one case that separates the two arms of the split.
+			issue("counted-node")
+			Expect(os.WriteFile(store.InventoryPath(),
+				[]byte("00 2026-01-01T00:00:00UTC 2027-01-01T00:00:00UTC /CN=forged\n"),
+				0o600)).To(Succeed())
+
+			err := myCA.RevokeSerial(ctx, "DEADBEEF", false)
+			Expect(err).To(MatchError(storage.ErrInventoryTampered))
+			Expect(err).NotTo(MatchError(ca.ErrSerialUnknown))
+			Expect(myCA.CRLUpdateFailures()).To(BeNumerically("==", 1))
+			Expect(crlSerials()).To(BeEmpty())
+		})
+
+		It("refuses a forged inventory entry rather than admitting its serial", func() {
+			// The whole point of verifying: without it, a serial this CA never
+			// issued would resolve to a subject and land on the CRL, where no
+			// expiry sweep could ever remove it — CleanupExpiredCerts drops
+			// entries only for serials it finds in the inventory. force must not
+			// help here either.
+			issue("forge-node")
+			Expect(os.WriteFile(store.InventoryPath(),
+				[]byte("BEEF 2026-01-01T00:00:00UTC 2027-01-01T00:00:00UTC /CN=forge-node\n"),
+				0o600)).To(Succeed())
+
+			Expect(myCA.RevokeSerial(ctx, "BEEF", false)).To(MatchError(storage.ErrInventoryTampered))
+			Expect(myCA.RevokeSerial(ctx, "BEEF", true)).To(MatchError(storage.ErrInventoryTampered))
 			Expect(crlSerials()).To(BeEmpty())
 		})
 
@@ -195,13 +245,21 @@ var _ = Describe("CA RevokeSerial", func() {
 			Expect(crlSerials()).To(BeEmpty())
 		})
 
-		It("rejects input that is not a hexadecimal serial", func() {
-			for _, bad := range []string{"", "  ", "zzz", "0x1234", "-1", "12 34"} {
-				err := myCA.RevokeSerial(ctx, bad, false)
-				Expect(err).To(MatchError(storage.ErrMalformedSerial), "input %q", bad)
-			}
-			Expect(crlSerials()).To(BeEmpty())
-		})
+		// One Entry per input rather than a loop: Gomega aborts a spec at the
+		// first failed Expect, so a loop would report one accepted input and
+		// never evaluate the rest.
+		DescribeTable("rejects input that is not a hexadecimal serial",
+			func(bad string) {
+				Expect(myCA.RevokeSerial(ctx, bad, false)).To(MatchError(storage.ErrMalformedSerial))
+				Expect(crlSerials()).To(BeEmpty())
+			},
+			Entry("empty", ""),
+			Entry("whitespace only", "  "),
+			Entry("non-hex letters", "zzz"),
+			Entry("0x prefix", "0x1234"),
+			Entry("negative", "-1"),
+			Entry("embedded space", "12 34"),
+		)
 
 		// RevokeSerial canonicalises before it looks anything up, so what these
 		// pin is that the operator's rendering reaches the same certificate.

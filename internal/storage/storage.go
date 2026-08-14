@@ -315,10 +315,29 @@ func (s *StorageService) SerialExists(ctx context.Context, serial string) (bool,
 // printed. Normalising here is also what lets a modern random serial and a
 // zero-padded sequential one from an older inventory be looked up the same way.
 //
-// The scan is linear in the inventory, on every backend: this answers an
-// operator-initiated single revocation, not a hot path, and doing it through
-// inventoryEntriesLocked keeps it working on backends with no by-serial index
-// without widening the InventoryStore interface for one caller.
+// Integrity matches LatestSerialForSubject, the by-subject lookup this is the
+// twin of: on a blob backend the HMAC is verified before the scan, so a tampered
+// inventory surfaces ErrInventoryTampered rather than answering from it. That
+// matters more here than for a plain read — the answer decides whether a serial
+// may be revoked at all, and which subject's stored certificate the live
+// certificate guard compares against, so an unverified row could both admit a
+// serial this CA never issued (a CRL entry no expiry sweep can ever remove) and
+// point the guard at the wrong certificate. InventoryStore backends are not
+// verified here, exactly as LatestSerialForSubject does not verify them: their
+// integrity head is advanced atomically per append rather than recomputed over a
+// blob, and re-verifying would cost a second full fetch of every row.
+//
+// The scan is linear in the inventory. An indexed by-serial lookup is NOT
+// available even on backends that have the index: the schema's unique index on
+// serial is an exact-match index over the stored text, while this lookup must
+// match on the normalised value, because an inventory written by an older
+// version — or migrated from Puppet Server — carries zero-padded sequential
+// serials (see buildSerialIndex's comment in internal/ca/ocsp.go). An indexed
+// exact match would silently miss precisely the historical certificates most
+// likely to need retiring. A fast path that tried the canonical rendering first
+// and fell back to this scan would be sound; it is deliberately left for later,
+// since this answers an operator-initiated single revocation rather than a hot
+// path, and on blob backends the verification above reads everything regardless.
 func (s *StorageService) SubjectForSerial(ctx context.Context, serial string) (string, error) {
 	want, err := NormaliseSerial(serial)
 	if err != nil {
@@ -327,20 +346,38 @@ func (s *StorageService) SubjectForSerial(ctx context.Context, serial string) (s
 
 	s.inventoryMu.RLock()
 	defer s.inventoryMu.RUnlock()
+
+	if _, indexed := asInventoryStore(s.backend); !indexed && s.hmacKey != nil {
+		if err := s.verifyInventoryHMACLocked(ctx, s.hmacKey); err != nil {
+			return "", err
+		}
+	}
+
 	entries, err := s.inventoryEntriesLocked(ctx)
 	if err != nil {
 		return "", err
 	}
+
+	// Malformed serials are counted and reported once, not once per row: a
+	// migrated inventory can carry many, and this runs under the cluster CRL
+	// lock while an operator watches the log for the outcome of one revocation.
+	// latestSerialFromBlob aggregates the same condition the same way.
+	skipped := 0
 	for _, e := range entries {
 		got, err := NormaliseSerial(e.Serial)
 		if err != nil {
-			slog.Warn("SubjectForSerial: skipping malformed serial in inventory",
-				"serial", e.Serial, "subject", e.Subject)
+			skipped++
 			continue
 		}
 		if got == want {
+			if skipped > 0 {
+				slog.Warn("Inventory contains entries with unparseable serials", "count", skipped)
+			}
 			return e.Subject, nil
 		}
+	}
+	if skipped > 0 {
+		slog.Warn("Inventory contains entries with unparseable serials", "count", skipped)
 	}
 	return "", fmt.Errorf("serial %s not found in inventory: %w", want, fs.ErrNotExist)
 }

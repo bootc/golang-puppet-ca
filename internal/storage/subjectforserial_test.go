@@ -49,8 +49,20 @@ var _ = Describe("StorageService SubjectForSerial", func() {
 			"0A 2026-01-01T00:00:00UTC 2027-01-01T00:00:00UTC /CN=first")).To(Succeed())
 		Expect(store.AppendInventory(ctx,
 			"00FF 2026-01-02T00:00:00UTC 2027-01-02T00:00:00UTC /CN=second")).To(Succeed())
+		// A row whose serial is not hex at all. parseInventoryEntry takes
+		// fields[0] verbatim with no validation, so a hand-edited row or one
+		// from a foreign tool produces this. It sits BEFORE the last good row
+		// on purpose: what needs pinning is that the scan continues past it.
+		Expect(store.AppendInventory(ctx,
+			"NOTHEX 2026-01-04T00:00:00UTC 2027-01-04T00:00:00UTC /CN=malformed")).To(Succeed())
 		Expect(store.AppendInventory(ctx,
 			"1b 2026-01-03T00:00:00UTC 2027-01-03T00:00:00UTC /CN=third")).To(Succeed())
+	})
+
+	It("skips an unparseable row and keeps scanning", func() {
+		// If the skip were an abort, one bad row would make every serial after
+		// it unresolvable — and so unrevokable — with nothing to say why.
+		Expect(store.SubjectForSerial(ctx, "1B")).To(Equal("CN=third"))
 	})
 
 	It("resolves a serial to the subject that holds it", func() {
