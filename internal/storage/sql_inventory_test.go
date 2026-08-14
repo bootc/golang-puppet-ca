@@ -89,7 +89,10 @@ var _ = Describe("SQLiteInventorySubjectForSerial", func() {
 		Expect(svc.SubjectForSerial(ctx, "3")).To(Equal("node1"))
 	})
 
-	It("resolves the stored rendering unchanged, and is case-insensitive", func() {
+	// Case-insensitivity is exercised on the blob arm, in
+	// subjectforserial_test.go, over the same shared normalisation; this fixture
+	// stores only numeric serials, so it can only speak to padding.
+	It("resolves the stored rendering, and any wider padding of it", func() {
 		ctx := context.Background()
 		svc, _ := newInventoryService()
 

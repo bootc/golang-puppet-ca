@@ -453,8 +453,13 @@ var _ = Describe("CRL chain read failures", func() {
 		myCA.CAKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
 		myCA.LeafKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
 		Expect(myCA.Init(ctx)).To(Succeed())
-		_, err := myCA.Generate(ctx, "doomed.example.com", nil)
+		gen, err := myCA.Generate(ctx, "doomed.example.com", nil)
 		Expect(err).NotTo(HaveOccurred())
+		blk, _ := pem.Decode(gen.CertificatePEM)
+		Expect(blk).NotTo(BeNil())
+		doomed, err := x509.ParseCertificate(blk.Bytes)
+		Expect(err).NotTo(HaveOccurred())
+		doomedSerial := strings.ToUpper(doomed.SerialNumber.Text(16))
 
 		_, upsCRL := upstreamCA("Upstream Root CA")
 		Expect(store.UpdateCRL(ctx, upsCRL)).To(Succeed())
@@ -475,6 +480,14 @@ var _ = Describe("CRL chain read failures", func() {
 		// what makes the deleted certificate still valid.
 		Expect(mustGetCRL(ctx, store)).To(Equal(before))
 		Expect(buf.String()).To(ContainSubstring("stays a valid credential until it expires"))
+
+		// The serial has to be in that line. It is the only place it is still
+		// recorded once the certificate is gone from storage, and docs/api.md
+		// sends the operator here to find it so they can retire the certificate
+		// with `revoke --serial`. Without this, dropping revokeLocked's wrap
+		// leaves the warning naming a subject and no serial, and nothing fails.
+		Expect(buf.String()).To(ContainSubstring(doomedSerial),
+			"the WARN line must name the serial; it is what the recovery command needs")
 	})
 
 	It("reads the stored blob once per re-sign, not once per purpose", func() {

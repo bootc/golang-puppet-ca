@@ -87,10 +87,6 @@ var _ = Describe("StorageService SubjectForSerial", func() {
 		Expect(buf.String()).To(ContainSubstring("count=2"))
 	})
 
-	It("resolves a serial to the subject that holds it", func() {
-		Expect(store.SubjectForSerial(ctx, "0A")).To(Equal("CN=first"))
-	})
-
 	// The normalisation is on both sides, which is what makes the stored
 	// rendering irrelevant. A lookup that compared the strings as written would
 	// pass the first of these and fail the rest.

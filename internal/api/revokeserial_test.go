@@ -145,7 +145,11 @@ var _ = Describe("PUT certificate_status_by_serial", func() {
 		rec := revoke(serial, `{"desired_state":"revoked"}`)
 		Expect(rec.Code).To(Equal(http.StatusConflict))
 		Expect(rec.Body.String()).To(ContainSubstring("api-live"))
-		Expect(rec.Body.String()).To(ContainSubstring("--certname api-live"))
+		// Actionable for a caller driving the API directly: the remedy is an
+		// operation ("revoke that subject by name"), not a CLI flag they have no
+		// way to pass. The flags follow as a parenthetical for CLI users.
+		Expect(rec.Body.String()).To(ContainSubstring("revoke that subject by name"))
+		Expect(rec.Body.String()).To(ContainSubstring("force set"))
 	})
 
 	It("revokes the live certificate when force is set", func() {
@@ -201,7 +205,7 @@ var _ = Describe("PUT certificate_status_by_serial", func() {
 	It("answers 409, not 503, when the guard could not run", func() {
 		// The stored certificate is unreadable, so the CA cannot show the serial
 		// is not the one in circulation. That is a refusal of the request, not a
-		// CA that cannot service it, and --force is the way past it — which is
+		// CA that cannot service it, and force is the way past it — which is
 		// exactly what a 503 would tell the operator not to reach for. Without
 		// this, deleting the handler's ErrSerialStateUnknown arm just falls
 		// through to the catch-all and nothing notices.
@@ -212,16 +216,17 @@ var _ = Describe("PUT certificate_status_by_serial", func() {
 		rec := revoke(serial, `{"desired_state":"revoked"}`)
 		Expect(rec.Code).To(Equal(http.StatusConflict))
 		Expect(rec.Body.String()).To(ContainSubstring("api-unreadable"))
-		Expect(rec.Body.String()).To(ContainSubstring("--force"))
+		Expect(rec.Body.String()).To(ContainSubstring("force set"))
 		Expect(rec.Body.String()).NotTo(ContainSubstring(tmpDir))
 		Expect(crlSerials()).To(BeEmpty())
 	})
 
 	It("answers 503 without leaking storage detail when the CA cannot service the request", func() {
-		// The default arm. It must not be a 409: the two 409s this route returns
-		// both document --force as the way forward, and a transient storage
-		// fault answered as "conflict" would send an operator to --force for a
-		// reason that was never the live-certificate guard.
+		// The default arm. It must not be a 409: two of this route's three 409s
+		// name force as the way forward (the foreign-CRL one does not), so a
+		// transient storage fault answered as "conflict" would leave force the
+		// likeliest thing an operator reaches for — disarming the
+		// live-certificate guard for a reason that was never that guard.
 		serial := superseded("api-unservable")
 		// Corrupt the stored CRL so readStoredCRL fails with something that is
 		// not one of the mapped sentinels.

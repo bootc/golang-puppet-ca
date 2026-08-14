@@ -405,9 +405,12 @@ func (s *Server) handlePutStatusBySerial(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	// Client identity is a Debug-level detail on every other route, and that
-	// convention is left alone — except here, where force has just disarmed the
-	// guard that stops a working credential being taken out of circulation. The
+	// Per-request client identity is a Debug-level detail everywhere else, rising
+	// above it only when a threshold or a rejection fires (the destructive-op
+	// warning just below, the middleware's denials). That convention is left
+	// alone — except here, this being the one unconditional success-path
+	// attribution, because force has just disarmed the guard that stops a working
+	// credential being taken out of circulation. The
 	// CA layer logs the revocation but cannot see who asked for it, so without
 	// this the one act on this route worth reconstructing afterwards has no
 	// attribution at the default level.

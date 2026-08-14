@@ -36,13 +36,20 @@ All endpoints are served under both the bare path and `/puppet-ca/v1/<path>`, so
 > closed — the `PUT` refuses, the `DELETE` succeeds. The revoke failure is logged
 > at `WARN` ("stays a valid credential until it expires") and counted in
 > `puppetca_crl_update_failures_total`, so
-> [`PuppetCACRLUpdateFailing`](metrics.md#crl) fires. Recovering needs both a
-> restart of the stale replica *and* the serial revoked directly, because the
-> certificate is no longer in storage to clean again — that is what
-> [revocation by serial](#revocation-by-serial) is for. In this state the `WARN`
-> line names the serial. A revocation that failed *before* the CRL was reached —
-> a lock it could not take, or a subject the inventory could not resolve — does
-> not, and the serial has to come from the inventory instead.
+> [`PuppetCACRLUpdateFailing`](metrics.md#crl) fires. Recovering means restarting
+> the stale replica and then revoking the certificate that was deleted but not
+> revoked — `clean` cannot be repeated, because the certificate is no longer in
+> storage. The inventory row outlives the delete, so
+> `PUT /certificate_status/{subject}` still resolves to that serial and is enough
+> on its own; [revocation by serial](#revocation-by-serial) is needed only once a
+> replacement has been issued for the same name, which makes the by-subject
+> lookup resolve to the replacement instead. That is common after a clean, since
+> the agent re-enrols.
+>
+> In this state the `WARN` line names the serial. A revocation that failed
+> *before* the CRL was reached — a lock it could not take, or a subject the
+> inventory could not resolve — does not, and the serial has to come from the
+> inventory instead.
 
 `GET` response:
 

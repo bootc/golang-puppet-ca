@@ -127,10 +127,13 @@ var ErrSerialStateUnknown = errors.New("cannot determine whether the serial is t
 // asking to revoke the subject now takes the working certificate out of
 // circulation and leaves the superseded one valid.
 //
-// force overrides the ErrSerialIsCurrent guard only. It is the escape hatch for
-// deliberately retiring a live certificate by serial (a compromise where the
-// operator has the serial in hand and not the name); it does not admit a serial
-// this CA never issued.
+// force overrides the two live-certificate guards, and nothing else:
+// ErrSerialIsCurrent, where the serial is demonstrably the one in circulation,
+// and the fail-closed ErrSerialStateUnknown, where that could not be determined
+// at all. It is the escape hatch for deliberately retiring a live certificate by
+// serial — a compromise where the operator has the serial in hand and not the
+// name. It does NOT admit a serial this CA never issued: ErrSerialUnknown is
+// refused with or without it, for the reason given on that sentinel.
 //
 // Locking matches Revoke: the cluster-wide "crl" lock, then c.mu, so concurrent
 // revocations on different replicas cannot clobber one another's CRL write.
@@ -184,17 +187,25 @@ func (c *CA) revokeSerialCheckedLocked(ctx context.Context, serial string, force
 				// wrapped. The message still has to be actionable on its own.
 				slog.Warn("Refusing to revoke by serial: the stored certificate could not be read",
 					"serial", serial, "subject", subject, "error", err)
+				// Worded for both audiences: this reaches an HTTP response as
+				// well as the CLI, so it names the operation and mentions the
+				// flag only as a parenthetical, rather than telling an API
+				// caller to pass a flag that is not in the contract.
 				return fmt.Errorf("%w: the certificate stored for %s could not be read, so it cannot be "+
-					"shown that serial %s is not the one in use; retry once storage is healthy, or pass "+
-					"--force to revoke it without that check (see the server log for the cause)",
+					"shown that serial %s is not the one in use; retry once storage is healthy, or repeat "+
+					"the request with force set to revoke it without that check "+
+					"(openvox-ca-ctl: --force). See the server log for the cause",
 					ErrSerialStateUnknown, subject, serial)
 			}
 			slog.Warn("Revoking by serial without confirming the stored certificate",
 				"serial", serial, "subject", subject, "error", err)
 		}
 	case live == serial && !force:
-		return fmt.Errorf("%w: %s is the certificate stored for %s; "+
-			"revoke it by name with --certname %s, or pass --force to revoke it by serial anyway",
+		// As above: the same string is rendered into an HTTP response body and
+		// printed by the CLI, so the remedy is named as an operation first.
+		return fmt.Errorf("%w: %s is the certificate stored for %s; revoke that subject by name "+
+			"instead, or repeat the request with force set to revoke it by serial anyway "+
+			"(openvox-ca-ctl: --certname %s, or --force)",
 			ErrSerialIsCurrent, serial, subject, subject)
 	case live == serial:
 		slog.Warn("Revoking the certificate currently stored for a subject, by serial and forced",

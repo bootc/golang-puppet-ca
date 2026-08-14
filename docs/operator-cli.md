@@ -110,10 +110,12 @@ openvox-ca-ctl revoke --serial 472C95FAA0DAE424BD7E911E26066010 --force
 # fails, so check the server log: a certificate that could not be revoked
 # stays a valid credential until it expires, and it is no longer in storage
 # to clean again. See docs/api.md for the state that causes it. To recover, fix
-# that state and retire the serial with `openvox-ca-ctl revoke --serial <hex>`
-# (above). The WARN line names the serial only when the revocation got as far as
-# the CRL; otherwise take it from the inventory. See docs/api.md for which is
-# which.
+# that state and revoke the certificate that was deleted but not revoked: the
+# inventory row outlives the delete, so `revoke --certname` still reaches it
+# while no replacement has been issued for that name, and `revoke --serial
+# <hex>` (above) is what is needed once one has. The WARN line names the serial
+# only when the revocation got as far as the CRL; otherwise take it from the
+# inventory. See docs/api.md for which is which.
 openvox-ca-ctl clean --certname agent.example.com
 
 # Re-sign the CRL with a fresh validity window (preserves all revocations)

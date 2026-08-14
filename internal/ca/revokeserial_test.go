@@ -155,9 +155,13 @@ var _ = Describe("CA RevokeSerial", func() {
 			serial := issue("live-named")
 
 			err := myCA.RevokeSerial(ctx, serial, false)
+			// The same string is rendered into an HTTP response body, so it has
+			// to be actionable without assuming the reader is using the CLI:
+			// the operation is named first, the flags only as a parenthetical.
 			Expect(err.Error()).To(ContainSubstring("live-named"))
+			Expect(err.Error()).To(ContainSubstring("revoke that subject by name"))
+			Expect(err.Error()).To(ContainSubstring("force set"))
 			Expect(err.Error()).To(ContainSubstring("--certname live-named"))
-			Expect(err.Error()).To(ContainSubstring("--force"))
 		})
 
 		It("revokes it anyway when forced", func() {
@@ -218,7 +222,8 @@ var _ = Describe("CA RevokeSerial", func() {
 			// message, which the API renders into a response body.
 			Expect(err.Error()).NotTo(ContainSubstring(tmpDir))
 			Expect(err.Error()).To(ContainSubstring("unreadable-node"))
-			Expect(err.Error()).To(ContainSubstring("--force"))
+			Expect(err.Error()).To(ContainSubstring("retry once storage is healthy"))
+			Expect(err.Error()).To(ContainSubstring("force set"))
 
 			logged := captureLogs(func() {
 				Expect(myCA.RevokeSerial(ctx, serial, true)).To(Succeed())
