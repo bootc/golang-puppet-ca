@@ -12,6 +12,7 @@ All endpoints are served under both the bare path and `/puppet-ca/v1/<path>`, so
 | `GET` | `/certificate_status/{subject}` | Get status: `signed`, `requested`, or `revoked` |
 | `PUT` | `/certificate_status/{subject}` | Change state (`signed` or `revoked`); supports `cert_ttl` (seconds). `revoked` returns `409 Conflict` when the stored CRL was not signed by the CA certificate this process loaded — see the note below |
 | `DELETE` | `/certificate_status/{subject}` | Revoke + delete cert and CSR (`puppet cert clean`). The delete happens even if the revocation fails, as does the deletion of any pending request — see the note below and [Authorization tiers](#authorization-tiers) |
+| `PUT` | `/certificate_status_by_serial/{serial}` | Revoke one specific serial, rather than whatever is newest for a subject — see [Revocation by serial](#revocation-by-serial); admin-only |
 
 `PUT` body:
 
@@ -36,8 +37,10 @@ All endpoints are served under both the bare path and `/puppet-ca/v1/<path>`, so
 > at `WARN` ("stays a valid credential until it expires") and counted in
 > `puppetca_crl_update_failures_total`, so
 > [`PuppetCACRLUpdateFailing`](metrics.md#crl) fires. Recovering needs both a
-> restart of the stale replica *and* the serial revoked by hand, because the
-> certificate is no longer in storage to clean again.
+> restart of the stale replica *and* the serial revoked directly, because the
+> certificate is no longer in storage to clean again — that is what
+> [revocation by serial](#revocation-by-serial) is for. The serial is in the
+> `WARN` line.
 
 `GET` response:
 
@@ -57,6 +60,54 @@ All endpoints are served under both the bare path and `/puppet-ca/v1/<path>`, so
 ```
 
 > **Note:** `serial_number` is the low 64 bits of the certificate's cryptographically random 128-bit serial, returned as a signed int64 for API compatibility. It is omitted for certificates in the `requested` state.
+
+### Revocation by serial
+
+`PUT /certificate_status/{subject}` with `desired_state: revoked` revokes
+whichever serial is *newest* for that subject. That is what an operator almost
+always wants, but it leaves one state unreachable: a certificate that a later
+issuance for the same subject displaced without retiring. Asking for the subject
+then revokes the live replacement and leaves the superseded certificate valid —
+worse than doing nothing. `PUT /certificate_status_by_serial/{serial}` names the
+certificate instead of the subject, so it can reach that one.
+
+The serial is hexadecimal, in any case and with or without leading zeros; it is
+matched against the inventory in canonical form (uppercase, unpadded), which is
+how `openvox-ca` logs it and how `openssl x509 -noout -serial` prints it.
+
+`PUT` body:
+
+```json
+{ "desired_state": "revoked", "force": false }
+```
+
+`desired_state` must be `revoked` — there is no by-serial signing operation, and
+any other value is a `400` rather than a revocation. Responses:
+
+| Status | Meaning |
+| --- | --- |
+| `204 No Content` | Revoked, or already revoked (repeating the call is a no-op) |
+| `400 Bad Request` | The serial is not hexadecimal, or `desired_state` was not `revoked` |
+| `404 Not Found` | No inventory entry carries that serial |
+| `409 Conflict` | The serial is the certificate currently stored for its subject (see `force` below), or the stored CRL was not signed by this process's CA certificate (see the note above) |
+
+Two refusals are deliberate:
+
+- **A serial this CA has no record of issuing is refused, and `force` does not
+  override it.** `CleanupExpiredCerts` drops CRL entries only for serials it
+  finds in the inventory, so an entry admitted for an unknown serial could never
+  be removed again — permanent growth in a document served to every agent.
+- **The serial of the certificate currently stored for its subject is refused
+  unless `force` is set.** That case is exactly what `PUT
+  /certificate_status/{subject}` is for, so reaching it by serial is more likely
+  a mistyped digit than an intent, and the cost of being wrong is a working node
+  losing its credential. The `409` body names the subject and the by-name
+  command. Set `"force": true` to revoke it anyway — the legitimate case is a
+  compromise where the serial, not the name, is what you have.
+
+  If the stored certificate cannot be read at all (corrupt, or an I/O failure),
+  the request is refused for the same reason: the CA cannot show that the serial
+  is *not* in circulation. `force` overrides this too, and logs that it did.
 
 ## Certificate statuses (list)
 
@@ -218,7 +269,7 @@ When mTLS is enabled (both `--tls-cert` and `--tls-key` set), each endpoint requ
 | **Public** | None | `GET /healthz/*`, `GET /certificate/{subject}`, `GET /certificate_revocation_list/ca`, `PUT /certificate_request/{subject}`, `GET /expirations`, `POST /ocsp`, `GET /ocsp/{request}` |
 | **Any client** | Any CA-signed cert with `clientAuth` EKU | `POST /certificate_renewal` — restricted to certificates this CA issued (see [renewal eligibility](#renewal-eligibility)); renewal reissues under our authority using that certificate's own subject, which is only safe for names we assigned. The empty-body path also carries that certificate's SANs and Puppet OID extensions forward unchanged; the CSR path takes Puppet OID extensions from the CSR and strips authorization-arc OIDs (see [Certificate renewal](#certificate-renewal)) |
 | **Self or admin** | Cert CN matches path subject, OR cert is admin | `GET /certificate_request/{subject}` |
-| **Admin** | Cert is admin (see below) | `GET /certificate_status/{subject}` (public with `--allow-public-status`), `PUT /certificate_status/{subject}`, `DELETE /certificate_status/{subject}`, `DELETE /certificate_request/{subject}`, `GET /certificate_statuses/*`, `POST /sign`, `POST /sign/all`, `POST /generate/{subject}`, `PUT /clean`, `PUT /certificate_revocation_list/ca`, `PUT /certificate/{subject}` |
+| **Admin** | Cert is admin (see below) | `GET /certificate_status/{subject}` (public with `--allow-public-status`), `PUT /certificate_status/{subject}`, `DELETE /certificate_status/{subject}`, `PUT /certificate_status_by_serial/{serial}`, `DELETE /certificate_request/{subject}`, `GET /certificate_statuses/*`, `POST /sign`, `POST /sign/all`, `POST /generate/{subject}`, `PUT /clean`, `PUT /certificate_revocation_list/ca`, `PUT /certificate/{subject}` |
 
 Above the public tier, a presented certificate must also be **currently valid,
 not revoked, and carry the `clientAuth` extended key usage**: an expired

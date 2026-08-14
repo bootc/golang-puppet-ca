@@ -91,8 +91,20 @@ openvox-ca-ctl sign --certname agent.example.com
 # Sign all pending CSRs
 openvox-ca-ctl sign --all
 
-# Revoke a certificate
+# Revoke a certificate (the most recent one issued for that name)
 openvox-ca-ctl revoke --certname agent.example.com
+
+# Revoke one exact certificate by serial. Use this when a replacement has
+# already been issued for the same name and the one it displaced was never
+# retired: --certname would now revoke the live replacement and leave the
+# superseded certificate valid. Serials are hexadecimal, in any case, and are
+# what `openssl x509 -noout -serial` prints.
+openvox-ca-ctl revoke --serial 472C95FAA0DAE424BD7E911E26066010
+
+# A serial that is still the certificate stored for its subject is refused,
+# because --certname already covers that and a mistyped digit would otherwise
+# take a working node offline. --force revokes it anyway.
+openvox-ca-ctl revoke --serial 472C95FAA0DAE424BD7E911E26066010 --force
 
 # Revoke + delete cert and CSR. The delete happens even if the revocation
 # fails, so check the server log: a certificate that could not be revoked
