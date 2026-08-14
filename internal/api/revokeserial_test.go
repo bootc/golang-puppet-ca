@@ -86,6 +86,22 @@ var _ = Describe("PUT certificate_status_by_serial", func() {
 		return old
 	}
 
+	// crlSerials reads the CRL back through the API, canonically rendered.
+	crlSerials := func() []string {
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, httptest.NewRequest("GET", "/puppet-ca/v1/certificate_revocation_list/ca", nil))
+		Expect(rec.Code).To(Equal(http.StatusOK))
+		block, _ := pem.Decode(rec.Body.Bytes())
+		Expect(block).NotTo(BeNil())
+		crl, err := x509.ParseRevocationList(block.Bytes)
+		Expect(err).NotTo(HaveOccurred())
+		out := make([]string, 0, len(crl.RevokedCertificateEntries))
+		for _, e := range crl.RevokedCertificateEntries {
+			out = append(out, strings.ToUpper(e.SerialNumber.Text(16)))
+		}
+		return out
+	}
+
 	put := func(path, body string) *httptest.ResponseRecorder {
 		req := httptest.NewRequest("PUT", path, strings.NewReader(body))
 		rec := httptest.NewRecorder()
@@ -135,6 +151,42 @@ var _ = Describe("PUT certificate_status_by_serial", func() {
 
 		rec := revoke(serial, `{"desired_state":"revoked","force":true}`)
 		Expect(rec.Code).To(Equal(http.StatusNoContent))
+
+		// This is the one spec here whose subject is a live credential being
+		// taken out of circulation, so it asserts which serial went, not merely
+		// that the request was accepted.
+		Expect(crlSerials()).To(ConsistOf(serial))
+	})
+
+	It("carries the diagnosis, not a bare conflict, when the stored CRL is foreign", func() {
+		// Same reasoning as the subject-keyed route's spec in api_test.go: the
+		// status is 409 either way, so only a body assertion can see a revert.
+		// This route matters more for that state than most — the docs now name
+		// revocation by serial as the way to retire the certificate a failed
+		// clean left behind, and this is the refusal an operator meets first.
+		serial := superseded("api-foreign-crl")
+		Expect(store.UpdateCRL(ctx, foreignCRL())).To(Succeed())
+
+		rec := revoke(serial, `{"desired_state":"revoked"}`)
+		Expect(rec.Code).To(Equal(http.StatusConflict))
+		Expect(rec.Body.String()).To(ContainSubstring("needs a restart"))
+	})
+
+	It("answers 503 without leaking storage detail when the CA cannot service the request", func() {
+		// The default arm. It must not be a 409: the two 409s this route returns
+		// both document --force as the way forward, and a transient storage
+		// fault answered as "conflict" would send an operator to --force for a
+		// reason that was never the live-certificate guard.
+		serial := superseded("api-unservable")
+		// Corrupt the stored CRL so readStoredCRL fails with something that is
+		// not one of the mapped sentinels.
+		Expect(store.UpdateCRL(ctx, []byte("not a CRL"))).To(Succeed())
+
+		rec := revoke(serial, `{"desired_state":"revoked"}`)
+		Expect(rec.Code).To(Equal(http.StatusServiceUnavailable))
+		Expect(rec.Body.String()).NotTo(ContainSubstring(tmpDir),
+			"a CA-side message may name storage paths; it must stay in the log")
+		Expect(rec.Body.String()).To(ContainSubstring("server log"))
 	})
 
 	It("answers 404 for a serial this CA never issued", func() {

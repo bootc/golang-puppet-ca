@@ -542,10 +542,13 @@ var _ = Describe("Authorisation baseline", Ordered, ContinueOnFailure, func() {
 		{
 			// Admin-only via lookupTier's default arm, like every other
 			// revocation route. Recorded here because the path deliberately
-			// sits outside the /certificate_status/ prefix — the tier lookup
-			// and extractPathSubject both match on it — so nothing but this
-			// row would notice if it were ever moved back under it and started
-			// treating the serial as a subject to self-match against.
+			// sits outside the /certificate_status/ prefix, which two auth
+			// mechanisms read as holding a subject: lookupTier's GET arm (which
+			// --allow-public-status can open) and extractPathSubject's
+			// self-match under tierSelfOrAdmin. Neither reaches a PUT today, so
+			// this row is not pinning a live misclassification — it is what
+			// would notice if the route were moved under that prefix and a
+			// later change gave either mechanism a path to it.
 			name: "admin: revoke a specific serial", method: "PUT",
 			path: "/certificate_status_by_serial/DEADBEEF",
 			denied: map[string]bool{

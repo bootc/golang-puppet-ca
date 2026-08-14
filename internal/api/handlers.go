@@ -338,10 +338,15 @@ type PutStatusBySerialBody struct {
 // for the field to select between, and rejecting the rest keeps an unrecognised
 // value from being read as a request to revoke.
 //
-// Admin-only, via lookupTier's default. The path deliberately does not sit
-// under /certificate_status/ — that prefix is matched by both the tier lookup
-// and extractPathSubject, and a serial arriving where they expect a subject
-// would be classified and self-matched as one.
+// Admin-only, via lookupTier's default. The path deliberately does not sit under
+// /certificate_status/, though nothing would misclassify it there today:
+// lookupTier's arm for that prefix is GET-only, so a PUT already falls to the
+// admin-only default, and extractPathSubject is reached only under
+// tierSelfOrAdmin, which no PUT on that prefix takes. The reason is forward
+// defence, not a present bug — two mechanisms read a segment under that prefix
+// as a *subject*, one to grant self-access and one to hand it to
+// --allow-public-status, and a serial has no business sitting where either might
+// later read it as a name.
 func (s *Server) handlePutStatusBySerial(w http.ResponseWriter, r *http.Request) {
 	serial := r.PathValue("serial")
 	slog.Debug("PUT certificate_status_by_serial", "serial", serial, "client", clientCN(r))
@@ -367,16 +372,33 @@ func (s *Server) handlePutStatusBySerial(w http.ResponseWriter, r *http.Request)
 			// value of the guard; this route is admin-only, so disclosing a
 			// subject the caller may already list is not a widening.
 			http.Error(w, err.Error(), http.StatusConflict)
+		case errors.Is(err, ca.ErrSerialStateUnknown):
+			// The guard could not run. Distinct from the case above because the
+			// remedy is different — wait for storage to recover, rather than
+			// decide the live certificate really should go — and answering both
+			// with the same bare status would send an operator to --force for a
+			// reason that was never the live-certificate guard. The CA builds
+			// this message without the underlying storage error for that reason.
+			http.Error(w, err.Error(), http.StatusConflict)
 		case errors.Is(err, ca.ErrForeignStoredCRL):
 			// Same reasoning as the subject-keyed revoke: this is the boundary
 			// an operator hits first, and a bare "conflict" leaves the cause in
 			// the log of whichever replica served the request.
 			http.Error(w, err.Error(), http.StatusConflict)
 		default:
-			// Everything left is a CA-side failure — an inventory read, a CRL
-			// read/sign/write — whose message may name storage paths, so it
-			// stays in the log above rather than the response.
-			http.Error(w, "conflict", http.StatusConflict)
+			// Everything left is a CA-side failure — an inventory read (including
+			// an integrity failure), a CRL read/sign/write, a lock that could not
+			// be taken. Its message may name storage paths, so it stays in the log
+			// above rather than the response.
+			//
+			// 503, not 409: nothing about the request conflicts with the CA's
+			// state, and the two 409s this route does return both document
+			// --force as their way forward. An operator who met a transient
+			// storage fault as "409 conflict", read the published table and
+			// applied the documented remedy would disarm the live-certificate
+			// guard for a reason that was never that guard.
+			http.Error(w, "the CA could not service this request; see the server log",
+				http.StatusServiceUnavailable)
 		}
 		return
 	}
