@@ -18,9 +18,11 @@
 package api_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/x509"
 	"encoding/pem"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -149,6 +151,11 @@ var _ = Describe("PUT certificate_status_by_serial", func() {
 	It("revokes the live certificate when force is set", func() {
 		serial := issue("api-forced")
 
+		var buf bytes.Buffer
+		orig := slog.Default()
+		slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})))
+		defer slog.SetDefault(orig)
+
 		rec := revoke(serial, `{"desired_state":"revoked","force":true}`)
 		Expect(rec.Code).To(Equal(http.StatusNoContent))
 
@@ -156,6 +163,25 @@ var _ = Describe("PUT certificate_status_by_serial", func() {
 		// taken out of circulation, so it asserts which serial went, not merely
 		// that the request was accepted.
 		Expect(crlSerials()).To(ConsistOf(serial))
+
+		// The CA layer records the revocation but cannot see who asked for it,
+		// so the handler attributes the forced case at the default level. Without
+		// this the one act on this route worth reconstructing afterwards has no
+		// caller in the log.
+		Expect(buf.String()).To(ContainSubstring("Forced revocation by serial"))
+		Expect(buf.String()).To(ContainSubstring(serial))
+	})
+
+	It("does not emit the forced-path attribution for an ordinary revocation", func() {
+		serial := superseded("api-unforced-log")
+
+		var buf bytes.Buffer
+		orig := slog.Default()
+		slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})))
+		defer slog.SetDefault(orig)
+
+		Expect(revoke(serial, `{"desired_state":"revoked"}`).Code).To(Equal(http.StatusNoContent))
+		Expect(buf.String()).NotTo(ContainSubstring("Forced revocation by serial"))
 	})
 
 	It("carries the diagnosis, not a bare conflict, when the stored CRL is foreign", func() {
