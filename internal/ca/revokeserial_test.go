@@ -21,7 +21,6 @@ import (
 	"context"
 	"crypto/x509"
 	"encoding/pem"
-	"io/fs"
 	"math/big"
 	"os"
 	"strings"
@@ -204,7 +203,13 @@ var _ = Describe("CA RevokeSerial", func() {
 			Expect(crlSerials()).To(BeEmpty())
 		})
 
-		DescribeTable("accepts any rendering of the same serial",
+		// RevokeSerial canonicalises before it looks anything up, so what these
+		// pin is that the operator's rendering reaches the same certificate.
+		// That the *stored* rendering is equally irrelevant is SubjectForSerial's
+		// contract, and is pinned in internal/storage — a certificate issued by
+		// this CA always lands in the inventory canonically, so nothing here
+		// could tell the difference.
+		DescribeTable("accepts any rendering the operator types",
 			func(render func(string) string) {
 				superseded, _ := orphan("render-node")
 				Expect(myCA.RevokeSerial(ctx, render(superseded), false)).To(Succeed())
@@ -251,48 +256,5 @@ var _ = Describe("CA RevokeSerial", func() {
 			Expect(err).NotTo(HaveOccurred())
 			Expect(revoked).To(BeTrue())
 		})
-	})
-})
-
-var _ = Describe("StorageService SubjectForSerial", func() {
-	var (
-		ctx    = context.Background()
-		tmpDir string
-		store  *storage.StorageService
-	)
-
-	BeforeEach(func() {
-		var err error
-		tmpDir, err = os.MkdirTemp("", "openvox-ca-subjectforserial-test")
-		Expect(err).NotTo(HaveOccurred())
-		DeferCleanup(func() { Expect(os.RemoveAll(tmpDir)).To(Succeed()) })
-
-		store = storage.New(tmpDir)
-		Expect(store.EnsureDirs(ctx)).To(Succeed())
-		Expect(store.TouchInventory(ctx)).To(Succeed())
-		Expect(store.AppendInventory(ctx,
-			"0A 2026-01-01T00:00:00UTC 2027-01-01T00:00:00UTC /CN=first")).To(Succeed())
-		Expect(store.AppendInventory(ctx,
-			"00FF 2026-01-02T00:00:00UTC 2027-01-02T00:00:00UTC /CN=second")).To(Succeed())
-	})
-
-	It("resolves a serial to the subject that holds it", func() {
-		Expect(store.SubjectForSerial(ctx, "0A")).To(Equal("CN=first"))
-	})
-
-	It("matches regardless of case or zero padding on either side", func() {
-		// "00FF" is stored padded; "0a" is queried unpadded and lowercase.
-		Expect(store.SubjectForSerial(ctx, "ff")).To(Equal("CN=second"))
-		Expect(store.SubjectForSerial(ctx, "0000000a")).To(Equal("CN=first"))
-	})
-
-	It("wraps fs.ErrNotExist for a serial no entry carries", func() {
-		_, err := store.SubjectForSerial(ctx, "BEEF")
-		Expect(err).To(MatchError(fs.ErrNotExist))
-	})
-
-	It("rejects a serial that is not hexadecimal", func() {
-		_, err := store.SubjectForSerial(ctx, "nope")
-		Expect(err).To(MatchError(storage.ErrMalformedSerial))
 	})
 })
