@@ -98,10 +98,13 @@ replica still admitting certificates the rest of the fleet has revoked — see
 [watching revocation propagate](#watching-revocation-propagate) below for the
 query, and `puppetca_crl_sync_failures_total` for why it is stuck.
 > **What the failure counter does and does not see.** It counts a CRL that
-> could not be re-signed or written, on any of the four paths that write one
-> (revoke, CRL reissue, background refresh, expired-cert cleanup), and — on the
-> revoke path only — a CRL that could not be read, a malformed serial, or an
-> inventory read that failed while resolving the subject's serial. That last one
+> could not be re-signed or written, *or read*, on any of the four paths that
+> write one (revoke, CRL reissue, background refresh, expired-cert cleanup).
+> The read half is `readStoredCRL`'s doing: it increments before returning, on
+> every path that calls it, which is what makes this counter cover all four
+> rather than only the one that noticed. On the revoke path alone it also counts
+> a malformed serial, or an inventory read that failed while resolving the
+> subject's serial. That last one
 > includes a revocation whose wait for the per-subject lock spent the 60-second
 > budget on the single-node backends, which reach the read with the deadline
 > already gone; see [revocation cost](api.md#certificate-status). So a queued
@@ -125,13 +128,13 @@ query, and `puppetca_crl_sync_failures_total` for why it is stuck.
 > budget produces on PostgreSQL, MySQL, etcd and Redis — the single-node
 > backends take the lock and fail later, which *is* counted, as above), a
 > subject that was simply never issued — though `PUT /certificate_status` also
-> answers its caller `409` in both cases — a
-> CRL that could not be read during reissue, refresh or cleanup, and a
-> malformed serial met by the cleanup job.
+> answers its caller `409` in both cases — and a malformed serial met by the
+> cleanup job.
 >
-> A background refresh that cannot read the CRL is therefore invisible here,
-> and to `puppetca_collector_scrape_success` as well: the exporter drops the
-> CRL gauges and still reports a successful scrape. It does not show up as an
+> A background refresh that cannot read the CRL does move this counter, by the
+> rule above. What it stays invisible to is `puppetca_collector_scrape_success`:
+> the exporter drops the CRL gauges and still reports a successful scrape. It
+> does not show up as an
 > expiring CRL either, because the gauge is *absent* rather than stale — the
 > shipped `PuppetCACRLExpiringSoon` and `PuppetCACRLExpired` rules compare
 > `puppetca_crl_next_update_timestamp_seconds` against `time()` and match
