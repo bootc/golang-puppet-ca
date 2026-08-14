@@ -172,6 +172,25 @@ var _ = Describe("PUT certificate_status_by_serial", func() {
 		Expect(rec.Body.String()).To(ContainSubstring("needs a restart"))
 	})
 
+	It("answers 409, not 503, when the guard could not run", func() {
+		// The stored certificate is unreadable, so the CA cannot show the serial
+		// is not the one in circulation. That is a refusal of the request, not a
+		// CA that cannot service it, and --force is the way past it — which is
+		// exactly what a 503 would tell the operator not to reach for. Without
+		// this, deleting the handler's ErrSerialStateUnknown arm just falls
+		// through to the catch-all and nothing notices.
+		serial := issue("api-unreadable")
+		Expect(os.WriteFile(store.SignedDir()+"/api-unreadable.pem",
+			[]byte("not a certificate"), 0o600)).To(Succeed())
+
+		rec := revoke(serial, `{"desired_state":"revoked"}`)
+		Expect(rec.Code).To(Equal(http.StatusConflict))
+		Expect(rec.Body.String()).To(ContainSubstring("api-unreadable"))
+		Expect(rec.Body.String()).To(ContainSubstring("--force"))
+		Expect(rec.Body.String()).NotTo(ContainSubstring(tmpDir))
+		Expect(crlSerials()).To(BeEmpty())
+	})
+
 	It("answers 503 without leaking storage detail when the CA cannot service the request", func() {
 		// The default arm. It must not be a 409: the two 409s this route returns
 		// both document --force as the way forward, and a transient storage
