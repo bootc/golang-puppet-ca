@@ -29,6 +29,8 @@ import (
 	"math/big"
 	"strings"
 	"time"
+
+	"github.com/voxpupuli/openvox-ca/internal/storage"
 )
 
 // Revoke serialises on the cluster-wide "crl" lock so concurrent revocations
@@ -78,11 +80,140 @@ func (c *CA) revokeLocked(ctx context.Context, subject string) error {
 	}
 
 	if err := c.revokeSerialLocked(ctx, serialStr); err != nil {
-		return err
+		// Name the serial. Clean logs this error and deletes the certificate
+		// anyway, so this is often the last place the serial of a certificate
+		// that is still a valid credential is recorded — and it is what
+		// RevokeSerial needs to retire it once the cause is fixed.
+		return fmt.Errorf("revoking serial %s for subject %s: %w", serialStr, subject, err)
 	}
 
 	slog.Debug("Certificate revoked", "subject", subject, "serial", serialStr)
 	return nil
+}
+
+// ErrSerialUnknown is returned by RevokeSerial for a serial no inventory entry
+// carries. It is deliberately not overridable by force: a serial this CA has no
+// record of issuing cannot be cleaned out of the CRL again, because
+// CleanupExpiredCerts drops CRL entries only for serials it finds in the
+// inventory. Admitting one would grow the CRL — served to every agent — by an
+// entry with no expiry, forever.
+var ErrSerialUnknown = errors.New("serial number not found in inventory")
+
+// ErrSerialIsCurrent is returned by RevokeSerial when the serial is the one on
+// the certificate currently stored for its subject — the live credential. That
+// is the case revoke --certname already covers, so reaching it by serial is far
+// more likely a mistyped digit than an intent, and the consequence (a working
+// node loses its certificate) is the expensive direction to be wrong in.
+var ErrSerialIsCurrent = errors.New("serial belongs to the certificate currently in use")
+
+// RevokeSerial revokes one specific serial number, rather than whatever serial
+// is currently newest for a subject.
+//
+// Revocation is otherwise only ever by subject: Revoke resolves through
+// findSerialForSubject, which answers with the *latest* serial issued for that
+// name. That leaves a superseded certificate unreachable once a replacement has
+// been issued — the state a failed supersession record leaves behind — since
+// asking to revoke the subject now takes the working certificate out of
+// circulation and leaves the superseded one valid.
+//
+// force overrides the ErrSerialIsCurrent guard only. It is the escape hatch for
+// deliberately retiring a live certificate by serial (a compromise where the
+// operator has the serial in hand and not the name); it does not admit a serial
+// this CA never issued.
+//
+// Locking matches Revoke: the cluster-wide "crl" lock, then c.mu, so concurrent
+// revocations on different replicas cannot clobber one another's CRL write.
+func (c *CA) RevokeSerial(ctx context.Context, serial string, force bool) error {
+	normalised, err := storage.NormaliseSerial(serial)
+	if err != nil {
+		return err
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, LockTimeout)
+	defer cancel()
+	return c.Storage.WithLock(ctx, lockNameCRL, func() error {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		return c.revokeSerialCheckedLocked(ctx, normalised, force)
+	})
+}
+
+// revokeSerialCheckedLocked is RevokeSerial's body: resolve the serial to a
+// subject, refuse the live certificate unless forced, then revoke. serial must
+// already be normalised. The cluster CRL lock and c.mu must both be held.
+func (c *CA) revokeSerialCheckedLocked(ctx context.Context, serial string, force bool) error {
+	subject, err := c.Storage.SubjectForSerial(ctx, serial)
+	if err != nil {
+		// Same split as revokeLocked: a serial that was simply never issued is
+		// operator error and is not counted, but an inventory read that *failed*
+		// is a revocation that could not be recorded, which is what
+		// crlUpdateFailures means. On a blob backend that includes an HMAC
+		// verification failure — a tamper signal — since the read goes through
+		// ReadInventory.
+		if errors.Is(err, fs.ErrNotExist) {
+			return fmt.Errorf("%w: %s", ErrSerialUnknown, serial)
+		}
+		c.crlUpdateFailures.Add(1)
+		return fmt.Errorf("looking up serial %s in inventory: %w", serial, err)
+	}
+
+	live, err := c.storedCertSerial(ctx, subject)
+	switch {
+	case err != nil:
+		// Fail closed. The question this answers is "would revoking this serial
+		// take a working credential out of circulation", and an unreadable
+		// certificate is precisely the case where we cannot say it would not.
+		// Deleted material reaches fs.ErrNotExist and is handled below; anything
+		// else is an I/O or parse failure, and treating that as "not live" would
+		// let the guard evaporate exactly when storage is unhealthy.
+		if !errors.Is(err, fs.ErrNotExist) {
+			if !force {
+				return fmt.Errorf("cannot confirm whether serial %s is the certificate currently stored for %s: %w",
+					serial, subject, err)
+			}
+			slog.Warn("Revoking by serial without confirming the stored certificate",
+				"serial", serial, "subject", subject, "error", err)
+		}
+	case live == serial && !force:
+		return fmt.Errorf("%w: %s is the certificate stored for %s; "+
+			"revoke it by name with --certname %s, or pass --force to revoke it by serial anyway",
+			ErrSerialIsCurrent, serial, subject, subject)
+	case live == serial:
+		slog.Warn("Revoking the certificate currently stored for a subject, by serial and forced",
+			"serial", serial, "subject", subject)
+	}
+
+	slog.Debug("Revoking certificate by serial", "serial", serial, "subject", subject, "force", force)
+	if err := c.revokeSerialLocked(ctx, serial); err != nil {
+		return err
+	}
+	slog.Info("Certificate revoked by serial", "serial", serial, "subject", subject)
+	return nil
+}
+
+// storedCertSerial returns the normalised serial of the certificate currently
+// stored for subject, wrapping fs.ErrNotExist when no certificate is stored.
+//
+// It reads the stored certificate rather than asking LatestSerialForSubject
+// because the two answer different questions. The inventory's newest row for a
+// subject is the newest *issuance*; the stored certificate is the credential in
+// circulation. They diverge after a clean (the inventory rows outlive the
+// deleted blob) and while an issuance is only partly complete, and it is the
+// second that this guard is about.
+func (c *CA) storedCertSerial(ctx context.Context, subject string) (string, error) {
+	certPEM, err := c.Storage.GetCert(ctx, subject)
+	if err != nil {
+		return "", err
+	}
+	block, _ := pem.Decode(certPEM)
+	if block == nil {
+		return "", fmt.Errorf("stored certificate for %s is not valid PEM", subject)
+	}
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return "", fmt.Errorf("parsing stored certificate for %s: %w", subject, err)
+	}
+	return serialHexStr(cert.SerialNumber), nil
 }
 
 // revokeSerialLocked adds serialStr to the CRL, unless it is already present.

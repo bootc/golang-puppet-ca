@@ -27,6 +27,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
+	"math/big"
 	"os"
 	"path/filepath"
 	"strings"
@@ -300,6 +301,70 @@ func (s *StorageService) SerialExists(ctx context.Context, serial string) (bool,
 		}
 	}
 	return false, nil
+}
+
+// SubjectForSerial returns the subject of the inventory entry carrying serial,
+// current or historical. Wraps fs.ErrNotExist when no entry carries it, and
+// returns an error for a serial that is not hexadecimal.
+//
+// Unlike SerialExists, the comparison is on the *normalised* value (uppercase
+// hex, no leading zeros) rather than the stored string. SerialExists can insist
+// on an exact match because both sides are written by this CA in one format; a
+// serial reaching this method was typed by an operator, who may reasonably
+// write it in the lowercase, zero-padded or colon-free form some other tool
+// printed. Normalising here is also what lets a modern random serial and a
+// zero-padded sequential one from an older inventory be looked up the same way.
+//
+// The scan is linear in the inventory, on every backend: this answers an
+// operator-initiated single revocation, not a hot path, and doing it through
+// inventoryEntriesLocked keeps it working on backends with no by-serial index
+// without widening the InventoryStore interface for one caller.
+func (s *StorageService) SubjectForSerial(ctx context.Context, serial string) (string, error) {
+	want, err := NormaliseSerial(serial)
+	if err != nil {
+		return "", err
+	}
+
+	s.inventoryMu.RLock()
+	defer s.inventoryMu.RUnlock()
+	entries, err := s.inventoryEntriesLocked(ctx)
+	if err != nil {
+		return "", err
+	}
+	for _, e := range entries {
+		got, err := NormaliseSerial(e.Serial)
+		if err != nil {
+			slog.Warn("SubjectForSerial: skipping malformed serial in inventory",
+				"serial", e.Serial, "subject", e.Subject)
+			continue
+		}
+		if got == want {
+			return e.Subject, nil
+		}
+	}
+	return "", fmt.Errorf("serial %s not found in inventory: %w", want, fs.ErrNotExist)
+}
+
+// ErrMalformedSerial marks input that is not a hexadecimal serial number, so
+// callers taking a serial from an operator can answer "you typed it wrong"
+// rather than reporting a server fault.
+var ErrMalformedSerial = errors.New("malformed serial")
+
+// NormaliseSerial parses a hexadecimal serial number and re-renders it in the
+// canonical form this CA stores and logs: uppercase hex, no leading zeros, and
+// no separators. It rejects anything that is not a non-negative hexadecimal
+// integer, so it doubles as the input validator for operator-supplied serials.
+//
+// It is the storage-layer twin of the ca package's serialHexStr, which
+// canonicalises a *big.Int that has already been parsed; this one starts from
+// text.
+func NormaliseSerial(serial string) (string, error) {
+	trimmed := strings.TrimSpace(serial)
+	n, ok := new(big.Int).SetString(trimmed, 16)
+	if trimmed == "" || !ok || n.Sign() < 0 {
+		return "", fmt.Errorf("%w: %q is not a hexadecimal serial number", ErrMalformedSerial, serial)
+	}
+	return strings.ToUpper(n.Text(16)), nil
 }
 
 // LatestSerialForSubject returns the most recently issued serial for subject.
