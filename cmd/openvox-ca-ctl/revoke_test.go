@@ -18,11 +18,11 @@
 package main
 
 import (
-	"bytes"
 	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -44,8 +44,20 @@ var _ = Describe("revoke subcommand", func() {
 		srv        *httptest.Server
 	)
 
+	var emptyConfig string
+
 	BeforeEach(func() {
 		saveCtlGlobals()
+		// These are the first specs in the package to run PersistentPreRunE for
+		// real (the others stop at --help, which returns before it). Without
+		// both guards the resolver would fall back to the host's own
+		// /etc/puppet-ca/ctl.yaml and to any PUPPET_CA_CTL_* in the
+		// environment — on a machine that actually runs openvox-ca, a
+		// client_cert with no client_key there would fail every spec here for
+		// reasons that have nothing to do with revoke.
+		clearCtlEnv()
+		emptyConfig = writeTempCtlConfig("")
+
 		gotMethod, gotPath, gotRawPath, gotBody = "", "", "", nil
 		status, respBody = http.StatusNoContent, ""
 
@@ -65,7 +77,7 @@ var _ = Describe("revoke subcommand", func() {
 		cmd := newRootCmd()
 		cmd.SetOut(io.Discard)
 		cmd.SetErr(io.Discard)
-		cmd.SetArgs(append([]string{"revoke", "--server-url", srv.URL}, args...))
+		cmd.SetArgs(append([]string{"revoke", "--config", emptyConfig, "--server-url", srv.URL}, args...))
 		return cmd.Execute()
 	}
 
@@ -141,17 +153,43 @@ var _ = Describe("revoke subcommand", func() {
 		})
 	})
 
-	It("reports which certificate it revoked", func() {
-		cmd := newRootCmd()
-		var out bytes.Buffer
-		cmd.SetOut(&out)
-		cmd.SetErr(io.Discard)
-		// The success line goes to stdout via fmt.Printf, so capture the
-		// subject through the request instead of the buffer: what matters is
-		// that a by-serial revoke reports the serial, not a bare name that
-		// would read as if the subject's live certificate had been taken.
-		cmd.SetArgs([]string{"revoke", "--server-url", srv.URL, "--serial", "DEADBEEF"})
-		Expect(cmd.Execute()).To(Succeed())
-		Expect(gotPath).To(HaveSuffix("/DEADBEEF"))
+	// The success line goes to stdout via fmt.Printf, not through cobra's
+	// output writer, so it is captured by swapping os.Stdout for a pipe — the
+	// pattern tls_test.go already uses. Asserting on it is the only way to see
+	// a regression in what the command *says* it did: a by-serial revoke that
+	// reported a bare subject name would read as if the subject's live
+	// certificate had been taken, which is the outcome the guard exists to
+	// prevent, and the request it sent would be identical.
+	Describe("what it reports", func() {
+		captureStdout := func(fn func()) string {
+			r, w, err := os.Pipe()
+			Expect(err).NotTo(HaveOccurred())
+			saved := os.Stdout
+			os.Stdout = w
+			DeferCleanup(func() { os.Stdout = saved })
+
+			fn()
+
+			Expect(w.Close()).To(Succeed())
+			out, err := io.ReadAll(r)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(r.Close()).To(Succeed())
+			return string(out)
+		}
+
+		It("names the serial, not a subject, on the by-serial path", func() {
+			out := captureStdout(func() {
+				Expect(run("--serial", "DEADBEEF")).To(Succeed())
+			})
+			Expect(out).To(ContainSubstring("Revoked serial DEADBEEF"))
+		})
+
+		It("names the subject on the by-name path", func() {
+			out := captureStdout(func() {
+				Expect(run("--certname", "node1")).To(Succeed())
+			})
+			Expect(out).To(ContainSubstring("Revoked node1"))
+			Expect(out).NotTo(ContainSubstring("serial"))
+		})
 	})
 })
