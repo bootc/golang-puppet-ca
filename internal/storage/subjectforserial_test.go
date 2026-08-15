@@ -131,6 +131,33 @@ var _ = Describe("StorageService SubjectForSerial", func() {
 		Entry("explicit plus", "+1A"),
 		Entry("very large", strings.Repeat("F", 256)),
 		Entry("zero", "0"),
+		// strings.TrimSpace is Unicode-aware, so these are accepted and
+		// canonicalised rather than rejected. They matter more than the ASCII
+		// entries above: U+2028 and U+2029 are line breaks to a JSON- or
+		// JS-based log viewer, which is the reading of "log injection" the
+		// CodeQL dismissal has to answer. What these pin is that the separator
+		// is stripped rather than carried into the output.
+		Entry("U+2028 line separator", "\u20280A\u2028"),
+		Entry("U+2029 paragraph separator", "\u20290A\u2029"),
+		Entry("U+0085 next line", "\u00850A\u0085"),
+		Entry("U+00A0 no-break space", "\u00a00A\u00a0"),
+	)
+
+	// The other half of "nothing the caller typed can reach a log line": on the
+	// failure path the value returned must be empty, not the raw input.
+	DescribeTable("returns nothing at all when it rejects",
+		func(in string) {
+			out, err := storage.NormaliseSerial(in)
+			Expect(err).To(MatchError(storage.ErrMalformedSerial))
+			Expect(out).To(BeEmpty(),
+				"a rejected serial must not be handed back to a caller that might log it")
+		},
+		Entry("non-hex letters", "nope"),
+		Entry("interior newline", "0A\nforged"),
+		Entry("interior U+2028", "0A\u2028forged"),
+		Entry("0x prefix", "0x1A"),
+		Entry("negative", "-1A"),
+		Entry("empty", ""),
 	)
 
 	DescribeTable("rejects input that is not a hexadecimal serial",

@@ -351,14 +351,22 @@ func (s *Server) handlePutStatusBySerial(w http.ResponseWriter, r *http.Request)
 	// Normalise before anything is logged or acted on, so every line this
 	// request produces names the same serial the CA acted on. Logging the raw
 	// path value instead put a different string in the handler's lines than in
-	// the CA's for the same operation — "0a" against "A" — which matters because
-	// the serial is what an operator greps for to correlate them (see the clean
-	// recovery in docs/api.md). It also keeps an unvalidated path segment out of
-	// the log entirely, which is defence in depth rather than a fix: slog's Text
-	// and JSON handlers both escape, so a newline could not forge an entry.
+	// the CA's for the same operation — "0a" against "A" — and the serial is
+	// what an operator correlates them by; docs/metrics.md is where that grep is
+	// prescribed.
 	//
-	// RevokeSerial normalises again for callers that do not come through here;
-	// the function is idempotent, so the second pass is free.
+	// It also keeps an unvalidated path segment out of *this handler's* lines.
+	// Not out of the log: the authorisation middleware logs r.URL.Path verbatim
+	// when it denies a request (auth.go, "Request denied by authorisation
+	// middleware"), and on an admin-only route that is exactly the untrusted
+	// caller. So this is tidiness rather than containment — and containment is
+	// not needed, because slog's Text and JSON handlers are the only two this
+	// project installs and both escape, so a newline cannot forge an entry.
+	//
+	// RevokeSerial normalises again. It has no non-HTTP caller today; keeping it
+	// is forward defence for an exported entry point, and it is what produces the
+	// value the CA's own lines and SubjectForSerial use. The function is
+	// idempotent, so the second pass is free.
 	normalised, err := storage.NormaliseSerial(r.PathValue("serial"))
 	if err != nil {
 		slog.Debug("PUT certificate_status_by_serial: malformed serial", "client", clientCN(r))

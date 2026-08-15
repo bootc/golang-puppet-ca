@@ -273,9 +273,12 @@ var _ = Describe("PUT certificate_status_by_serial", func() {
 		rec := revoke(typed, `{"desired_state":"revoked","force":true}`)
 		Expect(rec.Code).To(Equal(http.StatusNoContent))
 
-		Expect(buf.String()).To(ContainSubstring("Forced revocation by serial"))
-		Expect(buf.String()).To(ContainSubstring(serial),
-			"the handler must name the canonical serial, as the CA's own lines do")
+		// Anchored to the handler's own record. A bare ContainSubstring(serial)
+		// would be satisfied by the CA's lines, which log the same canonical
+		// value into this buffer — so it would hold even with the handler's
+		// serial attribute deleted. The Text handler puts msg and attrs on one
+		// line, so the regexp ties the two together.
+		Expect(buf.String()).To(MatchRegexp(`Forced revocation by serial[^\n]*serial=` + serial))
 		Expect(buf.String()).NotTo(ContainSubstring(typed),
 			"the raw path segment must not reach the log")
 	})
@@ -291,6 +294,13 @@ var _ = Describe("PUT certificate_status_by_serial", func() {
 
 		rec := revoke("0A%0Aforged", `{"desired_state":"revoked"}`)
 		Expect(rec.Code).To(Equal(http.StatusBadRequest))
+
+		// Positive anchors first: a bare 400 plus a negative log assertion would
+		// also pass if the request had failed earlier (decodeJSONBody and the
+		// desired_state guard both answer 400 from this handler), or if nothing
+		// had logged at all. These pin that the edge check is what fired.
+		Expect(rec.Body.String()).To(ContainSubstring("hexadecimal"))
+		Expect(buf.String()).To(ContainSubstring("malformed serial"))
 		Expect(buf.String()).NotTo(ContainSubstring("forged"))
 	})
 
