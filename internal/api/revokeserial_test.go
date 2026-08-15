@@ -256,6 +256,44 @@ var _ = Describe("PUT certificate_status_by_serial", func() {
 		Expect(rec.Body.String()).To(ContainSubstring("hexadecimal"))
 	})
 
+	It("logs the serial the CA acted on, not the one the caller typed", func() {
+		// The handler and the CA both log this operation. If the handler logged
+		// the raw path segment they would name different strings for one
+		// request — "0a" against "A" — and the serial is exactly what an
+		// operator greps for to correlate them.
+		serial := issue("api-log-shape")
+
+		var buf bytes.Buffer
+		orig := slog.Default()
+		slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})))
+		defer slog.SetDefault(orig)
+
+		// Typed in a rendering the CA would canonicalise: lowercase and padded.
+		typed := "000" + strings.ToLower(serial)
+		rec := revoke(typed, `{"desired_state":"revoked","force":true}`)
+		Expect(rec.Code).To(Equal(http.StatusNoContent))
+
+		Expect(buf.String()).To(ContainSubstring("Forced revocation by serial"))
+		Expect(buf.String()).To(ContainSubstring(serial),
+			"the handler must name the canonical serial, as the CA's own lines do")
+		Expect(buf.String()).NotTo(ContainSubstring(typed),
+			"the raw path segment must not reach the log")
+	})
+
+	It("rejects a malformed serial at the edge, before the CA is asked", func() {
+		// Validating here is what keeps an unvalidated path segment out of the
+		// log. slog escapes, so this is defence in depth rather than a fix — but
+		// it also means the CA is never called with something it would reject.
+		var buf bytes.Buffer
+		orig := slog.Default()
+		slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+		defer slog.SetDefault(orig)
+
+		rec := revoke("0A%0Aforged", `{"desired_state":"revoked"}`)
+		Expect(rec.Code).To(Equal(http.StatusBadRequest))
+		Expect(buf.String()).NotTo(ContainSubstring("forged"))
+	})
+
 	DescribeTable("rejects any desired_state but revoked",
 		func(body string) {
 			serial := superseded("api-desired-state")

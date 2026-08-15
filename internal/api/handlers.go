@@ -348,8 +348,24 @@ type PutStatusBySerialBody struct {
 // --allow-public-status, and a serial has no business sitting where either might
 // later read it as a name.
 func (s *Server) handlePutStatusBySerial(w http.ResponseWriter, r *http.Request) {
-	serial := r.PathValue("serial")
-	slog.Debug("PUT certificate_status_by_serial", "serial", serial, "client", clientCN(r))
+	// Normalise before anything is logged or acted on, so every line this
+	// request produces names the same serial the CA acted on. Logging the raw
+	// path value instead put a different string in the handler's lines than in
+	// the CA's for the same operation — "0a" against "A" — which matters because
+	// the serial is what an operator greps for to correlate them (see the clean
+	// recovery in docs/api.md). It also keeps an unvalidated path segment out of
+	// the log entirely, which is defence in depth rather than a fix: slog's Text
+	// and JSON handlers both escape, so a newline could not forge an entry.
+	//
+	// RevokeSerial normalises again for callers that do not come through here;
+	// the function is idempotent, so the second pass is free.
+	normalised, err := storage.NormaliseSerial(r.PathValue("serial"))
+	if err != nil {
+		slog.Debug("PUT certificate_status_by_serial: malformed serial", "client", clientCN(r))
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	slog.Debug("PUT certificate_status_by_serial", "serial", normalised, "client", clientCN(r))
 
 	var body PutStatusBySerialBody
 	if !decodeJSONBody(w, r, &body) {
@@ -360,11 +376,9 @@ func (s *Server) handlePutStatusBySerial(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	if err := s.CA.RevokeSerial(r.Context(), serial, body.Force); err != nil {
-		slog.Warn("RevokeSerial failed", "serial", serial, "force", body.Force, "error", err)
+	if err := s.CA.RevokeSerial(r.Context(), normalised, body.Force); err != nil {
+		slog.Warn("RevokeSerial failed", "serial", normalised, "force", body.Force, "error", err)
 		switch {
-		case errors.Is(err, storage.ErrMalformedSerial):
-			http.Error(w, err.Error(), http.StatusBadRequest)
 		case errors.Is(err, ca.ErrSerialUnknown):
 			http.Error(w, err.Error(), http.StatusNotFound)
 		case errors.Is(err, ca.ErrSerialIsCurrent):
@@ -415,7 +429,7 @@ func (s *Server) handlePutStatusBySerial(w http.ResponseWriter, r *http.Request)
 	// this the one act on this route worth reconstructing afterwards has no
 	// attribution at the default level.
 	if body.Force {
-		slog.Info("Forced revocation by serial", "serial", serial, "client", clientCN(r))
+		slog.Info("Forced revocation by serial", "serial", normalised, "client", clientCN(r))
 	}
 
 	if cn := clientCN(r); cn != "" && s.destructiveOps != nil && s.destructiveOps.Record(cn) {

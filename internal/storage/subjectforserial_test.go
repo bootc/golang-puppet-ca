@@ -108,6 +108,31 @@ var _ = Describe("StorageService SubjectForSerial", func() {
 		Expect(err).To(MatchError(fs.ErrNotExist))
 	})
 
+	// The output alphabet is the property two CodeQL log-injection dismissals on
+	// PR #213 rest on: the value CA.RevokeSerial logs is this function's output,
+	// so if it can only ever be [0-9A-F] it cannot carry a newline, a quote or a
+	// separator into a log line. Asserted rather than argued, so the dismissal
+	// is checkable by anyone who doubts it.
+	DescribeTable("emits only uppercase hexadecimal, whatever it is given",
+		func(in string) {
+			out, err := storage.NormaliseSerial(in)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(out).To(MatchRegexp(`^[0-9A-F]+$`),
+				"NormaliseSerial(%q) = %q; anything outside [0-9A-F] could reach a log line", in, out)
+		},
+		Entry("canonical", "0A"),
+		Entry("lowercase", "0a"),
+		Entry("zero-padded", "000000000A"),
+		Entry("leading whitespace", "   0A"),
+		Entry("trailing newline", "0A\n"),
+		Entry("newline both ends", "\n0A\n"),
+		Entry("tab-wrapped", "\t0A\t"),
+		Entry("carriage return", "0A\r"),
+		Entry("explicit plus", "+1A"),
+		Entry("very large", strings.Repeat("F", 256)),
+		Entry("zero", "0"),
+	)
+
 	DescribeTable("rejects input that is not a hexadecimal serial",
 		func(bad string) {
 			_, err := store.SubjectForSerial(ctx, bad)
