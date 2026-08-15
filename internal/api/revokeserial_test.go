@@ -172,8 +172,13 @@ var _ = Describe("PUT certificate_status_by_serial", func() {
 		// so the handler attributes the forced case at the default level. Without
 		// this the one act on this route worth reconstructing afterwards has no
 		// caller in the log.
-		Expect(buf.String()).To(ContainSubstring("Forced revocation by serial"))
-		Expect(buf.String()).To(ContainSubstring(serial))
+		//
+		// Anchored, for the same reason as the sibling spec below: this serial is
+		// a live certificate, so internal/ca writes the identical canonical value
+		// into this buffer twice on its way through (the forced-live Warn and the
+		// success Info). A bare ContainSubstring would hold with the handler's
+		// line deleted outright.
+		Expect(buf.String()).To(MatchRegexp(`Forced revocation by serial[^\n]*serial=` + serial))
 	})
 
 	It("does not emit the forced-path attribution for an ordinary revocation", func() {
@@ -216,9 +221,14 @@ var _ = Describe("PUT certificate_status_by_serial", func() {
 		rec := revoke(serial, `{"desired_state":"revoked"}`)
 		Expect(rec.Code).To(Equal(http.StatusConflict))
 		Expect(rec.Body.String()).To(ContainSubstring("api-unreadable"))
-		Expect(rec.Body.String()).To(ContainSubstring("force set"))
 		Expect(rec.Body.String()).NotTo(ContainSubstring(tmpDir))
 		Expect(crlSerials()).To(BeEmpty())
+
+		// The phrase unique to ErrSerialStateUnknown. Everything above is equally
+		// true of ErrSerialIsCurrent — same subject, same "force set", same 409 —
+		// so without this nothing here separates "the guard could not run" from
+		// "the guard fired", which is the entire reason the two sentinels exist.
+		Expect(rec.Body.String()).To(ContainSubstring("retry once storage is healthy"))
 	})
 
 	It("answers 503 without leaking storage detail when the CA cannot service the request", func() {
@@ -248,6 +258,11 @@ var _ = Describe("PUT certificate_status_by_serial", func() {
 	It("answers 404 for an unknown serial even when force is set", func() {
 		rec := revoke("DEADBEEF", `{"desired_state":"revoked","force":true}`)
 		Expect(rec.Code).To(Equal(http.StatusNotFound))
+		// The body, not just the status: ServeMux answers 404 for any path it has
+		// no pattern for, so a status-only assertion would survive the route
+		// being deleted. This is also the arm most worth pinning — ErrSerialUnknown
+		// is the one refusal force must never override.
+		Expect(rec.Body.String()).To(ContainSubstring("not found in inventory"))
 	})
 
 	It("answers 400 for a serial that is not hexadecimal", func() {
@@ -284,9 +299,14 @@ var _ = Describe("PUT certificate_status_by_serial", func() {
 	})
 
 	It("rejects a malformed serial at the edge, before the CA is asked", func() {
-		// Validating here is what keeps an unvalidated path segment out of the
-		// log. slog escapes, so this is defence in depth rather than a fix — but
-		// it also means the CA is never called with something it would reject.
+		// Validating here keeps the unvalidated segment out of *this handler's*
+		// lines — not out of the log: the authorisation middleware logs
+		// r.URL.Path verbatim when it denies a request, and on an admin-only
+		// route that is exactly the untrusted caller. This spec cannot see that
+		// either way, since api.New leaves AuthConfig nil and the middleware is
+		// inert here. slog escapes regardless, so this is tidiness rather than
+		// containment — but it also means the CA is never called with something
+		// it would reject.
 		var buf bytes.Buffer
 		orig := slog.Default()
 		slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
@@ -331,5 +351,11 @@ var _ = Describe("PUT certificate_status_by_serial", func() {
 
 		rec := revoke(serial, `not json`)
 		Expect(rec.Code).To(Equal(http.StatusBadRequest))
+		// Which of the handler's three 400s fired. Deleting decodeJSONBody's
+		// rejection would leave DesiredState at its zero value, so the
+		// desired_state guard answers 400 anyway and a status-only assertion
+		// would not notice.
+		Expect(rec.Body.String()).To(ContainSubstring("invalid request body"))
+		Expect(crlSerials()).To(BeEmpty())
 	})
 })
