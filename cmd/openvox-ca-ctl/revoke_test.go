@@ -116,6 +116,28 @@ var _ = Describe("revoke subcommand", func() {
 				"/puppet-ca/v1/certificate_status_by_serial/..%2Fcertificate_status%2Fnode1"))
 		})
 
+		DescribeTable("refuses an empty --serial before sending anything",
+			func(value string) {
+				// cobra's flag groups key on Changed, so these satisfy
+				// MarkFlagsOneRequired and do not trip the exclusivity check.
+				// Branching on the value rather than on Changed sent them down
+				// the by-name path — a by-serial invocation producing a by-name
+				// request, with --force silently dropped.
+				Expect(run("--serial", value)).To(MatchError(ContainSubstring("--serial requires")))
+				Expect(gotMethod).To(BeEmpty(), "no request should be sent")
+			},
+			Entry("empty", ""),
+			Entry("whitespace", "   "),
+		)
+
+		It("does not fall through to the by-name route when --serial is empty", func() {
+			// The specific misrouting: PUT /certificate_status/ with an empty
+			// certname, which is a different handler entirely.
+			_ = run("--serial", "", "--force")
+			Expect(gotPath).NotTo(Equal("/puppet-ca/v1/certificate_status/"))
+			Expect(gotPath).To(BeEmpty())
+		})
+
 		It("surfaces the server's refusal, including its remedy", func() {
 			status, respBody = http.StatusConflict,
 				"serial belongs to the certificate currently in use: revoke it by name with --certname node1\n"

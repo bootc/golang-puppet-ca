@@ -364,7 +364,18 @@ what you meant.`,
 				body    []byte
 				subject string
 			)
-			if serial != "" {
+			// Keyed on whether the flag was given, not on whether its value is
+			// non-empty. cobra's flag-group checks key on Changed, so
+			// `--serial ""` satisfies them; branching on the value instead sent
+			// it down the by-NAME path as PUT /certificate_status/ with an empty
+			// certname — silently addressing a different route, which is the one
+			// thing the escaping below exists to prevent — and dropped --force
+			// on the way. Refused here so the operator is told, rather than
+			// having the server answer 404 for a path with no serial in it.
+			if cmd.Flags().Changed("serial") {
+				if strings.TrimSpace(serial) == "" {
+					return fmt.Errorf("--serial requires a serial number")
+				}
 				// Escaped because the value is operator-typed: an embedded "/"
 				// would otherwise silently address a different route rather
 				// than reaching the server's own serial validation.

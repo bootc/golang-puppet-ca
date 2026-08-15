@@ -352,8 +352,9 @@ func (s *Server) handlePutStatusBySerial(w http.ResponseWriter, r *http.Request)
 	// request produces names the same serial the CA acted on. Logging the raw
 	// path value instead put a different string in the handler's lines than in
 	// the CA's for the same operation — "0a" against "A" — and the serial is
-	// what an operator correlates them by; docs/metrics.md is where that grep is
-	// prescribed.
+	// what an operator correlates them by. (docs/metrics.md sends them to the
+	// log to read a serial out of a warning; it greps by message prefix, not by
+	// serial, so it is where the serial matters, not a citation for the grep.)
 	//
 	// It also keeps an unvalidated path segment out of *this handler's* lines.
 	// Not out of the log: the authorisation middleware logs r.URL.Path verbatim

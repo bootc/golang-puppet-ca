@@ -224,10 +224,12 @@ var _ = Describe("PUT certificate_status_by_serial", func() {
 		Expect(rec.Body.String()).NotTo(ContainSubstring(tmpDir))
 		Expect(crlSerials()).To(BeEmpty())
 
-		// The phrase unique to ErrSerialStateUnknown. Everything above is equally
-		// true of ErrSerialIsCurrent — same subject, same "force set", same 409 —
-		// so without this nothing here separates "the guard could not run" from
-		// "the guard fired", which is the entire reason the two sentinels exist.
+		// The phrase unique to ErrSerialStateUnknown. ErrSerialIsCurrent would
+		// satisfy the assertions above too — same subject, same 409 — and it
+		// also names "force set", which is why asserting that phrase
+		// discriminated nothing and is no longer asserted here. Without this one
+		// nothing separates "the guard could not run" from "the guard fired",
+		// which is the entire reason the two sentinels exist.
 		Expect(rec.Body.String()).To(ContainSubstring("retry once storage is healthy"))
 	})
 
@@ -330,6 +332,11 @@ var _ = Describe("PUT certificate_status_by_serial", func() {
 
 			rec := revoke(serial, body)
 			Expect(rec.Code).To(Equal(http.StatusBadRequest))
+			// Which of the handler's three 400s fired. A regression in
+			// NormaliseSerial would answer 400 at the edge before this guard was
+			// reached, leaving the CRL empty and every Entry green while the
+			// spec reported on a branch that never ran.
+			Expect(rec.Body.String()).To(ContainSubstring("desired_state must be 'revoked'"))
 
 			// Nothing was revoked: an unrecognised desired_state must never be
 			// read as a request to revoke.

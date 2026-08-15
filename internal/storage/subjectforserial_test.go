@@ -64,10 +64,25 @@ var _ = Describe("StorageService SubjectForSerial", func() {
 			"1b 2026-01-03T00:00:00UTC 2027-01-03T00:00:00UTC /CN=third")).To(Succeed())
 	})
 
-	It("skips an unparseable row and keeps scanning", func() {
+	It("skips an unparseable row and keeps scanning, and still reports the skips", func() {
 		// If the skip were an abort, one bad row would make every serial after
 		// it unresolvable — and so unrevokable — with nothing to say why.
+		//
+		// The warning is asserted on the SUCCESS path too, not just the
+		// not-found one. The emission is deferred precisely so every return
+		// reports the same way; moving it back inline to the not-found return
+		// would leave the other spec green while an operator whose migrated
+		// inventory carries bad rows got no warning on the revocation that
+		// actually succeeded — the case where knowing matters most.
+		var buf bytes.Buffer
+		orig := slog.Default()
+		slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+		defer slog.SetDefault(orig)
+
 		Expect(store.SubjectForSerial(ctx, "1B")).To(Equal("CN=third"))
+
+		Expect(strings.Count(buf.String(), "unparseable serials")).To(Equal(1))
+		Expect(buf.String()).To(ContainSubstring("count=2"))
 	})
 
 	It("reports the unparseable rows once, with a count", func() {
