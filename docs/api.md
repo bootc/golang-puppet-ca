@@ -335,9 +335,10 @@ certificate goes away:
   server's `Clean: revoke failed`, `Clean: delete cert failed` and
   `Clean: delete CSR failed` warnings are the complete signal;
   `puppetca_crl_update_failures_total` covers most of the first — a CRL that
-  could not be read, signed or written all count — but not a revocation that
-  never reached the CRL (a lock it could not take, or a subject whose serial the
-  inventory could not resolve), and not a failed delete at all.
+  could not be read, signed or written all count, as does an inventory read that
+  *failed* while resolving the subject's serial — but not a revocation refused
+  at a cross-node lock acquisition, which never reaches the CRL work, not a
+  subject that was simply never issued, and not a failed delete at all.
 
 Otherwise the next CSR is accepted: with autosign enabled it is signed at once
 and the agent is back with a fresh, unrevoked certificate; with autosign off it

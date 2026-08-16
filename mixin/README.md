@@ -17,7 +17,7 @@ alerting rules for the openvox-ca exporter. It alerts on:
   could not record, or a CRL it could not re-sign, write or read), which can
   leave revoked or superseded certificates still valid. On filesystem and
   SQLite a revocation that merely queued too long for its subject's lock is
-  counted here too, so rule that out before assuming storage trouble — see
+  counted here too, so the alert distinguishes the two by log line — see
   [metrics](../docs/metrics.md).
 - **CRL propagation** — a replica that cannot reload the stored CRL, or that
   keeps enforcing one behind it. On a shared backend each replica decides

@@ -635,9 +635,12 @@ var _ = Describe("CA Revocation", func() {
 		// any CRL work. Only the counted half was reachable from this suite --
 		// the filesystem backend implements no Locker -- so the uncounted half
 		// was asserted in three documents and nowhere in the tests.
-		lockDir := GinkgoT().TempDir()
-		backend := &refusingLocker{Backend: storage.NewFilesystemBackend(lockDir)}
-		st := storage.NewWithBackend(backend, lockDir)
+		dir := GinkgoT().TempDir()
+		backend := &refusingLocker{
+			Backend: storage.NewFilesystemBackend(dir),
+			err:     context.DeadlineExceeded,
+		}
+		st := storage.NewWithBackend(backend, filepath.Join(dir, "private"))
 
 		Expect(st.EnsureDirs(context.Background())).To(Succeed())
 		Expect(st.SaveCAKey(context.Background(), cachedKeyPEM)).To(Succeed())
@@ -659,11 +662,64 @@ var _ = Describe("CA Revocation", func() {
 
 		backend.refuse.Store(true)
 
+		// Naming the lock matters: without it the spec passes just as well
+		// against the pre-branch Revoke, which took only the CRL lock. The
+		// subject lock is the acquisition this change added, and it is the
+		// outer one, so it is the one that must refuse first.
 		Expect(remoteCA.Revoke(context.Background(), "crossnode-node")).
-			To(MatchError(context.DeadlineExceeded),
-				"a rejected acquisition must surface rather than be swallowed")
+			To(SatisfyAll(
+				MatchError(context.DeadlineExceeded),
+				MatchError(ContainSubstring(`subject:crossnode-node`)),
+			), "the refusal must come from the subject lock this change added")
+		Expect(remoteCA.IsRevoked(context.Background(), "crossnode-node")).To(BeFalse(),
+			"a refused acquisition must leave the CRL untouched")
 		Expect(remoteCA.CRLUpdateFailures()).To(BeNumerically("==", 0),
 			"a revocation refused at the lock never reached the CRL, so the alert must stay quiet")
+	})
+
+	It("counts a queued revocation on a backend without distributed locking", func() {
+		// The SQLite arm of the same split. The alert text names filesystem and
+		// SQLite together, but they reach the counted failure by different
+		// routes: the filesystem backend implements no Locker at all (the
+		// sibling spec above), whereas SQLite answers
+		// ErrDistributedLockingUnsupported and WithLock falls through to the
+		// process-local mutex. Both then enter revokeLocked carrying the spent
+		// deadline and fail at the first storage read, which is counted.
+		dir := GinkgoT().TempDir()
+		backend := &refusingLocker{
+			Backend: storage.NewFilesystemBackend(dir),
+			err:     storage.ErrDistributedLockingUnsupported,
+		}
+		st := storage.NewWithBackend(backend, filepath.Join(dir, "private"))
+
+		Expect(st.EnsureDirs(context.Background())).To(Succeed())
+		Expect(st.SaveCAKey(context.Background(), cachedKeyPEM)).To(Succeed())
+		Expect(st.SaveCACert(context.Background(), cachedCrtPEM)).To(Succeed())
+		Expect(st.UpdateCRL(context.Background(), cachedCrlPEM)).To(Succeed())
+		Expect(st.WriteSerial(context.Background(), "0001")).To(Succeed())
+		Expect(st.TouchInventory(context.Background())).To(Succeed())
+
+		sqliteish := ca.New(st, ca.AutosignConfig{Mode: "off"}, "puppet.test")
+		Expect(sqliteish.Init(context.Background())).To(Succeed())
+
+		csrPEM, err := testutil.GenerateCSR("unsupported-node")
+		Expect(err).NotTo(HaveOccurred())
+		_, err = sqliteish.SaveRequest(context.Background(), "unsupported-node", csrPEM)
+		Expect(err).NotTo(HaveOccurred())
+		_, err = sqliteish.Sign(context.Background(), "unsupported-node")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(sqliteish.CRLUpdateFailures()).To(BeNumerically("==", 0))
+
+		backend.refuse.Store(true)
+
+		expired, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+		defer cancel()
+
+		Expect(sqliteish.Revoke(expired, "unsupported-node")).To(MatchError(context.DeadlineExceeded),
+			"the fall-through grants the lock, so the deadline is not noticed until the read")
+		Expect(sqliteish.IsRevoked(context.Background(), "unsupported-node")).To(BeFalse())
+		Expect(sqliteish.CRLUpdateFailures()).To(BeNumerically("==", 1),
+			"the alert text names SQLite alongside filesystem, so this arm must count too")
 	})
 
 	It("IsRevokedSerial returns true for a revoked certificate's serial", func() {
@@ -1982,18 +2038,22 @@ var _ = Describe("Bootstrap public key write", func() {
 // is not without this.
 //
 // While refuse is false every acquisition is granted, so the CA can be
-// bootstrapped and a certificate signed. Flipping it reproduces the state a
-// spent deadline leaves a real Locker in: AcquireLock returns
-// context.DeadlineExceeded, WithLock wraps it and returns without running the
-// closure, and nothing under the lock happens at all.
+// bootstrapped and a certificate signed. Flipping it makes AcquireLock answer
+// with err, which is how the two backend shapes the docs distinguish are
+// reproduced without either backend: context.DeadlineExceeded stands in for a
+// cross-node acquisition rejecting a spent deadline, so WithLock wraps it and
+// returns without running the closure at all, while
+// ErrDistributedLockingUnsupported is what SQLite answers, sending WithLock
+// down its fall-through to the process-local mutex and into the closure.
 type refusingLocker struct {
 	storage.Backend
 	refuse atomic.Bool
+	err    error
 }
 
 func (b *refusingLocker) AcquireLock(_ context.Context, _ string) (storage.Unlocker, error) {
 	if b.refuse.Load() {
-		return nil, context.DeadlineExceeded
+		return nil, b.err
 	}
 	return grantedLock{}, nil
 }
