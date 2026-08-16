@@ -133,7 +133,12 @@ var _ = Describe("revoke subcommand", func() {
 		It("does not fall through to the by-name route when --serial is empty", func() {
 			// The specific misrouting: PUT /certificate_status/ with an empty
 			// certname, which is a different handler entirely.
-			_ = run("--serial", "", "--force")
+			//
+			// The error is asserted, not discarded: without it, anything that
+			// failed before route selection — a renamed --force, a new flag-group
+			// rule, stricter client construction — would satisfy the gotPath
+			// assertions while the guard itself was gone.
+			Expect(run("--serial", "", "--force")).To(MatchError(ContainSubstring("--serial requires")))
 			Expect(gotPath).NotTo(Equal("/puppet-ca/v1/certificate_status/"))
 			Expect(gotPath).To(BeEmpty())
 		})
