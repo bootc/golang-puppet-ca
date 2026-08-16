@@ -58,6 +58,25 @@ the relevant flags (or mount a config file and set `--config`). See
 [configuring the server](configuration.md) for the full reference, and the
 [HTTP API reference](api.md) for the endpoints agents use.
 
+### Runtime user
+
+Both variants run as the non-root user `puppet`, uid/gid **1000**, declared
+numerically so that a host which cannot read the image's `/etc/passwd` can
+still tell who the process runs as. Under Kubernetes, a container whose image
+only names its user fails to start when the pod sets `runAsNonRoot` without
+also setting `runAsUser` — the kubelet cannot verify that a name is non-root,
+and the container stops at `CreateContainerConfigError`.
+
+A named volume like the one above is created with the right ownership
+automatically. A bind mount is not, so `chown 1000:1000` the host directory
+before starting the container, or the CA cannot write its state. Under
+rootless Podman the container's uid 1000 maps to a subordinate uid on the
+host, so a plain `chown` leaves the directory unwritable — use `podman
+unshare chown 1000:1000 <dir>`, or mount with the `:U` suffix. Under
+Kubernetes, `fsGroup: 1000` on the pod covers PersistentVolumeClaims and
+`emptyDir`, but the kubelet does not apply it to a `hostPath`, which needs
+the same treatment as a bind mount.
+
 ### Compose
 
 The [`compose.yml`](../compose.yml) at the repository root is the equivalent

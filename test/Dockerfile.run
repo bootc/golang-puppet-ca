@@ -14,15 +14,25 @@ FROM quay.io/centos/centos:stream10
 
 # curl: health checks and agent CSR submission
 # openssl: CSR generation and cert verification in integration tests
+#
+# uid/gid 1000 pinned to match the published images (see Dockerfile): `USER`
+# has to be numeric, and the local runtime image should present the same
+# identity as the one it stands in for.
+# The assertion below must be re-verified by hand when edited -- CI only ever
+# takes its passing branch. See docs/development/testing.md, "Container
+# identity guards".
 RUN dnf install -y curl openssl && dnf clean all && \
-    useradd -m puppet && \
+    groupadd -g 1000 puppet && \
+    useradd -m -u 1000 -g 1000 puppet && \
+    { [ "$(id -u puppet):$(id -g puppet)" = "1000:1000" ] || \
+        { echo "puppet is $(id -u puppet):$(id -g puppet), not 1000:1000; USER below must match" >&2; exit 1; }; } && \
     mkdir -p /etc/puppetlabs/puppet/ssl/ca /etc/puppet-ca /data && \
     chown -R puppet:puppet /etc/puppetlabs/puppet /etc/puppet-ca /data
 
 COPY bin/openvox-ca     /usr/local/bin/openvox-ca
 COPY bin/openvox-ca-ctl /usr/local/bin/openvox-ca-ctl
 
-USER puppet
+USER 1000:1000
 EXPOSE 8140
 
 # NOTE: autosign is OFF by default. Set --autosign-config=true only in

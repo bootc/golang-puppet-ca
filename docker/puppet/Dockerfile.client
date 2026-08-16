@@ -17,7 +17,19 @@ ENV PATH=/opt/puppetlabs/puppet/bin:${PATH}
 #
 # The puppet agent needs write access to its config, cache, log, and run
 # directories at runtime (SSL bootstrap, catalog cache, reports, etc.).
-RUN useradd -r -m -d /home/puppet-agent -s /sbin/nologin puppet-agent && \
+# The uid/gid is pinned so `USER` below can be numeric: the host has no way to
+# resolve a name out of the image's /etc/passwd.  1000 rather than a system uid
+# -- the system range is already crowded here (openvox-agent's own `puppet` at
+# 52, chrony at 998, systemd-oom at 999), so `useradd -r` lands on whatever
+# happens to be free that day, and it matches the uid the openvox-ca images
+# use.  groupadd/useradd fail the build if anything else has taken it.
+# The assertion below must be re-verified by hand when edited -- CI only ever
+# takes its passing branch. See docs/development/testing.md, "Container
+# identity guards".
+RUN groupadd -g 1000 puppet-agent && \
+    useradd -u 1000 -g puppet-agent -m -d /home/puppet-agent -s /sbin/nologin puppet-agent && \
+    { [ "$(id -u puppet-agent):$(id -g puppet-agent)" = "1000:1000" ] || \
+        { echo "puppet-agent is $(id -u puppet-agent):$(id -g puppet-agent), not 1000:1000; USER below must match" >&2; exit 1; }; } && \
     mkdir -p \
         /etc/puppetlabs/puppet/ssl \
         /opt/puppetlabs/puppet/cache \
@@ -30,6 +42,6 @@ RUN useradd -r -m -d /home/puppet-agent -s /sbin/nologin puppet-agent && \
         /opt/puppetlabs/puppet/public \
         /var/log/puppetlabs/puppet \
         /var/run/puppetlabs
-USER puppet-agent
+USER 1000:1000
 
 ENTRYPOINT ["tail", "-f", "/dev/null"]

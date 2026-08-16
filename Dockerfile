@@ -19,15 +19,31 @@ FROM quay.io/centos/centos:stream10
 
 # curl: health checks and agent CSR submission
 # openssl: CSR generation and cert verification in integration tests
+#
+# The puppet uid/gid is pinned to 1000 rather than left to useradd's first-free
+# allocation: `USER` below has to be numeric so a host that cannot read the
+# image's /etc/passwd -- Kubernetes checking `runAsNonRoot`, or an operator
+# matching ownership on a bind mount -- can still tell who the process runs as.
+# 1000 is what useradd picks today, so the runtime identity is unchanged.
+# Both assertions below must be re-verified by hand when edited -- CI only ever
+# takes their passing branch. See docs/development/testing.md, "Container
+# identity guards", for the mutations and the messages they should produce.
 RUN dnf install -y curl openssl && dnf clean all && \
-    useradd -m puppet && \
+    groupadd -g 1000 puppet && \
+    useradd -m -u 1000 -g 1000 puppet && \
+    { [ "$(id -u puppet):$(id -g puppet)" = "1000:1000" ] || \
+        { echo "puppet is $(id -u puppet):$(id -g puppet), not 1000:1000; USER below must match" >&2; exit 1; }; } && \
     mkdir -p /etc/puppetlabs/puppet/ssl/ca /data && \
-    chown -R puppet:puppet /etc/puppetlabs/puppet /data
+    chown -R puppet:puppet /etc/puppetlabs/puppet /data && \
+    for d in /etc/puppetlabs/puppet/ssl/ca /data; do \
+        [ "$(stat -c %u:%g "$d")" = "1000:1000" ] || \
+            { echo "$d is owned by $(stat -c %u:%g "$d"), not 1000:1000; the CA could not write there" >&2; exit 1; }; \
+    done
 
 COPY --from=builder /openvox-ca     /usr/local/bin/openvox-ca
 COPY --from=builder /openvox-ca-ctl /usr/local/bin/openvox-ca-ctl
 
-USER puppet
+USER 1000:1000
 EXPOSE 8140
 
 # --cadir             : where CA state is stored
