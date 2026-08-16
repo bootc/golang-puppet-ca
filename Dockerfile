@@ -31,7 +31,9 @@ RUN dnf install -y curl openssl && dnf clean all && \
     { [ "$(id -u puppet):$(id -g puppet)" = "1000:1000" ] || \
         { echo "puppet is $(id -u puppet):$(id -g puppet), not 1000:1000; USER below must match" >&2; exit 1; }; } && \
     mkdir -p /etc/puppetlabs/puppet/ssl/ca /data && \
-    chown -R puppet:puppet /etc/puppetlabs/puppet /data
+    chown -R puppet:puppet /etc/puppetlabs/puppet /data && \
+    { [ "$(stat -c %u:%g /data)" = "1000:1000" ] || \
+        { echo "/data is owned by $(stat -c %u:%g /data), not 1000:1000; the CA could not write its state" >&2; exit 1; }; }
 
 COPY --from=builder /openvox-ca     /usr/local/bin/openvox-ca
 COPY --from=builder /openvox-ca-ctl /usr/local/bin/openvox-ca-ctl

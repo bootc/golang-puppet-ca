@@ -113,6 +113,42 @@ behind a Go build tag and driven by a `mage` target:
 See [storage backends](../storage-backends.md) and
 [`AGENTS.md`](../../AGENTS.md) for the build tags and per-backend detail.
 
+## Container identity guards
+
+Every image asserts its own uid/gid at build time, because `USER` is numeric
+and cannot reference the account it is supposed to name — the two are separate
+literals, and nothing but these assertions stops them drifting apart. CI only
+ever exercises the passing branch, so **whenever you edit one of these
+assertions, re-verify by hand that it still fails.** A guard that has stopped
+failing is indistinguishable from one that passes.
+
+Each mutation below should abort the build naming the drift. Apply it to a
+copy, never to the tracked file:
+
+```bash
+# Pinned uid (Dockerfile, Dockerfile.alpine, test/Dockerfile.run,
+# docker/puppet/Dockerfile.client) -- expect "puppet is 1001:1000, not 1000:1000"
+sed 's/-u 1000/-u 1001/' Dockerfile > /tmp/mut && docker build -f /tmp/mut .
+
+# Ownership of the CA state directory (Dockerfile, Dockerfile.alpine)
+# -- expect "/data is owned by 0:0, not 1000:1000"
+sed 's/chown -R puppet:puppet \/etc\/puppetlabs\/puppet \/data/chown -R puppet:puppet \/etc\/puppetlabs\/puppet/' \
+    Dockerfile > /tmp/mut && docker build -f /tmp/mut .
+
+# Package-assigned identity (docker/puppet/Dockerfile). This one is inherited
+# rather than chosen, so mutate the image, not the expectation: flipping
+# `expected` only proves the comparison runs, not that `id` observes anything.
+# -- expect "is 53:53:53, not 52:52:52" and "is 52:52:52 10, not 52:52:52"
+sed 's/^RUN expected=/RUN usermod -u 53 puppet \&\& groupmod -g 53 puppet \&\& \\\n    expected=/' \
+    docker/puppet/Dockerfile > /tmp/mut && docker build -f /tmp/mut docker/puppet
+sed 's/^RUN expected=/RUN usermod -aG wheel puppet \&\& \\\n    expected=/' \
+    docker/puppet/Dockerfile > /tmp/mut && docker build -f /tmp/mut docker/puppet
+```
+
+These are deliberately not a CI job: each mutation is a full image build, and
+the failure they guard against is introduced by editing the assertion itself —
+which is exactly when this procedure is required.
+
 ## Diagnosing a failed compose suite
 
 When `test:puppet`, `test:puppetFIPS` or `test:backendsRedis` fails, the
