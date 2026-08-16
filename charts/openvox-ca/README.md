@@ -141,7 +141,7 @@ Helm 3.21 or 4.2; both are exercised in CI.
 | `metrics.serviceMonitor.path` | `/metrics` | |
 | `metrics.serviceMonitor.scheme` | `http` | |
 | `metrics.serviceMonitor.honorLabels` | `false` | |
-| `metrics.serviceMonitor.jobLabel` | `app.kubernetes.io/name` | Which Service label supplies the Prometheus `job` value. Pinned to the chart name so the shipped mixin's `job="openvox-ca"` selector matches on any release name; `""` restores the Operator's Service-name default. `nameOverride` changes this label too, so an install using it must match `puppetCASelector` to the override |
+| `metrics.serviceMonitor.jobLabel` | `""` | Which Service label supplies the Prometheus `job` value. Empty leaves it to the Operator, which uses the Service name, keeping `job` distinct per release. Do not point it at `app.kubernetes.io/name`: that is the chart name, so concurrent releases would collide. Match the mixin's `puppetCASelector` to your deployment instead |
 | `metrics.serviceMonitor.targetLabels` | `[]` | |
 | `metrics.serviceMonitor.relabelings` / `.metricRelabelings` | `[]` | |
 

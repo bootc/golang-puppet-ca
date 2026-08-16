@@ -262,14 +262,24 @@ metrics:
     path: /metrics
     scheme: http
     honorLabels: false
-    # Which Service *label* supplies the Prometheus `job` value. Defaulted, not
-    # empty: with no jobLabel the Prometheus Operator uses the Service name,
-    # which is release-derived (my-ca-openvox-ca), while the alerting mixin
-    # ships a fixed `job="openvox-ca"` selector — so on any release not named
-    # "openvox-ca" the shipped alerts would select nothing and look healthy
-    # doing it. app.kubernetes.io/name carries the chart name, which is what the
-    # mixin expects. Set to "" to restore the Operator's Service-name default.
-    jobLabel: app.kubernetes.io/name
+    # Which Service *label* supplies the Prometheus `job` value. Empty leaves it
+    # to the Prometheus Operator, which uses the Service name — distinct per
+    # release, which is what you want: two releases of this chart running side
+    # by side (an old CA and its replacement, during a fleet migration) must be
+    # tellable apart by `job`, or an alert cannot say which one is unhealthy.
+    #
+    # Do not point this at app.kubernetes.io/name. That label carries the
+    # *chart* name, identical across every release, so two concurrent releases
+    # would report the same job and the older one's alerts would silently start
+    # selecting the wrong pods.
+    #
+    # The consequence to know about: the alerting mixin ships a fixed
+    # `job="openvox-ca"` selector, which matches only a release whose Service is
+    # named openvox-ca. There is no default that satisfies both a fixed selector
+    # and per-release distinctness — they are contradictory — so the selector is
+    # the end that moves: set the mixin's puppetCASelector to match your
+    # deployment. See docs/helm-chart.md, "Monitoring".
+    jobLabel: ""
     targetLabels: []
     relabelings: []
     metricRelabelings: []
@@ -361,7 +371,8 @@ envFrom: []
 # fleet: it holds a serial index and a cache of pre-signed OCSP responses, one
 # entry per known certificate, pruned only on revocation or expired-cert
 # cleanup. Raise the limit before a growing inventory reaches it — crossing it
-# is an OOMKill, and with the default `strategy: Recreate` that is CA downtime.
+# is an OOMKill, and with the Recreate strategy a persistence-enabled
+# install derives, that is CA downtime.
 # Setting GOMEMLIMIT (via `env`) to just under the limit turns the cliff into GC
 # pressure. With `persistence.enabled: false` and the default `medium: Memory`,
 # the cadir tmpfs counts against this limit too.

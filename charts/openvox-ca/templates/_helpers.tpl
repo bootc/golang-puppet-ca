@@ -246,9 +246,13 @@ true
 {{/*
   A valueFrom reference has no readable value, so its mere presence is the
   signal: the operator is feeding the auth method in from a Secret or ConfigMap
-  and the chart cannot see which method it names.
+  and the chart cannot see which method it names. Tested on valueFrom's
+  presence, so neither an explicit `value: ""` nor an entry naming no source at
+  all is mistaken for one — the server ignores an empty variable either way,
+  which is the precedence stated above. tlsConfigured's scan discriminates
+  identically.
 */}}
-{{- if and (eq .name "PUPPET_CA_OPENBAO_AUTH_METHOD") (not .value) }}{{ $authMethod = "kubernetes" }}{{ end -}}
+{{- if and (eq .name "PUPPET_CA_OPENBAO_AUTH_METHOD") (hasKey . "valueFrom") }}{{ $authMethod = "kubernetes" }}{{ end -}}
 {{- end -}}
 {{/*
   extraArgs is appended to the argument list the chart builds, so unlike `args`
@@ -471,17 +475,22 @@ true
 {{- end -}}
 {{/*
   Same two branches needsAPIAccess uses, for the same reason: a readable
-  non-empty value counts, a valueFrom reference counts because the chart cannot
-  read it and mounting probes against the wrong scheme is the fail-open
-  direction, and an explicit empty value counts for nothing because the server
-  ignores it. Marking an explicit "" as set was the mirror of the env defect
-  above: it left the probes on HTTPS against a server serving cleartext.
+  non-empty value counts, and a valueFrom reference counts because the chart
+  cannot read it and assuming TLS is the fail-open direction. Everything else
+  counts for nothing, because the server ignores an empty variable.
+
+  Tested on valueFrom's presence rather than value's absence. An entry naming
+  neither — `extraEnv: [{name: PUPPET_CA_TLS_CERT}]` — also has no value key,
+  but Kubernetes renders it as the empty string, which the server discards; an
+  absence test counted it as configured and so suppressed the TLS precondition,
+  the plaintext NOTES warning and the HTTP probe scheme for a pod with no
+  certificate at all.
 */}}
 {{- range .Values.extraEnv -}}
 {{- if and (eq .name "PUPPET_CA_TLS_CERT") .value }}{{ $cert = .value }}{{ end -}}
 {{- if and (eq .name "PUPPET_CA_TLS_KEY") .value }}{{ $key = .value }}{{ end -}}
-{{- if and (eq .name "PUPPET_CA_TLS_CERT") (not (hasKey . "value")) }}{{ $cert = "set" }}{{ end -}}
-{{- if and (eq .name "PUPPET_CA_TLS_KEY") (not (hasKey . "value")) }}{{ $key = "set" }}{{ end -}}
+{{- if and (eq .name "PUPPET_CA_TLS_CERT") (hasKey . "valueFrom") }}{{ $cert = "set" }}{{ end -}}
+{{- if and (eq .name "PUPPET_CA_TLS_KEY") (hasKey . "valueFrom") }}{{ $key = "set" }}{{ end -}}
 {{- end -}}
 {{- if and $cert $key -}}
 true

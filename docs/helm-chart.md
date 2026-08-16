@@ -449,11 +449,18 @@ networkPolicy:
 ```
 
 A [Jsonnet alerting mixin](../mixin/) ships with the project for the expiry and
-export-failure alerts. Its selector is a fixed `job="openvox-ca"`, which is why
-the chart pins `metrics.serviceMonitor.jobLabel` to `app.kubernetes.io/name`
-rather than letting the Prometheus Operator derive `job` from the
-release-derived Service name. If you set `nameOverride`, that label carries the
-override instead, and the mixin's `puppetCASelector` has to be set to match.
+export-failure alerts. Its selector is a fixed `job="openvox-ca"`, and the
+chart leaves `metrics.serviceMonitor.jobLabel` empty so the Prometheus Operator
+derives `job` from the Service name.
+
+Those two only line up when the Service is named `openvox-ca`. **Set the
+mixin's `puppetCASelector` to match your deployment** rather than reaching for
+`jobLabel` to force the job name: `job` has to stay distinct per release,
+because two releases of this chart may run side by side while a fleet migrates
+from one CA to another, and an alert that cannot say which one is failing is
+worth little. Pointing `jobLabel` at `app.kubernetes.io/name` in particular
+would give every release of the chart the same job, since that label carries the
+chart name rather than the release name.
 
 ## Network policy
 
@@ -670,25 +677,24 @@ openvox-ca:
 ```console
 $ helm upgrade openvox-ca \
     oci://ghcr.io/voxpupuli/openvox-ca-charts/openvox-ca \
-    --version X.Y.Z --namespace puppet --reuse-values
+    --version X.Y.Z --namespace puppet --reset-then-reuse-values
 ```
 
-Three things worth knowing:
+`--reset-then-reuse-values` rather than `--reuse-values`: the latter rebuilds
+the previous release's values by coalescing your overrides with *the chart
+version you installed from*, and lays that over the upgrade, so a default the
+new chart changed is masked by the old chart's copy of it and never takes
+effect. `--reset-then-reuse-values` starts from the new chart's defaults and
+reapplies your overrides on top, which is almost always what an upgrade is for.
+Pass `-f values.yaml` instead if you keep your values in a file.
+
+Worth knowing before you upgrade:
 
 - While `persistence.enabled` is true the derived strategy is Recreate, so
   there is a brief outage as the old pod releases the volume. External-backend
   deployments (`persistence.enabled: false`) derive RollingUpdate and roll
-  without one.
-- **Upgrading from a chart that predates the derived strategy:** an existing
-  release that never set `strategy` and runs `persistence.enabled: false` moves
-  from Recreate to RollingUpdate on this upgrade, including under
-  `--reuse-values`, which keeps your values but picks up new chart defaults. Set
-  `strategy: {type: Recreate}` to keep the old behaviour.
-- **The Prometheus `job` label changes** for existing ServiceMonitor users: it
-  was the release-derived Service name and is now the chart name, so the shipped
-  mixin matches on any release name. Dashboards, recording rules and alerts
-  keyed on the old value need updating, and history splits at the upgrade. Set
-  `metrics.serviceMonitor.jobLabel: ""` to keep the Service-name behaviour.
+  without one. To keep Recreate there, set `strategy: {type: Recreate}`
+  explicitly.
 - The pods carry a checksum of the rendered config, so a change to `config`
   restarts them even though the Deployment's pod template is otherwise
   unchanged. Set `configChecksumAnnotation: false` if you would rather manage

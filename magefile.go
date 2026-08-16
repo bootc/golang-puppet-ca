@@ -1306,19 +1306,6 @@ func (Chart) Test() error {
 			notWants: []string{"ca_key_file: /run/secrets/openvox-ca-ca/tls.key"},
 		},
 		{
-			// Both halves of the coupling: the label the ServiceMonitor names,
-			// and the value the Service actually carries under it. The mixin
-			// selects job="openvox-ca", so a rename on either side breaks it.
-			name:  "the job label and the Service label it reads agree with the mixin",
-			sets:  []string{tls, "metrics.enabled=true", "metrics.serviceMonitor.enabled=true"},
-			wants: []string{"jobLabel: app.kubernetes.io/name", "app.kubernetes.io/name: openvox-ca"},
-		},
-		{
-			name:     "clearing jobLabel restores the Operator's Service-name default",
-			sets:     []string{tls, "metrics.enabled=true", "metrics.serviceMonitor.enabled=true", "metrics.serviceMonitor.jobLabel="},
-			notWants: []string{"jobLabel:"},
-		},
-		{
 			name:     "an explicit RollingUpdate is honoured while persistence is on",
 			sets:     []string{tls, "strategy.type=RollingUpdate", "persistence.enabled=true"},
 			wants:    []string{"type: RollingUpdate"},
@@ -1346,13 +1333,27 @@ func (Chart) Test() error {
 			notWants: []string{"type: RollingUpdate"},
 		},
 		{
-			// Without jobLabel the Prometheus Operator uses the Service name,
-			// which carries the release name — so the mixin's fixed
-			// job="openvox-ca" selector would match nothing on any release not
-			// named for the chart, silently.
-			name:  "the ServiceMonitor job label is stable across release names",
-			sets:  []string{tls, "metrics.enabled=true", "metrics.serviceMonitor.enabled=true"},
-			wants: []string{"jobLabel: app.kubernetes.io/name"},
+			// The Prometheus job must stay distinct per release: two releases of
+			// this chart run side by side during a fleet migration, and an alert
+			// that cannot tell the old CA from the new one is useless. Leaving
+			// jobLabel unset gives the Operator the Service name, which is
+			// release-derived. Pointing it at app.kubernetes.io/name would
+			// collide them, because that label carries the *chart* name.
+			name: "no jobLabel is emitted, so job stays per-release",
+			sets: []string{tls, "metrics.enabled=true", "metrics.serviceMonitor.enabled=true"},
+			// Positive control first: a ServiceMonitor that stopped rendering
+			// altogether would satisfy the absence assertion on its own.
+			wants:    []string{"kind: ServiceMonitor", "port: metrics"},
+			notWants: []string{"jobLabel:"},
+		},
+		{
+			// The extraEnv scan's unreadable-reference arm: the chart cannot see
+			// what a valueFrom resolves to, so it assumes TLS rather than refusing
+			// an install that is probably fine.
+			name:     "a TLS certificate fed in by valueFrom counts as configured",
+			sets:     []string{"extraEnv[0].name=PUPPET_CA_TLS_CERT", "extraEnv[0].valueFrom.secretKeyRef.name=tls", "extraEnv[0].valueFrom.secretKeyRef.key=tls.crt", "extraEnv[1].name=PUPPET_CA_TLS_KEY", "extraEnv[1].valueFrom.secretKeyRef.name=tls", "extraEnv[1].valueFrom.secretKeyRef.key=tls.key"},
+			wants:    []string{"scheme: HTTPS"},
+			notWants: []string{"scheme: HTTP\n"},
 		},
 		{
 			// The server ignores an empty PUPPET_CA_* variable and keeps what
@@ -2015,6 +2016,21 @@ func (Chart) Test() error {
 			sets:       []string{tls},
 			valuesYAML: "autosign:\n  patterns:\n    - \"*.a.example.com\\n*.b.example.com\"\n",
 			wantErr:    "single non-empty line",
+		},
+		{
+			// An explicit empty value is not a certificate: Kubernetes sets the
+			// variable to "" and the server discards it. Counting it was the
+			// fail-open mirror of the env defect fixed alongside.
+			name:    "a TLS certificate supplied through extraEnv as an explicit empty value",
+			sets:    []string{"extraEnv[0].name=PUPPET_CA_TLS_CERT", "extraEnv[0].value=", "extraEnv[1].name=PUPPET_CA_TLS_KEY", "extraEnv[1].value=/run/tls/tls.key"},
+			wantErr: "refuse to start",
+		},
+		{
+			// Neither value nor valueFrom: Kubernetes still renders the variable
+			// empty, so this is no more a certificate than the case above.
+			name:    "an extraEnv entry naming no source at all",
+			sets:    []string{"extraEnv[0].name=PUPPET_CA_TLS_CERT", "extraEnv[1].name=PUPPET_CA_TLS_KEY"},
+			wantErr: "refuse to start",
 		},
 		{
 			// values.yaml used to carry `type: Recreate` for a partial override
