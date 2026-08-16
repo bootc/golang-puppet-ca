@@ -109,12 +109,15 @@ func NewCollector(c *ca.CA) *Collector {
 			nil, nil),
 		crlUpdateFailures: prometheus.NewDesc(
 			prometheus.BuildFQName(namespace, "crl", "update_failures_total"),
-			"Total failures to amend the CRL — a CRL that could not be re-signed or written on any "+
-				"of the revoke, reissue, refresh and expired-cert cleanup paths, plus a CRL that could "+
-				"not be read or a malformed serial on the revoke path. A revocation that never reached "+
-				"the CRL is logged only, so this is a lower bound. A rising value means the CRL is not "+
-				"being maintained; for revocations it means a superseded certificate may still be a "+
-				"valid credential.",
+			"Total failures to amend the CRL — a CRL that could not be re-signed, written or read, "+
+				"on any of the revoke, reissue, refresh and expired-cert cleanup paths, plus, on the "+
+				"revoke path only, a malformed serial or a failed inventory read while resolving the "+
+				"subject's serial. Not every revocation that missed the CRL lands here: one refused "+
+				"at a cross-node lock acquisition fails ahead of any CRL work and is logged only, so "+
+				"this is a lower bound, while on filesystem and SQLite a revocation that queued past "+
+				"lockTimeout fails at that inventory read and is counted. A rising value means the "+
+				"CRL is not being maintained; for revocations it means a superseded certificate may "+
+				"still be a valid credential.",
 			nil, nil),
 		crlSyncFailures: prometheus.NewDesc(
 			prometheus.BuildFQName(namespace, "crl", "sync_failures_total"),

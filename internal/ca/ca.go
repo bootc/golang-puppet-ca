@@ -170,9 +170,15 @@ type CA struct {
 	cachedCRL   *x509.RevocationList      // in-memory CRL for auth checks; protected by mu
 	mu          sync.RWMutex
 
-	// crlUpdateFailures counts failures to amend the CRL: a revocation that
-	// could not be recorded (bad serial, unreadable CRL) or a CRL that could
-	// not be re-signed or written (during revoke, cleanup, reissue or refresh).
+	// crlUpdateFailures counts failures to amend the CRL: a CRL that could not
+	// be re-signed, written or read, on any of the four paths that write one
+	// (revoke, cleanup, reissue, refresh) — the read half centrally, in
+	// readStoredCRL, which is what makes this cover all four — plus, on the
+	// revoke path only, a bad serial or a failed inventory read while resolving
+	// the subject's serial. That last one is how a revocation which merely
+	// queued past LockTimeout lands here on the single-node backends, where the
+	// spent deadline is not spotted until the read; one refused at a cross-node
+	// acquisition fails earlier and is not counted. See docs/metrics.md.
 	// Some callers treat these as fatal and return the error; others — notably
 	// the best-effort revoke of a superseded certificate on renewal — swallow
 	// it so the primary operation still succeeds. Either way a rising count

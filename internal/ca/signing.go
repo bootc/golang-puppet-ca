@@ -163,15 +163,7 @@ func (c *CA) evictRevokedLocked(ctx context.Context, subject string) error {
 		return fmt.Errorf("certificate already exists for %s: %w", subject, ErrCertExists)
 	}
 
-	revoked := false
-	if c.cachedCRL != nil {
-		for _, entry := range c.cachedCRL.RevokedCertificateEntries {
-			if entry.SerialNumber.Cmp(cert.SerialNumber) == 0 {
-				revoked = true
-				break
-			}
-		}
-	}
+	revoked := c.cachedCRL != nil && serialInCRL(c.cachedCRL, cert.SerialNumber)
 
 	if !revoked {
 		return fmt.Errorf("certificate already exists for %s: %w", subject, ErrCertExists)
@@ -925,6 +917,30 @@ func (c *CA) Renew(ctx context.Context, subject string, csrPEM []byte, presented
 	defer cancel()
 	var out []byte
 	err = c.Storage.WithLock(ctx, subjectLockName(subject), func() error {
+		// SECURITY: ask the revocation question again, now the lock is held.
+		// The gate above answered it before this Storage.WithLock, and
+		// acquiring that lock can take a while — see StorageService.WithLock's
+		// godoc for what that wait is, and is not, bounded by. A revocation
+		// landing inside the window would otherwise be outrun: the gate has
+		// already decided, and nothing between it and the signing below looks
+		// again.
+		//
+		// This is deliberately the second storage read of the CRL on this path:
+		// refuseIfRevoked syncs the cache unconditionally, so the gate now costs
+		// two GetCRLs and two signature checks rather than one, and this one is
+		// inside the critical section. (The revoke step below adds a third of
+		// each whenever it retires a predecessor, which is the ordinary case.)
+		// Both earn their place. The gate above
+		// turns a revoked agent away before it queues on a lock this change
+		// makes slower to get, and only this one is authoritative, because only
+		// this one runs where nothing can revoke behind it. Renewals are rare
+		// (see refuseIfRevoked's godoc), so the extra parse under a contended
+		// lock is the cheaper of the two costs.
+		// NIST 800-53: IA-5(2) (PKI-Based Authentication), AC-3 (Access Enforcement)
+		if err := c.refuseIfRevoked(ctx, presentedCert, subject); err != nil {
+			return err
+		}
+
 		// Capture the serial of the certificate being replaced, if any, before
 		// signing overwrites the cert blob and appends a new inventory row —
 		// afterwards LatestSerialForSubject would resolve to the *new* serial,
@@ -1077,6 +1093,15 @@ func (c *CA) AutoRenew(ctx context.Context, presentedCert *x509.Certificate) ([]
 
 	var out []byte
 	err := c.Storage.WithLock(ctx, subjectLockName(subject), func() error {
+		// SECURITY: ask again under the lock, for the reason given on the
+		// re-key path above — the gate ran before this acquisition, and a
+		// revocation landing during it must bind the renewal it overlaps
+		// rather than lose a race with it.
+		// NIST 800-53: IA-5(2) (PKI-Based Authentication), AC-3 (Access Enforcement)
+		if err := c.refuseIfRevoked(ctx, presentedCert, subject); err != nil {
+			return err
+		}
+
 		// Issue the replacement while holding c.mu, releasing it via defer
 		// before the revoke step below re-acquires it (c.mu is non-reentrant).
 		// The closure keeps the unlock panic-safe: a panic mid-issue still

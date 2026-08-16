@@ -33,9 +33,62 @@ import (
 	"github.com/voxpupuli/openvox-ca/internal/storage"
 )
 
-// Revoke serialises on the cluster-wide "crl" lock so concurrent revocations
-// (and any future CRL rotation) on different replicas cannot both read the
-// same CRL, each append their own entry, and clobber one another's write.
+// Revoke serialises on the per-subject lock and then the cluster-wide "crl"
+// lock, so a revocation neither overlaps an issuance for the same subject nor
+// races another replica's CRL read-modify-write — two revocations that both
+// read the same CRL and each append their own entry would clobber one another.
+//
+// It takes the per-subject lock first, as Clean does. Without it the renewal
+// paths' re-check would still be a check-then-act: a revocation resolving the
+// outgoing serial while the replacement is being minted is defeated exactly as
+// one landing during the lock wait is, only over a shorter window. Holding the
+// subject lock leaves a revocation two orderings against a renewal for the same
+// subject, and both are answers rather than races — it commits first and the
+// re-check refuses the renewal, or the renewal completes and the revocation
+// then retires the serial that renewal issued.
+//
+// The second ordering leaves the agent nothing usable only where the renewal
+// retired the certificate it replaced, because this retires the subject's
+// latest serial and no other. That is the default rather than a guarantee:
+// under revoke_on_auto_renew=false AutoRenew keeps the predecessor
+// deliberately, and on both paths the post-issue revoke is best-effort and only
+// warns when it fails. A predecessor left behind stays valid for its own key
+// and still authenticates, since admission tests the serial presented rather
+// than whatever certificate is on disk. Retiring every unexpired serial a
+// subject holds would close that; it is a change to what revocation means, not
+// to when it happens, so it is not this one's business.
+//
+// The cost is that a revocation now waits for an issuance already under way for
+// that subject — the same trade Clean has always made, so DELETE
+// /certificate_status has always paid it. Do not read that wait as short: a
+// renewal holds the subject lock across its own acquisition of the cluster-wide
+// CRL lock, and SaveRequest holds it across an autosign signature. Nor does
+// LockTimeout bound it in the case that matters most, since WithLock's ctx
+// covers only the cross-node half of an acquisition (see its godoc).
+//
+// It does not bound that wait, but it is spent by it, so a wait longer than
+// LockTimeout ends in a failure rather than a late commit — on every backend,
+// just in two different places. Where there is a cross-node acquisition the
+// revocation is rejected there, before any of the work below. Where there is
+// not (SQLite, the filesystem) the local mutex is granted after the wait with
+// the deadline already gone, so the first storage read in revokeLocked fails
+// instead — and that one is counted into crlUpdateFailures, unlike the other,
+// because a spent deadline is not fs.ErrNotExist. A revocation that fails is
+// safe to retry either way: revokeSerialLocked short-circuits a serial already
+// listed, so revocation is idempotent.
+//
+// One issuance path it does not wait on this lock for: Generate takes no
+// distributed lock at all, so a server-side key generation on another replica
+// is not serialised against a revocation here. Within one process the two do
+// still serialise, but only on c.mu — which Generate holds across evict, save
+// and sign, and which this takes inside the CRL lock — so the ordering holds on
+// a single node and is lost as soon as there is a second one.
+//
+// Lock ordering: subject-lock (distributed) → CRL-lock (distributed) → c.mu,
+// matching Clean, and no path takes those two in the other order. Callers must
+// therefore not already hold the subject lock: those that do — Clean, and the
+// post-issue revokes in Renew and AutoRenew — reach revokeLocked or
+// revokeSerialLocked directly rather than coming through here.
 func (c *CA) Revoke(ctx context.Context, subject string) error {
 	if err := ValidateSubject(subject); err != nil {
 		return err
@@ -43,10 +96,12 @@ func (c *CA) Revoke(ctx context.Context, subject string) error {
 
 	ctx, cancel := context.WithTimeout(ctx, LockTimeout)
 	defer cancel()
-	return c.Storage.WithLock(ctx, lockNameCRL, func() error {
-		c.mu.Lock()
-		defer c.mu.Unlock()
-		return c.revokeLocked(ctx, subject)
+	return c.Storage.WithLock(ctx, subjectLockName(subject), func() error {
+		return c.Storage.WithLock(ctx, lockNameCRL, func() error {
+			c.mu.Lock()
+			defer c.mu.Unlock()
+			return c.revokeLocked(ctx, subject)
+		})
 	})
 }
 
@@ -356,12 +411,29 @@ func (c *CA) IsRevokedSerial(ctx context.Context, serial *big.Int) (bool, error)
 	if c.cachedCRL == nil {
 		return false, fmt.Errorf("CRL not loaded")
 	}
-	for _, entry := range c.cachedCRL.RevokedCertificateEntries {
+	return serialInCRL(c.cachedCRL, serial), nil
+}
+
+// serialInCRL reports whether serial appears among crl's revoked entries. The
+// one definition of "is this certificate revoked according to this CRL" for
+// every caller that needs only the yes or no — against the cached CRL or one
+// freshly read from storage.
+//
+// Two callers deliberately keep their own loop, because a bool cannot carry
+// what they need from the matched entry: ocsp.go's isRevokedSerial wants the
+// RevocationTime for the OCSP response, and revokeSerialLocked wants it to
+// project into the certificate index. Change the predicate here and check
+// those two.
+//
+// crl may not be nil; every caller guards that first, since a missing CRL is
+// not "nothing is revoked" and each has its own answer for it.
+func serialInCRL(crl *x509.RevocationList, serial *big.Int) bool {
+	for _, entry := range crl.RevokedCertificateEntries {
 		if entry.SerialNumber.Cmp(serial) == 0 {
-			return true, nil
+			return true
 		}
 	}
-	return false, nil
+	return false
 }
 
 // IsRevoked checks whether the certificate for subject appears in the CRL.
@@ -393,10 +465,5 @@ func (c *CA) IsRevoked(ctx context.Context, subject string) bool {
 		return false
 	}
 
-	for _, entry := range crl.RevokedCertificateEntries {
-		if entry.SerialNumber.Cmp(cert.SerialNumber) == 0 {
-			return true
-		}
-	}
-	return false
+	return serialInCRL(crl, cert.SerialNumber)
 }

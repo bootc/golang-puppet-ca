@@ -47,6 +47,11 @@ const (
 // leader election, short enough that a stuck lease on a crashed replica
 // does not hang startup past the lease TTL on the etcd backend.
 //
+// Read "distributed" strictly: it bounds the cross-node half of an acquisition
+// and not a wait on another goroutine in this process, which no deadline ends.
+// See StorageService.WithLock's godoc, and Revoke's for what that means for a
+// wait that outlives this budget.
+//
 // Exported because the shipped systemd unit's WatchdogSec has to exceed it:
 // the status line the heartbeat sends takes the CA's read lock, so a storage
 // operation holding the write lock blocks the heartbeat for up to this long.
@@ -55,7 +60,10 @@ const (
 const LockTimeout = 60 * time.Second
 
 // subjectLockName returns the distributed-lock name used to serialise
-// operations on a single subject (CSR submission, signing, cleaning).
+// operations on a single subject: evict, save CSR, sign, import, clean and
+// revoke. Keep this list and the Serialises cell of the Tier 1 table in
+// docs/development/locking.md in step — they are the same claim written twice,
+// so they should read the same.
 func subjectLockName(subject string) string { return lockSubjectPrefix + subject }
 
 func (c *CA) Init(ctx context.Context) error {

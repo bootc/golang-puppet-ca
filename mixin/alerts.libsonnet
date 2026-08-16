@@ -179,14 +179,19 @@
         rules: [
           {
             alert: 'PuppetCACRLUpdateFailing',
-            // The CA failed to amend the CRL — a CRL it could not re-sign or
-            // write (revoke, reissue, refresh or expired-cert cleanup), or one
-            // it could not read on the revoke path. Some callers swallow this
-            // (e.g. the best-effort revoke of a superseded cert on renewal), so
-            // a revoked/superseded certificate may remain valid. A revocation
-            // that never reached the CRL is logged only and does not appear
-            // here. The counter resets on restart, so alert on increase() over
-            // a window rather than a raw value.
+            // The CA failed to amend the CRL — a CRL it could not re-sign,
+            // write or read, on any of the four paths that write one (revoke,
+            // reissue, refresh or expired-cert cleanup). Some callers swallow
+            // this (e.g. the best-effort revoke of a superseded cert on
+            // renewal), so a revoked/superseded certificate may remain valid.
+            // Not every revocation that missed the CRL lands here, and which
+            // ones do depends on the backend: one refused at a cross-node lock
+            // acquisition fails ahead of any CRL work and is logged only, while
+            // on filesystem/SQLite a revocation that merely queued behind an
+            // issuance past lockTimeout fails at its first storage read and is
+            // counted — a benign cause worth ruling out first on those
+            // backends. See docs/metrics.md. The counter resets on restart, so
+            // alert on increase() over a window rather than a raw value.
             expr: 'increase(puppetca_crl_update_failures_total{%(selector)s}[%(window)s]) > 0' % {
               selector: $._config.puppetCASelector,
               window: $._config.crlUpdateWindow,
@@ -195,7 +200,7 @@
             labels: { severity: 'warning' } + $._config.alertLabels,
             annotations: {
               summary: 'Puppet CA is failing to update its CRL.',
-              description: 'The Puppet CA on {{ $labels.instance }} could not amend its CRL (puppetca_crl_update_failures_total is rising). Revocations may not have taken effect and superseded certificates may still be valid; check CRL storage and the CA logs.',
+              description: 'The Puppet CA on {{ $labels.instance }} could not amend its CRL (puppetca_crl_update_failures_total is rising). Revocations may not have taken effect and superseded certificates may still be valid. Check the CA logs to tell the causes apart: "Renew:"/"AutoRenew: failed to revoke replaced certificate"/"Clean:" warnings are a real failure to maintain the CRL, and on filesystem or SQLite a "Revoke failed" warning on a request that took over a minute is instead a revocation that merely queued too long for its subject lock. Then check CRL storage.',
             },
           },
           {

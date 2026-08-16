@@ -46,7 +46,7 @@ less protocol for it.
 | --- | --- | --- |
 | `bootstrap` | First-run CA generation; seeding supporting state (CRL/inventory/serial) for a mounted cert+key; whole-store migration | `CA.Init`, `CA.seedSupportingState`, `storage.MigrateService` (which reuses the name deliberately so a migration and a bootstrapping server exclude each other) |
 | `crl` | Every CRL read-modify-write (read entries → re-sign → write) | `Revoke`, `RevokeSerial`, `ReissueCRL`, `RefreshCRLIfDue`, `CleanupExpiredCerts`, and the revoke step inside `Clean`, `Renew`, `AutoRenew` |
-| `subject:<name>` | The whole lifecycle of one subject: evict/save CSR/sign/import/clean | `SaveRequest`, `Sign`, `SignWithTTL`, `Renew`, `AutoRenew`, `Clean`, `ImportCertificate` — but currently **not** `Generate` (see known gaps below) |
+| `subject:<name>` | The whole lifecycle of one subject: evict/save CSR/sign/import/clean/revoke | `SaveRequest`, `Sign`, `SignWithTTL`, `Renew`, `AutoRenew`, `Clean`, `ImportCertificate`, `Revoke` — but currently **not** `Generate` (see known gaps below) |
 | `inventory-decompose` | One-time legacy inventory blob conversion (etcd backend only) on the first start after upgrading | `EtcdBackend.decomposeLegacyInventory`, from `EnsureReady` |
 
 How each backend provides the distributed lock (a summary — the full per-backend
@@ -169,13 +169,18 @@ Nested acquisition always follows one global order:
 subject:<name>  →  crl  →  c.mu  →  (StorageService internal mutexes)
 ```
 
-- `Clean`, `Renew`, and `AutoRenew` are the paths that take all three: the
-  subject lock around the whole operation, then the `crl` lock + `c.mu` for the
-  revocation step. Note both release and re-acquire `c.mu` between the signing
-  and revocation steps — `c.mu` is not held across a `WithLock` acquisition.
+- `Revoke`, `Clean`, `Renew`, and `AutoRenew` are the paths that take all
+  three. For the three issuance paths it is the subject lock around the whole
+  operation, then the `crl` lock + `c.mu` for the revocation step; note they
+  release and re-acquire `c.mu` between the signing and revocation steps —
+  `c.mu` is not held across a `WithLock` acquisition. `Revoke` has the same
+  nesting for a different reason: the `crl` lock + `c.mu` cover the revocation
+  that is the whole operation, and the subject lock is there only to serialise
+  it against an issuance already under way for that subject.
 - No code path acquires `subject:<name>` while holding `crl`, and none acquires
   either while holding `c.mu`. Keep it that way; the comments in
-  [signing.go](../../internal/ca/signing.go) record this invariant at each
+  [signing.go](../../internal/ca/signing.go) and
+  [revoke.go](../../internal/ca/revoke.go) record this invariant at each
   nesting site.
 - Two *different* subject locks are never held at once (bulk operations like
   `SignMultiple` loop, taking one at a time).
@@ -281,11 +286,15 @@ path — still provides no cross-replica guarantee anyway.
    could collide with `crl`/`bootstrap`
    ([#203](https://github.com/voxpupuli/openvox-ca/issues/203)).
 8. **SQL pool sizing:** on PostgreSQL/MySQL every *held* distributed lock pins
-   one pooled connection. A single in-flight `Clean`/`Renew`/`AutoRenew` needs
-   at least three connections at once — one for the `subject:<name>` lock, a
-   second for the nested `crl` lock, and a third for the reads/writes inside
+   one pooled connection. A single in-flight `Revoke`/`Clean`/`Renew`/`AutoRenew`
+   needs at least three connections at once — one for the `subject:<name>` lock,
+   a second for the nested `crl` lock, and a third for the reads/writes inside
    the revocation step — so `sql_max_open_conns` must be at least 3 per
-   concurrently mutating request. Set below that and a single request
+   concurrently mutating request. `Revoke` joined that list when it took the
+   subject lock: revoking many *distinct* subjects at once used to queue on the
+   single `crl` gate and hold one lock connection between them, whereas each
+   concurrent revocation now pins its own `subject:<name>` connection while it
+   waits for `crl`. Set below that and a single request
    hard-stalls (not only under load), bounded only by the 60 s `lockTimeout`.
    See the `sql_max_open_conns` knob in
    [storage backends](../storage-backends.md).
@@ -350,12 +359,13 @@ state when the document was last updated and is not guaranteed exhaustive.
   `serialIndex` is built once at startup, so certificates issued on another
   replica answer `unknown`; the `ocspCache` half can even keep serving a
   pre-signed `good` for a certificate revoked elsewhere.
-- [#173](https://github.com/voxpupuli/openvox-ca/issues/173) — renewal
-  re-checked revocation before acquiring the subject lock.
-  [PR #186](https://github.com/voxpupuli/openvox-ca/pull/186) fixes it
-  (re-check from *storage* under the subject lock) and also moves `Revoke`
-  itself under `subject:<name>` → `crl`; the Tier 1 lock table describes
-  current `main`, and that PR carries its own update to the table when it lands.
+- ~~[#173](https://github.com/voxpupuli/openvox-ca/issues/173) — renewal
+  re-checked revocation before acquiring the subject lock.~~ Fixed: both
+  renewal paths now call `refuseIfRevoked` again as the first statement inside
+  the subject lock, and `Revoke` takes `subject:<name>` → `crl` so nothing can
+  revoke in the gap between that answer and the issuance it guards. The one
+  issuance path a revocation still cannot wait for is `Generate`, which takes
+  no distributed lock — see the `Generate` gap above.
 - On blob backends (filesystem/redis), an inventory append and its HMAC
   update are two writes, not one atomic unit; the failure window is documented
   at the write site in `AppendInventory` and the structured (SQL, etcd)
@@ -369,7 +379,17 @@ state when the document was last updated and is not guaranteed exhaustive.
 unlock-error handling are covered in
 [withlock_test.go](../../internal/storage/withlock_test.go); each distributed
 implementation's mutual exclusion is exercised in its backend integration
-suite (build-tagged; see [testing](testing.md)). The nested lock-ordering
-invariant and a race-detector run over the concurrency tests are not yet
-automated — tracked as
+suite (build-tagged; see [testing](testing.md)).
+
+The nested lock-ordering invariant *is* now automated, in
+[renewrace_test.go](../../internal/ca/renewrace_test.go): for each caller that
+holds both locks — `Revoke`, `Clean`, `Renew`, `AutoRenew` — it parks the
+operation on a held subject lock and requires `crl` to still be grantable while
+it waits. An inverted nesting therefore fails on an assertion rather than
+deadlocking the suite to its timeout, which is how an inversion otherwise
+presents: every backend serialises same-process callers on a mutex that ignores
+the context deadline. These run under the race detector on every unit
+run: `mage test:unit` passes `-race` over every unit package, `internal/ca`
+included. What is still unraced is the build-tagged backend integration
+suites — tracked as
 [#205](https://github.com/voxpupuli/openvox-ca/issues/205).

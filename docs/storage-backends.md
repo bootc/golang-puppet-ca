@@ -462,6 +462,26 @@ statements. A smaller pool would not merely be slow, it would deadlock, so the
 floor is not negotiable. Leave the setting at 0 unless you have measured a
 reason to cap it.
 
+That floor covers `migrate`; it does not size a busy server. The requests that
+retire a certificate — `Revoke`, `Clean`, and the renewal paths when they retire
+the certificate they replaced — take `subject:<name>` and then, inside it, the
+cluster-wide `crl` lock, so each one in flight wants three connections at once:
+one per held lock, plus one for its own reads and writes. A plain sign or CSR
+submission takes only `subject:<name>` and wants two.
+
+Revocation joined that set in this release, and the cost shows up when
+revocations overlap — several admin clients or an orchestration tool issuing
+`PUT`/`DELETE /certificate_status/{subject}` for *distinct* subjects at once.
+Throughput is unchanged, because they still queue one at a time on the single
+`crl` lock; what changed is that each one now holds its own `subject:<name>`
+connection for the whole of that wait instead of queueing without one. Size the
+pool for the retirements you expect to overlap rather than for a single request.
+Note that `PUT /clean` is not that case: it processes its certnames
+sequentially, so a bulk clean holds one subject lock at a time and has always
+paid this cost. See rule 8 in the
+[locking notes](development/locking.md#rules-for-new-or-changed-code) for the
+invariant behind this.
+
 ---
 
 ## CA cert/key as local files
