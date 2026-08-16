@@ -77,6 +77,15 @@ type InventoryStore interface {
     // LatestSerialForSubject returns the most recently issued serial for
     // subject, wrapping fs.ErrNotExist when the subject has no entry.
     LatestSerialForSubject(ctx context.Context, subject string) (string, error)
+
+    // PruneEntries removes every entry for which keep returns false and
+    // rewrites the integrity head over the survivors; advanceHead advances
+    // the chain by one entry (nil disables integrity). Entries and head must
+    // never be observable out of sync, but a prune may commit in several
+    // transactions, be bounded per call, and partially complete — whatever
+    // happens, the returned slice contains every entry actually removed,
+    // even alongside an error. See backend.go for the full contract.
+    PruneEntries(ctx context.Context, keep func(InventoryEntry) bool, advanceHead func(prev []byte, e InventoryEntry) []byte) ([]InventoryEntry, error)
 }
 ```
 
