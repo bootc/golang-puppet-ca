@@ -1298,6 +1298,33 @@ func (Chart) Test() error {
 			wants: []string{"scheme: HTTPS"},
 		},
 		{
+			// The recipe values.yaml documents for a provider-held key. It is a
+			// merge-precedence claim, which this repository requires be pinned.
+			name:     "an empty config value clears a path the ca block computed",
+			sets:     []string{tls, "ca.existingSecret=ca-material", "config.ca_key_provider=openbao", "config.ca_key_file="},
+			wants:    []string{`ca_key_file: ""`, "ca_cert_file: /run/secrets/openvox-ca-ca/tls.crt"},
+			notWants: []string{"ca_key_file: /run/secrets/openvox-ca-ca/tls.key"},
+		},
+		{
+			// Both halves of the coupling: the label the ServiceMonitor names,
+			// and the value the Service actually carries under it. The mixin
+			// selects job="openvox-ca", so a rename on either side breaks it.
+			name:  "the job label and the Service label it reads agree with the mixin",
+			sets:  []string{tls, "metrics.enabled=true", "metrics.serviceMonitor.enabled=true"},
+			wants: []string{"jobLabel: app.kubernetes.io/name", "app.kubernetes.io/name: openvox-ca"},
+		},
+		{
+			name:     "clearing jobLabel restores the Operator's Service-name default",
+			sets:     []string{tls, "metrics.enabled=true", "metrics.serviceMonitor.enabled=true", "metrics.serviceMonitor.jobLabel="},
+			notWants: []string{"jobLabel:"},
+		},
+		{
+			name:     "an explicit RollingUpdate is honoured while persistence is on",
+			sets:     []string{tls, "strategy.type=RollingUpdate", "persistence.enabled=true"},
+			wants:    []string{"type: RollingUpdate"},
+			notWants: []string{"type: Recreate"},
+		},
+		{
 			// Recreate exists to protect a ReadWriteOnce cadir. With persistence
 			// off the state is external and the serialisation buys only an
 			// outage per upgrade.
@@ -1309,7 +1336,7 @@ func (Chart) Test() error {
 		{
 			name:     "an unset strategy rolls once the state is external",
 			sets:     []string{tls, "persistence.enabled=false"},
-			wants:    []string{"type: RollingUpdate", "maxUnavailable: 0"},
+			wants:    []string{"type: RollingUpdate", "maxUnavailable: 0", "maxSurge: 1"},
 			notWants: []string{"type: Recreate"},
 		},
 		{
@@ -1333,7 +1360,7 @@ func (Chart) Test() error {
 			// The chart used to treat one as a deletion and then refuse the
 			// install for having no certificate.
 			name:     "an empty TLS env var does not unset a configured certificate",
-			sets:     []string{tls, "env.PUPPET_CA_TLS_CERT="},
+			sets:     []string{tls, "env.PUPPET_CA_TLS_CERT=", "env.PUPPET_CA_TLS_KEY="},
 			wants:    []string{"scheme: HTTPS"},
 			notWants: []string{"scheme: HTTP\n"},
 		},
@@ -1990,6 +2017,14 @@ func (Chart) Test() error {
 			wantErr:    "single non-empty line",
 		},
 		{
+			// values.yaml used to carry `type: Recreate` for a partial override
+			// to merge onto; with it empty, a typeless map reaches Kubernetes as
+			// RollingUpdate and surges against the ReadWriteOnce cadir.
+			name:    "a strategy map with no type, which Kubernetes reads as RollingUpdate",
+			sets:    []string{tls, "strategy.rollingUpdate.maxSurge=1"},
+			wantErr: "no type",
+		},
+		{
 			name:    "an autoscaler with no metric to act on",
 			sets:    []string{tls, "autoscaling.enabled=true", "autoscaling.targetCPUUtilizationPercentage="},
 			wantErr: "no metric is configured",
@@ -2171,29 +2206,41 @@ func (Chart) Test() error {
 	// that drift happens.
 	{
 		name := "both RBAC scopes grant identical rules"
-		exportSets := []string{
-			tls, "kubernetesExport.enabled=true",
-			"kubernetesExport.targets[0].kind=Secret",
-			"kubernetesExport.targets[0].metadata.name=trust",
-			"kubernetesExport.targets[0].cert=true",
-		}
-		clusterOut, clusterErr := helmTemplate(append(slices.Clone(exportSets), "kubernetesExport.rbac.scope=ClusterRole"))
-		roleOut, roleErr := helmTemplate(append(slices.Clone(exportSets), "kubernetesExport.rbac.scope=Role"))
-		switch {
-		case clusterErr != nil || roleErr != nil:
-			fmt.Printf("FAIL  %s\n      render failed: %v %v\n", name, clusterErr, roleErr)
-			failures++
-		default:
+		// All three arms exportRules can take, not just the first: the
+		// unknown-targets arm is the one that grants unrestricted patch, so a
+		// re-inline diverging only there is exactly what this must catch.
+		for _, arm := range []struct {
+			label string
+			sets  []string
+		}{
+			{"named targets", []string{
+				tls, "kubernetesExport.enabled=true",
+				"kubernetesExport.targets[0].kind=Secret",
+				"kubernetesExport.targets[0].metadata.name=trust",
+				"kubernetesExport.targets[0].cert=true",
+			}},
+			{"no targets", []string{tls, "kubernetesExport.enabled=true"}},
+			{"unknown targets", []string{"existingConfigMap=mine", "kubernetesExport.enabled=true"}},
+		} {
+			armName := fmt.Sprintf("%s (%s)", name, arm.label)
+			clusterOut, clusterErr := helmTemplate(append(slices.Clone(arm.sets), "kubernetesExport.rbac.scope=ClusterRole"))
+			roleOut, roleErr := helmTemplate(append(slices.Clone(arm.sets), "kubernetesExport.rbac.scope=Role"))
+			switch {
+			case clusterErr != nil || roleErr != nil:
+				fmt.Printf("FAIL  %s\n      render failed: %v %v\n", armName, clusterErr, roleErr)
+				failures++
+				continue
+			}
 			clusterRules, roleRules := chartRulesBlock(clusterOut), chartRulesBlock(roleOut)
 			switch {
 			case clusterRules == "":
-				fmt.Printf("FAIL  %s\n      no rules block rendered for ClusterRole\n", name)
+				fmt.Printf("FAIL  %s\n      no rules block rendered for ClusterRole\n", armName)
 				failures++
 			case clusterRules != roleRules:
-				fmt.Printf("FAIL  %s\n      ClusterRole rules:\n%s\n      Role rules:\n%s\n", name, clusterRules, roleRules)
+				fmt.Printf("FAIL  %s\n      ClusterRole rules:\n%s\n      Role rules:\n%s\n", armName, clusterRules, roleRules)
 				failures++
 			default:
-				fmt.Printf("ok    %s\n", name)
+				fmt.Printf("ok    %s\n", armName)
 			}
 		}
 	}

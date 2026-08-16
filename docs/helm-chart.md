@@ -238,9 +238,11 @@ config:
   storage_backend: postgres
 ```
 
-The `strategy` change matters: the chart defaults to `Recreate` because a
-surging replacement pod cannot mount the default ReadWriteOnce volume. Once
-state is external, a zero-downtime rollout is safe. `podDisruptionBudget` and
+The `strategy` block above is redundant, and shown only to be explicit: an
+unset `strategy` already follows `persistence.enabled`, so turning persistence
+off selects RollingUpdate on its own. Recreate applies while the cadir is a
+ReadWriteOnce PVC that a surging replacement pod could not mount; once the
+state is external there is nothing left to serialise on. `podDisruptionBudget` and
 `autoscaling` become meaningful at that point too.
 
 ### Sizing
@@ -249,7 +251,8 @@ The default memory limit is 64Mi, and it is a hard cap. The server's footprint
 grows with the size of the fleet: it keeps a serial index and a cache of
 pre-signed OCSP responses, one entry per known certificate, pruned only on
 revocation or expired-certificate cleanup. Crossing the limit is an OOMKill, and
-with the default `Recreate` strategy that is CA downtime. Raise
+with the Recreate strategy that persistence-enabled installs default to, that
+is CA downtime. Raise
 `resources.limits.memory` before a growing inventory reaches it, and consider
 setting `GOMEMLIMIT` just under it through `env` so the Go runtime collects
 harder instead of hitting the cgroup wall:
@@ -446,7 +449,11 @@ networkPolicy:
 ```
 
 A [Jsonnet alerting mixin](../mixin/) ships with the project for the expiry and
-export-failure alerts.
+export-failure alerts. Its selector is a fixed `job="openvox-ca"`, which is why
+the chart pins `metrics.serviceMonitor.jobLabel` to `app.kubernetes.io/name`
+rather than letting the Prometheus Operator derive `job` from the
+release-derived Service name. If you set `nameOverride`, that label carries the
+override instead, and the mixin's `puppetCASelector` has to be set to match.
 
 ## Network policy
 
@@ -591,6 +598,19 @@ config:
     kubernetes_role: openvox-ca
 ```
 
+If you also pin the CA *certificate* to a Secret, note that the `ca` block sets
+both `ca_cert_file` and `ca_key_file`, and under this provider there is no key
+file to point at. Clear that one explicitly — the empty string survives the
+merge, and the server treats an empty `ca_key_file` as unset:
+
+```yaml
+ca:
+  existingSecret: openvox-ca-cert   # certificate only
+config:
+  ca_key_provider: openbao
+  ca_key_file: ""
+```
+
 With `auth_method: kubernetes` the pod authenticates with its own projected
 ServiceAccount token — the chart detects this and mounts the token for you, so
 there is nothing else to configure. For `approle` or `token`, mount the
@@ -655,9 +675,20 @@ $ helm upgrade openvox-ca \
 
 Three things worth knowing:
 
-- With the default `Recreate` strategy there is a brief outage while the old
-  pod releases the volume. External-backend deployments using `RollingUpdate`
-  roll without one.
+- While `persistence.enabled` is true the derived strategy is Recreate, so
+  there is a brief outage as the old pod releases the volume. External-backend
+  deployments (`persistence.enabled: false`) derive RollingUpdate and roll
+  without one.
+- **Upgrading from a chart that predates the derived strategy:** an existing
+  release that never set `strategy` and runs `persistence.enabled: false` moves
+  from Recreate to RollingUpdate on this upgrade, including under
+  `--reuse-values`, which keeps your values but picks up new chart defaults. Set
+  `strategy: {type: Recreate}` to keep the old behaviour.
+- **The Prometheus `job` label changes** for existing ServiceMonitor users: it
+  was the release-derived Service name and is now the chart name, so the shipped
+  mixin matches on any release name. Dashboards, recording rules and alerts
+  keyed on the old value need updating, and history splits at the upgrade. Set
+  `metrics.serviceMonitor.jobLabel: ""` to keep the Service-name behaviour.
 - The pods carry a checksum of the rendered config, so a change to `config`
   restarts them even though the Deployment's pod template is otherwise
   unchanged. Set `configChecksumAnnotation: false` if you would rather manage

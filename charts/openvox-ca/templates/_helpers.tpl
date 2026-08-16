@@ -377,23 +377,6 @@ Call with (dict "backendPort" <value> "root" $).
 {{- end -}}
 
 {{/*
-Whether the chart can see the server's whole configuration.
-
-It cannot when the config file is somebody else's (existingConfigMap), when
-argv has been replaced outright (args), or when settings arrive from a
-ConfigMap or Secret the chart never reads (envFrom) — each of those layers
-outranks or replaces what the chart renders. Where the answer is "no", the
-chart says so rather than asserting: it neither refuses an install it cannot
-judge nor claims to know which scheme the probes should use.
-
-A --config in extraArgs counts too, and is the subtlest of the four. The
-chart renders its own --config and appends extraArgs straight after it, so a
-second one wins outright (it is a plain pflag StringVar) and the server reads
-a file the chart never saw — while the ConfigMap it did render goes unread.
-Both spellings are caught: --config=/path, and the bare --config whose value
-sits in the following element.
-*/}}
-{{/*
 Whether the config file the server reads is the one the chart rendered.
 
 Narrower than configFullyKnown on purpose. That one asks whether the chart can
@@ -428,6 +411,23 @@ file is the chart's *and* nothing arrives through envFrom. Spelling the
 --config scan out twice meant a change to the detection could land on one
 predicate and not the other, which is the defect class this branch kept
 reopening — and the scan is the half that took a separate round to get right.
+*/}}
+{{/*
+Whether the chart can see the server's whole configuration.
+
+It cannot when the config file is somebody else's (existingConfigMap), when
+argv has been replaced outright (args), or when settings arrive from a
+ConfigMap or Secret the chart never reads (envFrom) — each of those layers
+outranks or replaces what the chart renders. Where the answer is "no", the
+chart says so rather than asserting: it neither refuses an install it cannot
+judge nor claims to know which scheme the probes should use.
+
+A --config in extraArgs counts too, and is the subtlest of the four. The
+chart renders its own --config and appends extraArgs straight after it, so a
+second one wins outright (it is a plain pflag StringVar) and the server reads
+a file the chart never saw — while the ConfigMap it did render goes unread.
+Both spellings are caught: --config=/path, and the bare --config whose value
+sits in the following element.
 */}}
 {{- define "openvox-ca.configFullyKnown" -}}
 {{- if and (eq (include "openvox-ca.configFileKnown" .) "true") (not .Values.envFrom) -}}
@@ -469,9 +469,19 @@ true
 {{- if and (eq $name "PUPPET_CA_TLS_CERT") $value }}{{ $cert = $value }}{{ end -}}
 {{- if and (eq $name "PUPPET_CA_TLS_KEY") $value }}{{ $key = $value }}{{ end -}}
 {{- end -}}
+{{/*
+  Same two branches needsAPIAccess uses, for the same reason: a readable
+  non-empty value counts, a valueFrom reference counts because the chart cannot
+  read it and mounting probes against the wrong scheme is the fail-open
+  direction, and an explicit empty value counts for nothing because the server
+  ignores it. Marking an explicit "" as set was the mirror of the env defect
+  above: it left the probes on HTTPS against a server serving cleartext.
+*/}}
 {{- range .Values.extraEnv -}}
-{{- if eq .name "PUPPET_CA_TLS_CERT" }}{{ $cert = "set" }}{{ end -}}
-{{- if eq .name "PUPPET_CA_TLS_KEY" }}{{ $key = "set" }}{{ end -}}
+{{- if and (eq .name "PUPPET_CA_TLS_CERT") .value }}{{ $cert = .value }}{{ end -}}
+{{- if and (eq .name "PUPPET_CA_TLS_KEY") .value }}{{ $key = .value }}{{ end -}}
+{{- if and (eq .name "PUPPET_CA_TLS_CERT") (not (hasKey . "value")) }}{{ $cert = "set" }}{{ end -}}
+{{- if and (eq .name "PUPPET_CA_TLS_KEY") (not (hasKey . "value")) }}{{ $key = "set" }}{{ end -}}
 {{- end -}}
 {{- if and $cert $key -}}
 true

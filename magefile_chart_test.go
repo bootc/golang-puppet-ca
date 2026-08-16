@@ -113,6 +113,31 @@ var _ = Describe("chartValuesFiles", func() {
 	})
 })
 
+var _ = Describe("chartRulesBlock", func() {
+	// The RBAC parity check compares this helper's output for two renders. A
+	// parse that silently returned the whole tail would return the *same* tail
+	// for both and compare equal, so the parity assertion would pass while
+	// checking nothing. Pin the three shapes it has to get right.
+	It("cuts a rules block at the document separator", func() {
+		manifest := "kind: Role\nrules:\n  - verbs: [\"create\"]\n---\nkind: RoleBinding\n"
+		Expect(chartRulesBlock(manifest)).To(Equal("  - verbs: [\"create\"]"))
+	})
+
+	It("returns empty when there is no rules block", func() {
+		Expect(chartRulesBlock("kind: Service\nspec:\n  ports: []\n")).To(BeEmpty())
+	})
+
+	It("takes the whole tail when the rules block is the last document", func() {
+		Expect(chartRulesBlock("kind: Role\nrules:\n  - verbs: [\"patch\"]\n")).To(Equal(`  - verbs: ["patch"]`))
+	})
+
+	It("ignores an indented rules key, which the route templates emit", func() {
+		// ingress.yaml and the Gateway routes carry "  rules:" at indent two;
+		// cutting on those would compare the wrong block entirely.
+		Expect(chartRulesBlock("kind: HTTPRoute\nspec:\n  rules:\n    - backendRefs: []\n")).To(BeEmpty())
+	})
+})
+
 var _ = Describe("verifyChartPins", func() {
 	// Runs against the repository's real files: this is the cross-check that
 	// keeps Chart.yaml's advertised kubeVersion floor, the constant CI

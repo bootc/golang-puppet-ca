@@ -31,6 +31,17 @@ spec:
   {{- $strategy := .Values.strategy }}
   {{- if not $strategy }}
   {{- $strategy = ternary (dict "type" "Recreate") (dict "type" "RollingUpdate" "rollingUpdate" (dict "maxUnavailable" 0 "maxSurge" 1)) .Values.persistence.enabled }}
+  {{- else if not $strategy.type }}
+  {{- /*
+    A strategy map with no type used to be impossible: values.yaml carried
+    `type: Recreate` for a partial override to merge onto. Now that it ships
+    empty, `--set strategy.rollingUpdate.maxSurge=1` reaches here as a truthy
+    map with no type, and Kubernetes reads a typeless strategy as RollingUpdate
+    — surging a replacement pod against the ReadWriteOnce cadir this default
+    exists to protect. Refuse rather than pick: the two plausible readings
+    (roll with these settings / keep Recreate) differ by a CA outage.
+  */}}
+  {{- fail (printf "strategy is set but has no type: %s. A strategy without an explicit type is treated by Kubernetes as RollingUpdate, which would surge a second pod against the cadir volume. Set strategy.type to RollingUpdate or Recreate, or clear strategy entirely to let it follow persistence.enabled." (toJson $strategy)) }}
   {{- end }}
   strategy:
     {{- toYaml $strategy | nindent 4 }}

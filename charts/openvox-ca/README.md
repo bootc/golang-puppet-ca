@@ -104,7 +104,7 @@ Helm 3.21 or 4.2; both are exercised in CI.
 | `tls.existingSecret` | `""` | Secret holding the server certificate; sets `tls_cert`/`tls_key`. The server re-reads the keypair on `SIGHUP`, but nothing sends one, so a renewal needs a signal (`kubectl exec <pod> -- kill -HUP 1`) or a restart — see [the guide](https://github.com/voxpupuli/openvox-ca/blob/main/docs/helm-chart.md) |
 | `tls.certKey` / `tls.keyKey` | `tls.crt` / `tls.key` | Data keys within that Secret |
 | `tls.mountPath` | `/run/secrets/openvox-ca-tls` | |
-| `ca.existingSecret` | `""` | Secret holding the CA certificate and key; sets `ca_cert_file`/`ca_key_file` |
+| `ca.existingSecret` | `""` | Secret holding the CA certificate and key; sets `ca_cert_file`/`ca_key_file`. Under a provider that holds the key (`config.ca_key_provider: openbao`) clear the latter with `config.ca_key_file: ""` |
 | `ca.certKey` / `ca.keyKey` | `tls.crt` / `tls.key` | Data keys within that Secret |
 | `ca.mountPath` | `/run/secrets/openvox-ca-ca` | |
 | `caKeyPassphrase.existingSecret` | `""` | Secret holding the CA key passphrase; sets `encrypt_ca_key` and `ca_key_passphrase_file` |
@@ -141,7 +141,8 @@ Helm 3.21 or 4.2; both are exercised in CI.
 | `metrics.serviceMonitor.path` | `/metrics` | |
 | `metrics.serviceMonitor.scheme` | `http` | |
 | `metrics.serviceMonitor.honorLabels` | `false` | |
-| `metrics.serviceMonitor.jobLabel` / `.targetLabels` | `""` / `[]` | |
+| `metrics.serviceMonitor.jobLabel` | `app.kubernetes.io/name` | Which Service label supplies the Prometheus `job` value. Pinned to the chart name so the shipped mixin's `job="openvox-ca"` selector matches on any release name; `""` restores the Operator's Service-name default. `nameOverride` changes this label too, so an install using it must match `puppetCASelector` to the override |
+| `metrics.serviceMonitor.targetLabels` | `[]` | |
 | `metrics.serviceMonitor.relabelings` / `.metricRelabelings` | `[]` | |
 
 ### Kubernetes export
@@ -160,7 +161,7 @@ Helm 3.21 or 4.2; both are exercised in CI.
 | Key | Default | Description |
 | --- | --- | --- |
 | `replicaCount` | `1` | More than one requires an external storage backend |
-| `strategy` | `{type: Recreate}` | Recreate suits the default ReadWriteOnce volume; switch to RollingUpdate with an external backend |
+| `strategy` | `{}` | Empty follows `persistence.enabled`: Recreate while the cadir is a ReadWriteOnce PVC, RollingUpdate (maxUnavailable 0, maxSurge 1) once the state is external. Set it explicitly to override either way — a map without `type` is refused, because Kubernetes would read it as RollingUpdate |
 | `revisionHistoryLimit` | `10` | |
 | `command` | `[]` | Overrides the container entrypoint |
 | `args` | `[]` | Overrides the generated argument list outright |
