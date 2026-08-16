@@ -31,17 +31,23 @@ process-local named `sync.Mutex`, which is correct for genuinely single-node
 backends (filesystem, SQLite).
 
 The lock names are part of the cross-replica protocol: every replica must agree
-on them, so they are **stable across releases**. They are defined in
+on them, so they are **stable across releases**. Names taken through
+`WithLock` by the CA layer are defined in
 [init.go](../../internal/ca/init.go) — with one mirror: `migrateLockName` in
 [migrate.go](../../internal/storage/migrate.go) redefines `"bootstrap"`
 independently (the `internal/storage` package cannot import `internal/ca`), so
 the two are coupled only by the string literal and must be renamed together.
+Backend-internal locks live beside the backend that takes them, for the same
+import-direction reason: `etcdDecomposeLockName` (`"inventory-decompose"`) in
+[etcd_inventory.go](../../internal/storage/etcd_inventory.go). They are no
+less protocol for it.
 
 | Lock name | Serialises | Taken by |
 | --- | --- | --- |
 | `bootstrap` | First-run CA generation; seeding supporting state (CRL/inventory/serial) for a mounted cert+key; whole-store migration | `CA.Init`, `CA.seedSupportingState`, `storage.MigrateService` (which reuses the name deliberately so a migration and a bootstrapping server exclude each other) |
 | `crl` | Every CRL read-modify-write (read entries → re-sign → write) | `Revoke`, `RevokeSerial`, `ReissueCRL`, `RefreshCRLIfDue`, `CleanupExpiredCerts`, and the revoke step inside `Clean`, `Renew`, `AutoRenew` |
 | `subject:<name>` | The whole lifecycle of one subject: evict/save CSR/sign/import/clean | `SaveRequest`, `Sign`, `SignWithTTL`, `Renew`, `AutoRenew`, `Clean`, `ImportCertificate` — but currently **not** `Generate` (see known gaps below) |
+| `inventory-decompose` | One-time legacy inventory blob conversion (etcd backend only) on the first start after upgrading | `EtcdBackend.decomposeLegacyInventory`, from `EnsureReady` |
 
 How each backend provides the distributed lock (a summary — the full per-backend
 mechanism, key layouts and transaction/retry detail lives in
@@ -252,19 +258,22 @@ path — still provides no cross-replica guarantee anyway.
    would be the consequence, back the lock with a storage-level invariant that
    holds even without it — and check the invariant's own scope.
    `AppendInventory`'s duplicate-serial check (`ErrDuplicateSerial`) is the
-   worked example, but it is a cluster-wide guarantee only on SQL backends,
-   where the database's unique index enforces it; on blob backends the scan
-   runs under the process-local `inventoryMu` only, and etcd's CAS-guarded
-   append protects the blob against lost updates, not serial uniqueness (the
-   doc comment on `ErrDuplicateSerial` in
-   [storage.go](../../internal/storage/storage.go) spells this out, and the
-   blob-backend gap is tracked as
+   worked example: it is a cluster-wide guarantee on the structured backends —
+   SQL via the database's unique index, etcd via the `by-serial` key's
+   `CreateRevision == 0` guard inside the append transaction — but on the
+   remaining blob backends (filesystem, redis) the scan runs under the
+   process-local `inventoryMu` only (the doc comment on `ErrDuplicateSerial`
+   in [storage.go](../../internal/storage/storage.go) spells this out, and
+   the blob-backend gap is tracked as
    [#204](https://github.com/voxpupuli/openvox-ca/issues/204)).
-7. **New lock names are protocol.** Add them to the constants in
-   [init.go](../../internal/ca/init.go) (and keep `migrateLockName` in
+7. **New lock names are protocol.** Define CA-layer names as constants in
+   [init.go](../../internal/ca/init.go) (keeping `migrateLockName` in
    [migrate.go](../../internal/storage/migrate.go) in sync — it redefines
-   `"bootstrap"` independently), keep them stable across releases, and document
-   them in the table above. All callers using a name contend on one lock, so
+   `"bootstrap"` independently) and backend-internal names as constants in the
+   owning backend package (e.g. `etcdDecomposeLockName` in
+   [etcd_inventory.go](../../internal/storage/etcd_inventory.go)); keep them
+   all stable across releases, and document them in the table above. All
+   callers using a name contend on one lock, so
    never derive a name from unvalidated input (subject names pass
    `ValidateSubject` first). `ValidateSubject` is necessary but not sufficient
    on the SQL backends: there the lock identity is a 64-bit FNV-1a hash of the
@@ -327,9 +336,11 @@ state when the document was last updated and is not guaranteed exhaustive.
   command (or the planned offline `generate`,
   [#175](https://github.com/voxpupuli/openvox-ca/issues/175)) racing a running
   server on the same cadir is uncoordinated. The related blob-backend gap —
-  nothing wraps `AppendInventory` in a cluster lock on etcd/Redis either, so
-  its duplicate-serial check is not cross-replica there — is tracked separately
-  as [#204](https://github.com/voxpupuli/openvox-ca/issues/204).
+  nothing wraps `AppendInventory` in a cluster lock on Redis, so its
+  duplicate-serial check is not cross-replica there — is tracked separately
+  as [#204](https://github.com/voxpupuli/openvox-ca/issues/204); the etcd
+  half of that gap was closed by the decomposed inventory's atomic
+  `by-serial` guard ([#138](https://github.com/voxpupuli/openvox-ca/issues/138)).
 - [#171](https://github.com/voxpupuli/openvox-ca/issues/171) — `cachedCRL` is
   per-replica, so authentication and renewal keep accepting a certificate
   revoked elsewhere until this process re-signs the CRL.
@@ -345,10 +356,12 @@ state when the document was last updated and is not guaranteed exhaustive.
   (re-check from *storage* under the subject lock) and also moves `Revoke`
   itself under `subject:<name>` → `crl`; the Tier 1 lock table describes
   current `main`, and that PR carries its own update to the table when it lands.
-- On blob backends (filesystem/etcd/redis), an inventory append and its HMAC
+- On blob backends (filesystem/redis), an inventory append and its HMAC
   update are two writes, not one atomic unit; the failure window is documented
-  at the write site in `AppendInventory` and the structured (SQL) inventory is
-  the durable answer. See [the inventory store](inventory-store.md).
+  at the write site in `AppendInventory` and the structured (SQL, etcd)
+  inventory — which commits the entry and its integrity head in one
+  transaction — is the durable answer. See
+  [the inventory store](inventory-store.md).
 
 ## Tests
 

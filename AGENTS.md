@@ -190,7 +190,9 @@ the inventory, in-memory caches) must follow
 
 - Mutations serialise on cluster-wide named locks via `StorageService.WithLock`
   (`bootstrap`, `crl`, `subject:<name>`); the check that justifies a mutation
-  must run inside the same lock as the mutation.
+  must run inside the same lock as the mutation. Backend-internal locks taken
+  directly via `Backend.AcquireLock` (e.g. etcd's `inventory-decompose`) are a
+  second recognised pattern — see locking.md for when each applies.
 - Read-only paths must **not** take `WithLock` — they use in-memory caches and
   read locks only.
 - Lock ordering is `subject:<name>` → `crl` → `c.mu`; lock names are a stable

@@ -18,7 +18,7 @@ interface. Every backend serves the following logical keys:
 | `crl` | Certificate Revocation List (PEM). May hold several concatenated CRLs when a chain has been imported: this CA's own first, ancestors after it. The re-sign path (`readStoredCRL`) and every reader that parses a single CRL (`loadCRLCache`, the metrics collector, `/expirations`) take block 0; the whole-blob consumers are `GET`/`PUT /certificate_revocation_list/ca`, the Kubernetes exporter, and — to preserve ancestor blocks — `crlChainLocked` on the re-sign path and `storedCRLChain` on the import path. Revocation questions are answered from `cachedCRL`, which `loadCRLCache` fills with the block this CA signed — the newest block it signed, wherever it sits, so a stale copy of ours at block 0 is passed over as readily as an ancestor's | bootstrap, revoke, rotate, import, seed |
 | `serial` | Next leaf certificate serial counter | sign / seed |
 | `inventory` | Append-only log of issued/revoked certificates | sign / revoke / seed |
-| `inventory_hmac` | Inventory integrity head (blob HMAC or hash chain on SQL) | sign / revoke |
+| `inventory_hmac` | Inventory integrity head (blob HMAC, or hash chain on the structured backends: SQL, etcd) | sign / revoke |
 | `hmac_key` | Integrity key for `inventory_hmac` | first run |
 | `csr/<subject>` | Pending certificate signing request (PEM), per subject | CSR submission |
 | `cert/<subject>` | Issued certificate (PEM), per subject | sign |
@@ -65,7 +65,7 @@ With the default prefix `/puppet-ca`:
 | `ca_key` | `/puppet-ca/ca/key` |
 | `crl` | `/puppet-ca/ca/crl` |
 | `serial` | `/puppet-ca/serial` |
-| `inventory` | `/puppet-ca/inventory/data` |
+| `inventory` | `/puppet-ca/inventory/data` (presence marker only; see below) |
 | `inventory_hmac` | `/puppet-ca/inventory/hmac` |
 | `hmac_key` | `/puppet-ca/private/hmac_key` |
 | `csr/<subject>` | `/puppet-ca/requests/<subject>` |
@@ -75,11 +75,19 @@ Stored values carry an 8-byte big-endian `time.UnixNano` mtime prefix so
 `GET /puppet-ca/v1/certificate_revocation_list/ca` still answers
 `If-Modified-Since` without a second round-trip.
 
-Inventory appends use an etcd transaction guarded on the key's `ModRevision`
-with bounded retry, so concurrent appends across replicas don't lose lines.
-When two replicas race to bootstrap, etcd's compare-and-swap semantics prevent
-double-writes of `ca/cert` and `ca/key`; the loser observes the winner's cert
-and continues.
+The certificate inventory is not stored at `inventory/data` — that key is only
+a presence marker (and the location pre-decomposition versions kept the blob).
+The inventory itself is decomposed into one key per issued certificate under
+`inventory/entries/<seq>`, with `inventory/seq` acting as sequence allocator
+and mutation fence and `inventory/by-serial/<serial>` /
+`inventory/by-subject/<subject>` as index keys. Appends are transactions
+guarded on the fence's `ModRevision` with bounded retry, so concurrent
+appends across replicas lose nothing and duplicate serials are rejected
+cluster-wide. See
+[the inventory store](inventory-store.md#the-etcd-decomposition) for the full
+key family and the rules that keep it coherent. When two replicas race to
+bootstrap, etcd's compare-and-swap semantics prevent double-writes of
+`ca/cert` and `ca/key`; the loser observes the winner's cert and continues.
 
 ### Cross-node coordination
 

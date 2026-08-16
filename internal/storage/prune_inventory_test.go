@@ -47,6 +47,21 @@ func keepNotSerial(serial string) func(InventoryEntry) bool {
 	return func(e InventoryEntry) bool { return e.Serial != serial }
 }
 
+// failHMACPutBackend wraps a blob backend and, when armed, fails writes to
+// the integrity-head key — the failure mode after which the blob-fallback
+// prune has already durably rewritten the inventory.
+type failHMACPutBackend struct {
+	Backend
+	arm bool
+}
+
+func (b *failHMACPutBackend) Put(ctx context.Context, key string, data []byte, kind BlobKind) error {
+	if b.arm && key == KeyInventoryHMAC {
+		return fmt.Errorf("simulated HMAC write failure")
+	}
+	return b.Backend.Put(ctx, key, data, kind)
+}
+
 // PruneInventory exercises StorageService.PruneInventory against both the
 // structured (SQLite) and blob (filesystem) backends. The critical property is
 // that after a prune the integrity head is rewritten so ReadInventory — which
@@ -86,6 +101,40 @@ var _ = Describe("PruneInventory", func() {
 				Expect(svc.AppendInventory(ctx, "0004 2024-01-04T00:00:00UTC 2029-01-04T00:00:00UTC /node3")).NotTo(HaveOccurred(), "AppendInventory after prune")
 				_, err = svc.ReadInventory(ctx)
 				Expect(err).NotTo(HaveOccurred(), "ReadInventory after post-prune append")
+			})
+
+			It("returns the removed entries alongside a head-write failure", func() {
+				if name != "filesystem" {
+					Skip("blob-fallback path only")
+				}
+				// The blob fallback rewrites the inventory, then writes the
+				// head. A head-write failure after the durable rewrite must
+				// return the removed entries WITH the error — the inventory
+				// no longer names them, so the caller's CRL/blob cleanup is
+				// their last chance.
+				ctx := context.Background()
+				wrapper := &failHMACPutBackend{Backend: NewFilesystemBackend(GinkgoT().TempDir())}
+				svc := NewWithBackend(wrapper, "")
+				Expect(svc.EnsureDirs(ctx)).To(Succeed())
+				Expect(svc.TouchInventory(ctx)).To(Succeed())
+				Expect(svc.InitHMAC(ctx)).To(Succeed())
+				for _, line := range sampleInventoryLines {
+					Expect(svc.AppendInventory(ctx, line)).To(Succeed())
+				}
+
+				wrapper.arm = true
+				removed, err := svc.PruneInventory(ctx, keepNotSerial("0002"))
+				wrapper.arm = false
+				Expect(err).To(MatchError(ContainSubstring("updating inventory HMAC after prune")),
+					"the head-write failure must surface")
+				Expect(removed).To(HaveLen(1), "the durably removed entry must be returned with the error")
+				Expect(removed[0].Serial).To(Equal("0002"))
+
+				// The honest aftermath: the rewrite is durable, the head lags
+				// it, and the next verified read reports the mismatch.
+				_, err = svc.ReadInventory(ctx)
+				Expect(err).To(MatchError(ErrInventoryTampered),
+					"the stale head must surface as a verification failure, not silently")
 			})
 
 			It("no match leaves inventory and head untouched", func() {
