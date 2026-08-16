@@ -158,6 +158,7 @@ func (s *Server) Routes() http.Handler {
 		{"GET", "/certificate_status/{subject}", s.handleGetStatus},
 		{"PUT", "/certificate_status/{subject}", s.handlePutStatus},
 		{"DELETE", "/certificate_status/{subject}", s.handleDeleteStatus},
+		{"PUT", "/certificate_status_by_serial/{serial}", s.handlePutStatusBySerial},
 		{"GET", "/certificate_statuses/{ignored}", s.handleGetStatuses},
 		{"GET", "/certificate_request/{subject}", s.handleGetRequest},
 		{"PUT", "/certificate_request/{subject}", s.handlePutRequest},
@@ -314,6 +315,137 @@ func (s *Server) handlePutStatus(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, "desired_state must be 'signed' or 'revoked'", http.StatusBadRequest)
 	}
+}
+
+// PutStatusBySerialBody is the request body for PUT
+// /certificate_status_by_serial/{serial}.
+type PutStatusBySerialBody struct {
+	DesiredState string `json:"desired_state"`
+	// Force revokes the serial even when it is the certificate currently
+	// stored for its subject. Absent/false is the safe default; see
+	// ca.ErrSerialIsCurrent.
+	Force bool `json:"force,omitempty"`
+}
+
+// handlePutStatusBySerial revokes one specific serial number.
+//
+// The subject-keyed PUT /certificate_status/{subject} cannot express this: it
+// resolves to whatever serial is newest for the name, so a superseded
+// certificate becomes unreachable as soon as a replacement exists — and asking
+// for the subject then revokes the replacement instead, which is worse than
+// doing nothing. This route exists for that state and no other, which is why it
+// accepts only desired_state "revoked": there is no by-serial signing operation
+// for the field to select between, and rejecting the rest keeps an unrecognised
+// value from being read as a request to revoke.
+//
+// Admin-only, via lookupTier's default. The path deliberately does not sit under
+// /certificate_status/, though nothing would misclassify it there today:
+// lookupTier's arm for that prefix is GET-only, so a PUT already falls to the
+// admin-only default, and extractPathSubject is reached only under
+// tierSelfOrAdmin, which no PUT on that prefix takes. The reason is forward
+// defence, not a present bug — two mechanisms read a segment under that prefix
+// as a *subject*, one to grant self-access and one to hand it to
+// --allow-public-status, and a serial has no business sitting where either might
+// later read it as a name.
+func (s *Server) handlePutStatusBySerial(w http.ResponseWriter, r *http.Request) {
+	// Normalise before anything is logged or acted on, so every line this
+	// request produces names the same serial the CA acted on. Logging the raw
+	// path value instead put a different string in the handler's lines than in
+	// the CA's for the same operation — "0a" against "A" — and the serial is
+	// what an operator correlates them by. (docs/metrics.md sends them to the
+	// log to read a serial out of a warning; it greps by message prefix, not by
+	// serial, so it is where the serial matters, not a citation for the grep.)
+	//
+	// It also keeps an unvalidated path segment out of *this handler's* lines.
+	// Not out of the log: the authorisation middleware logs r.URL.Path verbatim
+	// when it denies a request (auth.go, "Request denied by authorisation
+	// middleware"), and on an admin-only route that is exactly the untrusted
+	// caller. So this is tidiness rather than containment — and containment is
+	// not needed, because slog's Text and JSON handlers are the only two this
+	// project installs and both escape, so a newline cannot forge an entry.
+	//
+	// RevokeSerial normalises again. It has no non-HTTP caller today; keeping it
+	// is forward defence for an exported entry point, and it is what produces the
+	// value the CA's own lines and SubjectForSerial use. The function is
+	// idempotent, so the second pass is free.
+	normalised, err := storage.NormaliseSerial(r.PathValue("serial"))
+	if err != nil {
+		slog.Debug("PUT certificate_status_by_serial: malformed serial", "client", clientCN(r))
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	slog.Debug("PUT certificate_status_by_serial", "serial", normalised, "client", clientCN(r))
+
+	var body PutStatusBySerialBody
+	if !decodeJSONBody(w, r, &body) {
+		return
+	}
+	if body.DesiredState != "revoked" {
+		http.Error(w, "desired_state must be 'revoked'", http.StatusBadRequest)
+		return
+	}
+
+	if err := s.CA.RevokeSerial(r.Context(), normalised, body.Force); err != nil {
+		slog.Warn("RevokeSerial failed", "serial", normalised, "force", body.Force, "error", err)
+		switch {
+		case errors.Is(err, ca.ErrSerialUnknown):
+			http.Error(w, err.Error(), http.StatusNotFound)
+		case errors.Is(err, ca.ErrSerialIsCurrent):
+			// The message names the subject and the remedy, which is the whole
+			// value of the guard; this route is admin-only, so disclosing a
+			// subject the caller may already list is not a widening.
+			http.Error(w, err.Error(), http.StatusConflict)
+		case errors.Is(err, ca.ErrSerialStateUnknown):
+			// The guard could not run. Distinct from the case above because the
+			// remedy is different — wait for storage to recover, rather than
+			// decide the live certificate really should go — and answering both
+			// with the same bare status would send an operator to --force for a
+			// reason that was never the live-certificate guard. The CA builds
+			// this message without the underlying storage error for that reason.
+			http.Error(w, err.Error(), http.StatusConflict)
+		case errors.Is(err, ca.ErrForeignStoredCRL):
+			// Same reasoning as the subject-keyed revoke: this is the boundary
+			// an operator hits first, and a bare "conflict" leaves the cause in
+			// the log of whichever replica served the request.
+			http.Error(w, err.Error(), http.StatusConflict)
+		default:
+			// Everything left is a CA-side failure — an inventory read (including
+			// an integrity failure), a CRL read/sign/write, a lock that could not
+			// be taken. Its message may name storage paths, so it stays in the log
+			// above rather than the response.
+			//
+			// 503, not 409: a transient CA-side fault is not a conflict with the
+			// request, which is what separates this from the subject-keyed
+			// route's blanket 409 for the same class of failure. Two of this
+			// route's three 409s — ErrSerialIsCurrent and ErrSerialStateUnknown
+			// — name force as the way forward; the foreign-CRL one does not. So
+			// answering a storage fault with 409 as well would leave force the
+			// likeliest thing an operator reaches for, disarming the
+			// live-certificate guard for a reason that was never that guard.
+			http.Error(w, "the CA could not service this request; see the server log",
+				http.StatusServiceUnavailable)
+		}
+		return
+	}
+
+	// Per-request client identity is a Debug-level detail everywhere else, rising
+	// above it only when a threshold or a rejection fires (the destructive-op
+	// warning just below, the middleware's denials). That convention is left
+	// alone — except here, this being the one unconditional success-path
+	// attribution, because force has just disarmed the guard that stops a working
+	// credential being taken out of circulation. The
+	// CA layer logs the revocation but cannot see who asked for it, so without
+	// this the one act on this route worth reconstructing afterwards has no
+	// attribution at the default level.
+	if body.Force {
+		slog.Info("Forced revocation by serial", "serial", normalised, "client", clientCN(r))
+	}
+
+	if cn := clientCN(r); cn != "" && s.destructiveOps != nil && s.destructiveOps.Record(cn) {
+		slog.Warn("High rate of destructive operations detected",
+			"client", cn, "operation", "revoke")
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // --- Certificate ---

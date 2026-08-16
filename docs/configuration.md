@@ -238,8 +238,11 @@ Two things the window does not cover, both worth knowing before you rely on it:
   than trusting the cached copy, so a revoked certificate is refused there even
   on a replica that has not synced — but if you are locking out a compromised
   node rather than retiring one certificate, check the inventory for other live
-  serials for that subject, or use `openvox-ca-ctl clean` to revoke and remove
-  them together.
+  serials for that subject and retire each one with
+  `openvox-ca-ctl revoke --serial <hex>` — see
+  [revocation by serial](api.md#revocation-by-serial). `openvox-ca-ctl clean` is
+  not a substitute: it revokes the most recently issued serial for the subject
+  and removes the stored certificate, leaving the subject's other serials valid.
 - **A renewal that coincides with a storage read failure.** That re-read is
   best-effort: if it fails, the check falls back to the CRL already in memory
   rather than refusing every renewal in the fleet over a transient backend

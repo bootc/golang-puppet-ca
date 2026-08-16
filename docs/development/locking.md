@@ -40,7 +40,7 @@ the two are coupled only by the string literal and must be renamed together.
 | Lock name | Serialises | Taken by |
 | --- | --- | --- |
 | `bootstrap` | First-run CA generation; seeding supporting state (CRL/inventory/serial) for a mounted cert+key; whole-store migration | `CA.Init`, `CA.seedSupportingState`, `storage.MigrateService` (which reuses the name deliberately so a migration and a bootstrapping server exclude each other) |
-| `crl` | Every CRL read-modify-write (read entries → re-sign → write) | `Revoke`, `ReissueCRL`, `RefreshCRLIfDue`, `CleanupExpiredCerts`, and the revoke step inside `Clean`, `Renew`, `AutoRenew` |
+| `crl` | Every CRL read-modify-write (read entries → re-sign → write) | `Revoke`, `RevokeSerial`, `ReissueCRL`, `RefreshCRLIfDue`, `CleanupExpiredCerts`, and the revoke step inside `Clean`, `Renew`, `AutoRenew` |
 | `subject:<name>` | The whole lifecycle of one subject: evict/save CSR/sign/import/clean | `SaveRequest`, `Sign`, `SignWithTTL`, `Renew`, `AutoRenew`, `Clean`, `ImportCertificate` — but currently **not** `Generate` (see known gaps below) |
 
 How each backend provides the distributed lock (a summary — the full per-backend
@@ -145,6 +145,15 @@ with the issuance.
 `c.mu` is non-reentrant. The same `...Locked` suffix convention applies: e.g.
 `revokeLocked` requires the cluster `crl` lock **and** `c.mu`; each `...Locked`
 function's comment states exactly which locks its caller must hold.
+
+`RevokeSerial` takes the same two as `Revoke` and in the same order, and its
+checks run inside them for the reason rule 3 exists: the subject a serial belongs
+to, and whether that subject's stored certificate still carries it, are what
+justify the CRL write, so resolving either outside the lock would let the answer
+go stale before the mutation. That puts an inventory read — on blob backends an
+HMAC verification over the whole blob — inside the `crl` lock, which is why the
+operation is documented as operator-initiated rather than something to call in a
+loop.
 
 ## Lock ordering
 

@@ -70,6 +70,53 @@ var _ = Describe("SQLiteInventoryLatestSerialForSubject", func() {
 	})
 })
 
+var _ = Describe("SQLiteInventorySubjectForSerial", func() {
+	// The InventoryStore arm of SubjectForSerial, which the blob-backed specs in
+	// subjectforserial_test.go never reach — and which every by-serial revoke on
+	// PostgreSQL and MySQL takes.
+	//
+	// The fixture's serials are stored zero-padded (0001/0002/0003), which is
+	// what makes these load-bearing rather than decorative: they are the exact
+	// rendering an indexed `WHERE serial = ?` on the schema's unique index would
+	// fail to match against the canonical form an operator is given, and the
+	// reason SubjectForSerial normalises both sides instead.
+	It("resolves an operator's unpadded serial against padded stored rows", func() {
+		ctx := context.Background()
+		svc, _ := newInventoryService()
+
+		Expect(svc.SubjectForSerial(ctx, "1")).To(Equal("node1"))
+		Expect(svc.SubjectForSerial(ctx, "2")).To(Equal("node2"))
+		Expect(svc.SubjectForSerial(ctx, "3")).To(Equal("node1"))
+	})
+
+	// Case-insensitivity is exercised on the blob arm, in
+	// subjectforserial_test.go, over the same shared normalisation; this fixture
+	// stores only numeric serials, so it can only speak to padding.
+	It("resolves the stored rendering, and any wider padding of it", func() {
+		ctx := context.Background()
+		svc, _ := newInventoryService()
+
+		Expect(svc.SubjectForSerial(ctx, "0001")).To(Equal("node1"))
+		Expect(svc.SubjectForSerial(ctx, "000000000001")).To(Equal("node1"))
+	})
+
+	It("wraps fs.ErrNotExist for a serial no row carries", func() {
+		ctx := context.Background()
+		svc, _ := newInventoryService()
+
+		_, err := svc.SubjectForSerial(ctx, "BEEF")
+		Expect(err).To(MatchError(fs.ErrNotExist))
+	})
+
+	It("rejects input that is not a hexadecimal serial", func() {
+		ctx := context.Background()
+		svc, _ := newInventoryService()
+
+		_, err := svc.SubjectForSerial(ctx, "nope")
+		Expect(err).To(MatchError(ErrMalformedSerial))
+	})
+})
+
 var _ = Describe("SQLiteInventorySerialUnique", func() {
 	It("rejects a duplicate serial via the unique index", func() {
 		ctx := context.Background()

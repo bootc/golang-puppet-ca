@@ -539,6 +539,27 @@ var _ = Describe("Authorisation baseline", Ordered, ContinueOnFailure, func() {
 			fingerprint: "eab32b2174903242",
 			baseline:    "2429990f643028ba",
 		},
+		{
+			// Admin-only via lookupTier's default arm, like every other
+			// revocation route. Recorded here because the path deliberately
+			// sits outside the /certificate_status/ prefix, which two auth
+			// mechanisms read as holding a subject: lookupTier's GET arm (which
+			// --allow-public-status can open) and extractPathSubject's
+			// self-match under tierSelfOrAdmin. Neither reaches a PUT today, so
+			// this row is not pinning a live misclassification — it is what
+			// would notice if the route were moved under that prefix and a
+			// later change gave either mechanism a path to it.
+			name: "admin: revoke a specific serial", method: "PUT",
+			path: "/certificate_status_by_serial/DEADBEEF",
+			denied: map[string]bool{
+				"none": true, "own-ca-plain": true, "own-ca-allowlisted": false,
+				"own-ca-pp-cli-auth": false, "own-ca-admin-both": false, "own-ca-issued": true,
+				"own-ca-expired": true, "own-ca-revoked": true, "own-ca-server-eku": true,
+				"own-ca-pp-cli-auth-false": true, "foreign-ca": true,
+			},
+			fingerprint: "c00e954e2057a4c0",
+			baseline:    "b384bfaa38f960fd",
+		},
 	}
 
 	// probe runs one route against one client class at pathPrefix and reports
@@ -1060,6 +1081,7 @@ var expectedRoutes = []string{
 	"admin: list all statuses",
 	"admin: sign all pending",
 	"admin: reissue the CRL",
+	"admin: revoke a specific serial",
 }
 
 // rowDigest hashes what a row records. Sorted so it does not depend on map

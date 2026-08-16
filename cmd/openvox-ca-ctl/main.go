@@ -31,6 +31,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -331,10 +332,26 @@ func newSignCmd() *cobra.Command {
 }
 
 func newRevokeCmd() *cobra.Command {
-	var certname string
+	var (
+		certname string
+		serial   string
+		force    bool
+	)
 	cmd := &cobra.Command{
-		Use:          "revoke",
-		Short:        "Revoke a certificate",
+		Use:   "revoke",
+		Short: "Revoke a certificate, by subject name or by serial number",
+		Long: `Revoke a certificate.
+
+With --certname, the certificate revoked is the one most recently issued for
+that name. With --serial, it is that exact certificate, whether or not a newer
+one has since been issued for the same name — which is the only way to retire a
+superseded certificate, since asking for the subject would revoke its live
+replacement instead.
+
+A serial that is still the certificate stored for its subject is refused, since
+--certname already covers that case and a mistyped digit should not take a
+working node offline. Pass --force when retiring a live certificate by serial is
+what you meant.`,
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			c, err := newClient()
@@ -342,8 +359,35 @@ func newRevokeCmd() *cobra.Command {
 				return err
 			}
 
-			path := "/puppet-ca/v1/certificate_status/" + certname
-			body, _ := json.Marshal(map[string]string{"desired_state": "revoked"})
+			var (
+				path    string
+				body    []byte
+				subject string
+			)
+			// Keyed on whether the flag was given, not on whether its value is
+			// non-empty. cobra's flag-group checks key on Changed, so
+			// `--serial ""` satisfies them; branching on the value instead sent
+			// it down the by-NAME path as PUT /certificate_status/ with an empty
+			// certname — silently addressing a different route, which is the one
+			// thing the escaping below exists to prevent — and dropped --force
+			// on the way. Refused here so the operator is told, rather than
+			// having the server answer 404 for a path with no serial in it.
+			if cmd.Flags().Changed("serial") {
+				if strings.TrimSpace(serial) == "" {
+					return fmt.Errorf("--serial requires a serial number")
+				}
+				// Escaped because the value is operator-typed: an embedded "/"
+				// would otherwise silently address a different route rather
+				// than reaching the server's own serial validation.
+				path = "/puppet-ca/v1/certificate_status_by_serial/" + url.PathEscape(serial)
+				body, _ = json.Marshal(map[string]any{"desired_state": "revoked", "force": force})
+				subject = "serial " + serial
+			} else {
+				path = "/puppet-ca/v1/certificate_status/" + certname
+				body, _ = json.Marshal(map[string]string{"desired_state": "revoked"})
+				subject = certname
+			}
+
 			code, respBody, err := c.put(path, body)
 			if err != nil {
 				return err
@@ -351,12 +395,18 @@ func newRevokeCmd() *cobra.Command {
 			if err := checkHTTP(code, respBody, "PUT", path); err != nil {
 				return err
 			}
-			fmt.Printf("Revoked %s\n", certname)
+			fmt.Printf("Revoked %s\n", subject)
 			return nil
 		},
 	}
-	cmd.Flags().StringVar(&certname, "certname", "", "Subject name to revoke")
-	_ = cmd.MarkFlagRequired("certname")
+	cmd.Flags().StringVar(&certname, "certname", "", "Subject name to revoke (revokes its most recent certificate)")
+	cmd.Flags().StringVar(&serial, "serial", "", "Hexadecimal serial number of the exact certificate to revoke")
+	cmd.Flags().BoolVar(&force, "force", false, "With --serial, revoke even if it is the certificate currently stored for its subject")
+	cmd.MarkFlagsMutuallyExclusive("certname", "serial")
+	cmd.MarkFlagsOneRequired("certname", "serial")
+	// --force only means anything on the by-serial path: the by-name path has no
+	// guard for it to override, so accepting it there would imply one exists.
+	cmd.MarkFlagsMutuallyExclusive("certname", "force")
 	return cmd
 }
 

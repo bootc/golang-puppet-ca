@@ -15,12 +15,22 @@ of `StorageService` methods (`AppendInventory`, `ReadInventory`,
 the **entire blob**, stored under `inventory_hmac` and keyed by `hmac_key`
 (see [storage-backends.md](../storage-backends.md)).
 
-Despite being a blob, the inventory is only ever used three ways:
+Despite being a blob, the inventory is only ever used four ways:
 
 1. **Append one entry** when a certificate is signed.
 2. **Find the latest serial for a subject** during revocation — a full scan.
 3. **Build a serial → subject index** at startup for OCSP — a full scan, then
    held in memory and updated incrementally on each signing.
+4. **Find the subject holding a given serial** during a by-serial revocation
+   (`StorageService.SubjectForSerial`) — a full scan on **every** backend,
+   including `InventoryStore` ones. The unique index on `serial` cannot serve
+   it: that index is an exact match over the stored text, while this lookup
+   matches on the normalised value, because an inventory written by an older
+   version — or migrated from Puppet Server — carries zero-padded sequential
+   serials. An indexed exact match would miss exactly the historical
+   certificates most likely to need retiring. A canonical-first fast path with
+   fallback to the scan would be sound and is noted as future work in
+   `SubjectForSerial`'s own comment.
 
 The inventory is never served over the API; the `inventory.txt` text format is
 an internal and on-disk-compatibility concern only.
@@ -29,7 +39,9 @@ an internal and on-disk-compatibility concern only.
 
 - Every append re-hashes the whole inventory (O(n) per append) and every read
   re-verifies it. Fine while inventories are small; wasteful as they grow.
-- Lookups (revocation) scan the whole blob.
+- Lookups (revocation) scan the whole blob. Implementing `InventoryStore` for a
+  backend fixes uses 1–3 but not use 4: the by-serial lookup stays a scan there
+  too, for the normalisation reason above.
 - A SQL backend stores the entire history as one ever-growing row.
 
 ## Goal

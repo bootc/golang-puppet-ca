@@ -27,6 +27,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
+	"math/big"
 	"os"
 	"path/filepath"
 	"strings"
@@ -300,6 +301,119 @@ func (s *StorageService) SerialExists(ctx context.Context, serial string) (bool,
 		}
 	}
 	return false, nil
+}
+
+// SubjectForSerial returns the subject of the inventory entry carrying serial,
+// current or historical. Wraps fs.ErrNotExist when no entry carries it, and
+// returns an error for a serial that is not hexadecimal.
+//
+// Unlike SerialExists, the comparison is on the *normalised* value (uppercase
+// hex, no leading zeros) rather than the stored string. SerialExists can insist
+// on an exact match because both sides are written by this CA in one format; a
+// serial reaching this method was typed by an operator, who may reasonably
+// write it in the lowercase, zero-padded or colon-free form some other tool
+// printed. Normalising here is also what lets a modern random serial and a
+// zero-padded sequential one from an older inventory be looked up the same way.
+//
+// Integrity matches LatestSerialForSubject, the by-subject lookup this is the
+// twin of: on a blob backend the HMAC is verified before the scan, so an
+// inventory whose rows were altered surfaces ErrInventoryTampered rather than
+// answering from it. The guarantee is exactly as strong as the stored MAC's
+// presence — verifyInventoryHMACLocked treats an absent one as first-run and
+// re-baselines over whatever is there, so deleting the MAC blob alongside the
+// edit still verifies clean. That is a property of the shared verifier, not of
+// this path (LatestSerialForSubject inherits it too), and closing it would mean
+// a read-only verify mode for every caller. It is left alone here rather than
+// papered over: the barrier stops an edited inventory, not an edited inventory
+// whose sibling MAC was also removed. That
+// matters more here than for a plain read — the answer decides whether a serial
+// may be revoked at all, and which subject's stored certificate the live
+// certificate guard compares against, so an unverified row could both admit a
+// serial this CA never issued (a CRL entry no expiry sweep can ever remove) and
+// point the guard at the wrong certificate. InventoryStore backends are not
+// verified here, exactly as LatestSerialForSubject does not verify them: their
+// integrity head is advanced atomically per append rather than recomputed over a
+// blob, and re-verifying would cost a second full fetch of every row.
+//
+// The scan is linear in the inventory. An indexed by-serial lookup is NOT
+// available even on backends that have the index: the schema's unique index on
+// serial is an exact-match index over the stored text, while this lookup must
+// match on the normalised value, because an inventory written by an older
+// version — or migrated from Puppet Server — carries zero-padded sequential
+// serials (see buildSerialIndex's comment in internal/ca/ocsp.go). An indexed
+// exact match would silently miss precisely the historical certificates most
+// likely to need retiring. A fast path that tried the canonical rendering first
+// and fell back to this scan would be sound; it is deliberately left for later,
+// since this answers an operator-initiated single revocation rather than a hot
+// path, and on blob backends the verification above reads everything regardless.
+func (s *StorageService) SubjectForSerial(ctx context.Context, serial string) (string, error) {
+	want, err := NormaliseSerial(serial)
+	if err != nil {
+		return "", err
+	}
+
+	s.inventoryMu.RLock()
+	defer s.inventoryMu.RUnlock()
+
+	if _, indexed := asInventoryStore(s.backend); !indexed && s.hmacKey != nil {
+		if err := s.verifyInventoryHMACLocked(ctx, s.hmacKey); err != nil {
+			return "", err
+		}
+	}
+
+	entries, err := s.inventoryEntriesLocked(ctx)
+	if err != nil {
+		return "", err
+	}
+
+	// Malformed serials are counted and reported once, not once per row: a
+	// migrated inventory can carry many, and this runs under the cluster CRL
+	// lock while an operator watches the log for the outcome of one revocation.
+	// latestSerialFromBlob aggregates the same condition the same way.
+	//
+	// Deferred so every return path reports the same way and the count means one
+	// thing: rows skipped before the scan stopped. Emitting at each return
+	// instead made the number silently depend on where the match landed.
+	skipped := 0
+	defer func() {
+		if skipped > 0 {
+			slog.Warn("Inventory contains entries with unparseable serials", "count", skipped)
+		}
+	}()
+
+	for _, e := range entries {
+		got, err := NormaliseSerial(e.Serial)
+		if err != nil {
+			skipped++
+			continue
+		}
+		if got == want {
+			return e.Subject, nil
+		}
+	}
+	return "", fmt.Errorf("serial %s not found in inventory: %w", want, fs.ErrNotExist)
+}
+
+// ErrMalformedSerial marks input that is not a hexadecimal serial number, so
+// callers taking a serial from an operator can answer "you typed it wrong"
+// rather than reporting a server fault.
+var ErrMalformedSerial = errors.New("malformed serial")
+
+// NormaliseSerial parses a hexadecimal serial number and re-renders it in the
+// canonical form this CA stores and logs: uppercase hex, no leading zeros, and
+// no separators. It rejects anything that is not a non-negative hexadecimal
+// integer, so it doubles as the input validator for operator-supplied serials.
+//
+// It is the storage-layer twin of the ca package's serialHexStr, which
+// canonicalises a *big.Int that has already been parsed; this one starts from
+// text.
+func NormaliseSerial(serial string) (string, error) {
+	trimmed := strings.TrimSpace(serial)
+	n, ok := new(big.Int).SetString(trimmed, 16)
+	if trimmed == "" || !ok || n.Sign() < 0 {
+		return "", fmt.Errorf("%w: %q is not a hexadecimal serial number", ErrMalformedSerial, serial)
+	}
+	return strings.ToUpper(n.Text(16)), nil
 }
 
 // LatestSerialForSubject returns the most recently issued serial for subject.
