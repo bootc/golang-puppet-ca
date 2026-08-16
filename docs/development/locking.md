@@ -886,3 +886,25 @@ would:
   rather than by store, so driving it would record a self-nesting that is not
   one. Out of scope here rather than misrepresented; rule 9's operator-visible
   half is pinned by the spec above.
+
+`GenerateWithOptions` is a fifth holder of both locks, on its `ReplaceExisting`
+path. Neither mechanism above reaches it: it is not in the per-caller fixture,
+and the edge observer does not drive it either — that spec's setup calls
+`Generate`, which takes `subject:<name>` alone and so records no pair. It is a
+worked instance of the "any caller the specs do not drive" bullet above, and its
+`subject:<name>` → `crl` pair is already sanctioned by `allowedLockNesting`, so
+nothing there fails; the pair is simply never observed. Two things are pinned
+for it separately, in
+[generate_test.go](../../internal/ca/generate_test.go):
+
+- **The subject → CRL ordering**, asserted directly rather than raced, for the
+  same reason `renewrace_test.go` parks rather than races: nothing forces the
+  hazardous interleaving reliably.
+- **The cross-replica outcome** — two `CA` values over one `StorageService`-shared
+  backend that implements `Locker`, racing the same subject, exactly one
+  certificate. This is the outcome the per-subject lock exists for, as opposed
+  to the per-backend mechanism the integration suites cover. Note what the
+  fixture has to do to be a test at all: the two callers rendezvous at the
+  existence check, because an unsynchronised race is decided by whichever
+  goroutine writes first and detects a missing lock only by luck. Its doc
+  comment records the measurements.
