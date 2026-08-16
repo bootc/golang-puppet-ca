@@ -28,7 +28,7 @@ guide is the human-friendly entry point; where the two overlap, AGENTS.md wins.
 - Only if you are changing the Helm chart under [`charts/`](charts/):
   [Helm](https://helm.sh/docs/intro/install/) and
   [kubeconform](https://github.com/yannh/kubeconform)
-  (`go install github.com/yannh/kubeconform/cmd/kubeconform@v0.7.0`)
+  (`go install github.com/yannh/kubeconform/cmd/kubeconform@v0.8.0`)
 
 ## Building
 
