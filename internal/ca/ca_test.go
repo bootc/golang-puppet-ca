@@ -32,6 +32,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -623,6 +624,46 @@ var _ = Describe("CA Revocation", func() {
 			"nothing may be written when the deadline is already gone")
 		Expect(myCA.CRLUpdateFailures()).To(BeNumerically("==", 1),
 			"the docs promise this failure is counted, so the alert can fire on a queued revocation")
+	})
+
+	It("does not count a revocation refused at a cross-node lock acquisition", func() {
+		// The mirror of the spec above, and the other half of a split that
+		// docs/metrics.md, docs/api.md and the mixin's alert text all now turn
+		// on: a spent deadline is counted where the lock is process-local and
+		// the failure lands inside revokeLocked, but not where the backend has
+		// a cross-node acquisition to reject it, because that fails ahead of
+		// any CRL work. Only the counted half was reachable from this suite --
+		// the filesystem backend implements no Locker -- so the uncounted half
+		// was asserted in three documents and nowhere in the tests.
+		lockDir := GinkgoT().TempDir()
+		backend := &refusingLocker{Backend: storage.NewFilesystemBackend(lockDir)}
+		st := storage.NewWithBackend(backend, lockDir)
+
+		Expect(st.EnsureDirs(context.Background())).To(Succeed())
+		Expect(st.SaveCAKey(context.Background(), cachedKeyPEM)).To(Succeed())
+		Expect(st.SaveCACert(context.Background(), cachedCrtPEM)).To(Succeed())
+		Expect(st.UpdateCRL(context.Background(), cachedCrlPEM)).To(Succeed())
+		Expect(st.WriteSerial(context.Background(), "0001")).To(Succeed())
+		Expect(st.TouchInventory(context.Background())).To(Succeed())
+
+		remoteCA := ca.New(st, ca.AutosignConfig{Mode: "off"}, "puppet.test")
+		Expect(remoteCA.Init(context.Background())).To(Succeed())
+
+		csrPEM, err := testutil.GenerateCSR("crossnode-node")
+		Expect(err).NotTo(HaveOccurred())
+		_, err = remoteCA.SaveRequest(context.Background(), "crossnode-node", csrPEM)
+		Expect(err).NotTo(HaveOccurred())
+		_, err = remoteCA.Sign(context.Background(), "crossnode-node")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(remoteCA.CRLUpdateFailures()).To(BeNumerically("==", 0))
+
+		backend.refuse.Store(true)
+
+		Expect(remoteCA.Revoke(context.Background(), "crossnode-node")).
+			To(MatchError(context.DeadlineExceeded),
+				"a rejected acquisition must surface rather than be swallowed")
+		Expect(remoteCA.CRLUpdateFailures()).To(BeNumerically("==", 0),
+			"a revocation refused at the lock never reached the CRL, so the alert must stay quiet")
 	})
 
 	It("IsRevokedSerial returns true for a revoked certificate's serial", func() {
@@ -1932,3 +1973,31 @@ var _ = Describe("Bootstrap public key write", func() {
 		Expect(err).To(MatchError(ContainSubstring("simulated backend failure")))
 	})
 })
+
+// refusingLocker makes a filesystem-backed store look like a distributed one
+// whose cross-node acquisition can be made to fail on demand. StorageService
+// only takes the distributed path when its backend implements storage.Locker,
+// and the filesystem backend does not — which is exactly why the counted half
+// of Revoke's failure split is reachable in the suite and the uncounted half
+// is not without this.
+//
+// While refuse is false every acquisition is granted, so the CA can be
+// bootstrapped and a certificate signed. Flipping it reproduces the state a
+// spent deadline leaves a real Locker in: AcquireLock returns
+// context.DeadlineExceeded, WithLock wraps it and returns without running the
+// closure, and nothing under the lock happens at all.
+type refusingLocker struct {
+	storage.Backend
+	refuse atomic.Bool
+}
+
+func (b *refusingLocker) AcquireLock(_ context.Context, _ string) (storage.Unlocker, error) {
+	if b.refuse.Load() {
+		return nil, context.DeadlineExceeded
+	}
+	return grantedLock{}, nil
+}
+
+type grantedLock struct{}
+
+func (grantedLock) Unlock() error { return nil }

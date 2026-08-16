@@ -462,6 +462,21 @@ statements. A smaller pool would not merely be slow, it would deadlock, so the
 floor is not negotiable. Leave the setting at 0 unless you have measured a
 reason to cap it.
 
+That floor covers `migrate`; it does not size a busy server. Every mutating
+request for a subject — signing, renewal, cleaning and, since the per-subject
+lock was extended to it, revocation — nests `subject:<name>` inside `crl` and
+then does its own reads and writes, so each one in flight wants three
+connections at once rather than one. Bulk revocation is where that first bites.
+`PUT /clean`, or a scripted `openvox-ca-ctl revoke` loop, used to queue every
+subject on the single `crl` gate and hold one lock connection between them;
+revocations of *distinct* subjects now proceed in parallel instead, each
+pinning its own `subject:<name>` connection while it waits for `crl`. Size the
+pool for the mutations you expect to overlap rather than for one, or a bulk
+decommission will exhaust it and stall — bounded only by the 60-second
+`lockTimeout`. See rule 8 in the
+[locking notes](development/locking.md#rules-for-new-or-changed-code) for the
+invariant behind this.
+
 ---
 
 ## CA cert/key as local files

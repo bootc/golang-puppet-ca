@@ -14,8 +14,11 @@ alerting rules for the openvox-ca exporter. It alerts on:
 - **leaf certificates** nearing/at expiry — excluding revoked ones — and
   certificate **requests that stay pending** too long;
 - **CRL update failures** — the CA failing to amend its CRL (a revocation it
-  could not record, or a CRL it could not re-sign or write), which can leave
-  revoked or superseded certificates still valid.
+  could not record, or a CRL it could not re-sign, write or read), which can
+  leave revoked or superseded certificates still valid. On filesystem and
+  SQLite a revocation that merely queued too long for its subject's lock is
+  counted here too, so rule that out before assuming storage trouble — see
+  [metrics](../docs/metrics.md).
 - **CRL propagation** — a replica that cannot reload the stored CRL, or that
   keeps enforcing one behind it. On a shared backend each replica decides
   revocation from its own copy, so a replica left behind still accepts
