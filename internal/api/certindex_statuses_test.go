@@ -234,7 +234,7 @@ var _ = Describe("Certificate statuses via the certificate index", func() {
 			"the display fields must come from the stored PEM")
 	})
 
-	It("falls back to the stored PEM for a projection-less record, keeping the record's state", func() {
+	It("falls back to the stored PEM for a projection-less record, re-deriving state from the served certificate", func() {
 		submitAndSign("idx-legacy", generateCSRWithSANs("idx-legacy", []string{"idx-legacy"}))
 
 		// Append a projection-less inventory row for the same subject, as a
@@ -331,6 +331,27 @@ var _ = Describe("Certificate statuses via the certificate index", func() {
 		revoked := getStatuses("?state=revoked")
 		Expect(revoked).To(HaveLen(1))
 		Expect(revoked[0].Name).To(Equal("idx-donor"))
+	})
+
+	It("re-derives state from the served certificate when the row serial is not even hex", func() {
+		// A non-hex row serial fails both normaliseSerial (so no CRL lookup
+		// keys off the row) and certSerialIs (so the fallback treats it as a
+		// mismatch). The revoked state of the certificate actually served must
+		// still come through — under the pre-fix code the unparseable row's
+		// "signed" default was carried into the response, so this spec fails
+		// if the fallback re-derivation is removed.
+		submitAndSign("idx-nonhex", generateCSRWithSANs("idx-nonhex", []string{"idx-nonhex"}))
+		Expect(myCA.Revoke(ctx, "idx-nonhex")).To(Succeed())
+
+		Expect(store.AppendInventory(ctx,
+			"zz-not-hex 2024-01-01T00:00:00UTC 2029-01-01T00:00:00UTC /idx-nonhex")).To(Succeed())
+
+		statuses := getStatuses("")
+		Expect(statuses).To(HaveLen(1))
+		Expect(statuses[0].State).To(Equal("revoked"),
+			"a row serial that cannot parse must not mask the served certificate's revocation")
+		Expect(getStatuses("?state=revoked")).To(HaveLen(1))
+		Expect(getStatuses("?state=signed")).To(BeEmpty())
 	})
 
 	It("matches a legacy zero-padded row serial against the CRL", func() {
