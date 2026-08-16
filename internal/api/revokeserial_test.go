@@ -354,13 +354,14 @@ var _ = Describe("PUT certificate_status_by_serial", func() {
 		Entry("misspelt", `{"desired_state":"revoke"}`),
 	)
 
-	// The destructive-op tracker. Round 5 declined to cover this on the grounds
-	// that it needed a repo-wide TLS-peer fixture; that was wrong. The
+	// The destructive-op tracker. Round three declined to cover this on the
+	// grounds that it needed a repo-wide TLS-peer fixture; that was wrong. The
 	// middleware is bypassed here (api.New leaves AuthConfig nil), and clientCN
 	// reads the CN straight off r.TLS.PeerCertificates[0] with no verification,
-	// so a bare certificate value is enough. Revoking the same serial is
-	// idempotent, so repeated successful calls exercise the counter without
-	// needing a certificate or an orphan per call.
+	// so a bare certificate value is enough — withClientCert in auth_test.go
+	// clones the request and sets that field, and nothing on the path checks it.
+	// Revoking the same serial is idempotent, so repeated successful calls
+	// exercise the counter without needing a certificate or an orphan per call.
 	Describe("the destructive-op tracker", func() {
 		var caller *x509.Certificate
 
@@ -392,9 +393,12 @@ var _ = Describe("PUT certificate_status_by_serial", func() {
 				Expect(revokeAs(caller, serial).Code).To(Equal(http.StatusNoContent))
 			}
 
-			Expect(buf.String()).To(ContainSubstring("High rate of destructive operations detected"))
-			Expect(buf.String()).To(ContainSubstring("cli-user"))
-			Expect(buf.String()).To(ContainSubstring("operation=revoke"))
+			// Anchored, and on the attribute KEYS: docs/ca-key-security.md
+			// publishes this rendered line as a contract for operator alerting,
+			// so renaming "client" to "cn" would break every query built on it.
+			// A bare ContainSubstring("cli-user") would not notice.
+			Expect(buf.String()).To(MatchRegexp(
+				`High rate of destructive operations detected[^\n]*client=cli-user[^\n]*operation=revoke`))
 		})
 
 		It("stays quiet below the threshold", func() {
