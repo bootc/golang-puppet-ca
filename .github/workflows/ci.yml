@@ -145,7 +145,7 @@ jobs:
       - name: Install Mage
         run: go install github.com/magefile/mage@v1.17.2
       - name: Install kubeconform
-        run: go install github.com/yannh/kubeconform/cmd/kubeconform@v0.7.0
+        run: go install github.com/yannh/kubeconform/cmd/kubeconform@v0.8.0
       # helm is preinstalled on GitHub-hosted runners, but at whatever version
       # the runner image happens to carry; pin it so the matrix means something.
       - name: Set up Helm

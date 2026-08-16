@@ -988,7 +988,7 @@ func (Chart) Validate() error {
 	mg.Deps(Chart.Lint)
 
 	if err := requireChartTool("kubeconform",
-		"go install github.com/yannh/kubeconform/cmd/kubeconform@v0.7.0"); err != nil {
+		"go install github.com/yannh/kubeconform/cmd/kubeconform@v0.8.0"); err != nil {
 		return err
 	}
 	values, err := chartValuesFiles()
