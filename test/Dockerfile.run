@@ -21,6 +21,8 @@ FROM quay.io/centos/centos:stream10
 RUN dnf install -y curl openssl && dnf clean all && \
     groupadd -g 1000 puppet && \
     useradd -m -u 1000 -g 1000 puppet && \
+    { [ "$(id -u puppet):$(id -g puppet)" = "1000:1000" ] || \
+        { echo "puppet is $(id -u puppet):$(id -g puppet), not 1000:1000; USER below must match" >&2; exit 1; }; } && \
     mkdir -p /etc/puppetlabs/puppet/ssl/ca /etc/puppet-ca /data && \
     chown -R puppet:puppet /etc/puppetlabs/puppet /etc/puppet-ca /data
 

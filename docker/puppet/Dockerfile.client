@@ -25,6 +25,8 @@ ENV PATH=/opt/puppetlabs/puppet/bin:${PATH}
 # use.  groupadd/useradd fail the build if anything else has taken it.
 RUN groupadd -g 1000 puppet-agent && \
     useradd -u 1000 -g puppet-agent -m -d /home/puppet-agent -s /sbin/nologin puppet-agent && \
+    { [ "$(id -u puppet-agent):$(id -g puppet-agent)" = "1000:1000" ] || \
+        { echo "puppet-agent is $(id -u puppet-agent):$(id -g puppet-agent), not 1000:1000; USER below must match" >&2; exit 1; }; } && \
     mkdir -p \
         /etc/puppetlabs/puppet/ssl \
         /opt/puppetlabs/puppet/cache \

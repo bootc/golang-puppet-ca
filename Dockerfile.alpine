@@ -25,6 +25,8 @@ FROM alpine:3.24.1@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6ee
 RUN apk add --no-cache ca-certificates && \
     addgroup -g 1000 puppet && \
     adduser -D -u 1000 -G puppet -h /home/puppet puppet && \
+    { [ "$(id -u puppet):$(id -g puppet)" = "1000:1000" ] || \
+        { echo "puppet is $(id -u puppet):$(id -g puppet), not 1000:1000; USER below must match" >&2; exit 1; }; } && \
     mkdir -p /etc/puppetlabs/puppet/ssl/ca /data && \
     chown -R puppet:puppet /etc/puppetlabs/puppet /data
 

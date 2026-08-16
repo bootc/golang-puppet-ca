@@ -34,7 +34,10 @@ ENV PATH=/opt/puppetlabs/server/bin:/opt/puppetlabs/puppet/bin:${PATH}
 # uid:gid pair skips that walk.
 RUN expected="52:52:52"; actual="$(id -u puppet):$(id -g puppet):$(id -G puppet)"; \
     [ "$actual" = "$expected" ] || { \
-        echo "openvox-server puppet uid:gid:groups is $actual, not $expected; update expected above and USER below to match" >&2; \
+        echo "openvox-server puppet uid:gid:groups is $actual, not $expected." >&2; \
+        echo "If the uid or gid moved, update expected above and USER below to match." >&2; \
+        echo "If the extra ids are supplementary groups, USER cannot carry them --" >&2; \
+        echo "add group_add: to the compose services that run this image instead." >&2; \
         exit 1; \
     } && \
     mkdir -p /etc/puppetlabs/puppet/ssl && \

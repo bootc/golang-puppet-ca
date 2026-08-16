@@ -69,9 +69,13 @@ and the container stops at `CreateContainerConfigError`.
 
 A named volume like the one above is created with the right ownership
 automatically. A bind mount is not, so `chown 1000:1000` the host directory
-before starting the container, or the CA cannot write its state; under
-Kubernetes, set `fsGroup: 1000` on the pod so the same applies to a mounted
-volume.
+before starting the container, or the CA cannot write its state. Under
+rootless Podman the container's uid 1000 maps to a subordinate uid on the
+host, so a plain `chown` leaves the directory unwritable — use `podman
+unshare chown 1000:1000 <dir>`, or mount with the `:U` suffix. Under
+Kubernetes, `fsGroup: 1000` on the pod covers PersistentVolumeClaims and
+`emptyDir`, but the kubelet does not apply it to a `hostPath`, which needs
+the same treatment as a bind mount.
 
 ### Compose
 
