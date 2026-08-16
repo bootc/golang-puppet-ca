@@ -5,9 +5,12 @@
 # lefthook on PATH) and it generates the pre-commit/pre-push shims that call
 # `lefthook run <hook>`, which then drives the commands below.
 #
-# Hooks degrade gracefully: if a tool is missing the command prints a SKIP
-# notice and exits 0 rather than blocking the commit/push. Run the same checks
-# manually via `mage dev:check` (lint), `go test -race ./...`, and
+# Hooks degrade gracefully where they can: a command whose tool is missing from
+# PATH prints a SKIP notice and exits 0 rather than blocking. Two exceptions —
+# on Linux `-race` needs a C compiler and fails rather than skipping without one
+# (macOS builds it without cgo), and the
+# verify-tags.sh script has no tool to be missing, so it always runs. Run the
+# same checks manually via `mage dev:check` (lint), `go test -race ./...`, and
 # `mage test:magefile` (the build-tagged magefile suite); the pre-push hook
 # additionally refuses v* tags that do not match internal/version (see
 # .lefthook/pre-push/verify-tags.sh).
@@ -19,6 +22,10 @@ pre-commit:
       # gofmt -l prints unformatted files and exits 0; treat any output as a
       # failure so unformatted code never lands.
       run: |
+        if ! command -v gofmt >/dev/null 2>&1; then
+          echo "SKIP: gofmt not found on PATH"
+          exit 0
+        fi
         unformatted=$(gofmt -l .)
         if [ -n "$unformatted" ]; then
           echo "These files need formatting (run 'go fmt ./...'):"
@@ -49,4 +56,26 @@ pre-push:
       # allow-list swap -- pass locally and fail after the push. The second
       # invocation covers the build-tagged magefile suite, which
       # `go test ./...` cannot see (same suite CI runs via `mage test:magefile`).
-      run: go test -race ./... && go test -tags mage .
+      #
+      # The unset is defence in depth for the hazard that gives this hook its
+      # teeth: git exports these to every hook it runs, they outrank a child
+      # process's working directory, and a test that shells out to git while
+      # inheriting them operates on the repository being pushed. The magefile
+      # suite's fixtures strip them for themselves (fixtureEnv), which is what
+      # protects them under any other wrapper; this stops a future test that
+      # forgets from being destructive here, where it matters most.
+      run: |
+        if ! command -v go >/dev/null 2>&1; then
+          echo "SKIP: go not found on PATH"
+          exit 0
+        fi
+        # Captured first, so a failure is visible instead of silently leaving
+        # GIT_DIR in place: the 2>/dev/null on an `unset $(...)` would redirect
+        # unset's own stderr, not the substitution's, since expansion happens
+        # before redirection.
+        if local_env="$(git rev-parse --local-env-vars)"; then
+          [ -n "$local_env" ] && unset $local_env
+        else
+          echo "WARNING: could not enumerate git's local env vars; not stripping them"
+        fi
+        go test -race ./... && go test -tags mage .

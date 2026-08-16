@@ -1,0 +1,659 @@
+# Default values for the openvox-ca chart.
+#
+# The server's own settings live under `config` below: that block is written
+# verbatim to /etc/puppet-ca/config.yaml, where openvox-ca auto-detects it, so
+# every key in docs/configuration.md is reachable without the chart needing a
+# value of its own for each one. The blocks below it (tls, ca, puppetServers,
+# metrics, kubernetesExport, …) are conveniences that wire up the Kubernetes
+# side — volumes, RBAC, ports — *and* set the matching config keys for you.
+# Anything you set in `config` wins over what those blocks compute — except
+# `port`, `cadir` and `metrics_listen`, which also shape a Kubernetes object; the
+# install is refused rather than left to diverge. Use listen.port,
+# persistence.mountPath and metrics.port for those.
+
+# -- Image ---------------------------------------------------------------------
+
+image:
+  registry: ghcr.io
+  repository: voxpupuli/openvox-ca
+
+  # Image tag. Empty (the default) resolves to the Alpine variant of the
+  # chart's appVersion, e.g. "0.9.0-alpine" — Alpine is the chart's default
+  # image. To run the CentOS Stream variant instead, set the unsuffixed tag:
+  #
+  #   image:
+  #     tag: "0.9.0"
+  #
+  # An explicit tag is used exactly as given; the chart never appends a suffix
+  # to it. Charts built from an unreleased tree (a -dev appVersion) fall back
+  # to the rolling "edge-alpine" tag, which is what main publishes.
+  tag: ""
+
+  # Pin by digest. When set it takes precedence over tag, and the reference
+  # becomes registry/repository@sha256:… (the tag is dropped, as Kubernetes
+  # ignores it anyway).
+  digest: ""
+
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+# -- Naming --------------------------------------------------------------------
+
+nameOverride: ""
+fullnameOverride: ""
+
+# Deploy into a namespace other than the release namespace.
+namespaceOverride: ""
+
+# Extra labels/annotations added to every object the chart creates.
+commonLabels: {}
+commonAnnotations: {}
+
+# -- Server configuration ------------------------------------------------------
+
+# Written verbatim to <configMount>/config.yaml. Every key documented in
+# docs/configuration.md is valid here, including the nested `kubernetes_export`
+# and `openbao` blocks. Keys set here override anything the convenience blocks
+# below would have computed.
+#
+# Example:
+#   config:
+#     storage_backend: postgres
+#     leaf_key_algo: ecdsa
+#     leaf_key_size: 256
+#     crl_validity_days: 90
+#     crl_url: https://ca.example.com/puppet-ca/v1/certificate_revocation_list/ca
+#     enable_expired_cert_cleanup: true
+config: {}
+
+# Use a ConfigMap you manage yourself instead of one rendered from `config`.
+# It must contain a config.yaml key; the chart mounts it at configMount and
+# skips rendering its own ConfigMap.
+#
+# This turns off everything downstream of that rendering, because the chart no
+# longer knows what the server is configured with:
+#   * `config`, `verbosity`, `listen.host`, `puppetServers`, `autosign`,
+#     `extraConfigFiles` and `kubernetesExport.targets` stop being written
+#     anywhere — set the equivalents in your own ConfigMap.
+#   * The tls/ca/caKeyPassphrase Secrets are still *mounted*, but nothing points
+#     the server at them; write the paths into your config.yaml yourself.
+#   * `configChecksumAnnotation` goes inert, so pods do not roll on a change.
+#   * The TLS precondition is not checked, and the probes assume HTTPS. Set
+#     `httpGet.scheme` explicitly if your config.yaml sets no_tls_required.
+#   * Export RBAC cannot narrow `patch` to your target names, so it grants it
+#     in full, and the ServiceAccount token is mounted unconditionally.
+#
+# Two values keep working and must be kept in step with your own config.yaml by
+# hand, because they shape the pod rather than the config file:
+#   * `listen.port` is the container port, the target of all three probes, and
+#     what the Service forwards to. Set it to whatever your config.yaml's
+#     `port` says or the pod never becomes ready.
+#   * `metrics.port` and `metrics.enabled` likewise open the pod and Service
+#     metrics port; your config.yaml still has to set `metrics_listen` on the
+#     matching port.
+existingConfigMap: ""
+
+# Where the config ConfigMap is mounted. openvox-ca auto-detects
+# /etc/puppet-ca/config.yaml, and the chart passes --config explicitly, so
+# this only needs changing in unusual layouts.
+configMount: /etc/puppet-ca
+
+# Extra files to place alongside config.yaml in the config ConfigMap, keyed by
+# filename. Useful for an autosign allowlist or any file a config key points
+# at. They land in <configMount>/<filename>.
+#
+# A key is refused when the chart is itself rendering that file, because yours is
+# written last and would take its place. With existingConfigMap set the chart
+# renders no ConfigMap at all, so nothing here is refused — and nothing here is
+# written either, per the note above. Otherwise: config.yaml always,
+# puppet-server when puppetServers is set, autosign.conf when autosign.patterns
+# is set. Use existingConfigMap, puppetServers or autosign.patterns instead in
+# those cases; where the chart renders none of them — the allow list supplied by
+# hand, say — supplying it here is fine.
+#
+# Keys must also look like ConfigMap keys (letters, digits, '-', '_', '.'); a
+# padded or quoted name would fold onto a different one.
+extraConfigFiles: {}
+
+# Listen address and port for the Puppet CA API.
+#
+# host defaults to 0.0.0.0 (IPv4). For a dual-stack Service, set it to "[::]"
+# so the pod accepts both families on one socket — see service.ipFamilyPolicy.
+listen:
+  host: 0.0.0.0
+  port: 8140
+
+# Log verbosity: 0=Info, 1=Debug, 2=Trace. Written into config.yaml rather
+# than passed as --verbosity, so that config.verbosity can override it — a flag
+# would outrank the config file unconditionally.
+verbosity: 0
+
+# CNs granted admin API access over mTLS. Rendered into the config ConfigMap
+# as a puppet-server file and wired up via puppet_server_file. One entry per
+# line, so an entry containing a newline is refused rather than silently
+# mangling the allow list.
+puppetServers: []
+# - openvoxserver.example.com
+# - compile-1.example.com
+
+# Autosigning. mode is "false" (manual signing, the default), "true" (sign
+# everything — dev/test only), or a path to a file or executable inside the
+# container. Setting `patterns` renders a glob allowlist into the config
+# ConfigMap and points autosign_config at it.
+autosign:
+  mode: ""
+  patterns: []
+  # - "*.agent.example.com"
+
+# -- TLS and CA material -------------------------------------------------------
+
+# Server TLS certificate for the HTTPS listener. Typically a kubernetes.io/tls
+# Secret issued by cert-manager. When set, the Secret is mounted read-only and
+# tls_cert/tls_key are pointed at it.
+#
+# IMPORTANT: openvox-ca re-reads the keypair on SIGHUP, but nothing here sends
+# one. The kubelet refreshes the mounted files when cert-manager renews the
+# Secret, and the running process keeps serving the old certificate until it is
+# signalled or restarted — while the probes speak to that same listener, so
+# readiness stays green until it expires and every agent fails at once. Act on
+# renewal: `kubectl exec <pod> -- kill -HUP 1` (PID 1 forwards it, no restart),
+# `kubectl rollout restart`, a Reloader annotation on the pod template
+# (`reloader.stakater.com/auto: "true"` watches every mounted Secret and
+# ConfigMap and restarts the pod; ci/postgres-ha-values.yaml sets it under
+# podAnnotations), or your own controller.
+tls:
+  existingSecret: ""
+  certKey: tls.crt
+  keyKey: tls.key
+  mountPath: /run/secrets/openvox-ca-tls
+
+# CA certificate and private key held in a Secret, kept at a local path
+# regardless of the storage backend (ca_cert_file / ca_key_file). Leave
+# existingSecret empty to let openvox-ca bootstrap its own CA into cadir.
+#
+# A third route needs no value here: running under an external root, via the
+# offline `openvox-ca csr` and `openvox-ca import-ca-cert` subcommands. The
+# server refuses to start between the two — a crash-loop under a Deployment — so
+# read "Running under an external root" in docs/helm-chart.md for what the
+# chart's names and defaults substitute into the procedure, and don't begin a
+# rollout inside that window.
+#
+# Both ca_cert_file and ca_key_file are set from this block. Under a provider
+# that holds the key itself (config.ca_key_provider: openbao) there is no key
+# file, so clear that one — an empty string is honoured all the way through, and
+# the server treats an empty ca_key_file as unset:
+#
+#   ca:
+#     existingSecret: openvox-ca-cert   # certificate only
+#   config:
+#     ca_key_provider: openbao
+#     ca_key_file: ""
+ca:
+  existingSecret: ""
+  certKey: tls.crt
+  keyKey: tls.key
+  mountPath: /run/secrets/openvox-ca-ca
+
+# Passphrase for CA key encryption at rest. Setting existingSecret mounts it
+# and sets encrypt_ca_key plus ca_key_passphrase_file. See
+# docs/ca-key-security.md.
+caKeyPassphrase:
+  existingSecret: ""
+  key: passphrase
+  mountPath: /run/secrets/openvox-ca-passphrase
+
+# -- Storage -------------------------------------------------------------------
+
+# The cadir volume. Required for the filesystem and sqlite backends, which keep
+# the whole CA — including its private key — here; losing it loses the CA.
+#
+# With an external backend (postgres, mysql, etcd, redis) the directory holds
+# nothing durable, so set enabled: false to use an emptyDir instead.
+persistence:
+  enabled: true
+  mountPath: /var/lib/puppet-ca
+
+  # Use a PersistentVolumeClaim you created yourself.
+  existingClaim: ""
+
+  storageClass: ""
+  accessModes:
+    - ReadWriteOnce
+  size: 1Gi
+  annotations: {}
+  labels: {}
+  selector: {}
+
+  # Keep the PVC when the release is uninstalled. Strongly recommended for a
+  # filesystem-backend CA.
+  retain: true
+
+# emptyDir spec used for cadir when persistence.enabled is false. `medium:
+# Memory` keeps ephemeral CA state off disk entirely.
+emptyDir:
+  medium: Memory
+  sizeLimit: ""
+
+# -- Metrics -------------------------------------------------------------------
+
+metrics:
+  # Enables the Prometheus exporter on its own plain-HTTP listener and adds the
+  # port to the pod and Service.
+  enabled: false
+
+  # Address the exporter binds to. "0.0.0.0" listens on IPv4; use "[::]" to
+  # match a dual-stack Service.
+  host: 0.0.0.0
+  port: 9140
+
+  # SECURITY: leaf-certificate metrics carry node hostnames as label values.
+  # Restrict scrapes to your monitoring namespace — see networkPolicy below.
+  serviceMonitor:
+    # Opt-in: requires the Prometheus Operator CRDs.
+    enabled: false
+    # Namespace for the ServiceMonitor; defaults to the release namespace.
+    namespace: ""
+    # Extra labels, e.g. the release label your Prometheus selects on.
+    labels: {}
+    annotations: {}
+    interval: 60s
+    scrapeTimeout: ""
+    path: /metrics
+    scheme: http
+    honorLabels: false
+    # Which Service *label* supplies the Prometheus `job` value. Empty leaves it
+    # to the Prometheus Operator, which uses the Service name — distinct per
+    # release, which is what you want: two releases of this chart running side
+    # by side (an old CA and its replacement, during a fleet migration) must be
+    # tellable apart by `job`, or an alert cannot say which one is unhealthy.
+    #
+    # Do not point this at app.kubernetes.io/name. That label carries the
+    # *chart* name, identical across every release, so two concurrent releases
+    # would report the same job and the older one's alerts would silently start
+    # selecting the wrong pods.
+    #
+    # The consequence to know about: the alerting mixin ships a fixed
+    # `job="openvox-ca"` selector, which matches only a release whose Service is
+    # named openvox-ca. There is no default that satisfies both a fixed selector
+    # and per-release distinctness — they are contradictory — so the selector is
+    # the end that moves: set the mixin's puppetCASelector to match your
+    # deployment. See docs/helm-chart.md, "Monitoring".
+    jobLabel: ""
+    targetLabels: []
+    relabelings: []
+    metricRelabelings: []
+
+# -- Kubernetes export ---------------------------------------------------------
+
+# Publish the CA certificate and/or CRL into Secrets and ConfigMaps via
+# in-cluster server-side apply. See docs/kubernetes-export.md.
+kubernetesExport:
+  enabled: false
+
+  # Server-side apply field manager; empty uses openvox-ca's default.
+  fieldManager: ""
+
+  # Export targets, passed straight through to kubernetes_export.targets.
+  targets: []
+  # - kind: Secret
+  #   metadata:
+  #     name: openvox-ca-trust
+  #   cert: true
+  #   crl: true
+
+  rbac:
+    # Create the Role/RoleBinding (or ClusterRole/ClusterRoleBinding) granting
+    # create and patch on secrets and configmaps.
+    create: true
+
+    # "Role" grants access in one namespace at a time; "ClusterRole" grants it
+    # cluster-wide. Prefer Role unless you export into many namespaces.
+    scope: Role
+
+    # Namespaces to bind the Role into, on top of the release namespace. Each
+    # target namespace you export into needs a binding. Ignored when scope is
+    # ClusterRole.
+    namespaces: []
+
+# -- Workload ------------------------------------------------------------------
+
+replicaCount: 1
+
+# Deployment strategy. Empty follows the reason the default exists rather than
+# restating it: Recreate while persistence is enabled, because the default cadir
+# volume is a ReadWriteOnce PVC that a surging replacement pod could not mount —
+# and RollingUpdate once persistence.enabled is false, where the CA's state is in
+# an external backend and there is nothing left to serialise on. Leaving Recreate
+# fixed there bought a full outage on every upgrade for no reason.
+#
+# Set it explicitly to override either way — a ReadWriteMany volume can roll
+# while persistence is on, for instance:
+#
+#   strategy:
+#     type: RollingUpdate
+#     rollingUpdate:
+#       maxUnavailable: 0
+#       maxSurge: 1
+strategy: {}
+
+revisionHistoryLimit: 10
+
+# Override the container entrypoint and arguments outright. When args is set
+# the chart stops constructing --config for you, and stops checking the TLS
+# precondition — it can no longer tell what the server will be told.
+command: []
+args: []
+
+# Appended to the arguments the chart builds. Ignored when args is set.
+extraArgs: []
+
+# Extra environment variables. Map form for literals, list form for anything
+# needing valueFrom.
+env: {}
+# PUPPET_CA_HOSTNAME: ca.example.com
+
+extraEnv: []
+# - name: POSTGRES_PASSWORD
+#   valueFrom:
+#     secretKeyRef:
+#       name: openvox-ca-db
+#       key: password
+# - name: PUPPET_CA_SQL_DSN
+#   value: postgres://openvox-ca:$(POSTGRES_PASSWORD)@db-rw:5432/openvox-ca?sslmode=require
+
+envFrom: []
+# - configMapRef:
+#     name: openvox-ca-extra
+#   prefix: PUPPET_CA_
+
+# 64Mi is a hard cap, and the server's footprint grows with the size of the
+# fleet: it holds a serial index and a cache of pre-signed OCSP responses, one
+# entry per known certificate, pruned only on revocation or expired-cert
+# cleanup. Raise the limit before a growing inventory reaches it — crossing it
+# is an OOMKill, and with the Recreate strategy a persistence-enabled
+# install derives, that is CA downtime.
+# Setting GOMEMLIMIT (via `env`) to just under the limit turns the cliff into GC
+# pressure. With `persistence.enabled: false` and the default `medium: Memory`,
+# the cadir tmpfs counts against this limit too.
+resources:
+  requests:
+    cpu: 10m
+    memory: 48Mi
+  limits:
+    memory: 64Mi
+
+# Roll the pods when the rendered config changes. Inert when existingConfigMap
+# is set: the chart cannot checksum a ConfigMap it did not render.
+configChecksumAnnotation: true
+
+podAnnotations: {}
+podLabels: {}
+
+# Annotations on the Deployment object itself, rather than the pods it creates
+# — e.g. ignore-check.kube-linter.io/… suppressions.
+deploymentAnnotations: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  fsGroup: 1000
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+  seccompProfile:
+    type: RuntimeDefault
+
+# Probes. Everything except `enabled` is the probe spec, passed through as
+# written; set `enabled: false` to drop a probe entirely.
+#
+# `httpGet.scheme` is deliberately absent: the kubelet has to speak whatever the
+# server speaks, so the chart fills it in as HTTPS when a server certificate is
+# configured and HTTP when one is not (behind a TLS-terminating proxy with
+# config.no_tls_required). Set it explicitly to override that.
+livenessProbe:
+  enabled: true
+  httpGet:
+    path: /healthz/live
+    port: https
+
+readinessProbe:
+  enabled: true
+  httpGet:
+    path: /healthz/ready
+    port: https
+
+startupProbe:
+  enabled: true
+  failureThreshold: 30
+  periodSeconds: 2
+  httpGet:
+    path: /healthz/startup
+    port: https
+
+lifecycle: {}
+
+# Must exceed shutdown_timeout_sec by at least 3s so the supervisor's drain is
+# never truncated — see docs/configuration.md#graceful-shutdown.
+terminationGracePeriodSeconds: 30
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# A constraint with no labelSelector gets this release's own pod selector, so
+# the common case needs no boilerplate. Supply one explicitly to spread against
+# a different set of pods.
+topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: kubernetes.io/hostname
+    whenUnsatisfiable: ScheduleAnyway
+
+priorityClassName: ""
+runtimeClassName: ""
+schedulerName: ""
+
+dnsPolicy: ""
+dnsConfig: {}
+hostAliases: []
+
+enableServiceLinks: false
+
+# null lets the chart decide: mounted when the pod needs the Kubernetes API —
+# Kubernetes export (from either `kubernetesExport.enabled` or
+# `config.kubernetes_export.targets`) or OpenBao Kubernetes auth (from
+# `config.openbao.auth_method`, PUPPET_CA_OPENBAO_AUTH_METHOD in `env` or
+# `extraEnv`, or `--openbao-auth-method` in `extraArgs`) — and also whenever the
+# chart cannot see the whole configuration, because `existingConfigMap`, `args`,
+# `envFrom` and a `--config` in `extraArgs` can each carry those settings
+# somewhere it does not read. A spare token costs nothing; a missing one fails
+# the feature while readiness stays green. Set true/false to force the decision.
+automountServiceAccountToken: null
+
+initContainers: []
+extraContainers: []
+extraVolumes: []
+extraVolumeMounts: []
+
+serviceAccount:
+  create: true
+  # Required when kubernetesExport.rbac.create is on and create is false: the
+  # chart refuses to bind the export Role to the namespace's default
+  # ServiceAccount, which would grant create/patch on Secrets to every pod in
+  # the namespace.
+  name: ""
+  annotations: {}
+  labels: {}
+
+# -- Service -------------------------------------------------------------------
+
+service:
+  type: ClusterIP
+  port: 443
+
+  annotations: {}
+  labels: {}
+
+  # Dual stack. ipFamilyPolicy is SingleStack, PreferDualStack, or
+  # RequireDualStack; ipFamilies pins the families and their order, e.g.
+  # [IPv6, IPv4] for an IPv6-primary Service. Remember to set listen.host to
+  # "[::]" so the pod actually accepts both families.
+  ipFamilyPolicy: ""
+  ipFamilies: []
+
+  clusterIP: ""
+  externalIPs: []
+  externalTrafficPolicy: ""
+  internalTrafficPolicy: ""
+  # Kubernetes 1.31+: "PreferClose" keeps traffic in-zone.
+  trafficDistribution: ""
+  sessionAffinity: ""
+  sessionAffinityConfig: {}
+  publishNotReadyAddresses: false
+
+  loadBalancerIP: ""
+  loadBalancerClass: ""
+  loadBalancerSourceRanges: []
+  allocateLoadBalancerNodePorts: null
+
+  # NodePort/LoadBalancer only.
+  nodePort: ""
+  metricsNodePort: ""
+
+  appProtocol: ""
+
+  extraPorts: []
+
+# -- Ingress -------------------------------------------------------------------
+
+# IMPORTANT: openvox-ca terminates TLS itself and authenticates agents by
+# client certificate, so the ingress controller must pass TLS through
+# untouched. A controller that terminates TLS strips the client certificate and
+# every admin endpoint stops authenticating. The annotation below is the
+# HAProxy form; nginx uses nginx.ingress.kubernetes.io/ssl-passthrough.
+#
+# If you deliberately terminate TLS at the ingress, set
+# config.no_tls_required: true and understand that mTLS-authenticated
+# endpoints are then unreachable.
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  #   ingress.kubernetes.io/ssl-passthrough: "true"
+  labels: {}
+
+  # Service port the rules point at: "https" or "metrics". "metrics" requires
+  # metrics.enabled — the Service has no metrics port otherwise, and the chart
+  # refuses the combination rather than routing nowhere.
+  backendPort: https
+
+  hosts:
+    - host: ca.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+
+  tls: []
+  # - secretName: openvox-ca-ingress-tls
+  #   hosts:
+  #     - ca.example.com
+
+# -- Gateway API ---------------------------------------------------------------
+
+gateway:
+  # TLSRoute passes the TLS connection through to the pod, preserving client
+  # certificates. This is the Gateway API equivalent of ssl-passthrough and the
+  # right choice for a Puppet CA. Requires the Gateway API experimental
+  # channel, and a Gateway listener with tls.mode: Passthrough.
+  tlsRoute:
+    enabled: false
+    apiVersion: gateway.networking.k8s.io/v1alpha2
+    annotations: {}
+    labels: {}
+    parentRefs: []
+    # - name: external
+    #   namespace: gateway-system
+    #   sectionName: tls-passthrough
+    hostnames: []
+    # - ca.example.com
+    backendPort: https
+    # Replace the generated rules outright.
+    rules: []
+
+  # HTTPRoute terminates TLS at the Gateway, so the CA sees no client
+  # certificate. Only useful for the anonymous endpoints (CRL distribution,
+  # health, OCSP) or alongside config.no_tls_required.
+  httpRoute:
+    enabled: false
+    apiVersion: gateway.networking.k8s.io/v1
+    annotations: {}
+    labels: {}
+    parentRefs: []
+    hostnames: []
+    backendPort: https
+    rules: []
+
+# -- Network policy ------------------------------------------------------------
+
+networkPolicy:
+  enabled: false
+
+  # Ingress to the API port. "any" admits every pod in the cluster (agents live
+  # anywhere); "namespace" restricts to this namespace; "none" writes no API
+  # rule, leaving `extraIngress` to define access.
+  apiAccess: any
+
+  # Namespaces allowed to scrape the metrics port, matched on the
+  # kubernetes.io/metadata.name label. Applies only when metrics.enabled.
+  metricsNamespaces:
+    - monitoring
+
+  # Egress rules. DNS is always allowed when egress is enabled; add rules for
+  # your storage backend, OpenBao, and the Kubernetes API as needed.
+  egress:
+    enabled: false
+    rules: []
+    # - to:
+    #     - podSelector:
+    #         matchLabels:
+    #           cnpg.io/cluster: openvox-ca-db
+    #   ports:
+    #     - port: 5432
+    #       protocol: TCP
+
+  extraIngress: []
+
+# -- Availability --------------------------------------------------------------
+
+podDisruptionBudget:
+  enabled: false
+  minAvailable: 1
+  maxUnavailable: ""
+  # Kubernetes 1.27+.
+  unhealthyPodEvictionPolicy: ""
+
+# At least one metric source is required when enabled: an HPA with nothing to
+# act on holds the replica count at minReplicas while looking like it
+# autoscales, so the chart refuses that combination at install time. Scaling out
+# also needs an external storage backend.
+autoscaling:
+  enabled: false
+  minReplicas: 2
+  maxReplicas: 6
+  targetCPUUtilizationPercentage: 80
+  targetMemoryUtilizationPercentage: ""
+  metrics: []
+  behavior: {}
+
+# -- Extra objects -------------------------------------------------------------
+
+# Arbitrary manifests rendered alongside the release. Each entry is templated,
+# so it can reference .Values and the chart helpers.
+extraObjects: []

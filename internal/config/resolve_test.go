@@ -40,7 +40,8 @@ var _ = Describe("ResolveConfigFile", func() {
 	const envVar = "PUPPET_CA_TEST_CONFIG"
 
 	// Each spec saves and restores the env var so it never leaks into a
-	// sibling; t.Setenv is unavailable inside Ginkgo nodes.
+	// sibling; equivalent to GinkgoT().Setenv (see AGENTS.md), since a bare
+	// t.Setenv needs a *testing.T that Ginkgo nodes do not have.
 	BeforeEach(func() {
 		prev, had := os.LookupEnv(envVar)
 		DeferCleanup(func() {

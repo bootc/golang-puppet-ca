@@ -26,6 +26,11 @@ Task. Invoke targets with `go run mage.go <Target>` or the `mage` binary:
 | `mage test:backendsRedis` | Redis backend full-stack bash TAP suite (Puppet topology) |
 | `mage test:backendsRedisGo` | Redis backend Go integration suite (build tag `redis_integration`) |
 | `mage test:backendsOpenBao` | OpenBao Transit signer integration suite (build tag `openbao_integration`, `test/compose-backends-openbao.yml`) |
+| `mage chart:lint` | Run `helm lint --strict` over the Helm chart, once per fixture in `charts/openvox-ca/ci/` |
+| `mage chart:validate` | Lint the Helm chart and check every rendered fixture against the Kubernetes schemas (needs `helm` and `kubeconform`; caches the remote schemas under `.test-output/kubeconform-cache/`, which `mage dev:clean` removes) |
+| `mage chart:test` | Assert what the chart renders, and that each precondition refuses what it claims to |
+| `mage chart:version` | Assert `charts/openvox-ca/Chart.yaml` still tracks `internal/version` |
+| `mage chart:package` | Package the Helm chart to `dist/openvox-ca-<version>.tgz`, as CI does before the publish workflow pushes it |
 
 `golangci-lint` is pinned in CI (`.github/workflows/ci.yml`). Build it with the
 repository's Go toolchain (`go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@<pinned>`);
@@ -124,9 +129,23 @@ Conventions:
   affordable per spec, as the configuration-axes block below it and
   `auth_test.go` both show.
 - Mutating process state: prefer hermetic alternatives. When a test must set an
-  environment variable, save and restore it in `BeforeEach`/`DeferCleanup` so it
-  never leaks into sibling specs (Go's `t.Setenv` is unavailable inside Ginkgo
-  nodes). Do not rely on tests running serially.
+  environment variable, use `GinkgoT().Setenv`, or save and restore it in
+  `BeforeEach`/`DeferCleanup` so it never leaks into sibling specs (Go's bare
+  `t.Setenv` needs a `*testing.T`, which Ginkgo nodes do not have; `GinkgoT()`
+  supplies the same save-and-restore semantics). Do not rely on tests running
+  serially.
+- A spec that shells out to `git` — or to anything that may itself run `git`, a
+  hook script included, which is where this was missed twice — must build its
+  environment by *stripping*
+  `GIT_*` from `os.Environ()`, never by appending to it. git exports `GIT_DIR`,
+  `GIT_WORK_TREE`, `GIT_INDEX_FILE` and `GIT_OBJECT_DIRECTORY` to the hooks it
+  runs, and they outrank `cmd.Dir` — so under the pre-push hook an inherited
+  environment makes the fixture operate on the real repository. This has already
+  cost one branch: see `fixtureEnv` in [`magefile_chart_test.go`](magefile_chart_test.go).
+  A hook is the only thing that leaks that environment naturally, so a spec has
+  to plant it deliberately to be covered — see the decoy repository in the same
+  file, which is what makes this class visible to `mage test:magefile` and CI at
+  all. Without one, neither can reproduce it.
 - Prefer `Eventually(...).Should(...)` over `time.Sleep` for asynchronous
   conditions; sleeps make the suite flaky on loaded CI runners.
 - Keep negative and edge cases first-class: every security-relevant branch
@@ -208,6 +227,36 @@ not** be rebranded:
 - Environment-variable prefix `PUPPET_CA_` (and `PUPPET_CA_CTL_` for the CLI)
 - Prometheus metric namespace `puppetca_`
 - Storage key prefixes / default paths (`puppet-ca`, `/etc/puppet-ca`, `/var/lib/puppet-ca`)
+
+## Helm chart
+
+The chart in `charts/openvox-ca/` releases in lockstep with the binaries: its
+`version` and `appVersion` are both the `internal/version` constant. Four
+places parse those two lines (`mage chart:version`, the shared
+`verify-release-tag` action, the pre-push hook, and the publish workflow, which
+keys its main-vs-tag decision on the version) and `mage release:prepare`
+rewrites them together — so never hand-edit one of the version lines on its
+own, and never assume a chart version is `-dev` just because it has a hyphen.
+
+The chart deliberately does **not** enumerate the server's settings as values.
+`config` is written verbatim to `/etc/puppet-ca/config.yaml`, and the
+convenience blocks (`tls`, `ca`, `metrics`, `kubernetesExport`, …) do the
+Kubernetes wiring *and* set the config keys pointing at it, deep-merged with
+`config` winning. Adding a server setting to `docs/configuration.md` therefore
+needs no chart change; adding a value that duplicates one is a regression.
+
+Every fixture under `charts/openvox-ca/ci/` is linted and schema-checked in CI.
+A new template branch needs a fixture that exercises it, or it is untested —
+and schema validity is not correctness, so anything a reader has to *trust*
+(tag resolution, merge precedence, which kind a value selects) needs a case in
+`chart:test` as well.
+
+Preconditions live in one place, the `openvox-ca.validate` helper, and are
+checked from `deployment.yaml`. When a value combination would render something
+a cluster silently mishandles — a route to a port that does not exist, a
+binding to the `default` ServiceAccount — `fail` at install time with the
+remedy in the message, rather than rendering it. Each one needs a matching
+reject case in `chart:test`.
 
 ## Commits
 
