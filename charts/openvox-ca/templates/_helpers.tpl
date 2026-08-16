@@ -421,16 +421,19 @@ true
 {{- end -}}
 {{- end -}}
 
+{{/*
+Defined in terms of configFileKnown rather than repeating its inputs, because
+the two differ by exactly one term: the configuration is fully known when the
+file is the chart's *and* nothing arrives through envFrom. Spelling the
+--config scan out twice meant a change to the detection could land on one
+predicate and not the other, which is the defect class this branch kept
+reopening — and the scan is the half that took a separate round to get right.
+*/}}
 {{- define "openvox-ca.configFullyKnown" -}}
-{{- $configOverridden := false -}}
-{{- range .Values.extraArgs -}}
-{{- $arg := . | toString -}}
-{{- if or (eq $arg "--config") (hasPrefix "--config=" $arg) }}{{ $configOverridden = true }}{{ end -}}
-{{- end -}}
-{{- if or .Values.existingConfigMap .Values.args .Values.envFrom $configOverridden -}}
-false
-{{- else -}}
+{{- if and (eq (include "openvox-ca.configFileKnown" .) "true") (not .Values.envFrom) -}}
 true
+{{- else -}}
+false
 {{- end -}}
 {{- end -}}
 
@@ -453,9 +456,18 @@ true
 {{- $config := include "openvox-ca.config" . | fromYaml -}}
 {{- $cert := dig "tls_cert" "" $config -}}
 {{- $key := dig "tls_key" "" $config -}}
+{{/*
+  Non-empty only, following the server's own precedence: applyServerEnv assigns
+  from PUPPET_CA_* only when the variable is non-empty
+  (cmd/openvox-ca/config.go), so an empty one leaves whatever the config file
+  said. Assigning unconditionally let `env: {PUPPET_CA_TLS_CERT: ""}` clear a
+  certificate the config had set, and the TLS precondition then refused a
+  perfectly good install for having no certificate. needsAPIAccess already
+  guards its identical scan this way.
+*/}}
 {{- range $name, $value := .Values.env -}}
-{{- if eq $name "PUPPET_CA_TLS_CERT" }}{{ $cert = $value }}{{ end -}}
-{{- if eq $name "PUPPET_CA_TLS_KEY" }}{{ $key = $value }}{{ end -}}
+{{- if and (eq $name "PUPPET_CA_TLS_CERT") $value }}{{ $cert = $value }}{{ end -}}
+{{- if and (eq $name "PUPPET_CA_TLS_KEY") $value }}{{ $key = $value }}{{ end -}}
 {{- end -}}
 {{- range .Values.extraEnv -}}
 {{- if eq .name "PUPPET_CA_TLS_CERT" }}{{ $cert = "set" }}{{ end -}}
@@ -737,6 +749,55 @@ unknown
 {{- end -}}
 {{- $names | uniq | sortAlpha | toJson -}}
 {{- end -}}
+{{- end -}}
+
+{{/*
+The export Role's rules, shared by both scopes.
+
+One definition because the ClusterRole and the Role branches of rbac.yaml need
+the identical grant, and they held byte-for-byte copies of it. A narrowing
+applied to one and not the other would leave `rbac.scope: Role` and
+`rbac.scope: ClusterRole` granting different permissions for the same
+configuration — silently, since the tests pin each branch's behaviour
+separately and nothing asserted the two stayed in step. That is the same
+one-setting-decided-in-two-places shape as the export Role's own gate, which
+opened a privilege escalation earlier on this branch.
+
+Three outcomes, and the middle one is why an empty resourceNames list is never
+emitted: RBAC reads an absent list as every resource, so "no targets" has to
+mean no patch rule at all rather than an unrestricted one.
+*/}}
+{{- define "openvox-ca.exportRules" -}}
+{{- $rawNames := include "openvox-ca.exportTargetNames" . -}}
+{{- $unknownTargets := eq $rawNames "unknown" -}}
+{{- $names := list -}}
+{{- if not $unknownTargets }}{{ $names = fromJsonArray $rawNames }}{{ end -}}
+rules:
+  # create cannot be restricted by resourceNames — the object has no name yet
+  # at admission time — but patch can, so overwriting an *existing* Secret is
+  # held to the objects actually configured as export targets. Names come from
+  # the merged config, so targets set through config.kubernetes_export count.
+  - apiGroups: [""]
+    resources: ["secrets", "configmaps"]
+    verbs: ["create"]
+  {{- if $names }}
+  - apiGroups: [""]
+    resources: ["secrets", "configmaps"]
+    verbs: ["patch"]
+    resourceNames:
+      {{- toYaml $names | nindent 6 }}
+  {{- else if $unknownTargets }}
+  # The export config lives somewhere the chart does not render, so the target
+  # names are unknown and patch cannot be narrowed. Grant it in full, visibly,
+  # rather than appearing to restrict something.
+  - apiGroups: [""]
+    resources: ["secrets", "configmaps"]
+    verbs: ["patch"]
+  {{- end }}
+  {{- /*
+    Otherwise: export is on but no target is configured, so the exporter will
+    never apply anything and needs no patch rule at all.
+  */}}
 {{- end -}}
 
 {{/*

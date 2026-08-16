@@ -29,38 +29,7 @@ metadata:
   annotations:
     {{- toYaml . | nindent 4 }}
   {{- end }}
-{{- $rawNames := include "openvox-ca.exportTargetNames" $ }}
-{{- $unknownTargets := eq $rawNames "unknown" }}
-{{- $names := list }}
-{{- if not $unknownTargets }}{{ $names = fromJsonArray $rawNames }}{{ end }}
-rules:
-  # create cannot be restricted by resourceNames — the object has no name yet
-  # at admission time — but patch can, so overwriting an *existing* Secret is
-  # held to the objects actually configured as export targets. Names come from
-  # the merged config, so targets set through config.kubernetes_export count.
-  - apiGroups: [""]
-    resources: ["secrets", "configmaps"]
-    verbs: ["create"]
-  {{- if $names }}
-  - apiGroups: [""]
-    resources: ["secrets", "configmaps"]
-    verbs: ["patch"]
-    resourceNames:
-      {{- toYaml $names | nindent 6 }}
-  {{- else if $unknownTargets }}
-  # The export config lives in a ConfigMap the chart does not render, so the
-  # target names are unknown and patch cannot be narrowed. Grant it in full,
-  # visibly, rather than appearing to restrict something.
-  - apiGroups: [""]
-    resources: ["secrets", "configmaps"]
-    verbs: ["patch"]
-  {{- end }}
-  {{- /*
-    Otherwise: export is on but no target is configured, so the exporter will
-    never apply anything and needs no patch rule at all. Emitting one with an
-    empty resourceNames would be an unrestricted grant, since RBAC reads an
-    absent list as "every resource".
-  */}}
+{{- include "openvox-ca.exportRules" $ | nindent 0 }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -98,38 +67,7 @@ metadata:
   annotations:
     {{- toYaml . | nindent 4 }}
   {{- end }}
-{{- $rawNames := include "openvox-ca.exportTargetNames" $ }}
-{{- $unknownTargets := eq $rawNames "unknown" }}
-{{- $names := list }}
-{{- if not $unknownTargets }}{{ $names = fromJsonArray $rawNames }}{{ end }}
-rules:
-  # create cannot be restricted by resourceNames — the object has no name yet
-  # at admission time — but patch can, so overwriting an *existing* Secret is
-  # held to the objects actually configured as export targets. Names come from
-  # the merged config, so targets set through config.kubernetes_export count.
-  - apiGroups: [""]
-    resources: ["secrets", "configmaps"]
-    verbs: ["create"]
-  {{- if $names }}
-  - apiGroups: [""]
-    resources: ["secrets", "configmaps"]
-    verbs: ["patch"]
-    resourceNames:
-      {{- toYaml $names | nindent 6 }}
-  {{- else if $unknownTargets }}
-  # The export config lives in a ConfigMap the chart does not render, so the
-  # target names are unknown and patch cannot be narrowed. Grant it in full,
-  # visibly, rather than appearing to restrict something.
-  - apiGroups: [""]
-    resources: ["secrets", "configmaps"]
-    verbs: ["patch"]
-  {{- end }}
-  {{- /*
-    Otherwise: export is on but no target is configured, so the exporter will
-    never apply anything and needs no patch rule at all. Emitting one with an
-    empty resourceNames would be an unrestricted grant, since RBAC reads an
-    absent list as "every resource".
-  */}}
+{{- include "openvox-ca.exportRules" $ | nindent 0 }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

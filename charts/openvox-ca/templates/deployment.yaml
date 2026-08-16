@@ -23,10 +23,17 @@ spec:
   selector:
     matchLabels:
       {{- include "openvox-ca.selectorLabels" . | nindent 6 }}
-  {{- with .Values.strategy }}
-  strategy:
-    {{- toYaml . | nindent 4 }}
+  {{- /*
+    An unset strategy follows persistence: Recreate has to hold while the cadir
+    is a ReadWriteOnce PVC, and has no justification once the state lives in an
+    external backend — where keeping it would cost an outage on every upgrade.
+  */}}
+  {{- $strategy := .Values.strategy }}
+  {{- if not $strategy }}
+  {{- $strategy = ternary (dict "type" "Recreate") (dict "type" "RollingUpdate" "rollingUpdate" (dict "maxUnavailable" 0 "maxSurge" 1)) .Values.persistence.enabled }}
   {{- end }}
+  strategy:
+    {{- toYaml $strategy | nindent 4 }}
   template:
     metadata:
       labels:

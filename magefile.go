@@ -728,16 +728,26 @@ func chartVersions() (version, appVersion string, err error) {
 // Both YAML extensions are collected: globbing only *.yaml would skip a *.yml
 // fixture in silence, which is that same rubber stamp one file at a time.
 func chartValuesFiles() ([]string, error) {
+	return chartValuesFilesIn(filepath.Join(chartDir, "ci"))
+}
+
+// chartValuesFilesIn is chartValuesFiles over a caller-supplied directory, so
+// that the *.yml arm and the empty-set error can be exercised without writing
+// into the real fixture directory. Every fixture in the repository happens to
+// be .yaml, so without this seam the second glob is dead code as far as the
+// suite is concerned — which is the same rubber stamp the comment above warns
+// about, one branch at a time.
+func chartValuesFilesIn(dir string) ([]string, error) {
 	var files []string
 	for _, ext := range []string{"*.yaml", "*.yml"} {
-		matched, err := filepath.Glob(filepath.Join(chartDir, "ci", ext))
+		matched, err := filepath.Glob(filepath.Join(dir, ext))
 		if err != nil {
 			return nil, err
 		}
 		files = append(files, matched...)
 	}
 	if len(files) == 0 {
-		return nil, fmt.Errorf("no fixture values files found under %s", filepath.Join(chartDir, "ci"))
+		return nil, fmt.Errorf("no fixture values files found under %s", dir)
 	}
 	slices.Sort(files)
 	return files, nil
@@ -1071,6 +1081,18 @@ func chartConfigChecksum(sets ...string) (string, error) {
 	return m[1], nil
 }
 
+// chartRulesBlock returns the first RBAC `rules:` block in a rendered
+// manifest, up to the document separator, so two scopes' grants can be
+// compared as text.
+func chartRulesBlock(manifest string) string {
+	_, after, found := strings.Cut(manifest, "\nrules:\n")
+	if !found {
+		return ""
+	}
+	block, _, _ := strings.Cut(after, "\n---")
+	return strings.TrimRight(block, "\n")
+}
+
 // chartRenderCase is one assertion over a rendering of the chart: render with
 // these --set overrides, then require each `wants` string to appear in the
 // output and each `notWants` string to be absent.
@@ -1274,6 +1296,46 @@ func (Chart) Test() error {
 			name:  "probes follow the server: HTTPS when a certificate is configured",
 			sets:  []string{tls},
 			wants: []string{"scheme: HTTPS"},
+		},
+		{
+			// Recreate exists to protect a ReadWriteOnce cadir. With persistence
+			// off the state is external and the serialisation buys only an
+			// outage per upgrade.
+			name:     "an unset strategy is Recreate while the cadir is a PVC",
+			sets:     []string{tls},
+			wants:    []string{"type: Recreate"},
+			notWants: []string{"type: RollingUpdate"},
+		},
+		{
+			name:     "an unset strategy rolls once the state is external",
+			sets:     []string{tls, "persistence.enabled=false"},
+			wants:    []string{"type: RollingUpdate", "maxUnavailable: 0"},
+			notWants: []string{"type: Recreate"},
+		},
+		{
+			name:     "an explicit strategy is honoured either way",
+			sets:     []string{tls, "strategy.type=Recreate", "persistence.enabled=false"},
+			wants:    []string{"type: Recreate"},
+			notWants: []string{"type: RollingUpdate"},
+		},
+		{
+			// Without jobLabel the Prometheus Operator uses the Service name,
+			// which carries the release name — so the mixin's fixed
+			// job="openvox-ca" selector would match nothing on any release not
+			// named for the chart, silently.
+			name:  "the ServiceMonitor job label is stable across release names",
+			sets:  []string{tls, "metrics.enabled=true", "metrics.serviceMonitor.enabled=true"},
+			wants: []string{"jobLabel: app.kubernetes.io/name"},
+		},
+		{
+			// The server ignores an empty PUPPET_CA_* variable and keeps what
+			// the config file said (applyServerEnv in cmd/openvox-ca/config.go).
+			// The chart used to treat one as a deletion and then refuse the
+			// install for having no certificate.
+			name:     "an empty TLS env var does not unset a configured certificate",
+			sets:     []string{tls, "env.PUPPET_CA_TLS_CERT="},
+			wants:    []string{"scheme: HTTPS"},
+			notWants: []string{"scheme: HTTP\n"},
 		},
 		{
 			name:     "probes follow the server: HTTP behind a terminating proxy",
@@ -2099,6 +2161,40 @@ func (Chart) Test() error {
 			failures++
 		default:
 			fmt.Printf("ok    %s\n", name)
+		}
+	}
+
+	// The two RBAC scopes must grant the same thing. Nothing pinned that: each
+	// scope's kinds were asserted separately, so a narrowing applied to one
+	// branch and not the other would have gone unnoticed — and the branches
+	// used to hold byte-for-byte copies of the rules, which is exactly how
+	// that drift happens.
+	{
+		name := "both RBAC scopes grant identical rules"
+		exportSets := []string{
+			tls, "kubernetesExport.enabled=true",
+			"kubernetesExport.targets[0].kind=Secret",
+			"kubernetesExport.targets[0].metadata.name=trust",
+			"kubernetesExport.targets[0].cert=true",
+		}
+		clusterOut, clusterErr := helmTemplate(append(slices.Clone(exportSets), "kubernetesExport.rbac.scope=ClusterRole"))
+		roleOut, roleErr := helmTemplate(append(slices.Clone(exportSets), "kubernetesExport.rbac.scope=Role"))
+		switch {
+		case clusterErr != nil || roleErr != nil:
+			fmt.Printf("FAIL  %s\n      render failed: %v %v\n", name, clusterErr, roleErr)
+			failures++
+		default:
+			clusterRules, roleRules := chartRulesBlock(clusterOut), chartRulesBlock(roleOut)
+			switch {
+			case clusterRules == "":
+				fmt.Printf("FAIL  %s\n      no rules block rendered for ClusterRole\n", name)
+				failures++
+			case clusterRules != roleRules:
+				fmt.Printf("FAIL  %s\n      ClusterRole rules:\n%s\n      Role rules:\n%s\n", name, clusterRules, roleRules)
+				failures++
+			default:
+				fmt.Printf("ok    %s\n", name)
+			}
 		}
 	}
 

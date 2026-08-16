@@ -178,6 +178,17 @@ tls:
 # read "Running under an external root" in docs/helm-chart.md for what the
 # chart's names and defaults substitute into the procedure, and don't begin a
 # rollout inside that window.
+#
+# Both ca_cert_file and ca_key_file are set from this block. Under a provider
+# that holds the key itself (config.ca_key_provider: openbao) there is no key
+# file, so clear that one — an empty string is honoured all the way through, and
+# the server treats an empty ca_key_file as unset:
+#
+#   ca:
+#     existingSecret: openvox-ca-cert   # certificate only
+#   config:
+#     ca_key_provider: openbao
+#     ca_key_file: ""
 ca:
   existingSecret: ""
   certKey: tls.crt
@@ -251,7 +262,14 @@ metrics:
     path: /metrics
     scheme: http
     honorLabels: false
-    jobLabel: ""
+    # Which Service *label* supplies the Prometheus `job` value. Defaulted, not
+    # empty: with no jobLabel the Prometheus Operator uses the Service name,
+    # which is release-derived (my-ca-openvox-ca), while the alerting mixin
+    # ships a fixed `job="openvox-ca"` selector — so on any release not named
+    # "openvox-ca" the shipped alerts would select nothing and look healthy
+    # doing it. app.kubernetes.io/name carries the chart name, which is what the
+    # mixin expects. Set to "" to restore the Operator's Service-name default.
+    jobLabel: app.kubernetes.io/name
     targetLabels: []
     relabelings: []
     metricRelabelings: []
@@ -292,18 +310,22 @@ kubernetesExport:
 
 replicaCount: 1
 
-# Deployment strategy. Recreate is the default because the default cadir volume
-# is a ReadWriteOnce PVC, which a surging replacement pod could not mount.
-# Running an external storage backend (persistence.enabled: false) or a
-# ReadWriteMany volume? Switch to a zero-downtime rollout:
+# Deployment strategy. Empty follows the reason the default exists rather than
+# restating it: Recreate while persistence is enabled, because the default cadir
+# volume is a ReadWriteOnce PVC that a surging replacement pod could not mount —
+# and RollingUpdate once persistence.enabled is false, where the CA's state is in
+# an external backend and there is nothing left to serialise on. Leaving Recreate
+# fixed there bought a full outage on every upgrade for no reason.
+#
+# Set it explicitly to override either way — a ReadWriteMany volume can roll
+# while persistence is on, for instance:
 #
 #   strategy:
 #     type: RollingUpdate
 #     rollingUpdate:
 #       maxUnavailable: 0
 #       maxSurge: 1
-strategy:
-  type: Recreate
+strategy: {}
 
 revisionHistoryLimit: 10
 

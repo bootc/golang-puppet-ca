@@ -71,6 +71,46 @@ var _ = Describe("chartValuesFiles", func() {
 		// with an obvious message too.
 		Expect(names).To(ContainElement(chartFloorFixture))
 	})
+
+	// The repository's own fixtures are all .yaml, so without these two the
+	// second glob pattern and the empty-set guard are never executed by the
+	// suite: a later edit could drop either and every test would still pass,
+	// leaving a .yml fixture silently unvalidated by chart:lint and
+	// chart:validate.
+	Context("over a directory of its own", func() {
+		var dir string
+
+		BeforeEach(func() {
+			dir = GinkgoT().TempDir()
+		})
+
+		It("collects .yml fixtures as well as .yaml", func() {
+			Expect(os.WriteFile(filepath.Join(dir, "only-values.yml"), []byte("{}\n"), 0o644)).To(Succeed())
+
+			files, err := chartValuesFilesIn(dir)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(files).To(ConsistOf(filepath.Join(dir, "only-values.yml")))
+		})
+
+		It("sorts the two extensions into one stable order", func() {
+			for _, name := range []string{"b-values.yml", "a-values.yaml"} {
+				Expect(os.WriteFile(filepath.Join(dir, name), []byte("{}\n"), 0o644)).To(Succeed())
+			}
+
+			files, err := chartValuesFilesIn(dir)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(files).To(Equal([]string{
+				filepath.Join(dir, "a-values.yaml"),
+				filepath.Join(dir, "b-values.yml"),
+			}))
+		})
+
+		It("refuses an empty fixture set rather than validating nothing", func() {
+			_, err := chartValuesFilesIn(dir)
+			Expect(err).To(MatchError(ContainSubstring("no fixture values files found under")))
+			Expect(err).To(MatchError(ContainSubstring(dir)))
+		})
+	})
 })
 
 var _ = Describe("verifyChartPins", func() {
