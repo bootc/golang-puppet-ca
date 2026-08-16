@@ -63,6 +63,12 @@ func certIndexRoundTrip(b *SQLBackend) {
 	Expect(svc.AppendInventory(ctx, "0001 2024-01-01T00:00:00UTC 2029-01-01T00:00:00UTC /node1")).To(Succeed())
 	Expect(svc.AppendInventoryRecord(ctx, "0003 2024-01-03T00:00:00UTC 2029-01-03T00:00:00UTC /node1", &proj)).To(Succeed())
 	Expect(svc.AppendInventory(ctx, "0002 2024-01-02T00:00:00UTC 2029-01-02T00:00:00UTC /node2")).To(Succeed())
+	// node3 keeps its inventory row but has no stored certificate — the
+	// cleaned-certificate shape. Statuses' blob gate (the List-derived
+	// exclusion set over the MAX(id) GROUP BY rows) must drop it, and having
+	// it here runs that per-dialect SQL against real PostgreSQL and MySQL,
+	// not just SQLite.
+	Expect(svc.AppendInventory(ctx, "0004 2024-01-04T00:00:00UTC 2029-01-04T00:00:00UTC /node3")).To(Succeed())
 	for _, subject := range []string{"node1", "node2"} {
 		Expect(b.Put(ctx, CertKey(subject), []byte("pem-"+subject), BlobPublic)).To(Succeed())
 	}
@@ -70,7 +76,7 @@ func certIndexRoundTrip(b *SQLBackend) {
 	recs, ok, err := svc.CertStatuses(ctx, "")
 	Expect(err).NotTo(HaveOccurred(), "CertStatuses")
 	Expect(ok).To(BeTrue())
-	Expect(recs).To(HaveLen(2), "one record per subject, latest issuance only")
+	Expect(recs).To(HaveLen(2), "one record per subject with a stored certificate, latest issuance only")
 	Expect(recs[0].Subject).To(Equal("node1"))
 	Expect(recs[0].Serial).To(Equal("0003"), "node1's latest issuance wins")
 	Expect(recs[0].Fingerprint).To(Equal(proj.Fingerprint))

@@ -769,11 +769,6 @@ func certStatusFromCert(subject string, certPEM []byte, state string, timeFmt st
 	}
 }
 
-// certStatusFromRecord builds a CertStatusResponse from a certificate-index
-// record without touching the stored PEM. ok=false means the record cannot
-// stand alone — its display projection was never populated (legacy inventory
-// import) or a canonical field does not parse — and the caller should fall
-// back to the PEM path for that subject.
 // normaliseSerial renders an inventory serial the way the CA's revoked-serial map
 // keys it, so a legacy zero-padded form still matches. Reports false when the
 // serial is not hex at all, which certStatusFromRecord also rejects.
@@ -785,18 +780,10 @@ func normaliseSerial(serial string) (string, bool) {
 	return fmt.Sprintf("%X", n), true
 }
 
-// certMatchesSerial reports whether certPEM is the certificate the given
-// inventory serial names. Serials are compared through big.Int so a legacy
-// zero-padded form still matches, exactly as the index repair compares them.
-func certMatchesSerial(certPEM []byte, serial string) bool {
-	block, _ := pem.Decode(certPEM)
-	if block == nil {
-		return false
-	}
-	cert, err := x509.ParseCertificate(block.Bytes)
-	if err != nil {
-		return false
-	}
+// certSerialIs reports whether cert is the certificate the given inventory
+// serial names. Serials are compared through big.Int so a legacy zero-padded
+// form still matches, exactly as the index repair compares them.
+func certSerialIs(cert *x509.Certificate, serial string) bool {
 	want := new(big.Int)
 	if _, ok := want.SetString(serial, 16); !ok {
 		return false
@@ -804,6 +791,11 @@ func certMatchesSerial(certPEM []byte, serial string) bool {
 	return want.Cmp(cert.SerialNumber) == 0
 }
 
+// certStatusFromRecord builds a CertStatusResponse from a certificate-index
+// record without touching the stored PEM. ok=false means the record cannot
+// stand alone — its display projection was never populated (legacy inventory
+// import) or a canonical field does not parse — and the caller should fall
+// back to the PEM path for that subject.
 func certStatusFromRecord(rec storage.CertRecord, timeFmt string) (CertStatusResponse, bool) {
 	if rec.Fingerprint == "" {
 		return CertStatusResponse{}, false
@@ -941,11 +933,10 @@ func (s *Server) handleGetStatuses(w http.ResponseWriter, r *http.Request) {
 					state = storage.CertStateRevoked
 				}
 			}
-			if stateFilter != "" && state != stateFilter {
-				continue
-			}
 			resp, ok := certStatusFromRecord(rec, s.timeFormat())
-			if !ok {
+			if ok {
+				resp.State = state
+			} else {
 				// Projection not (yet) populated for this record — fall back to
 				// the stored PEM for this one subject.
 				certPEM, err := s.CA.Storage.GetCert(r.Context(), rec.Subject)
@@ -958,19 +949,31 @@ func (s *Server) handleGetStatuses(w http.ResponseWriter, r *http.Request) {
 				// repair refuses this same pairing because it would *write* the
 				// PEM's fields onto the row, making the row assert something about
 				// a certificate it does not describe. Here nothing of the row is
-				// used: every display field comes from the authoritative PEM and
-				// the state from the signed CRL, so the response describes the
-				// stored certificate accurately. Omitting instead would drop a
-				// real certificate from the listing, which is the divergence from
-				// the scan path this branch exists to avoid.
-				if !certMatchesSerial(certPEM, rec.Serial) {
+				// used: every display field comes from the authoritative PEM, and
+				// the state — derived above from the *row's* serial, which this
+				// branch has just proven names a different certificate — is
+				// re-derived from the serial of the certificate actually served,
+				// so the response describes the stored certificate accurately.
+				// Omitting instead would drop a real certificate from the listing,
+				// which is the divergence from the scan path this branch exists to
+				// avoid.
+				if cert, perr := parseCert(certPEM); perr == nil && !certSerialIs(cert, rec.Serial) {
+					state = storage.CertStateSigned
+					if _, inCRL := revoked[fmt.Sprintf("%X", cert.SerialNumber)]; inCRL {
+						state = storage.CertStateRevoked
+					}
 					slog.Warn("statuses: stored certificate does not match the index record's serial; "+
 						"answering from the stored certificate",
 						"subject", rec.Subject, "index_serial", rec.Serial)
 				}
 				resp = certStatusFromCert(rec.Subject, certPEM, state, s.timeFormat())
-			} else {
-				resp.State = state
+			}
+			// The filter runs against the state the response actually carries,
+			// which the fallback above may have re-derived — filtering on the
+			// row-derived state would sort a certificate under a state the
+			// response itself contradicts.
+			if stateFilter != "" && resp.State != stateFilter {
+				continue
 			}
 			statuses = append(statuses, resp)
 		}
@@ -1004,7 +1007,10 @@ func (s *Server) handleGetStatuses(w http.ResponseWriter, r *http.Request) {
 			if s.CA.IsRevoked(r.Context(), subject) {
 				state = storage.CertStateRevoked
 			}
-			slog.Warn("statuses: stored certificate has no index row; reporting it from the stored PEM",
+			// Detection only: the filter below may still drop the subject from
+			// this particular response, but the anomaly is worth surfacing
+			// either way — nothing self-heals a certificate without a row.
+			slog.Warn("statuses: stored certificate has no index row",
 				"subject", subject)
 			if stateFilter != "" && state != stateFilter {
 				continue

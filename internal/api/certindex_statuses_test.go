@@ -26,6 +26,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/json"
 	"encoding/pem"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -233,7 +234,7 @@ var _ = Describe("Certificate statuses via the certificate index", func() {
 			"the display fields must come from the stored PEM")
 	})
 
-	It("falls back to the stored PEM for a projection-less record, keeping the record's state", func() {
+	It("falls back to the stored PEM for a projection-less record, re-deriving state from the served certificate", func() {
 		submitAndSign("idx-legacy", generateCSRWithSANs("idx-legacy", []string{"idx-legacy"}))
 
 		// Append a projection-less inventory row for the same subject, as a
@@ -264,6 +265,131 @@ var _ = Describe("Certificate statuses via the certificate index", func() {
 		Expect(*got.SerialNumber).To(Equal(cert.SerialNumber.Text(10)),
 			"the serial must be the PEM's, not the projection-less row's")
 		Expect(got.DNSAltNames).To(Equal([]string{"idx-legacy"}))
+	})
+
+	It("derives the fallback state from the certificate actually served, not the mismatched row", func() {
+		// A projection-less row whose serial names a different certificate
+		// forces the PEM fallback. The response is built from the stored PEM,
+		// so its state must come from that certificate's serial too: deriving
+		// it from the row's serial reported a revoked certificate as signed
+		// and hid it from ?state=revoked.
+		submitAndSign("idx-mismatch", generateCSRWithSANs("idx-mismatch", []string{"idx-mismatch"}))
+		Expect(myCA.Revoke(ctx, "idx-mismatch")).To(Succeed())
+
+		// The stale row's serial (0FFF) is not in the CRL; the stored
+		// certificate's serial is.
+		Expect(store.AppendInventory(ctx,
+			"0FFF 2024-01-01T00:00:00UTC 2029-01-01T00:00:00UTC /idx-mismatch")).To(Succeed())
+
+		statuses := getStatuses("")
+		Expect(statuses).To(HaveLen(1))
+		Expect(statuses[0].State).To(Equal("revoked"),
+			"the state must describe the served certificate, not the stale row")
+		Expect(getStatuses("?state=revoked")).To(HaveLen(1))
+		Expect(getStatuses("?state=signed")).To(BeEmpty())
+	})
+
+	It("returns a signed certificate to signed when only the stale row's serial is revoked", func() {
+		// The mirror direction of the spec above: the fallback's re-derivation
+		// must also flip a row-derived "revoked" back to "signed" when the
+		// certificate actually served is not in the CRL — without it, a stale
+		// row naming a revoked serial would over-report revocation for a
+		// certificate the CA still stands behind. Revoke a donor subject,
+		// then give another subject a projection-less row carrying the
+		// zero-padded variant of the donor's serial: distinct as an inventory
+		// string (the duplicate-serial guard rejects a verbatim copy) yet a
+		// CRL hit through the same normalisation, so the row-derived state is
+		// "revoked" while the served certificate is not.
+		submitAndSign("idx-donor", generateCSRWithSANs("idx-donor", []string{"idx-donor"}))
+		Expect(myCA.Revoke(ctx, "idx-donor")).To(Succeed())
+		submitAndSign("idx-victim", generateCSRWithSANs("idx-victim", []string{"idx-victim"}))
+
+		donorPEM, err := store.GetCert(ctx, "idx-donor")
+		Expect(err).NotTo(HaveOccurred())
+		block, _ := pem.Decode(donorPEM)
+		Expect(block).NotTo(BeNil())
+		donor, err := x509.ParseCertificate(block.Bytes)
+		Expect(err).NotTo(HaveOccurred())
+		donorPadded := "00" + fmt.Sprintf("%X", donor.SerialNumber)
+		Expect(store.AppendInventory(ctx,
+			storage.FormatInventoryLine(donorPadded, donor.NotBefore, donor.NotAfter, "idx-victim"))).To(Succeed())
+
+		statuses := getStatuses("")
+		Expect(statuses).To(HaveLen(2))
+		states := map[string]string{}
+		for _, s := range statuses {
+			states[s.Name] = s.State
+		}
+		Expect(states).To(Equal(map[string]string{
+			"idx-donor":  "revoked",
+			"idx-victim": "signed",
+		}), "the served certificate's serial decides the state, not the stale row's")
+
+		signed := getStatuses("?state=signed")
+		Expect(signed).To(HaveLen(1))
+		Expect(signed[0].Name).To(Equal("idx-victim"))
+		revoked := getStatuses("?state=revoked")
+		Expect(revoked).To(HaveLen(1))
+		Expect(revoked[0].Name).To(Equal("idx-donor"))
+	})
+
+	It("re-derives state from the served certificate when the row serial is not even hex", func() {
+		// A non-hex row serial fails both normaliseSerial (so no CRL lookup
+		// keys off the row) and certSerialIs (so the fallback treats it as a
+		// mismatch). The revoked state of the certificate actually served must
+		// still come through — under the pre-fix code the unparseable row's
+		// "signed" default was carried into the response, so this spec fails
+		// if the fallback re-derivation is removed.
+		submitAndSign("idx-nonhex", generateCSRWithSANs("idx-nonhex", []string{"idx-nonhex"}))
+		Expect(myCA.Revoke(ctx, "idx-nonhex")).To(Succeed())
+
+		Expect(store.AppendInventory(ctx,
+			"zz-not-hex 2024-01-01T00:00:00UTC 2029-01-01T00:00:00UTC /idx-nonhex")).To(Succeed())
+
+		statuses := getStatuses("")
+		Expect(statuses).To(HaveLen(1))
+		Expect(statuses[0].State).To(Equal("revoked"),
+			"a row serial that cannot parse must not mask the served certificate's revocation")
+		Expect(getStatuses("?state=revoked")).To(HaveLen(1))
+		Expect(getStatuses("?state=signed")).To(BeEmpty())
+	})
+
+	It("matches a legacy zero-padded row serial against the CRL", func() {
+		// The CRL-derived map is keyed by canonical %X serials, while a
+		// blob-imported legacy inventory can carry the same serial
+		// zero-padded. normaliseSerial is what makes the two meet, and this
+		// is the one place it does real work: every other revoked serial in
+		// the suite comes from live signing and is already canonical, so a
+		// regression to identity comparison fails here and nowhere else.
+		submitAndSign("idx-padded", generateCSRWithSANs("idx-padded", []string{"idx-padded"}))
+		Expect(myCA.Revoke(ctx, "idx-padded")).To(Succeed())
+
+		certPEM, err := store.GetCert(ctx, "idx-padded")
+		Expect(err).NotTo(HaveOccurred())
+		block, _ := pem.Decode(certPEM)
+		Expect(block).NotTo(BeNil())
+		cert, err := x509.ParseCertificate(block.Bytes)
+		Expect(err).NotTo(HaveOccurred())
+
+		// Append a fully projected row naming the same certificate through a
+		// zero-padded serial; being the latest issuance it is the row the
+		// index serves, and its projection keeps the PEM fallback out of the
+		// way so the state can only come from the padded-serial CRL match.
+		proj := storage.CertProjection{
+			Fingerprint:    ca.SHA256ColonFingerprint(block.Bytes),
+			DNSAltNames:    cert.DNSNames,
+			AuthExtensions: ca.AuthExtensionMap(cert.Extensions),
+		}
+		padded := "00" + fmt.Sprintf("%X", cert.SerialNumber)
+		line := storage.FormatInventoryLine(padded, cert.NotBefore, cert.NotAfter, "idx-padded")
+		Expect(store.AppendInventoryRecord(ctx, line, &proj)).To(Succeed())
+
+		statuses := getStatuses("")
+		Expect(statuses).To(HaveLen(1))
+		Expect(statuses[0].State).To(Equal("revoked"),
+			"a zero-padded row serial must still match the CRL's canonical key")
+		Expect(getStatuses("?state=revoked")).To(HaveLen(1))
+		Expect(getStatuses("?state=signed")).To(BeEmpty())
 	})
 
 	It("suppresses a pending re-submission for an already-certified subject", func() {

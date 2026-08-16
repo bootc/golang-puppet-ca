@@ -26,6 +26,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/asn1"
 	"encoding/pem"
+	"fmt"
 	"log/slog"
 	"math/big"
 	"path/filepath"
@@ -313,6 +314,39 @@ var _ = Describe("CA certificate index", func() {
 			Expect(recs[0].AuthExtensions).To(Equal(map[string]string{"pp_auth_role": "webserver"}),
 				"the auth extension must survive sign→projection→JSON column→record")
 			Expect(recs[0].Fingerprint).To(Equal(storedFingerprint(store, "import-node")))
+		})
+
+		It("reconciles a zero-padded row serial against the CRL when repair runs", func() {
+			signLive(myCA, "padded-node")
+			Expect(myCA.Revoke(ctx, "padded-node")).To(Succeed())
+
+			// A legacy blob import can carry the same serial zero-padded.
+			// Plant one as the subject's latest issuance, projection-less and
+			// still claiming "signed": only the repair pass's big.Int
+			// normalisation can connect it to the CRL entry, which the CA
+			// keys by the canonical %X form.
+			certPEM, err := store.GetCert(ctx, "padded-node")
+			Expect(err).NotTo(HaveOccurred())
+			block, _ := pem.Decode(certPEM)
+			Expect(block).NotTo(BeNil())
+			cert, err := x509.ParseCertificate(block.Bytes)
+			Expect(err).NotTo(HaveOccurred())
+			padded := "00" + fmt.Sprintf("%X", cert.SerialNumber)
+			line := storage.FormatInventoryLine(padded, cert.NotBefore, cert.NotAfter, "padded-node")
+			Expect(store.AppendInventory(ctx, line)).To(Succeed())
+
+			restarted := ca.New(store, ca.AutosignConfig{Mode: "off"}, "puppet.test")
+			Expect(restarted.Init(ctx)).To(Succeed())
+
+			recs, _, err := store.CertStatuses(ctx, "")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(recs).To(HaveLen(1))
+			Expect(recs[0].Serial).To(Equal(padded))
+			Expect(recs[0].State).To(Equal(storage.CertStateRevoked),
+				"repair must match the padded row serial to the canonical CRL entry")
+			Expect(recs[0].RevokedAt).NotTo(BeNil())
+			Expect(recs[0].Fingerprint).To(Equal(storedFingerprint(store, "padded-node")),
+				"the backfill accepts the pairing: the padded row and the PEM name the same certificate")
 		})
 
 		It("records the projection at signing and the revocation at revoke time", func() {

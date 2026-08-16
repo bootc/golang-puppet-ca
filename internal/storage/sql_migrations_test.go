@@ -19,12 +19,15 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"sync"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	"github.com/uptrace/bun"
+	"github.com/uptrace/bun/dialect"
 )
 
 // certIndexVersion is the migration whose half-application these tests
@@ -173,6 +176,12 @@ var _ = Describe("SQL schema migrations", func() {
 		})
 	})
 
+	Describe("a migration failing mid-sequence", func() {
+		It("rolls back whole or stays resumable, per the dialect's contract", func() {
+			migrationDDLFaultInjection(newSQLiteBackend())
+		})
+	})
+
 	Describe("the inventory integrity read", func() {
 		// The startup integrity check reads the inventory before anything else
 		// touches the table. It must not depend on columns it has no use for, or
@@ -200,6 +209,71 @@ var _ = Describe("SQL schema migrations", func() {
 		})
 	})
 })
+
+// migrationDDLFaultInjection proves migrationDDL's recoverability contract by
+// failing a multi-statement sequence partway through, instead of manufacturing
+// the half-applied state by hand as the recovery specs do. The contract under
+// test is the one migrationDDL's own comment states:
+//
+//   - PostgreSQL and SQLite run the unit in a transaction, so a mid-sequence
+//     failure leaves the schema completely untouched;
+//   - MySQL commits every DDL statement implicitly, so the work before the
+//     failure persists — and a re-run of the same idempotent sequence must
+//     finish the job rather than trip over it.
+//
+// Shared with the PostgreSQL/MySQL integration suites so both sides of the
+// dialect branch run against the real engines. Uses a scratch table so the
+// probe cannot interact with the product schema on the shared integration
+// databases.
+func migrationDDLFaultInjection(b *SQLBackend) {
+	ctx := context.Background()
+	const table = "puppet_ca_ddl_fault_probe"
+
+	_, err := b.db.ExecContext(ctx, "DROP TABLE IF EXISTS "+table)
+	Expect(err).NotTo(HaveOccurred())
+	_, err = b.db.ExecContext(ctx, "CREATE TABLE "+table+" (id INTEGER)")
+	Expect(err).NotTo(HaveOccurred())
+	DeferCleanup(func() {
+		_, _ = b.db.ExecContext(context.Background(), "DROP TABLE IF EXISTS "+table)
+	})
+
+	// One statement succeeds, then the migration fails — a crash, a lost
+	// connection, or a later statement erroring all land here.
+	boom := errors.New("injected mid-migration failure")
+	err = migrationDDL(ctx, b.db, func(ctx context.Context, idb bun.IDB) error {
+		if err := addColumnIfMissing(ctx, idb, table, "col_a", "VARCHAR(16)"); err != nil {
+			return err
+		}
+		return boom
+	})
+	Expect(err).To(MatchError(boom))
+
+	existsA, err := columnExists(ctx, b.db, table, "col_a")
+	Expect(err).NotTo(HaveOccurred())
+	if b.db.Dialect().Name() == dialect.MySQL {
+		Expect(existsA).To(BeTrue(),
+			"MySQL commits DDL implicitly; the pre-failure statement must persist")
+	} else {
+		Expect(existsA).To(BeFalse(),
+			"transactional dialects must roll the whole unit back")
+	}
+
+	// The retry runs the full sequence. On MySQL the idempotent helper must
+	// step over col_a's remnant; on the transactional dialects it starts from
+	// a clean slate. Either way both columns exist afterwards.
+	err = migrationDDL(ctx, b.db, func(ctx context.Context, idb bun.IDB) error {
+		if err := addColumnIfMissing(ctx, idb, table, "col_a", "VARCHAR(16)"); err != nil {
+			return err
+		}
+		return addColumnIfMissing(ctx, idb, table, "col_b", "VARCHAR(16)")
+	})
+	Expect(err).NotTo(HaveOccurred(), "re-run after the fault must complete")
+	for _, col := range []string{"col_a", "col_b"} {
+		exists, err := columnExists(ctx, b.db, table, col)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(exists).To(BeTrue(), "column %s must exist after the re-run", col)
+	}
+}
 
 // dropCertIndexSchema removes the certindex indices and the named columns,
 // undoing part or all of that migration so a re-run has something to do. Indices

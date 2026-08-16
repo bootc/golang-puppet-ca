@@ -275,4 +275,8 @@ var _ = Describe("MySQL schema migrations", func() {
 	It("survives two backends migrating the same database at once", func() {
 		sqlMigrationsConcurrentRunners(newMySQLBackend)
 	})
+
+	It("rolls back or resumes a migration failing mid-sequence, per the dialect's contract", func() {
+		migrationDDLFaultInjection(newMySQLBackend())
+	})
 })
