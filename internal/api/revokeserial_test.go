@@ -21,6 +21,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/pem"
 	"log/slog"
 	"net/http"
@@ -352,6 +353,82 @@ var _ = Describe("PUT certificate_status_by_serial", func() {
 		Entry("empty string", `{"desired_state":""}`),
 		Entry("misspelt", `{"desired_state":"revoke"}`),
 	)
+
+	// The destructive-op tracker. Round 5 declined to cover this on the grounds
+	// that it needed a repo-wide TLS-peer fixture; that was wrong. The
+	// middleware is bypassed here (api.New leaves AuthConfig nil), and clientCN
+	// reads the CN straight off r.TLS.PeerCertificates[0] with no verification,
+	// so a bare certificate value is enough. Revoking the same serial is
+	// idempotent, so repeated successful calls exercise the counter without
+	// needing a certificate or an orphan per call.
+	Describe("the destructive-op tracker", func() {
+		var caller *x509.Certificate
+
+		revokeAs := func(cert *x509.Certificate, serial string) *httptest.ResponseRecorder {
+			req := httptest.NewRequest("PUT",
+				"/puppet-ca/v1/certificate_status_by_serial/"+serial,
+				strings.NewReader(`{"desired_state":"revoked"}`))
+			req = withClientCert(req, cert)
+			rec := httptest.NewRecorder()
+			mux.ServeHTTP(rec, req)
+			return rec
+		}
+
+		BeforeEach(func() {
+			caller = &x509.Certificate{Subject: pkix.Name{CommonName: "cli-user"}}
+		})
+
+		It("warns once a caller crosses the threshold", func() {
+			serial := superseded("api-destructive")
+
+			var buf bytes.Buffer
+			orig := slog.Default()
+			slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+			defer slog.SetDefault(orig)
+
+			// Record warns above 5 in the window, so the sixth call is the one
+			// that trips it.
+			for i := 0; i < 6; i++ {
+				Expect(revokeAs(caller, serial).Code).To(Equal(http.StatusNoContent))
+			}
+
+			Expect(buf.String()).To(ContainSubstring("High rate of destructive operations detected"))
+			Expect(buf.String()).To(ContainSubstring("cli-user"))
+			Expect(buf.String()).To(ContainSubstring("operation=revoke"))
+		})
+
+		It("stays quiet below the threshold", func() {
+			serial := superseded("api-destructive-quiet")
+
+			var buf bytes.Buffer
+			orig := slog.Default()
+			slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+			defer slog.SetDefault(orig)
+
+			for i := 0; i < 5; i++ {
+				Expect(revokeAs(caller, serial).Code).To(Equal(http.StatusNoContent))
+			}
+
+			Expect(buf.String()).NotTo(ContainSubstring("High rate of destructive operations"))
+		})
+
+		It("counts per caller, so one client cannot trip another's threshold", func() {
+			serial := superseded("api-destructive-per-caller")
+			other := &x509.Certificate{Subject: pkix.Name{CommonName: "other-user"}}
+
+			var buf bytes.Buffer
+			orig := slog.Default()
+			slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+			defer slog.SetDefault(orig)
+
+			for i := 0; i < 5; i++ {
+				Expect(revokeAs(caller, serial).Code).To(Equal(http.StatusNoContent))
+			}
+			Expect(revokeAs(other, serial).Code).To(Equal(http.StatusNoContent))
+
+			Expect(buf.String()).NotTo(ContainSubstring("High rate of destructive operations"))
+		})
+	})
 
 	It("rejects a body that is not JSON", func() {
 		serial := superseded("api-bad-body")
