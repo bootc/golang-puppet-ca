@@ -23,6 +23,9 @@ ENV PATH=/opt/puppetlabs/puppet/bin:${PATH}
 # 52, chrony at 998, systemd-oom at 999), so `useradd -r` lands on whatever
 # happens to be free that day, and it matches the uid the openvox-ca images
 # use.  groupadd/useradd fail the build if anything else has taken it.
+# The assertion below must be re-verified by hand when edited -- CI only ever
+# takes its passing branch. See docs/development/testing.md, "Container
+# identity guards".
 RUN groupadd -g 1000 puppet-agent && \
     useradd -u 1000 -g puppet-agent -m -d /home/puppet-agent -s /sbin/nologin puppet-agent && \
     { [ "$(id -u puppet-agent):$(id -g puppet-agent)" = "1000:1000" ] || \

@@ -32,6 +32,10 @@ ENV PATH=/opt/puppetlabs/server/bin:/opt/puppetlabs/puppet/bin:${PATH}
 # numeric `USER` form does not carry them the way the name form does: the
 # runtime collects them by walking /etc/group for the named user, and a
 # uid:gid pair skips that walk.
+#
+# Re-verify by hand when editing this -- CI only ever takes the passing branch.
+# See docs/development/testing.md, "Container identity guards"; mutate the image
+# rather than `expected`, or the check proves only that the comparison runs.
 RUN expected="52:52:52"; actual="$(id -u puppet):$(id -g puppet):$(id -G puppet)"; \
     [ "$actual" = "$expected" ] || { \
         echo "openvox-server puppet uid:gid:groups is $actual, not $expected." >&2; \

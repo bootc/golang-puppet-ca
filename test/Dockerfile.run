@@ -18,6 +18,9 @@ FROM quay.io/centos/centos:stream10
 # uid/gid 1000 pinned to match the published images (see Dockerfile): `USER`
 # has to be numeric, and the local runtime image should present the same
 # identity as the one it stands in for.
+# The assertion below must be re-verified by hand when edited -- CI only ever
+# takes its passing branch. See docs/development/testing.md, "Container
+# identity guards".
 RUN dnf install -y curl openssl && dnf clean all && \
     groupadd -g 1000 puppet && \
     useradd -m -u 1000 -g 1000 puppet && \
