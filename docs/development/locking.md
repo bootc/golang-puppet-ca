@@ -730,9 +730,12 @@ state when the document was last updated and is not guaranteed exhaustive.
   re-checked revocation before acquiring the subject lock.~~ Fixed: both
   renewal paths now call `refuseIfRevoked` again as the first statement inside
   the subject lock, and `Revoke` takes `subject:<name>` → `crl` so nothing can
-  revoke in the gap between that answer and the issuance it guards. The one
-  issuance path a revocation still cannot wait for is `Generate`, which takes
-  no distributed lock — see the `Generate` gap above.
+  revoke in the gap between that answer and the issuance it guards. `Generate`
+  takes `subject:<name>` as well, so a revocation orders against it like any
+  other issuance. It remains the one issuance path with no `refuseIfRevoked`
+  gate, and deliberately so: it issues *for* a subject rather than renewing a
+  certificate someone presented, so a revoked certificate for that name is
+  evicted and replaced rather than refused.
 - On blob backends (filesystem/redis), an inventory append and its HMAC
   update are two writes, not one atomic unit; the failure window is documented
   at the write site in `AppendInventory` and the structured (SQL, etcd)
