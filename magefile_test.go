@@ -708,7 +708,20 @@ jobs:
 			Expect(err).To(MatchError(ContainSubstring("the inverse of the pin")))
 		})
 
-		// Killed by dropping `==` from automergeBasePin and by nothing else:
+		// Killed by dropping `==` from automergeBasePin and by nothing else.
+		// The base ref is conjoined, so the conjunct requirement is satisfied
+		// and cannot be what rejects it; only the operator can. Semantically a
+		// non-empty string is truthy, so this pins nothing at all.
+		It("rejects a bare truthy conjunct on the base ref", func() {
+			bad := bytes.Replace(unfiltered,
+				[]byte("github.event.pull_request.base.ref == github.event.repository.default_branch"),
+				[]byte("github.event.pull_request.base.ref"), 1)
+			Expect(verifyAutomergeBasePinIn("ci.yml", bad)).To(
+				MatchError(ContainSubstring(`job "automerge"`)))
+		})
+
+		// Also rejected, and by the conjunct requirement rather than the
+		// operator: the ref is consulted inside a call, so nothing compares it.
 		// the operand is present, so an operand-only check accepts it, while
 		// the job is confined to release/* rather than the default branch.
 		// Trips neither the anti-pin nor a comparison, so no other branch
