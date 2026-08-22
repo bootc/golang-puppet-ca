@@ -585,6 +585,25 @@ func verifyAutomergeLabelExclusionIn(name string, src []byte) error {
 // operator flip, which is a single keystroke.
 const automergeBasePin = "github.event.pull_request.base.ref =="
 
+// automergeBaseAntiPin is the comparison the same condition must NOT make.
+//
+// Requiring the pin is not sufficient on its own, because a substring can be
+// supplied by a clause other than the one it is meant to certify. Inverting the
+// real pin to `!=` and adding a plausible neighbour -- `!(base.ref ==
+// 'gh-pages')`, say, to keep bot PRs off a docs branch -- leaves
+// automergeBasePin present in the condition while the job merges on every base
+// except the default one. The positive check passed that. So the guard also
+// refuses the inverted form outright: the pin has to be there, and its negation
+// has to not be.
+//
+// This does reject a condition that legitimately excludes some other base with
+// `base.ref != 'x'`. That is deliberate. Such a clause is rare, the failure is
+// loud and immediate, and the remedy -- express the exclusion another way, or
+// teach this guard the difference -- is a decision worth making explicitly. The
+// alternative is a silent pass on the one condition that decides whether
+// unattended merges are gated at all.
+const automergeBaseAntiPin = "github.event.pull_request.base.ref !="
+
 // baseScopedWorkflows are the workflows whose pull_request trigger must stay
 // unfiltered by base. Both were filtered to ["main"] until the change that
 // added these guards, which meant neither ran on a stacked PR.
@@ -768,6 +787,12 @@ func verifyAutomergeBasePinIn(name string, src []byte) error {
 		// folded block already joins lines with spaces, but a second space
 		// around the operator would otherwise read as a missing pin.
 		cond := strings.Join(strings.Fields(j.If), " ")
+		if strings.Contains(cond, automergeBaseAntiPin) {
+			return fmt.Errorf("%s job %q merges pull requests and its 'if:' contains %q, "+
+				"which confines it to every base except the default branch -- the inverse of the pin; "+
+				"if some other base genuinely needs excluding, extend this guard rather than the condition",
+				name, job, automergeBaseAntiPin)
+		}
 		if !strings.Contains(cond, automergeBasePin) {
 			return fmt.Errorf("%s job %q merges pull requests but its 'if:' does not contain %q; "+
 				"nothing else confines it to the default branch, and the \"Main\" ruleset covers no other",

@@ -705,7 +705,24 @@ jobs:
 				[]byte("github.event.pull_request.base.ref != github.event.repository.default_branch"), 1)
 			err := verifyAutomergeBasePinIn("ci.yml", bad)
 			Expect(err).To(MatchError(ContainSubstring(`job "automerge"`)))
-			Expect(err).To(MatchError(ContainSubstring("base.ref ==")))
+			Expect(err).To(MatchError(ContainSubstring("base.ref !=")))
+		})
+
+		// The decoy: invert the real pin and let a plausible neighbouring
+		// clause supply the required substring. Requiring the pin alone passed
+		// this, because a substring says nothing about which clause produced
+		// it.
+		It("rejects an inverted pin even when another clause supplies the substring", func() {
+			bad := bytes.Replace(unfiltered,
+				[]byte("      && github.event.pull_request.base.ref == github.event.repository.default_branch\n"),
+				[]byte("      && github.event.pull_request.base.ref != github.event.repository.default_branch\n"+
+					"      && !(github.event.pull_request.base.ref == 'gh-pages')\n"), 1)
+			// The fixture really is a decoy: the required substring is present,
+			// so a guard checking only for it would pass this.
+			Expect(string(bad)).To(ContainSubstring("github.event.pull_request.base.ref =="))
+			err := verifyAutomergeBasePinIn("ci.yml", bad)
+			Expect(err).To(MatchError(ContainSubstring(`job "automerge"`)))
+			Expect(err).To(MatchError(ContainSubstring("the inverse of the pin")))
 		})
 
 		// Spacing is not spelling: the required comparison is matched on its
