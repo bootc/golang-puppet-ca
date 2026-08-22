@@ -250,8 +250,10 @@ jobs:
             ~/.cache/go-build
           # Unique key per commit so every run saves its updated cache;
           # restore-keys fall back to the most recent cache for this variant.
-          # Caches saved on main are visible to all refs, including release
-          # tags.
+          # Caches saved on main are visible to all refs, but release tags no
+          # longer restore them: release.yml's build job sets cache: false and
+          # links from source, so nothing that can write a cache entry here
+          # reaches a published binary.
           key: dist-gocache-${{ matrix.variant }}-${{ hashFiles('go.mod', 'go.sum') }}-${{ github.sha }}
           restore-keys: |
             dist-gocache-${{ matrix.variant }}-${{ hashFiles('go.mod', 'go.sum') }}-
@@ -264,6 +266,16 @@ jobs:
         # Shared with the Release workflow's build job, so the artefacts that
         # actually get published receive the same verification as PR builds.
         uses: ./.github/actions/verify-dist-artifact
+        with:
+          variant: ${{ matrix.variant }}
+      - name: Generate SBOMs
+        # Generated but not attested: signing needs id-token: write and a tag
+        # context, neither of which belongs on a PR. The point is that the
+        # scan-and-validate half of the release's SBOM step runs on every pull
+        # request, so a Syft upgrade or a cataloguer regression fails here
+        # rather than midway through a release, when the only remedy is
+        # delete-tag/fix/retag.
+        uses: ./.github/actions/generate-sbom
         with:
           variant: ${{ matrix.variant }}
 
@@ -493,7 +505,19 @@ jobs:
 
   automerge:
     name: Enable auto-merge
-    if: github.event_name == 'pull_request' && (github.event.pull_request.user.login == 'dependabot[bot]' || github.event.pull_request.user.login == 'renovate[bot]')
+    # The label exclusion is not decoration: renovate.json applies
+    # 'review-signing-path' to bumps of the release signing surface (cosign,
+    # Syft, actions/attest), and nothing in this workflow runs cosign — signing
+    # happens in container-images.yml's merge job and in helm-chart.yml, which
+    # has no pull_request trigger at all. Without this clause a bump that
+    # changed signing behaviour would go green here, merge unattended, and
+    # first misbehave on a tag. `mage dev:check` enforces the clause
+    # (verifyAutomergeLabelExclusion), so it cannot be tidied away.
+    if: >-
+      github.event_name == 'pull_request'
+      && !contains(github.event.pull_request.labels.*.name, 'review-signing-path')
+      && (github.event.pull_request.user.login == 'dependabot[bot]'
+      || github.event.pull_request.user.login == 'renovate[bot]')
     needs:
       - ci
     runs-on: ubuntu-24.04

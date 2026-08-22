@@ -75,9 +75,11 @@ root for a Docker/Podman Compose deployment.
 ### Release tarballs
 
 Each release publishes four tarballs — `linux_amd64` and `linux_arm64`, each in a standard and a
-FIPS (`_fips`) build — plus `checksums.txt`. Every archive contains both binaries (`openvox-ca`,
-`openvox-ca-ctl`) and the systemd unit `openvox-ca.service`. Asset names carry the release version,
-so set `VERSION` to the release you want (the newest is on the
+FIPS (`_fips`) build — plus an SBOM pair per tarball, `checksums.txt`, and a signed provenance
+bundle (see [verifying what you downloaded](#verifying-what-you-downloaded)). Every archive
+contains both binaries (`openvox-ca`, `openvox-ca-ctl`) and the systemd unit
+`openvox-ca.service`. Asset names carry the release version, so set `VERSION` to the release you
+want (the newest is on the
 [releases page](https://github.com/voxpupuli/openvox-ca/releases/latest)) and download by tag:
 
 ```console
@@ -89,6 +91,92 @@ $ tar xzf openvox-ca_${VERSION}_linux_amd64.tar.gz
 ```
 
 See [running under systemd](docs/systemd.md) for the rest of a VM install.
+
+### Verifying what you downloaded
+
+`checksums.txt` establishes that a download arrived intact. Provenance establishes
+where it came from: every tarball, container image and chart published from a
+release tag carries a [SLSA v1.0](https://slsa.dev/spec/v1.0/provenance) build
+provenance attestation, signed through [Sigstore](https://www.sigstore.dev/) with a
+short-lived certificate — there is no long-lived signing key to trust or rotate.
+
+With the GitHub CLI, verification is one command per artefact:
+
+```console
+$ gh attestation verify openvox-ca_${VERSION}_linux_amd64.tar.gz \
+    --repo voxpupuli/openvox-ca \
+    --signer-workflow voxpupuli/openvox-ca/.github/workflows/release.yml \
+    --source-ref refs/tags/v${VERSION}
+```
+
+All three flags matter, and they do different jobs. `--repo` on its own accepts any
+attestation this repository produced — and the container image workflow signs
+pull-request builds too, so repository-scoped verification is weaker than it
+looks. `--signer-workflow` pins *which* workflow signed; it has no ref
+component, so it does not on its own separate a release from a pull request.
+`--source-ref` is what pins the ref. The cosign commands below get all three
+properties from one certificate identity — `--certificate-identity` where the
+exact URL is known, `--certificate-identity-regexp` where the version is not
+fixed in advance — because the identity URL carries repository, workflow path
+and ref together.
+
+The provenance bundle is also published as a release asset, so verification needs
+nothing but `cosign` and `curl` — no GitHub API call, and it works air-gapped.
+It is a Sigstore-format bundle, so it wants cosign v3 or newer (on cosign v2.4
+and later, add `--new-bundle-format`; earlier v2 releases cannot read it):
+
+```console
+$ curl -fLO https://github.com/voxpupuli/openvox-ca/releases/download/v${VERSION}/provenance.sigstore.json
+$ cosign verify-blob-attestation openvox-ca_${VERSION}_linux_amd64.tar.gz \
+    --bundle provenance.sigstore.json \
+    --type slsaprovenance1 \
+    --certificate-identity https://github.com/voxpupuli/openvox-ca/.github/workflows/release.yml@refs/tags/v${VERSION} \
+    --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
+
+The bundle covers every file listed in `checksums.txt` — each tarball and each SBOM —
+so the same bundle verifies any of them.
+
+Container images and the Helm chart are both attested and signed. Because images are
+also built for pull requests, whose certificates name `refs/pull/N/merge`, pin the
+identity to the release shape rather than accepting any identity from this repository:
+
+```console
+$ cosign verify ghcr.io/voxpupuli/openvox-ca:${VERSION} \
+    --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+    --certificate-identity-regexp '^https://github\.com/voxpupuli/openvox-ca/\.github/workflows/container-images\.yml@refs/tags/v'
+```
+
+**SBOMs.** Each tarball ships an SBOM in both SPDX-JSON (`.spdx.json`, ISO/IEC 5962)
+and CycloneDX-JSON (`.cdx.json`, ECMA-424), generated from the built binaries rather
+than from `go.mod`, so they record what actually linked.
+
+Container images carry the equivalent pair as registry attestations, catalogued from
+the image so the base-layer packages are included too. These are attached to each
+**per-architecture** image rather than to the multi-arch index, because that is where
+they differ — so resolve a child digest first; a tag resolves to the index, which
+carries provenance only:
+
+```console
+$ digest="$(docker buildx imagetools inspect ghcr.io/voxpupuli/openvox-ca:${VERSION} \
+    --format '{{range .Manifest.Manifests}}{{if eq .Platform.Architecture "amd64"}}{{.Digest}}{{end}}{{end}}')"
+$ gh attestation verify oci://ghcr.io/voxpupuli/openvox-ca@${digest} \
+    --repo voxpupuli/openvox-ca \
+    --signer-workflow voxpupuli/openvox-ca/.github/workflows/container-images.yml \
+    --source-ref refs/tags/v${VERSION} \
+    --predicate-type https://spdx.dev/Document/v2.3
+```
+
+Select the child by architecture rather than by position — the order the index
+lists them in is not meaningful, so `index … 0` would verify whichever image
+happened to sort first. Substitute `arm64` for the other architecture, and
+`--predicate-type https://cyclonedx.org/bom` for the CycloneDX document.
+
+The SPDX predicate type carries the document's own SPDX version, so it moves if
+the generator's output version does: check the `spdxVersion` field of the
+published `.spdx.json` if `v2.3` stops matching. CycloneDX's is unversioned.
+The Helm chart carries provenance and a signature but no SBOM: it declares no
+dependencies, so there would be nothing to catalogue.
 
 ### Kubernetes (Helm)
 
@@ -103,7 +191,14 @@ $ helm install openvox-ca \
 ```
 
 See [deploying with Helm](docs/helm-chart.md) for the guide and the
-[chart README](charts/openvox-ca/README.md) for the values reference.
+[chart README](charts/openvox-ca/README.md) for the values reference. The chart is
+signed and attested like the images:
+
+```console
+$ cosign verify ghcr.io/voxpupuli/openvox-ca-charts/openvox-ca:${VERSION} \
+    --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+    --certificate-identity-regexp '^https://github\.com/voxpupuli/openvox-ca/\.github/workflows/helm-chart\.yml@refs/tags/v'
+```
 
 ### Building from source
 

@@ -5,9 +5,14 @@ on:
     tags:
       - 'v*'
 
-# The verify and build jobs only read; contents: write is granted to the
-# release job alone, so a compromise in the build path cannot push refs or
-# publish releases.
+# The verify and build jobs only read; contents: write, id-token: write and
+# attestations: write are granted to the release job alone, so a compromise in
+# the build path cannot push refs, publish releases, or mint a signing
+# certificate that speaks for this repository. The cost of keeping the signing
+# identity in one job is that provenance binds the bytes the release job
+# downloaded from the run's artifact store, rather than binding them to the
+# individual build job that compiled them; attesting in build instead would
+# tighten that at the price of granting attestations: write to four more jobs.
 permissions:
   contents: read
   checks: read  # verify-release-tag reads the tagged commit's check runs
@@ -22,9 +27,9 @@ jobs:
       - uses: ./.github/actions/verify-release-tag
 
   # -- Build one variant per native runner ------------------------------------
-  # Same variant/runner matrix as CI's dist job (which keeps the per-variant
-  # caches warm on main), so the FIPS cgo builds run natively with no cross
-  # toolchain.
+  # Same variant/runner matrix as CI's dist job, so the FIPS cgo builds run
+  # natively with no cross toolchain. CI's job keeps per-variant Go caches;
+  # this one deliberately does not restore them — see cache: false below.
   build:
     name: Build ${{ matrix.variant }}
     needs: verify
@@ -46,20 +51,13 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
-          # Per-variant cache shared with ci.yml's dist job; see the comment
-          # there. CI's runs on main keep it warm, so the tag build mostly
-          # just links.
+          # Tag builds go cold deliberately. A restored ~/.cache/go-build is
+          # not checksum-verified the way the module cache is, so anything
+          # able to write a cache entry on main could in principle have
+          # reached the published binaries. CI's dist job keeps its own
+          # per-variant caches; releases pay a few minutes to link from
+          # source instead.
           cache: false
-      - name: Go caches (${{ matrix.variant }})
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: |
-            ~/go/pkg/mod
-            ~/.cache/go-build
-          key: dist-gocache-${{ matrix.variant }}-${{ hashFiles('go.mod', 'go.sum') }}-${{ github.sha }}
-          restore-keys: |
-            dist-gocache-${{ matrix.variant }}-${{ hashFiles('go.mod', 'go.sum') }}-
-            dist-gocache-${{ matrix.variant }}-
       - name: Install Mage
         run: go install github.com/magefile/mage@v1.17.2
       - name: Build release artifact
@@ -68,15 +66,24 @@ jobs:
         # The exact binaries being published are executed and (for FIPS
         # variants) checked for boringcrypto build info before upload —
         # "the commit passed CI" does not by itself verify these artefacts,
-        # since release builds restore Go caches saved by CI runs on main.
+        # since they are built here rather than carried over from that run.
         uses: ./.github/actions/verify-dist-artifact
+        with:
+          variant: ${{ matrix.variant }}
+      - name: Generate SBOMs
+        # Produced next to the binaries that were just verified, by the same
+        # composite action CI's dist job runs on every pull request.
+        uses: ./.github/actions/generate-sbom
         with:
           variant: ${{ matrix.variant }}
       - name: Upload artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: dist-${{ matrix.variant }}
-          path: dist/*.tar.gz
+          path: |
+            dist/*.tar.gz
+            dist/*.spdx.json
+            dist/*.cdx.json
           if-no-files-found: error
           retention-days: 1
 
@@ -86,7 +93,9 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     permissions:
-      contents: write  # create the release and upload assets
+      contents: write      # create the release and upload assets
+      id-token: write      # mint the Sigstore signing certificate
+      attestations: write  # record the attestation against the repository
     steps:
       - name: Download artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -101,20 +110,68 @@ jobs:
           cd dist
           ls -l
           # Refuse to publish an incomplete release: every variant in the
-          # build matrix must have produced exactly one tarball, and nothing
-          # unexpected may sneak in. This list, the matrix above, ci.yml's
-          # dist matrix, and distVariants() in magefile.go are checked for
-          # agreement by `mage dev:check` (verifyDistVariants).
+          # build matrix must have produced exactly one tarball and one SBOM
+          # per format, and nothing unexpected may sneak in. This list, the
+          # matrix above, ci.yml's dist matrix, and distVariants() in
+          # magefile.go are checked for agreement by `mage dev:check`
+          # (verifyDistVariants).
           for variant in linux_amd64 linux_arm64 linux_amd64_fips linux_arm64_fips; do
             ls -- openvox-ca_*_"$variant".tar.gz > /dev/null
+            ls -- openvox-ca_*_"$variant".spdx.json > /dev/null
+            ls -- openvox-ca_*_"$variant".cdx.json > /dev/null
           done
           tarballs="$(ls -- *.tar.gz | wc -l)"
           if [ "$tarballs" -ne 4 ]; then
             echo "::error::Expected 4 release tarballs, found $tarballs"
             exit 1
           fi
-          sha256sum -- *.tar.gz > checksums.txt
+          # Two documents per variant: SPDX-JSON and CycloneDX-JSON.
+          sboms="$(ls -- *.spdx.json *.cdx.json | wc -l)"
+          if [ "$sboms" -ne 8 ]; then
+            echo "::error::Expected 8 release SBOMs, found $sboms"
+            exit 1
+          fi
+          # The SBOMs are checksummed alongside the tarballs: they are
+          # published artefacts in their own right, and the attestation below
+          # takes its subject list from this file.
+          sha256sum -- *.tar.gz *.spdx.json *.cdx.json > checksums.txt
           cat checksums.txt
+      - name: Attest build provenance
+        id: attest
+        # One call, whose subjects are exactly the lines of checksums.txt —
+        # every tarball and every SBOM. Using the checksum file as the subject
+        # list rather than a glob means the attested set and the published set
+        # cannot drift apart, and it authenticates checksums.txt's contents as
+        # a side effect: the signed subject list is the same list.
+        #
+        # Provenance only, no SBOM attestation. The SBOM documents are
+        # published as release assets and are themselves subjects of this
+        # bundle, so they are authenticated; what they do not get is a
+        # separate "this SBOM describes that tarball" predicate. The images
+        # do get one, because there the SBOM has nowhere else to live — for a
+        # blob, attaching it would mean one attest call per artefact per
+        # format, which is the drift problem described below.
+        #
+        # This is one multi-subject bundle rather than one bundle per
+        # artefact. `gh attestation verify` and `cosign verify-blob-attestation`
+        # both match a blob's digest against the subject list, so verifying a
+        # single tarball is unambiguous either way, and a bundle per artefact
+        # would mean a hand-maintained attest step per variant — exactly the
+        # copied-variant-list drift that verifyDistVariants exists to prevent.
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-checksums: dist/checksums.txt
+      - name: Stage the attestation bundle
+        env:
+          BUNDLE: ${{ steps.attest.outputs.bundle-path }}
+        # Published as a release asset so verification needs only cosign and
+        # curl: no gh CLI, no GitHub API call, and it works air-gapped. The
+        # bundle is deliberately absent from checksums.txt — it is generated
+        # after that file and, being signed, authenticates itself; listing it
+        # would add nothing and invite a circular ordering.
+        run: |
+          cp -- "$BUNDLE" dist/provenance.sigstore.json
+          ls -l dist/provenance.sigstore.json
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -130,4 +187,7 @@ jobs:
           esac
           gh release create "${args[@]}" \
             dist/*.tar.gz \
+            dist/*.spdx.json \
+            dist/*.cdx.json \
+            dist/provenance.sigstore.json \
             dist/checksums.txt

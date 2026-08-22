@@ -24,17 +24,29 @@ fails the gate instead of shipping mislabelled artefacts.
 | `openvox-ca_X.Y.Z_linux_arm64.tar.gz` | `mage build:distVariant` (Release workflow) | GitHub release assets |
 | `openvox-ca_X.Y.Z_linux_amd64_fips.tar.gz` | `mage build:distVariant` (`GOEXPERIMENT=boringcrypto`) | GitHub release assets |
 | `openvox-ca_X.Y.Z_linux_arm64_fips.tar.gz` | `mage build:distVariant` (`GOEXPERIMENT=boringcrypto`) | GitHub release assets |
-| `checksums.txt` (SHA-256) | Release workflow (`sha256sum` aggregate step) | GitHub release assets |
+| `openvox-ca_X.Y.Z_<variant>.spdx.json` / `.cdx.json` | Syft, via [`generate-sbom`](../../.github/actions/generate-sbom/action.yml) (one pair per variant) | GitHub release assets |
+| `checksums.txt` (SHA-256, covers the tarballs and the SBOMs) | Release workflow (`sha256sum` aggregate step) | GitHub release assets |
+| `provenance.sigstore.json` | `actions/attest`, over every line of `checksums.txt` | GitHub release assets |
 | GitHub release + auto-generated notes | `gh release create --generate-notes` | Releases page |
 | `ghcr.io/voxpupuli/openvox-ca:{X.Y.Z,X.Y,latest}` | *Container images* workflow | GHCR |
 | `…:{X.Y.Z,X.Y,latest}-alpine` | *Container images* workflow | GHCR |
 | `ghcr.io/voxpupuli/openvox-ca-charts/openvox-ca:X.Y.Z` | *Helm chart* workflow | GHCR (OCI, separate package) |
 
+Every tarball and SBOM above, plus each published image and the chart, carries
+SLSA v1.0 build provenance signed through Sigstore; the images and the chart are
+additionally signed with `cosign sign`. `checksums.txt` is not itself an
+attestation subject — its lines *are* the signed subject list, so it is
+authenticated by the bundle rather than alongside it — and
+`provenance.sigstore.json` is that bundle. See [verifying a
+release](#verifying-a-release).
+
 Each tarball contains both binaries, `openvox-ca` and `openvox-ca-ctl` (mode
 0755), and the systemd unit `openvox-ca.service` (mode 0644) — see [running
 under systemd](../systemd.md). Only Linux is built: there are no macOS or
-Windows release artefacts. To build the same set (plus `checksums.txt`) locally
-in one go, run `mage build:dist`.
+Windows release artefacts. To build the same four tarballs (plus a
+tarballs-only `checksums.txt`) locally in one go, run `mage build:dist`; the
+SBOMs and the provenance bundle are produced by the release workflow, not
+locally.
 
 The major-only container tag (`:1`, `:2`) is deliberately suppressed while the
 version is `v0.*`, because a `0.x` major carries no compatibility promise.
@@ -49,9 +61,9 @@ chart can never name an image that does not exist.
 
 | Workflow | File | What it does on a `v*` tag |
 | --- | --- | --- |
-| **Release** | [`release.yml`](../../.github/workflows/release.yml) | Verifies the tag equals `"v" +` the `internal/version` constant, builds each variant on a runner native to its architecture (`mage build:distVariant`, no cross toolchain), verifies each built artefact (binaries execute, FIPS variants carry boringcrypto build info), then aggregates the tarballs, generates `checksums.txt`, and runs `gh release create` |
-| **Container images** | [`container-images.yml`](../../.github/workflows/container-images.yml) | After the same verify gate, builds both image variants on native amd64 and arm64 runners and publishes multi-arch manifests. See [publishing container images](publishing-images.md) |
-| **Helm chart** | [`helm-chart.yml`](../../.github/workflows/helm-chart.yml) | After the same verify gate, packages `charts/openvox-ca`, waits for the tag's alpine image to appear, pushes the chart to `ghcr.io/voxpupuli/openvox-ca-charts` as an OCI artefact, then pulls it back to prove the reference resolves |
+| **Release** | [`release.yml`](../../.github/workflows/release.yml) | Verifies the tag equals `"v" +` the `internal/version` constant, builds each variant on a runner native to its architecture (`mage build:distVariant`, no cross toolchain), verifies each built artefact (binaries execute, FIPS variants carry boringcrypto build info), generates each variant's SBOM pair, then aggregates the lot, generates `checksums.txt`, attests provenance over everything it lists, and runs `gh release create` |
+| **Container images** | [`container-images.yml`](../../.github/workflows/container-images.yml) | After the same verify gate, builds both image variants on native amd64 and arm64 runners, attests provenance and an SBOM pair per architecture, publishes multi-arch manifests, then attests and `cosign sign`s each published index. See [publishing container images](publishing-images.md) |
+| **Helm chart** | [`helm-chart.yml`](../../.github/workflows/helm-chart.yml) | After the same verify gate, packages `charts/openvox-ca`, waits for the tag's alpine image to appear, pushes the chart to `ghcr.io/voxpupuli/openvox-ca-charts` as an OCI artefact, attests and signs it against the digest the push reported, then pulls it back to prove the reference resolves |
 
 > **CI's full suite does not re-run on tags.** Instead, all three
 > tag-triggered workflows start with the shared
@@ -198,6 +210,36 @@ $ mage release:prepare 0.10.0-dev
 ```
 
 This opens a small "Bump version to 0.10.0-dev" PR; merge it.
+
+## Verifying a release
+
+Every artefact published from a `v*` tag — each tarball, each SBOM, each image
+and the chart — carries SLSA v1.0 build provenance, signed through Sigstore's
+public-good instance with a short-lived certificate. There is
+no signing key held anywhere: the identity in the certificate is the workflow
+that produced the artefact, which is what a verifier should be checking anyway.
+
+| Artefact | Provenance | SBOM | `cosign sign` signature |
+| --- | --- | --- | --- |
+| Release tarballs | `provenance.sigstore.json`, one bundle over every line of `checksums.txt` | Published as assets, both formats | — (the bundle is the signature) |
+| Container images, per architecture | Registry attestation on the digest | Registry attestation, both formats | Yes — written by the index's `--recursive` signing, not a separate call |
+| Container image indexes | Registry attestation on the index digest | — (per-architecture SBOMs are the meaningful ones) | Yes, `--recursive` over the index and its children |
+| Helm chart | Registry attestation on the pushed digest | — (no dependencies, nothing to catalogue) | Yes |
+
+The reader-facing commands are in the [README](../../README.md#verifying-what-you-downloaded).
+Two things worth knowing that belong here rather than there:
+
+- **Verify against a digest, or against a pinned identity — not a bare tag.**
+  Images are built for pull requests too, and those runs mint certificates whose
+  identity ends `@refs/pull/N/merge`. `--certificate-identity-regexp` anchored to
+  `@refs/tags/v` is what distinguishes a release build from a PR build.
+- **`cosign sign` accepts a tag, and signing one would be a mistake.** A tag is
+  mutable; the whole publishing path is careful to sign only digests it learned
+  from the push itself — `imagetools create --metadata-file` for the image
+  indexes, `helm push`'s reported digest for the chart. Nothing re-resolves a tag
+  between publishing and signing. After signing, each workflow asserts that the
+  tags it published still resolve to the digest it signed, which converts a lost
+  race into a red build rather than a silently unsigned tag.
 
 ## Release notes
 
@@ -350,6 +392,97 @@ Worth checking specifically:
   $ docker buildx imagetools inspect ghcr.io/<you>/<fork>:0.9.0-test1
   ```
 
+- All eight SBOMs are present, both formats for each variant, and each one
+  actually catalogues the Go modules rather than being an empty document:
+
+  ```console
+  $ ls *.spdx.json *.cdx.json | wc -l          # expect 8
+  $ jq '[.packages[].externalRefs[]?.referenceLocator
+         | select(startswith("pkg:golang/"))] | length' \
+      openvox-ca_0.9.0-test1_linux_amd64.spdx.json
+  ```
+
+- Provenance verifies, both ways — through GitHub and offline through the
+  published bundle:
+
+  ```console
+  $ gh attestation verify openvox-ca_0.9.0-test1_linux_amd64.tar.gz --repo <you>/<fork> \
+      --signer-workflow <you>/<fork>/.github/workflows/release.yml \
+      --source-ref refs/tags/v0.9.0-test1
+  $ cosign verify-blob-attestation openvox-ca_0.9.0-test1_linux_amd64.tar.gz \
+      --bundle provenance.sigstore.json --type slsaprovenance1 \
+      --certificate-identity https://github.com/<you>/<fork>/.github/workflows/release.yml@refs/tags/v0.9.0-test1 \
+      --certificate-oidc-issuer https://token.actions.githubusercontent.com
+  ```
+
+  The second command is the one that matters most: it is the only check that
+  the bundle published as a release asset is usable on its own. It also proves
+  the multi-subject bundle resolves for an individual file — verify a second
+  artefact against the *same* bundle to confirm that:
+
+  ```console
+  $ cosign verify-blob-attestation openvox-ca_0.9.0-test1_linux_arm64_fips.tar.gz \
+      --bundle provenance.sigstore.json --type slsaprovenance1 \
+      --certificate-identity https://github.com/<you>/<fork>/.github/workflows/release.yml@refs/tags/v0.9.0-test1 \
+      --certificate-oidc-issuer https://token.actions.githubusercontent.com
+  ```
+
+- The image signature and attestations are discoverable on GHCR. This is the
+  assumption the whole GitHub-native-attestation choice rests on — that cosign
+  finds attestations GitHub pushed to the registry — so it is worth checking
+  explicitly rather than inferring from a green build:
+
+  ```console
+  $ ident='^https://github\.com/<you>/<fork>/\.github/workflows/container-images\.yml@refs/tags/v'
+  $ cosign verify ghcr.io/<you>/<fork>:0.9.0-test1 \
+      --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+      --certificate-identity-regexp "$ident"
+  $ cosign verify-attestation ghcr.io/<you>/<fork>:0.9.0-test1 \
+      --type slsaprovenance1 \
+      --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+      --certificate-identity-regexp "$ident"
+  $ gh attestation verify oci://ghcr.io/<you>/<fork>:0.9.0-test1 --repo <you>/<fork> \
+      --signer-workflow <you>/<fork>/.github/workflows/container-images.yml \
+      --source-ref refs/tags/v0.9.0-test1
+  ```
+
+- `cosign sign --recursive` reached the children, not just the index. Signing an
+  index assembled by `imagetools create` (rather than pushed directly by buildx)
+  is the step most likely to surprise, so check a child manifest by digest:
+
+  ```console
+  $ child="$(docker buildx imagetools inspect ghcr.io/<you>/<fork>:0.9.0-test1 \
+      --format '{{range .Manifest.Manifests}}{{if eq .Platform.Architecture "amd64"}}{{.Digest}}{{end}}{{end}}')"
+  $ cosign verify "ghcr.io/<you>/<fork>@${child}" \
+      --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+      --certificate-identity-regexp "$ident"
+  ```
+
+- The per-architecture SBOM attestations are discoverable, which is the one
+  verification command a rehearsal would otherwise never exercise — the index
+  carries provenance only, so a check against the tag passes without ever
+  touching an SBOM:
+
+  ```console
+  $ gh attestation verify "oci://ghcr.io/<you>/<fork>@${child}" --repo <you>/<fork> \
+      --signer-workflow <you>/<fork>/.github/workflows/container-images.yml \
+      --source-ref refs/tags/v0.9.0-test1 \
+      --predicate-type https://spdx.dev/Document/v2.3
+  $ gh attestation verify "oci://ghcr.io/<you>/<fork>@${child}" --repo <you>/<fork> \
+      --signer-workflow <you>/<fork>/.github/workflows/container-images.yml \
+      --source-ref refs/tags/v0.9.0-test1 \
+      --predicate-type https://cyclonedx.org/bom
+  ```
+
+- The chart is signed too:
+
+  ```console
+  $ cosign verify ghcr.io/<you>/<fork>-charts/openvox-ca:0.9.0-test1 \
+      --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+      --certificate-identity-regexp \
+        '^https://github\.com/<you>/<fork>/\.github/workflows/helm-chart\.yml@refs/tags/v'
+  ```
+
 - The chart published, and installs the image the release actually produced:
 
   ```console
@@ -394,9 +527,13 @@ means a later `git fetch --tags` from the fork pollutes your local tag list.
 ## Known gaps
 
 These are current limitations of the release machinery rather than things you
-can work around at release time. They are worth fixing before 1.0.
+can work around at release time. Some are worth closing before 1.0; others are
+accepted trade-offs, recorded here so that the limitation is not a surprise
+rather than because anyone intends to fix them. (Two entries that stood here
+previously — unsigned artefacts, and tag builds restoring Go caches saved on
+`main` — were closed together; see [verifying a
+release](#verifying-a-release).)
 
 | Gap | Impact |
 | --- | --- |
-| **No signing or attestation of release artefacts.** | `checksums.txt` establishes integrity against tampering in transit, but nothing establishes provenance. Image provenance attestations are also explicitly disabled, because they break the push-by-digest manifest merge, and the chart is packaged without `helm package --sign`, so no `.prov` provenance file exists for `helm push` to upload and `helm verify` has nothing to check. |
-| **Release builds restore Go caches saved by CI runs on `main`.** | A deliberate trade-off for fast tag builds: the published binaries link against `~/.cache/go-build` contents that are not checksum-verified (unlike the module cache, which `go.sum` covers), so code already running in `main`'s CI could in principle poison a cache that a later release build consumes. Signing/attestation (above) would be the durable fix. |
+| **`helm verify` has nothing to check.** | The chart is signed with cosign and carries SLSA provenance like everything else, but it is packaged without `helm package --sign`, so there is no `.prov` file for `helm push` to upload. Helm's own provenance mechanism is PGP: it wants a long-lived keyring, which is the thing Sigstore's short-lived certificates exist to avoid. Anyone whose tooling asserts specifically on `helm verify`, rather than on a cosign signature, is not served. |

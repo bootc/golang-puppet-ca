@@ -32,9 +32,11 @@ on:
         default: false
 
 # GITHUB_TOKEN needs packages:write to push to GHCR; it is granted per-job to
-# the build and merge jobs that actually push. On pull requests from forks
-# GitHub automatically downgrades it to read-only; the build job detects that
-# and skips pushing.
+# the build and merge jobs that actually push, together with the id-token and
+# attestations scopes those jobs need to sign what they pushed. On pull
+# requests from forks GitHub automatically downgrades it to read-only; the
+# build job detects that and skips pushing, and every signing step is gated on
+# the same output, so a fork PR neither pushes nor signs.
 permissions:
   contents: read
   checks: read  # verify-release-tag reads the tagged commit's check runs
@@ -104,7 +106,9 @@ jobs:
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
-      packages: write  # push per-arch images by digest
+      packages: write      # push per-arch images by digest
+      id-token: write      # mint the Sigstore signing certificate
+      attestations: write  # record the attestation against the repository
     strategy:
       fail-fast: false
       matrix:
@@ -188,6 +192,77 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+      # -- Provenance and SBOM for this per-architecture image ---------------─
+      # The per-arch images are the meaningful ones to catalogue: each has its
+      # own binary and its own base package set (CentOS Stream vs Alpine), so
+      # scanning them here catalogues curl, openssl and the rest of the base
+      # layer as well as the Go modules. The merged index gets provenance only.
+      #
+      # Every step below is keyed off the same push output as the build: fork
+      # PRs push nothing and so sign nothing, and their GITHUB_TOKEN could not
+      # mint a certificate anyway.
+      - name: Install Syft
+        if: needs.setup.outputs.push == 'true'
+        id: syft
+        uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          syft-version: v1.51.0
+
+      - name: Generate image SBOMs
+        if: needs.setup.outputs.push == 'true'
+        env:
+          IMAGE: ${{ needs.setup.outputs.image }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+          SYFT: ${{ steps.syft.outputs.cmd }}
+        # Scanned by digest, never by tag, and read straight back out of the
+        # registry so the document describes the image that was pushed rather
+        # than a local rebuild of it. Syft authenticates with the credentials
+        # docker/login-action already wrote.
+        run: |
+          "$SYFT" scan "registry:${IMAGE}@${DIGEST}" \
+            --source-name "$IMAGE" \
+            -o "spdx-json=/tmp/image.spdx.json" \
+            -o "cyclonedx-json=/tmp/image.cdx.json"
+          for f in /tmp/image.spdx.json /tmp/image.cdx.json; do
+            if [ ! -s "$f" ]; then
+              echo "::error::$f is empty; Syft catalogued nothing for ${IMAGE}@${DIGEST}"
+              exit 1
+            fi
+          done
+          echo "SPDX packages:      $(jq '.packages | length' /tmp/image.spdx.json)"
+          echo "CycloneDX components: $(jq '.components | length' /tmp/image.cdx.json)"
+
+      - name: Attest image provenance
+        if: needs.setup.outputs.push == 'true'
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          # subject-name carries no tag: the image being attested is
+          # identified by the digest the push reported, and re-resolving a
+          # tag here is exactly the race this workflow avoids.
+          subject-name: ${{ needs.setup.outputs.image }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
+      # sbom-path takes a single file, so attesting both formats is two calls
+      # against the same subject rather than one call with two documents.
+      - name: Attest image SBOM (SPDX)
+        if: needs.setup.outputs.push == 'true'
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ${{ needs.setup.outputs.image }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          sbom-path: /tmp/image.spdx.json
+          push-to-registry: true
+
+      - name: Attest image SBOM (CycloneDX)
+        if: needs.setup.outputs.push == 'true'
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ${{ needs.setup.outputs.image }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          sbom-path: /tmp/image.cdx.json
+          push-to-registry: true
+
   # -- Merge per-architecture digests into one multi-arch manifest ------------─
   merge:
     name: Publish ${{ matrix.variant }} manifest
@@ -195,7 +270,9 @@ jobs:
     if: needs.setup.outputs.push == 'true'
     runs-on: ubuntu-latest
     permissions:
-      packages: write  # push the multi-arch manifests and tags
+      packages: write      # push the multi-arch manifests and tags
+      id-token: write      # mint the Sigstore signing certificate
+      attestations: write  # record the attestation against the repository
     strategy:
       fail-fast: false
       matrix:
@@ -242,20 +319,164 @@ jobs:
             type=ref,event=pr
 
       - name: Create multi-arch manifest
+        id: manifest
         working-directory: /tmp/digests
         env:
           IMAGE: ${{ needs.setup.outputs.image }}
         run: |
+          # --metadata-file reports the digest of the index this command just
+          # pushed. That matters: the obvious way to learn it afterwards is
+          # `imagetools inspect <tag>`, which is a fresh tag resolution, and a
+          # tag is mutable. Re-resolving one between publishing and signing
+          # opens a window where the thing signed is not the thing published.
+          #
           # Word splitting is intentional: expand the -t flags and the
           # per-digest image references into separate arguments.
           # shellcheck disable=SC2046
           docker buildx imagetools create \
+            --metadata-file /tmp/index.json \
             $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
             $(printf "${IMAGE}@sha256:%s " *)
+          digest="$(jq -r '.["containerimage.descriptor"].digest' /tmp/index.json)"
+          case "$digest" in
+            sha256:*) ;;
+            *) echo "::error::imagetools create reported no index digest"; exit 1 ;;
+          esac
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "index digest: $digest"
+
+      - name: Attest index provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ${{ needs.setup.outputs.image }}
+          subject-digest: ${{ steps.manifest.outputs.digest }}
+          push-to-registry: true
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v3.1.3
+
+      - name: Sign the published index
+        env:
+          IMAGE: ${{ needs.setup.outputs.image }}
+          DIGEST: ${{ steps.manifest.outputs.digest }}
+        # Signed as well as attested: an attestation satisfies `gh attestation
+        # verify` and `cosign verify-attestation`, but an admission policy that
+        # simply asserts "this image is signed" wants a plain signature, which
+        # is what `cosign verify` checks.
+        #
+        # --recursive covers the index and every child manifest in one call.
+        #
+        # The storage scheme is left at cosign's default. Setting
+        # --registry-referrers-mode=oci-1-1 explicitly, as would be tidier,
+        # is refused by cosign v3.1.3 unless COSIGN_EXPERIMENTAL=1 is also
+        # set, and an experimental gate is not a thing to depend on in the
+        # publishing path: a release that renames or drops it would break
+        # signing. What that flag was meant to buy — no silent change of
+        # scheme under us — is bought instead by pinning cosign's version
+        # above, and the default is what a plain `cosign verify` reads with
+        # no environment variable set.
+        #
+        # The subject is always ${IMAGE}@${DIGEST}: `cosign sign` accepts a
+        # tag, and signing one would reintroduce the race the metadata file
+        # exists to close.
+        run: |
+          cosign sign --yes --recursive "${IMAGE}@${DIGEST}"
 
       - name: Inspect published image
         env:
           IMAGE: ${{ needs.setup.outputs.image }}
+          DIGEST: ${{ steps.manifest.outputs.digest }}
         run: |
-          tag="$(jq -r '.tags[0]' <<< "$DOCKER_METADATA_OUTPUT_JSON")"
-          docker buildx imagetools inspect "$tag"
+          docker buildx imagetools inspect "${IMAGE}@${DIGEST}"
+
+      - name: Verify the published tags still point at what was signed
+        env:
+          IMAGE: ${{ needs.setup.outputs.image }}
+          DIGEST: ${{ steps.manifest.outputs.digest }}
+        # A post-condition, not a lock: it cannot prevent a tag moving between
+        # the push and the signature, but it converts "silently published a tag
+        # pointing at unsigned content" into a red build. Concurrency already
+        # serialises runs on the same ref; this catches the cross-ref case,
+        # e.g. an `edge` push landing on top of a tag build.
+        run: |
+          checked=0
+          while read -r tag; do
+            [ -n "$tag" ] || continue
+            got="$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$tag")"
+            if [ "$got" != "$DIGEST" ]; then
+              echo "::error::$tag resolves to $got, but $DIGEST was signed"
+              exit 1
+            fi
+            echo "ok: $tag -> $got"
+            checked=$((checked + 1))
+          done < <(jq -r '.tags[]' <<< "$DOCKER_METADATA_OUTPUT_JSON")
+          # Guard against the loop having verified nothing at all: an empty tag
+          # list would otherwise pass this step in silence.
+          if [ "$checked" -eq 0 ]; then
+            echo "::error::No tags were checked; the metadata action produced an empty tag list"
+            exit 1
+          fi
+          echo "verified $checked tag(s) against $DIGEST"
+
+      # -- Prove the signature and attestations are actually consumable ------─
+      # Signing exiting zero says the push was accepted, not that anyone can
+      # verify the result. Three assumptions this design rests on are only
+      # testable against a real registry, and each is checked here so that a
+      # wrong one is a red build on `main`/`edge` rather than a discovery
+      # during a release:
+      #
+      #   1. Keyless Sigstore signing produces a signature that verifies
+      #      against the workflow identity we expect.
+      #   2. `cosign sign --recursive` really did reach the index's children,
+      #      not just the index. This is the step most likely to surprise,
+      #      because the index was assembled by `imagetools create` rather than
+      #      pushed by buildx.
+      #   3. cosign can discover the attestations `actions/attest` pushed to
+      #      GHCR through the OCI 1.1 referrers API. The whole choice of
+      #      GitHub-native attestation over `cosign attest` depends on this; if
+      #      it does not hold, the fallback is running `cosign attest` too.
+      #
+      # The identity is built from the run's own context rather than hardcoded,
+      # so this verifies correctly on a fork as well as upstream, and on a tag
+      # as well as a branch.
+      - name: Verify what was just signed
+        env:
+          IMAGE: ${{ needs.setup.outputs.image }}
+          DIGEST: ${{ steps.manifest.outputs.digest }}
+        working-directory: /tmp/digests
+        run: |
+          identity="https://github.com/${GITHUB_REPOSITORY}/.github/workflows/container-images.yml@${GITHUB_REF}"
+          issuer="https://token.actions.githubusercontent.com"
+          echo "expecting certificate identity: $identity"
+
+          echo "--- index signature ---"
+          cosign verify --certificate-identity "$identity" \
+            --certificate-oidc-issuer "$issuer" "${IMAGE}@${DIGEST}" > /dev/null
+
+          # A child digest, taken from the same files the manifest was built
+          # from rather than by inspecting the index back out of the registry.
+          child="$(set -- *; echo "$1")"
+          if [ -z "$child" ] || [ ! -e "$child" ]; then
+            echo "::error::No per-architecture digest files found; nothing to verify --recursive against"
+            exit 1
+          fi
+          echo "--- child manifest signature (sha256:$child) ---"
+          cosign verify --certificate-identity "$identity" \
+            --certificate-oidc-issuer "$issuer" "${IMAGE}@sha256:${child}" > /dev/null
+
+          # Provenance only, not the SBOM attestations. Those carry a
+          # versioned predicate type (https://spdx.dev/Document/v2.3, tracking
+          # the SBOM's own spdxVersion), and cosign's `spdxjson` shorthand
+          # resolves to the unversioned URI, so asserting them here would
+          # couple the build to Syft's SPDX version and fail on a bump for a
+          # reason that is not a real defect. Provenance is enough for what
+          # this step exists to prove: it is pushed to the registry by the same
+          # mechanism, so discovering it demonstrates the referrers path works.
+          echo "--- provenance attestation on the child, via the referrers API ---"
+          cosign verify-attestation --type slsaprovenance1 \
+            --certificate-identity "$identity" \
+            --certificate-oidc-issuer "$issuer" \
+            "${IMAGE}@sha256:${child}" > /dev/null
+          echo "signature and provenance verified against $identity"
