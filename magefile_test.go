@@ -696,16 +696,73 @@ jobs:
 			Expect(verifyAutomergeBasePinIn("ci.yml", bad)).To(MatchError(ContainSubstring(`job "automerge"`)))
 		})
 
-		// The inversion is the case an operand-only check let through: the
-		// operand is still there, so a substring check on it alone passed
-		// while the job merged on every base *except* the default branch.
+		// Pins the anti-pin branch. (It no longer pins the operator folded
+		// into automergeBasePin: the anti-pin fires first for any inverted
+		// fixture, so the operand-only spec below is what covers that.)
 		It("rejects an inverted comparison, and names the job", func() {
 			bad := bytes.Replace(unfiltered,
 				[]byte("github.event.pull_request.base.ref == github.event.repository.default_branch"),
 				[]byte("github.event.pull_request.base.ref != github.event.repository.default_branch"), 1)
 			err := verifyAutomergeBasePinIn("ci.yml", bad)
 			Expect(err).To(MatchError(ContainSubstring(`job "automerge"`)))
-			Expect(err).To(MatchError(ContainSubstring("base.ref !=")))
+			Expect(err).To(MatchError(ContainSubstring("the inverse of the pin")))
+		})
+
+		// Killed by dropping `==` from automergeBasePin and by nothing else:
+		// the operand is present, so an operand-only check accepts it, while
+		// the job is confined to release/* rather than the default branch.
+		// Trips neither the anti-pin nor a comparison, so no other branch
+		// reaches it.
+		It("rejects a condition that consults the base ref without comparing it", func() {
+			bad := bytes.Replace(unfiltered,
+				[]byte("github.event.pull_request.base.ref == github.event.repository.default_branch"),
+				[]byte("startsWith(github.event.pull_request.base.ref, 'release/')"), 1)
+			Expect(verifyAutomergeBasePinIn("ci.yml", bad)).To(
+				MatchError(ContainSubstring(`job "automerge"`)))
+		})
+
+		// Spacing is not spelling in the direction that matters: GitHub reads
+		// `a!=b` as `a != b`, so a tight inversion plus a spaced decoy must
+		// still be refused. Collapsing whitespace rather than removing it let
+		// this through.
+		It("rejects a tight inverted pin even with a spaced decoy", func() {
+			bad := bytes.Replace(unfiltered,
+				[]byte("      && github.event.pull_request.base.ref == github.event.repository.default_branch\n"),
+				[]byte("      && github.event.pull_request.base.ref!=github.event.repository.default_branch\n"+
+					"      && !(github.event.pull_request.base.ref == 'gh-pages')\n"), 1)
+			Expect(verifyAutomergeBasePinIn("ci.yml", bad)).To(
+				MatchError(ContainSubstring("the inverse of the pin")))
+		})
+
+		// The same asymmetry misfired upward: a correct pin written tight is
+		// a valid spelling and must not be reported as drift.
+		It("accepts an upright pin written with no spaces", func() {
+			tight := bytes.Replace(unfiltered,
+				[]byte("github.event.pull_request.base.ref == github.event.repository.default_branch"),
+				[]byte("github.event.pull_request.base.ref==github.event.repository.default_branch"), 1)
+			Expect(verifyAutomergeBasePinIn("ci.yml", tight)).To(Succeed())
+		})
+
+		// One keystroke, `&&` to `||`. GitHub binds && tighter, so this reads
+		// as `A || (B && C)` with A true for every pull_request event: the job
+		// loses the base pin *and* the author gate. The comparison is still
+		// present, so only requiring it as a conjunct catches this.
+		It("rejects a pin that is disjoined rather than conjoined", func() {
+			bad := bytes.Replace(unfiltered,
+				[]byte("      github.event_name == 'pull_request'\n      && github.event.pull_request.base.ref"),
+				[]byte("      github.event_name == 'pull_request'\n      || github.event.pull_request.base.ref"), 1)
+			Expect(verifyAutomergeBasePinIn("ci.yml", bad)).To(
+				MatchError(ContainSubstring("does not require")))
+		})
+
+		// A negation wrapped around the whole comparison keeps the substring
+		// and inverts anyway; it is not conjoined, so it is refused too.
+		It("rejects a pin wrapped in a negation", func() {
+			bad := bytes.Replace(unfiltered,
+				[]byte("&& github.event.pull_request.base.ref == github.event.repository.default_branch"),
+				[]byte("&& !(github.event.pull_request.base.ref == github.event.repository.default_branch)"), 1)
+			Expect(verifyAutomergeBasePinIn("ci.yml", bad)).To(
+				MatchError(ContainSubstring("does not require")))
 		})
 
 		// The decoy: invert the real pin and let a plausible neighbouring

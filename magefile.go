@@ -41,6 +41,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/magefile/mage/mg"
 	"github.com/magefile/mage/sh"
@@ -560,49 +561,52 @@ func verifyAutomergeLabelExclusionIn(name string, src []byte) error {
 	return nil
 }
 
-// automergeBasePin is the comparison an auto-merge job's condition must make to
-// be confined by base branch.
+// automergeBaseRef is the expression context naming the branch a pull request
+// is aimed at. The two checks below are built from it.
+const automergeBaseRef = "github.event.pull_request.base.ref"
+
+// automergeBasePin is the comparison an auto-merge job's condition must make,
+// and automergeBaseAntiPin the one it must not. Both are matched against the
+// condition with *all* whitespace removed, so spacing is not spelling: GitHub's
+// expression parser treats `a!=b` and `a != b` alike, and so must this.
 //
-// The `==` is part of it, and that is the whole point. An earlier version
-// required only the operand, on the reasoning that a guard should catch a
-// missing pin rather than dictate how a present one is spelled. That reasoning
-// holds for spellings that *weaken* the pin -- and fails completely for one
-// that inverts it. Flipping `==` to `!=` leaves the operand present, so the
-// operand-only check passed while the job merged on every base *except* the
-// default branch: the exact ungated merge the guard exists to prevent, turned
-// into the only thing it permits. A weak pin still pins something; an anti-pin
-// does not, so the looser contract is not available here.
+// The pin is required as a conjunct -- `&&` immediately before it, or the whole
+// condition beginning with it. Requiring the comparison alone is not enough,
+// because a substring says nothing about the boolean structure it sits in. Each
+// of these passed a check that only looked for the comparison, and each merges
+// bot PRs under no ruleset:
+//
+//	pin != default_branch, plus a neighbour supplying `pin ==` elsewhere
+//	!(pin == default_branch)                      -- negation wrapped around it
+//	event_name == 'pull_request' || pin == ...    -- one keystroke, `&&` to `||`
+//
+// The last is the worst: `&&` binds tighter than `||`, so it evaluates as
+// `A || (B && C)` with A true for every pull_request event, losing the author
+// gate as well as the base pin. Demanding the pin be conjoined rejects all
+// three, because none of them has `&&pin==` and none begins with it.
 //
 // The right-hand side stays unconstrained. ci.yml compares against
 // github.event.repository.default_branch so the pin tracks the ruleset's
 // ~DEFAULT_BRANCH scope, but a literal == 'main' confines the job just as well
 // and must not be reported as drift.
 //
-// Not caught: a negation wrapped around the whole comparison, as in
-// !(base.ref == default_branch), which contains this substring and inverts
-// anyway. Catching that needs an expression parser rather than a substring,
-// and is not worth one for a form nobody reaches by accident -- unlike the
-// operator flip, which is a single keystroke.
-const automergeBasePin = "github.event.pull_request.base.ref =="
-
-// automergeBaseAntiPin is the comparison the same condition must NOT make.
+// Not caught, stated as the property rather than a list of shapes, because the
+// list has twice been shorter than the truth: a substring cannot see boolean
+// structure, so any arrangement that keeps a conjoined `pin ==` while
+// neutralising it elsewhere passes. Closing that needs an expression parser.
+// The three shapes above are closed because each loses the conjunction; a
+// fourth that keeps it would not be.
 //
-// Requiring the pin is not sufficient on its own, because a substring can be
-// supplied by a clause other than the one it is meant to certify. Inverting the
-// real pin to `!=` and adding a plausible neighbour -- `!(base.ref ==
-// 'gh-pages')`, say, to keep bot PRs off a docs branch -- leaves
-// automergeBasePin present in the condition while the job merges on every base
-// except the default one. The positive check passed that. So the guard also
-// refuses the inverted form outright: the pin has to be there, and its negation
-// has to not be.
-//
-// This does reject a condition that legitimately excludes some other base with
-// `base.ref != 'x'`. That is deliberate. Such a clause is rare, the failure is
-// loud and immediate, and the remedy -- express the exclusion another way, or
-// teach this guard the difference -- is a decision worth making explicitly. The
-// alternative is a silent pass on the one condition that decides whether
-// unattended merges are gated at all.
-const automergeBaseAntiPin = "github.event.pull_request.base.ref !="
+// One deliberate cost: this rejects a condition that legitimately excludes some
+// other base with `base.ref != 'x'`. Such a clause is rare, the failure is loud
+// and immediate, and the remedy -- express the exclusion another way, or teach
+// this guard the difference -- is worth deciding explicitly. The alternative is
+// a silent pass on the one condition deciding whether unattended merges are
+// gated at all.
+var (
+	automergeBasePin     = automergeBaseRef + "=="
+	automergeBaseAntiPin = automergeBaseRef + "!="
+)
 
 // baseScopedWorkflows are the workflows whose pull_request trigger must stay
 // unfiltered by base. Both were filtered to ["main"] until the change that
@@ -782,21 +786,27 @@ func verifyAutomergeBasePinIn(name string, src []byte) error {
 		if !merges {
 			continue
 		}
-		// Whitespace-normalised so the required comparison is matched on its
-		// tokens rather than on how the expression happens to be wrapped: a
-		// folded block already joins lines with spaces, but a second space
-		// around the operator would otherwise read as a missing pin.
-		cond := strings.Join(strings.Fields(j.If), " ")
+		// All whitespace removed, not merely collapsed: strings.Fields can
+		// only ever widen spacing, never insert it, so a normaliser that
+		// leaves single spaces stays blind to `base.ref!=x` -- which GitHub
+		// evaluates identically to the spaced form.
+		cond := strings.Map(func(r rune) rune {
+			if unicode.IsSpace(r) {
+				return -1
+			}
+			return r
+		}, j.If)
 		if strings.Contains(cond, automergeBaseAntiPin) {
-			return fmt.Errorf("%s job %q merges pull requests and its 'if:' contains %q, "+
+			return fmt.Errorf("%s job %q merges pull requests and its 'if:' compares %s with != , "+
 				"which confines it to every base except the default branch -- the inverse of the pin; "+
 				"if some other base genuinely needs excluding, extend this guard rather than the condition",
-				name, job, automergeBaseAntiPin)
+				name, job, automergeBaseRef)
 		}
-		if !strings.Contains(cond, automergeBasePin) {
-			return fmt.Errorf("%s job %q merges pull requests but its 'if:' does not contain %q; "+
-				"nothing else confines it to the default branch, and the \"Main\" ruleset covers no other",
-				name, job, automergeBasePin)
+		if !strings.HasPrefix(cond, automergeBasePin) && !strings.Contains(cond, "&&"+automergeBasePin) {
+			return fmt.Errorf("%s job %q merges pull requests but its 'if:' does not require %s== as a "+
+				"conjunct; nothing else confines it to the default branch, and the \"Main\" ruleset covers "+
+				"no other. A comparison that is disjoined (||) or negated (!) does not confine anything",
+				name, job, automergeBaseRef)
 		}
 	}
 	return nil
@@ -3703,8 +3713,11 @@ func checkModuleTidy(dir string, files []string, tidy func() error) error {
 	return nil
 }
 
-// Check is the CI gate: everything that must hold before a change can merge,
-// gathered behind one target. Unlike `mage dev:tidy`, it is a non-mutating
+// Check is the static half of the CI gate: the non-test checks that must hold
+// before a change can merge, gathered behind one target. The suites are
+// separate -- `mage test:magefile` is its own step in ci.yml, and the unit,
+// chart, mixin, lint and integration jobs are separate required checks -- so a
+// green dev:check is necessary and not sufficient. Unlike `mage dev:tidy`, it is a non-mutating
 // verifier -- it reports drift as a failure instead of silently fixing it, so
 // CI catches untidy code and modules. gofmt -l prints unformatted files
 // without rewriting them, and the tidiness step runs `go mod tidy` then
@@ -3731,6 +3744,7 @@ func (Dev) Check() error {
 	}); err != nil {
 		return err
 	}
+	fmt.Println("Running go vet...")
 	if err := sh.Run("go", "vet", "./..."); err != nil {
 		return err
 	}
