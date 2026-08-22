@@ -716,22 +716,21 @@ jobs:
 			bad := bytes.Replace(unfiltered,
 				[]byte("github.event.pull_request.base.ref == github.event.repository.default_branch"),
 				[]byte("github.event.pull_request.base.ref"), 1)
-			Expect(verifyAutomergeBasePinIn("ci.yml", bad)).To(
-				MatchError(ContainSubstring(`job "automerge"`)))
+			err := verifyAutomergeBasePinIn("ci.yml", bad)
+			Expect(err).To(MatchError(ContainSubstring(`job "automerge"`)))
+			Expect(err).To(MatchError(ContainSubstring("never compares")))
 		})
 
-		// Also rejected, and by the conjunct requirement rather than the
-		// operator: the ref is consulted inside a call, so nothing compares it.
-		// the operand is present, so an operand-only check accepts it, while
-		// the job is confined to release/* rather than the default branch.
-		// Trips neither the anti-pin nor a comparison, so no other branch
-		// reaches it.
+		// The ref is consulted but never compared, so it constrains nothing.
+		// Both error paths name the job, so this asserts the one substring only
+		// the missing-comparison path emits.
 		It("rejects a condition that consults the base ref without comparing it", func() {
 			bad := bytes.Replace(unfiltered,
 				[]byte("github.event.pull_request.base.ref == github.event.repository.default_branch"),
 				[]byte("startsWith(github.event.pull_request.base.ref, 'release/')"), 1)
-			Expect(verifyAutomergeBasePinIn("ci.yml", bad)).To(
-				MatchError(ContainSubstring(`job "automerge"`)))
+			err := verifyAutomergeBasePinIn("ci.yml", bad)
+			Expect(err).To(MatchError(ContainSubstring(`job "automerge"`)))
+			Expect(err).To(MatchError(ContainSubstring("never compares")))
 		})
 
 		// Spacing is not spelling in the direction that matters: GitHub reads
@@ -765,17 +764,53 @@ jobs:
 				[]byte("      github.event_name == 'pull_request'\n      && github.event.pull_request.base.ref"),
 				[]byte("      github.event_name == 'pull_request'\n      || github.event.pull_request.base.ref"), 1)
 			Expect(verifyAutomergeBasePinIn("ci.yml", bad)).To(
-				MatchError(ContainSubstring("does not require")))
+				MatchError(ContainSubstring("outside any parenthesised group")))
 		})
 
-		// A negation wrapped around the whole comparison keeps the substring
-		// and inverts anyway; it is not conjoined, so it is refused too.
-		It("rejects a pin wrapped in a negation", func() {
+		// The same slip one operator along: the pin stays where it was and the
+		// `||` moves after it. Caught for the same reason -- the disjunction is
+		// top-level -- which the earlier conjunct-adjacency form missed.
+		It("rejects a disjunction that follows the pin", func() {
+			bad := bytes.Replace(unfiltered,
+				[]byte("github.event.repository.default_branch\n      && (github.event.pull_request.user.login"),
+				[]byte("github.event.repository.default_branch\n      || (github.event.pull_request.user.login"), 1)
+			Expect(verifyAutomergeBasePinIn("ci.yml", bad)).To(
+				MatchError(ContainSubstring("outside any parenthesised group")))
+		})
+
+		// Documented limit, pinned so the comment and the code cannot drift:
+		// a negation wrapped around the comparison keeps it and inverts anyway.
+		// Not caught, on purpose -- nobody writes it by accident, and anyone
+		// writing it deliberately would delete the guard instead.
+		It("does not catch a comparison negated as a whole", func() {
 			bad := bytes.Replace(unfiltered,
 				[]byte("&& github.event.pull_request.base.ref == github.event.repository.default_branch"),
 				[]byte("&& !(github.event.pull_request.base.ref == github.event.repository.default_branch)"), 1)
-			Expect(verifyAutomergeBasePinIn("ci.yml", bad)).To(
-				MatchError(ContainSubstring("does not require")))
+			Expect(verifyAutomergeBasePinIn("ci.yml", bad)).To(Succeed())
+		})
+
+		// Spellings a maintainer plausibly writes, all semantically identical
+		// to the baseline. The conjunct-adjacency form rejected every one.
+		It("accepts the comparison parenthesised", func() {
+			ok := bytes.Replace(unfiltered,
+				[]byte("&& github.event.pull_request.base.ref == github.event.repository.default_branch"),
+				[]byte("&& (github.event.pull_request.base.ref == github.event.repository.default_branch)"), 1)
+			Expect(verifyAutomergeBasePinIn("ci.yml", ok)).To(Succeed())
+		})
+
+		It("accepts the operands in either order", func() {
+			ok := bytes.Replace(unfiltered,
+				[]byte("github.event.pull_request.base.ref == github.event.repository.default_branch"),
+				[]byte("github.event.repository.default_branch == github.event.pull_request.base.ref"), 1)
+			Expect(verifyAutomergeBasePinIn("ci.yml", ok)).To(Succeed())
+		})
+
+		It("accepts a condition wrapped in ${{ }}", func() {
+			ok := bytes.Replace(unfiltered, []byte("    if: >-\n"),
+				[]byte("    if: >-\n      ${{\n"), 1)
+			ok = bytes.Replace(ok, []byte("|| github.event.pull_request.user.login == 'renovate[bot]')\n"),
+				[]byte("|| github.event.pull_request.user.login == 'renovate[bot]')\n      }}\n"), 1)
+			Expect(verifyAutomergeBasePinIn("ci.yml", ok)).To(Succeed())
 		})
 
 		// The decoy: invert the real pin and let a plausible neighbouring

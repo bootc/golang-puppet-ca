@@ -562,51 +562,89 @@ func verifyAutomergeLabelExclusionIn(name string, src []byte) error {
 }
 
 // automergeBaseRef is the expression context naming the branch a pull request
-// is aimed at. The two checks below are built from it.
+// is aimed at. The checks below are built from it.
 const automergeBaseRef = "github.event.pull_request.base.ref"
 
-// automergeBasePin is the comparison an auto-merge job's condition must make,
-// and automergeBaseAntiPin the one it must not. Both are matched against the
-// condition with *all* whitespace removed, so spacing is not spelling: GitHub's
-// expression parser treats `a!=b` and `a != b` alike, and so must this.
+// What the base-pin check is for, stated plainly because it is easy to mistake
+// for more than it is: it catches an honest slip, not an attacker. This guard
+// lives in the same repository as the workflow it reads, behind the same
+// permissions, so anyone able to unpin the auto-merge job can delete this
+// function in the same commit. The controls that actually gate a merge are the
+// "Main" ruleset and human review. What this buys is that a mistaken edit to
+// ci.yml fails `mage dev:check` in the author's own terminal rather than going
+// green -- the auto-merge job holds contents: write and pull-requests: write,
+// and the ruleset covers the default branch only, so an unpinned job would
+// merge bot PRs elsewhere under nothing at all.
 //
-// The pin is required as a conjunct -- `&&` immediately before it, or the whole
-// condition beginning with it. Requiring the comparison alone is not enough,
-// because a substring says nothing about the boolean structure it sits in. Each
-// of these passed a check that only looked for the comparison, and each merges
-// bot PRs under no ruleset:
+// Being a slip-detector rather than a boundary is what decides its contract.
+// The mistakes worth catching are the ones people actually make: deleting the
+// comparison, flipping `==` to `!=`, and flipping `&&` to `||` -- the last
+// because `&&` binds tighter, so `A && pin || B` reads as `(A && pin) || B`,
+// and any bot PR on any base satisfies B. Those three are checked.
 //
-//	pin != default_branch, plus a neighbour supplying `pin ==` elsewhere
-//	!(pin == default_branch)                      -- negation wrapped around it
-//	event_name == 'pull_request' || pin == ...    -- one keystroke, `&&` to `||`
+// Contrived shapes that keep a comparison while neutralising it -- of which
+// `!(A && pin) && B` is the tidiest -- are not checked, deliberately. Nobody
+// reaches one by accident, and anyone writing one on purpose would delete this
+// function instead. An earlier version chased them, and the price was rejecting
+// `&& (pin == default_branch)`: correct, semantically identical to what ci.yml
+// already has, this file's own house style for the neighbouring clause, and
+// precisely the edit an honest maintainer makes. Refusing that is a worse
+// failure than missing a shape only an adversary writes.
 //
-// The last is the worst: `&&` binds tighter than `||`, so it evaluates as
-// `A || (B && C)` with A true for every pull_request event, losing the author
-// gate as well as the base pin. Demanding the pin be conjoined rejects all
-// three, because none of them has `&&pin==` and none begins with it.
+// So the contract is: the comparison must appear, in either operand order and
+// with any spacing or none; its inverse must not appear; and no `||` may sit
+// outside a parenthesised group. ci.yml's own `||` between the two bot logins
+// is inside one, which is what keeps the last check usable rather than a
+// nuisance.
 //
-// The right-hand side stays unconstrained. ci.yml compares against
-// github.event.repository.default_branch so the pin tracks the ruleset's
-// ~DEFAULT_BRANCH scope, but a literal == 'main' confines the job just as well
-// and must not be reported as drift.
-//
-// Not caught, stated as the property rather than a list of shapes, because the
-// list has twice been shorter than the truth: a substring cannot see boolean
-// structure, so any arrangement that keeps a conjoined `pin ==` while
-// neutralising it elsewhere passes. Closing that needs an expression parser.
-// The three shapes above are closed because each loses the conjunction; a
-// fourth that keeps it would not be.
-//
-// One deliberate cost: this rejects a condition that legitimately excludes some
-// other base with `base.ref != 'x'`. Such a clause is rare, the failure is loud
-// and immediate, and the remedy -- express the exclusion another way, or teach
-// this guard the difference -- is worth deciding explicitly. The alternative is
-// a silent pass on the one condition deciding whether unattended merges are
-// gated at all.
-var (
+// One deliberate cost, unchanged: a condition that legitimately excludes some
+// other base with `base.ref != 'x'` is refused. Rare, loud, and the message
+// names the remedy.
+
+const (
 	automergeBasePin     = automergeBaseRef + "=="
+	automergeBasePinRev  = "==" + automergeBaseRef
 	automergeBaseAntiPin = automergeBaseRef + "!="
+	automergeAntiPinRev  = "!=" + automergeBaseRef
 )
+
+// automergeCondition normalises an `if:` for the checks above: the optional
+// ${{ }} wrapper removed, then every space stripped. GitHub's expression parser
+// reads `a!=b` and `a != b` alike, and an earlier version that only collapsed
+// runs of whitespace was blind to the tight spelling -- strings.Fields can
+// widen spacing but never insert it.
+func automergeCondition(ifExpr string) string {
+	cond := strings.Map(func(r rune) rune {
+		if unicode.IsSpace(r) {
+			return -1
+		}
+		return r
+	}, ifExpr)
+	cond = strings.TrimPrefix(cond, "${{")
+	return strings.TrimSuffix(cond, "}}")
+}
+
+// automergeTopLevelOr reports whether a `||` sits outside any parenthesised
+// group. Such a `||` makes the whole condition a disjunction, so no comparison
+// anywhere in it confines the job -- the other side admits it alone.
+func automergeTopLevelOr(cond string) bool {
+	depth := 0
+	for i := 0; i < len(cond); i++ {
+		switch cond[i] {
+		case '(':
+			depth++
+		case ')':
+			if depth > 0 {
+				depth--
+			}
+		case '|':
+			if depth == 0 && i+1 < len(cond) && cond[i+1] == '|' {
+				return true
+			}
+		}
+	}
+	return false
+}
 
 // baseScopedWorkflows are the workflows whose pull_request trigger must stay
 // unfiltered by base. Both were filtered to ["main"] until the change that
@@ -786,27 +824,23 @@ func verifyAutomergeBasePinIn(name string, src []byte) error {
 		if !merges {
 			continue
 		}
-		// All whitespace removed, not merely collapsed: strings.Fields can
-		// only ever widen spacing, never insert it, so a normaliser that
-		// leaves single spaces stays blind to `base.ref!=x` -- which GitHub
-		// evaluates identically to the spaced form.
-		cond := strings.Map(func(r rune) rune {
-			if unicode.IsSpace(r) {
-				return -1
-			}
-			return r
-		}, j.If)
-		if strings.Contains(cond, automergeBaseAntiPin) {
-			return fmt.Errorf("%s job %q merges pull requests and its 'if:' compares %s with != , "+
-				"which confines it to every base except the default branch -- the inverse of the pin; "+
-				"if some other base genuinely needs excluding, extend this guard rather than the condition",
+		cond := automergeCondition(j.If)
+		if strings.Contains(cond, automergeBaseAntiPin) || strings.Contains(cond, automergeAntiPinRev) {
+			return fmt.Errorf("%s job %q merges pull requests and its 'if:' compares %s with `!=`, "+
+				"which confines it to every base except the default branch -- the inverse of the pin. "+
+				"If some other base genuinely needs excluding, extend this guard rather than the condition",
 				name, job, automergeBaseRef)
 		}
-		if !strings.HasPrefix(cond, automergeBasePin) && !strings.Contains(cond, "&&"+automergeBasePin) {
-			return fmt.Errorf("%s job %q merges pull requests but its 'if:' does not require %s== as a "+
-				"conjunct; nothing else confines it to the default branch, and the \"Main\" ruleset covers "+
-				"no other. A comparison that is disjoined (||) or negated (!) does not confine anything",
+		if !strings.Contains(cond, automergeBasePin) && !strings.Contains(cond, automergeBasePinRev) {
+			return fmt.Errorf("%s job %q merges pull requests but its 'if:' never compares %s with `==`; "+
+				"nothing else confines it to the default branch, and the \"Main\" ruleset covers no other",
 				name, job, automergeBaseRef)
+		}
+		if automergeTopLevelOr(cond) {
+			return fmt.Errorf("%s job %q merges pull requests and its 'if:' has a `||` outside any "+
+				"parenthesised group, so the base comparison does not constrain the whole condition: "+
+				"`&&` binds tighter, and whatever sits on the other side of the `||` admits the job on "+
+				"its own. Parenthesise the alternatives, as the author check already is", name, job)
 		}
 	}
 	return nil
@@ -3713,11 +3747,10 @@ func checkModuleTidy(dir string, files []string, tidy func() error) error {
 	return nil
 }
 
-// Check is the static half of the CI gate: the non-test checks that must hold
-// before a change can merge, gathered behind one target. The suites are
-// separate -- `mage test:magefile` is its own step in ci.yml, and the unit,
-// chart, mixin, lint and integration jobs are separate required checks -- so a
-// green dev:check is necessary and not sufficient. Unlike `mage dev:tidy`, it is a non-mutating
+// Check is the static half of the CI gate: the non-test checks, gathered behind
+// one target. The suites run as separate ci.yml jobs, so a green dev:check is
+// necessary and not sufficient -- deliberately not listed here, for the reason
+// the next paragraph gives. Unlike `mage dev:tidy`, it is a non-mutating
 // verifier -- it reports drift as a failure instead of silently fixing it, so
 // CI catches untidy code and modules. gofmt -l prints unformatted files
 // without rewriting them, and the tidiness step runs `go mod tidy` then
