@@ -560,13 +560,30 @@ func verifyAutomergeLabelExclusionIn(name string, src []byte) error {
 	return nil
 }
 
-// automergeBasePin is the context an auto-merge job's condition must consult
-// to be confined by base branch. Deliberately just the operand and not a whole
-// comparison: ci.yml compares it against github.event.repository.default_branch
-// so the pin tracks the ruleset's ~DEFAULT_BRANCH scope, but a literal
-// == 'main' would confine the job too, and the guard exists to catch a missing
-// pin rather than to dictate how a present one is spelled.
-const automergeBasePin = "github.event.pull_request.base.ref"
+// automergeBasePin is the comparison an auto-merge job's condition must make to
+// be confined by base branch.
+//
+// The `==` is part of it, and that is the whole point. An earlier version
+// required only the operand, on the reasoning that a guard should catch a
+// missing pin rather than dictate how a present one is spelled. That reasoning
+// holds for spellings that *weaken* the pin -- and fails completely for one
+// that inverts it. Flipping `==` to `!=` leaves the operand present, so the
+// operand-only check passed while the job merged on every base *except* the
+// default branch: the exact ungated merge the guard exists to prevent, turned
+// into the only thing it permits. A weak pin still pins something; an anti-pin
+// does not, so the looser contract is not available here.
+//
+// The right-hand side stays unconstrained. ci.yml compares against
+// github.event.repository.default_branch so the pin tracks the ruleset's
+// ~DEFAULT_BRANCH scope, but a literal == 'main' confines the job just as well
+// and must not be reported as drift.
+//
+// Not caught: a negation wrapped around the whole comparison, as in
+// !(base.ref == default_branch), which contains this substring and inverts
+// anyway. Catching that needs an expression parser rather than a substring,
+// and is not worth one for a form nobody reaches by accident -- unlike the
+// operator flip, which is a single keystroke.
+const automergeBasePin = "github.event.pull_request.base.ref =="
 
 // baseScopedWorkflows are the workflows whose pull_request trigger must stay
 // unfiltered by base. Both were filtered to ["main"] until the change that
@@ -746,8 +763,13 @@ func verifyAutomergeBasePinIn(name string, src []byte) error {
 		if !merges {
 			continue
 		}
-		if !strings.Contains(j.If, automergeBasePin) {
-			return fmt.Errorf("%s job %q merges pull requests but its 'if:' never consults %s; "+
+		// Whitespace-normalised so the required comparison is matched on its
+		// tokens rather than on how the expression happens to be wrapped: a
+		// folded block already joins lines with spaces, but a second space
+		// around the operator would otherwise read as a missing pin.
+		cond := strings.Join(strings.Fields(j.If), " ")
+		if !strings.Contains(cond, automergeBasePin) {
+			return fmt.Errorf("%s job %q merges pull requests but its 'if:' does not contain %q; "+
 				"nothing else confines it to the default branch, and the \"Main\" ruleset covers no other",
 				name, job, automergeBasePin)
 		}

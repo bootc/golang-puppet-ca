@@ -696,10 +696,31 @@ jobs:
 			Expect(verifyAutomergeBasePinIn("ci.yml", bad)).To(MatchError(ContainSubstring(`job "automerge"`)))
 		})
 
-		// The guard checks that the condition consults the base ref, not how
-		// the comparison is spelled: ci.yml uses default_branch so the pin
-		// tracks the ruleset, but a literal confines the job just as well and
-		// must not be reported as drift.
+		// The inversion is the case an operand-only check let through: the
+		// operand is still there, so a substring check on it alone passed
+		// while the job merged on every base *except* the default branch.
+		It("rejects an inverted comparison, and names the job", func() {
+			bad := bytes.Replace(unfiltered,
+				[]byte("github.event.pull_request.base.ref == github.event.repository.default_branch"),
+				[]byte("github.event.pull_request.base.ref != github.event.repository.default_branch"), 1)
+			err := verifyAutomergeBasePinIn("ci.yml", bad)
+			Expect(err).To(MatchError(ContainSubstring(`job "automerge"`)))
+			Expect(err).To(MatchError(ContainSubstring("base.ref ==")))
+		})
+
+		// Spacing is not spelling: the required comparison is matched on its
+		// tokens, so an extra space around the operator is not drift.
+		It("accepts extra whitespace around the operator", func() {
+			spaced := bytes.Replace(unfiltered,
+				[]byte("github.event.pull_request.base.ref == github.event.repository.default_branch"),
+				[]byte("github.event.pull_request.base.ref   ==   github.event.repository.default_branch"), 1)
+			Expect(verifyAutomergeBasePinIn("ci.yml", spaced)).To(Succeed())
+		})
+
+		// The guard checks that the condition makes the comparison, not what it
+		// compares against: ci.yml uses default_branch so the pin tracks the
+		// ruleset, but a literal confines the job just as well and must not be
+		// reported as drift.
 		It("accepts a pin written against a literal branch name", func() {
 			literal := bytes.Replace(unfiltered,
 				[]byte("github.event.pull_request.base.ref == github.event.repository.default_branch"),
