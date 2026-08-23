@@ -227,6 +227,40 @@ local issuance defers its removals, so pruned serials linger an interval or two.
 (`PuppetCAOCSPIndexSyncFailing`); the fleet-relative gauge comparison above does
 not, and has to be added by hand if you want it.
 
+### Delayed supersession
+
+Present on every CA, and flat at zero unless
+[`superseded_cert_revoke_after_sec`](configuration.md#delayed-supersession) is
+set: with no delay a renewal revokes its predecessor inside the call, nothing is
+recorded, and a failure there is a CRL failure counted above instead.
+
+| Metric | Description |
+| --- | --- |
+| `puppetca_supersede_pending` | Certificates a renewal has replaced that are still inside their overlap window and not yet revoked. Read from storage, so identical on every replica. |
+| `puppetca_supersede_failures_total` | Counter of failures to schedule or carry out one of those revocations. Per-process, and resets to `0` on process restart. |
+
+`puppetca_supersede_pending` is the live measure of the exposure the window
+buys: each of those certificates is a credential the CA still accepts even
+though something newer has taken its place. It rises as renewals happen and
+falls as the sweep drains the list, so a value that does not fall means the
+sweep is not completing — check the failure counter.
+
+> **What the failure counter sees.** A supersession the renewal path could not
+> record (the certificate was replaced but nothing scheduled its revocation —
+> the `failed to retire replaced certificate` warning names the serial), a
+> pending list that could not be read or parsed, and each sweep pass that left
+> an entry unrevoked or discarded one whose serial it could never revoke. A pass
+> counts once however many entries it failed on, so this is a count of bad
+> passes rather than of lost certificates. The three cases differ in what you
+> have to do about them: a sweep failure retries on the next pass by itself,
+> whereas a supersession that was never recorded and an entry that was discarded
+> are both gone for good — nothing will rediscover them, and the certificate
+> stays valid for its full remaining life. Retire those by serial with
+> `openvox-ca-ctl revoke --serial <hex>`; see
+> [revocation by serial](api.md#revocation-by-serial). Revoking by subject
+> cannot reach them: the replacement is what makes it a renewal, so
+> `revoke --certname` would retire that instead.
+
 ### Leaf certificates
 
 One series per known (non-deleted) leaf certificate or pending request. Cleaned
@@ -368,3 +402,7 @@ failures, with all thresholds configurable. It does **not** alert on the
 fleet-relative `puppetca_ocsp_index_serials` comparison — that one is left to
 the operator, since it needs a `by (job)` aggregation to avoid fanning in
 across unrelated CAs and the condition it catches is not fail-open.
+
+`puppetca_crl_sync_failures_total`), delayed revocations that were lost or could
+not be carried out (`puppetca_supersede_failures_total`), and Kubernetes export
+failures, with all thresholds configurable.
