@@ -271,19 +271,34 @@ That costs nothing in ordering: a rejection and a `Generate` for the same name
 serialise on `subject:<name>`, which both take, in every process rather than
 merely within one. `c.mu` was never what stood between them.
 
-`c.mu` is also held across the signing call itself. Every issuance path (`Sign`,
-`SignWithTTL`, `SaveRequest`'s autosign, `Renew`, `AutoRenew`,
-`ImportCertificate`, `Generate`) calls `issueLeafLocked` with `c.mu` held, and
-`x509.CreateCertificate` runs inside it — so with an external key provider
-(`ca_key_provider: openbao`, or the isolated signer) `c.mu`, not the per-subject
-cluster lock, is the process-wide issuance serialiser, and it spans a
-network/IPC round trip. Issuance therefore proceeds at roughly one signing
-round trip at a time within a process, and a stalled signer backend pins the
-mutex and stalls all issuance — see the "Performance and outage behaviour"
-section of [the OpenBao Transit guide](../openbao-transit.md). This is the one
-deliberate exception to rule 3 (keep expensive work outside the lock): the
-signature is inside the lock because the cache update it guards must be atomic
-with the issuance.
+`c.mu` is held across the signing call itself **on the issuance paths**. Every
+one of them (`Sign`, `SignWithTTL`, `SaveRequest`'s autosign, `Renew`,
+`AutoRenew`, `ImportCertificate`, `Generate`) calls `issueLeafLocked` with
+`c.mu` held, and `x509.CreateCertificate` runs inside it — so with an external
+key provider (`ca_key_provider: openbao`, or the isolated signer) `c.mu`, not
+the per-subject cluster lock, is the process-wide issuance serialiser, and it
+spans a network/IPC round trip. Issuance therefore proceeds at roughly one
+signing round trip at a time within a process, and a stalled signer backend
+pins the mutex and stalls all issuance — see the "Performance and outage
+behaviour" section of [the OpenBao Transit guide](../openbao-transit.md). This
+is the one deliberate exception to rule 3 (keep expensive work outside the
+lock): the signature is inside the lock because the cache update it guards must
+be atomic with the issuance.
+
+**The OCSP responder is not in that set, and the difference is worth stating
+because it used to be.** `AnswerOCSP` reads what it needs under `c.mu.RLock` —
+whether the serial is in `serialIndex`, the `cachedCRL` pointer, `CACert` and
+`CAKey` — releases, and signs holding no CA lock at all; it re-takes the write
+lock only to store the finished response. It can do this and issuance cannot
+because the two guard different things. An issuance *mutates* storage, so its
+cache update has to be atomic with the write. A response is *derived* from
+state the responder only reads, so the equivalent obligation is weaker: not
+"nothing may change while I sign", but "do not cache an answer that stopped
+being true while I signed". `AnswerOCSP` discharges that by re-deciding the
+status under the write lock and dropping the cache write if it moved — see
+[#197](#known-gaps). A revocation landing mid-signature therefore costs a
+re-sign on the next request rather than a stale `good` served for
+`OCSPValidity`.
 
 `c.mu` is non-reentrant. The same `...Locked` suffix convention applies: e.g.
 `revokeLocked` requires the cluster `crl` lock **and** `c.mu`; each `...Locked`
@@ -393,8 +408,10 @@ Read-only operations must stay cheap and must keep working while another
 replica holds a lock. The pattern:
 
 - **Authentication revocation checks** (`IsRevokedSerial`) and **OCSP**
-  (`OCSPResponse` fast path) answer from `cachedCRL`/`ocspCache`/`serialIndex`
-  under `c.mu.RLock`.
+  (`AnswerOCSP`) answer from `cachedCRL`/`ocspCache`/`serialIndex` under
+  `c.mu.RLock`. That covers the whole of the OCSP read, not only a cache hit:
+  a miss takes its snapshot under the same `RLock` and signs outside it, so a
+  response the cache cannot serve no longer blocks the readers in this list.
 - **HTTP GETs** (certificate, CRL, status listings) read straight through
   `StorageService` getters, which take only the relevant tier-2 read lock.
 - `ReadInventory` verifies the integrity HMAC under `inventoryMu.RLock` but
@@ -439,11 +456,15 @@ path — still provides no cross-replica guarantee anyway.
    assembles a CSR at all — that round trip through the signing path was
    removed); parsing and validation in `Renew`/`SaveRequest` likewise. Only the
    storage-touching tail belongs inside. The deliberate exception is the CA
-   signature itself: `x509.CreateCertificate` runs under `c.mu` (see Tier 3),
-   because the cache update it guards must be atomic with the issuance.
+   signature *on the issuance paths*: `x509.CreateCertificate` runs under
+   `c.mu` (see Tier 3), because the cache update it guards must be atomic with
+   the issuance. The OCSP responder's signature is not an exception — it signs
+   outside the lock and re-checks before caching, which is the shape to copy
+   for anything else that signs from state it only reads.
 4. **Respect the ordering** (`subject` → `crl` → `c.mu`, and `bootstrap` →
    `crl` on the CA-import path), never acquire the same lock reentrantly, and
-   release `c.mu` before entering another `WithLock`. Use the closure-with-defer shape from `Renew`/`AutoRenew` so a
+   release `c.mu` before entering another `WithLock`. Use the
+   closure-with-defer shape from `Renew`/`AutoRenew` so a
    panic can't wedge a mutex.
 5. **Calling convention:** public CA methods take their own locks and say so
    ("The caller must NOT hold c.mu"); internal `...Locked` helpers document
@@ -593,12 +614,33 @@ path — still provides no cross-replica guarantee anyway.
 Concurrency limitations that are understood and tracked. This list reflects the
 state when the document was last updated and is not guaranteed exhaustive.
 
-- [#197](https://github.com/voxpupuli/openvox-ca/issues/197) — OCSP's slow
+- ~~[#197](https://github.com/voxpupuli/openvox-ca/issues/197) — OCSP's slow
   path signs responses while holding `c.mu` exclusively, so nonced requests
   (which always miss the cache) serialise process-wide behind the signing
-  round trip. This is the same "signature under `c.mu`" property as the
-  issuance paths (see Tier 3) surfacing on the OCSP responder; an efficiency
-  gap rather than a correctness one.
+  round trip.~~ Fixed. `AnswerOCSP` now snapshots the decision inputs under
+  `c.mu.RLock`, signs holding no CA lock, and re-takes the write lock only to
+  store the result. Concurrent responses sign in parallel, and neither they
+  nor the `c.mu.RLock` readers on the authentication path queue behind a
+  signer round trip.
+
+  **What the restructure had to add, and why anything else narrowing a lock
+  around a cache needs the same.** Signing outside `c.mu` opens a window the
+  serialised version did not have: a revocation can land between the status
+  snapshot and the cache write. Storing unconditionally would put a pre-signed
+  `good` back *after* `installCachedCRLLocked` evicted it, where it would be
+  served for `OCSPValidity` — reintroducing, by a different door, exactly the
+  staleness the #183 entry below closed. `AnswerOCSP` therefore re-decides the
+  status under the write lock (`ocspStatusFor`, the same function the response
+  was built from) and skips the cache write if the answer moved; the response
+  already signed is still returned, since an OCSP response is a statement about
+  its `ThisUpdate`/`NextUpdate` window and the pre-fix code returned an equally
+  stale one whenever a revocation was waiting behind the lock.
+
+  The predicate is re-run rather than a generation counter compared. Both work;
+  re-running settles the question a later reader of the cache actually has, and
+  survives a third eviction path being added. `serialIndexEpoch` is the counter
+  shape, and the #183 entry below says why the index sync has to use it —
+  that path cannot re-check its own predicate, and this one can.
 - [#201](https://github.com/voxpupuli/openvox-ca/issues/201) — `CA.Init`'s slow
   path can re-enter the `bootstrap` lock (via `finishLoadExisting` →
   `seedSupportingState`) and deadlock startup, because `WithLock` is not

@@ -20,6 +20,7 @@ package ca
 import (
 	"bytes"
 	"context"
+	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/asn1"
 	"errors"
@@ -223,8 +224,16 @@ type OCSPAnswer struct {
 // request gets the same MaxAge for a different reason: an RFC 8954 response
 // answers one request and must not be served to another.
 //
-// The caller must NOT hold c.mu.
-func (c *CA) AnswerOCSP(ctx context.Context, reqDER []byte) (OCSPAnswer, error) {
+// The caller must NOT hold c.mu. The signature is taken outside it — see the
+// snapshot comment in the body — so a slow signer no longer serialises the
+// process (#197).
+//
+// ctx is unused: everything this answers from is already in memory, and it was
+// only ever passed to a CRL scan that ignored it. It stays in the signature
+// because this is a request-scoped entry point reached from an HTTP handler,
+// and a public method that may later need to reach storage should not change
+// shape to acquire a context.
+func (c *CA) AnswerOCSP(_ context.Context, reqDER []byte) (OCSPAnswer, error) {
 	// Extract nonce before acquiring any lock (pure DER parse, no shared state).
 	nonce, hasNonce := extractNonce(reqDER)
 
@@ -246,54 +255,64 @@ func (c *CA) AnswerOCSP(ctx context.Context, reqDER []byte) (OCSPAnswer, error) 
 	// uppercase hex without leading zeros.
 	serialHex := serialHexStr(req.SerialNumber)
 
-	// Fast path: check cache with a read lock (only when no nonce).
+	// One read-locked look does both jobs: serve a fresh cache entry if there
+	// is one, and otherwise take the snapshot the answer will be built from.
+	// Splitting them would take c.mu twice for a single miss, and leave the
+	// cache check and the status read looking at two different moments.
+	//
 	// Cache returns must be defensive copies: the cached slice is shared
 	// across concurrent readers, and the HTTP layer should never observe
 	// a buffer that another goroutine could mutate.
-	if !hasNonce {
-		c.mu.RLock()
-		entry, ok := c.ocspCache[serialHex]
-		c.mu.RUnlock()
-		if ok && time.Now().Before(entry.expiresAt) {
-			return OCSPAnswer{DER: bytes.Clone(entry.der), MaxAge: time.Until(entry.expiresAt)}, nil
-		}
-	}
-
-	// Slow path: acquire write lock for status lookup + cache write.
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	// Double-check after acquiring the write lock.
+	c.mu.RLock()
 	if !hasNonce {
 		if entry, ok := c.ocspCache[serialHex]; ok && time.Now().Before(entry.expiresAt) {
+			c.mu.RUnlock()
 			return OCSPAnswer{DER: bytes.Clone(entry.der), MaxAge: time.Until(entry.expiresAt)}, nil
 		}
 	}
+	_, known := c.serialIndex[serialHex]
+	crlSnapshot := c.cachedCRL
+	caCert, caKey := c.CACert, c.CAKey
+	c.mu.RUnlock()
 
+	// From here until the cache write, no CA lock is held. That is the whole of
+	// #197: ocsp.CreateResponse below performs a signature, and under an
+	// isolated signer or ca_key_provider: openbao that is a synchronous IPC or
+	// network round trip. Holding c.mu across it made the responder a
+	// process-wide serialisation point — not only for other OCSP requests, but
+	// for every c.mu.RLock reader, including the IsRevokedSerial call on the
+	// authentication path. Nonced requests (RFC 8954) bypass the cache and so
+	// took that path on every single request.
+	//
+	// The snapshot is safe to use unlocked, for a different reason per field:
+	//
+	//   - CACert/CAKey are written only on the Init path and never afterwards;
+	//     there is no rotation and no reload, which parseStoredCRL documents
+	//     from the other side ("picked up by restarting"). Both are read under
+	//     the one RLock above, so they cannot be a mismatched cert/key pair.
+	//   - cachedCRL is replaced by pointer and never mutated in place — see
+	//     installCachedCRLLocked — so holding the pointer is holding an
+	//     immutable view of one CRL, not a window onto a changing one.
+	//   - serialIndex is consulted here and nowhere else in this function; the
+	//     bool is a value, and staleness in it is handled at the cache write.
 	now := time.Now().UTC()
 	template := ocsp.Response{
 		SerialNumber: req.SerialNumber,
 		ThisUpdate:   now,
 	}
 
-	if _, known := c.serialIndex[serialHex]; !known {
-		// NextUpdate stays zero, which x/crypto/ocsp omits from the encoding.
-		// This is the answer a later inventory read can overturn without
-		// anything happening here, so it must not carry a four-hour licence to
-		// be replayed by the verifier and every cache between.
-		template.Status = ocsp.Unknown
-	} else {
+	status, revokedAt, err := ocspStatusFor(crlSnapshot, req.SerialNumber, known)
+	if err != nil {
+		return OCSPAnswer{}, fmt.Errorf("%w: %w", ErrInternal, err)
+	}
+	template.Status = status
+	template.RevokedAt = revokedAt
+	if status != ocsp.Unknown {
+		// NextUpdate stays zero for an unknown, which x/crypto/ocsp omits from
+		// the encoding. That is the answer a later inventory read can overturn
+		// without anything happening here, so it must not carry a four-hour
+		// licence to be replayed by the verifier and every cache between.
 		template.NextUpdate = now.Add(OCSPValidity)
-		revoked, revokedAt, err := c.isRevokedSerial(ctx, req.SerialNumber)
-		if err != nil {
-			return OCSPAnswer{}, fmt.Errorf("%w: %w", ErrInternal, err)
-		}
-		if revoked {
-			template.Status = ocsp.Revoked
-			template.RevokedAt = revokedAt
-		} else {
-			template.Status = ocsp.Good
-		}
 	}
 
 	// Echo the nonce extension into the response's singleExtensions.
@@ -301,7 +320,7 @@ func (c *CA) AnswerOCSP(ctx context.Context, reqDER []byte) (OCSPAnswer, error) 
 		template.ExtraExtensions = append(template.ExtraExtensions, nonce)
 	}
 
-	respDER, err := ocsp.CreateResponse(c.CACert, c.CACert, template, c.CAKey)
+	respDER, err := ocsp.CreateResponse(caCert, caCert, template, caKey)
 	if err != nil {
 		return OCSPAnswer{}, fmt.Errorf("creating OCSP response: %w", err)
 	}
@@ -348,13 +367,52 @@ func (c *CA) AnswerOCSP(ctx context.Context, reqDER []byte) (OCSPAnswer, error) 
 	// One consequence for an operator running an external key provider: an
 	// unnonced query about a serial this replica has not yet indexed now signs
 	// every time rather than once, so for up to one sync interval after each
-	// issuance those queries join the nonced ones in the signer-round-trip-
-	// under-c.mu class that docs/development/locking.md records as #197.
+	// issuance those queries join the nonced ones in signing on every request.
+	// Those signatures no longer serialise the process behind them (#197); they
+	// are still round trips, and still a reason to keep the sync interval
+	// sensible.
+	//
+	// The status is re-decided under the write lock before anything is stored,
+	// and the entry is dropped if the answer moved while the signature was in
+	// flight. Signing outside c.mu is what makes that necessary: a revocation
+	// can now land in between, and it installs a new CRL and evicts the
+	// responses that CRL contradicts (invalidateOCSPForNewlyRevokedLocked),
+	// while a prune drops the serial from the index and the cache together
+	// (dropSerialLocked). Storing unconditionally would put a pre-signed `good`
+	// back *after* the eviction that removed it, and it would then be served
+	// for OCSPValidity — four hours of vouching for a revoked certificate,
+	// which is precisely what that eviction exists to prevent.
+	//
+	// The response already built is still returned to this caller. It was
+	// correct when it was signed, and an OCSP response is a statement about the
+	// moment in its ThisUpdate/NextUpdate window rather than a promise about
+	// the future; the pre-#197 arrangement handed back an equally stale answer
+	// whenever a revocation was waiting on the lock behind it. What must not
+	// happen is that statement being *reused* for callers arriving after the
+	// change, so a moved answer costs one dropped cache write and a re-sign on
+	// the next request.
+	//
+	// This re-runs the predicate rather than comparing a generation counter,
+	// which serialIndexEpoch would be the precedent for. "Is this still the
+	// answer" is exactly the question a later reader of the cache needs settled,
+	// so checking it directly cannot be satisfied by a proxy that drifts, and it
+	// stays correct if a third eviction path is added later. The index sync uses
+	// a counter only because it genuinely cannot re-check its own predicate — it
+	// cannot tell "pruned elsewhere" from "issued here since I read".
 	if !hasNonce && template.Status != ocsp.Unknown {
-		c.ocspCache[serialHex] = ocspCacheEntry{
-			der:       bytes.Clone(respDER),
-			expiresAt: now.Add(OCSPValidity),
+		c.mu.Lock()
+		_, stillKnown := c.serialIndex[serialHex]
+		stillStatus, stillRevokedAt, statusErr := ocspStatusFor(c.cachedCRL, req.SerialNumber, stillKnown)
+		if statusErr == nil && stillStatus == template.Status && stillRevokedAt.Equal(template.RevokedAt) {
+			c.ocspCache[serialHex] = ocspCacheEntry{
+				der:       bytes.Clone(respDER),
+				expiresAt: now.Add(OCSPValidity),
+			}
+		} else {
+			slog.Debug("not caching an OCSP response the CA state moved under",
+				"serial", serialHex, "signed_status", template.Status, "current_status", stillStatus)
 		}
+		c.mu.Unlock()
 	}
 
 	// A nonced response answers one request and no other (RFC 8954 §3), and an
@@ -367,26 +425,40 @@ func (c *CA) AnswerOCSP(ctx context.Context, reqDER []byte) (OCSPAnswer, error) 
 	return answer, nil
 }
 
-// isRevokedSerial checks the in-memory CRL cache for the given serial number.
+// ocspStatusFor decides what an OCSP response should say about serial, given
+// whether the serial index recognises it and a CRL to check it against.
+//
+// A free function over an explicit CRL rather than a method reading
+// c.cachedCRL, because AnswerOCSP asks this question twice and from different
+// places: once on the snapshot it signs from, holding no lock, and again under
+// the write lock to check the answer has not moved before caching it. Passing
+// the CRL in is what lets the unlocked caller work from an immutable snapshot;
+// two copies of the decision that drifted apart would make the guard test a
+// different question from the one the response answered.
 //
 // The deliberate twin of serialInCRL in revoke.go, which every caller needing
 // only a yes or no uses: this one exists because OCSP must return the entry's
 // RevocationTime, which a bool cannot carry. Change the predicate there and
 // change it here too.
 //
-// Returns (true, revocationTime, nil) if found, (false, zero, nil) if not,
-// or (false, zero, error) if the CRL is not loaded.
-// Must be called while c.mu is already held by the caller.
-func (c *CA) isRevokedSerial(ctx context.Context, serial *big.Int) (bool, time.Time, error) {
-	if c.cachedCRL == nil {
-		return false, time.Time{}, fmt.Errorf("CRL not loaded")
+// Returns (ocsp.Unknown, zero, nil) when the index does not recognise the
+// serial — checked first, so an unrecognised serial does not depend on a CRL
+// being loaded — (ocsp.Revoked, revocationTime, nil) when it appears on crl,
+// (ocsp.Good, zero, nil) when it does not, and an error when the serial is
+// known but no CRL is loaded, which the caller reports as ErrInternal.
+func ocspStatusFor(crl *x509.RevocationList, serial *big.Int, known bool) (int, time.Time, error) {
+	if !known {
+		return ocsp.Unknown, time.Time{}, nil
 	}
-	for _, entry := range c.cachedCRL.RevokedCertificateEntries {
+	if crl == nil {
+		return ocsp.Unknown, time.Time{}, fmt.Errorf("CRL not loaded")
+	}
+	for _, entry := range crl.RevokedCertificateEntries {
 		if entry.SerialNumber.Cmp(serial) == 0 {
-			return true, entry.RevocationTime, nil
+			return ocsp.Revoked, entry.RevocationTime, nil
 		}
 	}
-	return false, time.Time{}, nil
+	return ocsp.Good, time.Time{}, nil
 }
 
 // buildAIAExtension constructs the DER-encoded value of an Authority Information
