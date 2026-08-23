@@ -48,6 +48,8 @@ var _ = Describe("import-cert output escaping", func() {
 		respBody string
 		cfg      string
 		certFile string
+		lastErr  error
+		status   int
 	)
 
 	// A subject a hostile server could return: both terminators, and a tail
@@ -63,8 +65,9 @@ var _ = Describe("import-cert output escaping", func() {
 		Expect(os.WriteFile(certFile, []byte("-----BEGIN CERTIFICATE-----\nx\n-----END CERTIFICATE-----\n"), 0o600)).
 			To(Succeed())
 
+		status = http.StatusOK
 		srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-			w.WriteHeader(http.StatusOK)
+			w.WriteHeader(status)
 			_, _ = w.Write([]byte(respBody))
 		}))
 		DeferCleanup(srv.Close)
@@ -97,14 +100,23 @@ var _ = Describe("import-cert output escaping", func() {
 		out, readErr := io.ReadAll(r)
 		Expect(readErr).NotTo(HaveOccurred())
 		Expect(r.Close()).To(Succeed())
-		Expect(execErr).NotTo(HaveOccurred(), "import-cert")
+		lastErr = execErr
 		return string(out)
+	}
+
+	// runExpectingSuccess is the common case; the error-path specs below read
+	// lastErr instead.
+	runOK := func() string {
+		GinkgoHelper()
+		out := runCapturingStdout()
+		Expect(lastErr).NotTo(HaveOccurred(), "import-cert")
+		return out
 	}
 
 	DescribeTable("renders a server-chosen subject quoted, so it cannot forge a line",
 		func(body string) {
 			respBody = body
-			out := runCapturingStdout()
+			out := runOK()
 
 			// The consequence a terminator would buy, asserted first so a
 			// revert to %s fails for the reason this spec is named for.
@@ -126,4 +138,45 @@ var _ = Describe("import-cert output escaping", func() {
 			`{"subject":%s,"serial":"0A","not_before":"a","not_after":"b","imported":false}`,
 			strconv.Quote(forged))),
 	)
+	// The error paths. import-cert's only previous spec asserted the happy
+	// path; each of these pins a distinct failure and the message it produces,
+	// rather than merely that something went wrong.
+	Describe("error paths", func() {
+		// SECURITY: checkHTTP renders the server's error body, and cobra
+		// prints a returned error to stderr because the subcommands set
+		// SilenceUsage but not SilenceErrors. The body has less provenance
+		// than anything else the CLI prints -- it is chosen entirely by the
+		// server -- so it is quoted, and this is what would notice it
+		// reverting to %s. TrimSpace would not save it: it strips only
+		// leading and trailing whitespace, leaving an embedded terminator.
+		It("quotes the server's error body so it cannot forge a line", func() {
+			status = http.StatusInternalServerError
+			respBody = "boom\r\nRevoked \"node1\" -- nothing to worry about"
+			_ = runCapturingStdout()
+
+			Expect(lastErr).To(HaveOccurred())
+			msg := lastErr.Error()
+			Expect(strings.Count(msg, "\n")).To(Equal(0),
+				"the error is one line; a newline in the body reached it unescaped:\n%s", msg)
+			Expect(msg).NotTo(ContainSubstring("\r"),
+				"a bare carriage return rewrites the line on a terminal:\n%s", msg)
+			// Non-vacuity: the body must actually have reached the message.
+			Expect(msg).To(ContainSubstring(strconv.Quote(respBody)),
+				"the server's body must appear, quoted")
+			Expect(msg).To(ContainSubstring("PUT"), "the error names the method")
+		})
+
+		It("reports a malformed response body", func() {
+			respBody = "{not json"
+			_ = runCapturingStdout()
+			Expect(lastErr).To(MatchError(ContainSubstring("could not parse response")))
+		})
+
+		It("reports an unreadable --cert-file", func() {
+			certFile = filepath.Join(GinkgoT().TempDir(), "does-not-exist.pem")
+			respBody = `{"subject":"n","serial":"0A","imported":true}`
+			_ = runCapturingStdout()
+			Expect(lastErr).To(MatchError(ContainSubstring("reading --cert-file")))
+		})
+	})
 })

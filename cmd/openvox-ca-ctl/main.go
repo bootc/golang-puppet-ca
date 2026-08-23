@@ -204,11 +204,22 @@ func (c *Client) post(path string, body []byte) (int, []byte, error) {
 
 // ---------- helpers ----------
 
+// checkHTTP turns a non-2xx response into an error naming the request.
+//
+// %q on the body, for the same reason as the import summary below: it is
+// chosen entirely by the server, and cobra prints a returned error straight to
+// stderr (the subcommands set SilenceUsage but not SilenceErrors), so it
+// reaches an operator's terminal unescaped. TrimSpace removes only leading and
+// trailing whitespace, so an embedded CR or LF would survive it and could
+// fabricate a reassuring second line after a failed operation -- against a
+// hostile or MITM'd server, which the CLI's own --insecure warning admits is a
+// case worth considering. This is the sink with the least provenance of any in
+// the CLI, so it is quoted rather than enumerated as an exception.
 func checkHTTP(code int, body []byte, method, path string) error {
 	if code >= 200 && code < 300 {
 		return nil
 	}
-	return fmt.Errorf("HTTP %d on %s %s: %s", code, method, path, strings.TrimSpace(string(body)))
+	return fmt.Errorf("HTTP %d on %s %s: %q", code, method, path, strings.TrimSpace(string(body)))
 }
 
 func printTable(rows [][2]string) {
@@ -556,12 +567,15 @@ func newImportCertCmd() *cobra.Command {
 			if err := json.Unmarshal(body, &result); err != nil {
 				return fmt.Errorf("could not parse response: %w", err)
 			}
-			// %q on the subject: it is decoded from the server's response and
-			// nothing re-validates it on the way out (handleGetStatuses feeds
-			// subjects straight from ListCerts/ListCSRs, which the filesystem
-			// backend derives from directory entry names). These are free-form
-			// lines, so unlike the status table there is no column alignment to
-			// lose by quoting.
+			// %q on the subject: it is decoded from a response body this CLI
+			// does not trust. The server that serves this route does validate
+			// -- PUT /certificate/{subject} reaches handlePutCert, which gates
+			// on ca.ValidateSubject, and ImportCertificate validates again --
+			// but that is the honest server's behaviour, not a property of the
+			// bytes arriving here. A compromised or MITM'd server (see the
+			// --insecure warning) chooses this field freely. These are
+			// free-form lines, so unlike the status table there is no column
+			// alignment to lose by quoting.
 			if result.Imported {
 				fmt.Printf("Imported %q (serial %s, valid %s to %s)\n",
 					result.Subject, result.Serial, result.NotBefore, result.NotAfter)
