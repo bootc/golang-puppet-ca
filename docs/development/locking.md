@@ -543,10 +543,19 @@ state when the document was last updated and is not guaranteed exhaustive.
   the same shape for the same reason and is ordered instead by CRL number.
 
   `InventoryEntries` exists for this path: `ReadInventory` verifies and then
-  fetches, which on an `InventoryStore` backend materialises the whole
-  inventory twice per call, and a job on a timer should not pay that. Its
-  integrity policy is `SubjectForSerial`'s — blob backends verified, structured
-  backends not, since their head advances atomically per append.
+  fetches, and its verification recomputes from storage, so every call
+  materialises the whole inventory twice — on both backend families — and a job
+  on a timer should not pay that. It fetches once and folds the integrity value
+  over the rows it already holds.
+
+  **It verifies on every backend**, which is where it parts company with
+  `SubjectForSerial`. That method skips the check on `InventoryStore` backends
+  because doing so "would cost a second full fetch of every row"; here it costs
+  no fetch at all, so the reason to skip does not apply. The distinction matters
+  for this caller in particular, because it drives *removals*: a row deleted out
+  of band takes a serial out of the index, and an index miss downgrades the
+  responder's answer for that serial from `revoked` to `unknown` before the CRL
+  is consulted. Tampering has to fail closed here.
 - ~~[#196](https://github.com/voxpupuli/openvox-ca/issues/196) —
   `DELETE /certificate_request/{subject}` deleted the CSR directly through
   `StorageService`, bypassing the subject lock.~~ Fixed: the handler now goes

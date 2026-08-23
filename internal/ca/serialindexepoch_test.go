@@ -123,6 +123,26 @@ var _ = Describe("serial index epoch guard", func() {
 		Expect(c.serialIndex).To(HaveKey("CC"), "the serial the newer pass added")
 	})
 
+	// The loop's second write condition. A serial already in the index whose
+	// stored subject disagrees is not reachable in normal operation — serials
+	// are unique and inventory rows are append-only — but the branch decides
+	// which of the two wins, and the answer has to be storage. Stated directly
+	// rather than left to inference, because the alternative reading (keep what
+	// this process already believes) is the one that would let a rewritten row
+	// go unnoticed for the life of the process.
+	It("takes storage's answer when a known serial's subject disagrees", func() {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+
+		delta := c.reconcileSerialIndexLocked(
+			map[string]string{"AA": "renamed.example.com"}, c.serialIndexEpoch)
+
+		Expect(c.serialIndex["AA"]).To(Equal("renamed.example.com"),
+			"storage is authoritative where the two disagree")
+		Expect(delta.Added).To(BeZero(), "the serial was already known; this is a rewrite, not an addition")
+		Expect(delta.Removed).To(BeZero(), "and the inventory still holds it, so nothing is pruned")
+	})
+
 	// A pruned serial's pre-signed response must go with its index entry, or a
 	// good signed while the certificate was still known outlives the index that
 	// justified it — the same coupling CleanupExpiredCerts maintains on the

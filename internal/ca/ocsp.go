@@ -318,9 +318,24 @@ func (c *CA) AnswerOCSP(ctx context.Context, reqDER []byte) (OCSPAnswer, error) 
 	//     caching unknowns would let anyone who can reach /ocsp grow the map
 	//     without limit, an entry (and a signed response) per made-up serial.
 	//
-	// It costs no DoS protection to leave out: a request carrying a nonce
-	// bypasses the cache entirely and is answered with a fresh signature, so an
-	// attacker who wants to make this CA sign per request already can.
+	// It costs no DoS protection to leave out, and the reason is on this path
+	// rather than another one. The cache never bounded how much signing an
+	// attacker could provoke: a *miss* signs, so N distinct made-up serials
+	// always cost N signatures, and varying the serial is free. What it bounded
+	// was repeats of one serial — and it paid for that with an entry per serial,
+	// so the same attacker got unbounded memory growth thrown in. Dropping
+	// unknowns from the cache removes the memory vector and leaves the signing
+	// ceiling where it already was; it only means an attacker who wants that
+	// ceiling no longer has to bother varying the serial. (A nonced request
+	// bypasses the cache outright and always signed, which is a second route to
+	// the same place, but it is not the argument — this one is.)
+	//
+	// Note there is no rate limit in front of /ocsp: the limiter in this package
+	// is CSR-only. Putting one there, or a bounded negative cache with a TTL far
+	// shorter than an index sync interval, would be a real improvement and is
+	// deliberately not attempted here — a negative cache is what this commit
+	// removes, and reintroducing one carelessly restores the staleness the index
+	// refresh exists to end.
 	//
 	// One consequence for an operator running an external key provider: an
 	// unnonced query about a serial this replica has not yet indexed now signs

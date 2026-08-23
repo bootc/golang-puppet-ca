@@ -502,6 +502,15 @@ switch to turn it off, for the same reason the CRL sync has none — a deploymen
 cannot opt out of `/ocsp` answering, so it should not be able to opt out of
 answering correctly.
 
+Note what the cost scales with: certificates **ever issued**, not certificates
+currently valid, because the inventory keeps a row per issuance for the life of
+the CA. On a long-lived or high-churn fleet that grows without bound, and the
+knob that bounds it is `enable_expired_cert_cleanup`, which is off by default —
+it prunes rows for certificates that expired more than
+`expired_cert_retention_sec` ago, and so caps what this job (and the startup
+index build) has to read. Worth turning on before the inventory is large rather
+than after.
+
 Watch `puppetca_ocsp_index_serials` across replicas to confirm they agree, and
 `puppetca_ocsp_index_sync_failures_total` for a replica that cannot catch up. A
 replica reading *above* its peers is not a fault: a pass that overlaps a local

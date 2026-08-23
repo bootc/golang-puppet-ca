@@ -24,6 +24,13 @@ alerting rules for the openvox-ca exporter. It alerts on:
   revocation from its own copy, so a replica left behind still accepts
   certificates revoked elsewhere; see `crl_sync_interval_sec` in
   [configuration](../docs/configuration.md).
+- **OCSP index propagation** — a replica that cannot reload the inventory into
+  the serial index its OCSP responder answers from. While that fails the
+  responder answers `unknown` for certificates its peers have signed since the
+  last successful pass, which is not fail-open but does split a fleet: a
+  verifier that hard-fails on `unknown` rejects against that replica and no
+  other. See `ocsp_index_sync_interval_sec` in
+  [configuration](../docs/configuration.md).
 - **Kubernetes export** targets whose applies keep failing, and targets that are
   configured but never attempted at all (only when the
   [Kubernetes export](../docs/kubernetes-export.md) feature is in use).
@@ -118,6 +125,8 @@ jsonnet -J vendor -m . mixin.jsonnet
 | `crlUpdateFor` | `15m` | `for:` debounce for the CRL-update-failure alert. |
 | `crlSyncWindow` | `1h` | Window over which CRL-reload failures are counted (the metric is a restart-resetting counter). |
 | `crlSyncFor` | `5m` | `for:` debounce for the CRL-reload-failure alert. Keep it below `crlLagFor` so the warning precedes the page it explains. |
+| `ocspIndexSyncWindow` | `1h` | Window over which OCSP-index-reload failures are counted (the metric is a restart-resetting counter). |
+| `ocspIndexSyncFor` | `15m` | `for:` debounce for the OCSP-index-reload-failure alert. Longer than `crlSyncFor` because an `unknown` is not fail-open. Note `increase()` over the window stays true for the whole window after one failure, so this delays the page rather than filtering a transient. |
 | `crlLagFor` | `10m` | How long a replica may keep enforcing a CRL behind the stored one before it is paged on. Raise it if you have raised `crl_sync_interval_sec`. |
 | `k8sExportNotRunningFor` | `30m` | How long a configured export target may go with no apply attempt at all before alerting. Only has to outlast a slow start: the counters reset on restart and the startup export runs immediately. |
 | `k8sExportFailingFor` | `15m` | How long a target's most recent apply may stay failed before alerting. Keep it above the CA's export retry interval, a compile-time constant of two minutes: below that, every blip the retry would have cleared by itself pages. It cannot reach a target that fails once and succeeds on retry every cycle — see [metrics](../docs/metrics.md) for the query that can. |
