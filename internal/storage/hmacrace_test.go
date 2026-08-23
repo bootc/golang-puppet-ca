@@ -270,6 +270,14 @@ var _ = Describe("EnsureHMACKey on a concurrent cold start", func() {
 	// verify the inventory baseline the cold-start cohort wrote. This is
 	// deterministic under the fix — every replica MACs an empty inventory
 	// under one shared key, so the baselines are byte-identical.
+	//
+	// The final InitHMAC is NOT on its own a regression assertion, and it must
+	// not be mistaken for one. Nothing gates the Get(inventory_hmac) that
+	// VerifyInventoryHMAC issues, so against the unfixed code all four replicas
+	// can read the baseline as absent, every InitHMAC returns nil, and the last
+	// check passes whenever the last key write and the last baseline write
+	// happen to come from the same replica. The Put count below is what makes
+	// this spec fail by construction rather than by luck.
 	It("leaves an inventory baseline a later replica can verify", func() {
 		be := newSharedStoreBackend(replicas)
 		ctx := context.Background()
@@ -288,8 +296,9 @@ var _ = Describe("EnsureHMACKey on a concurrent cold start", func() {
 			Expect(errs[i]).NotTo(HaveOccurred(), "replica %d: InitHMAC: %v", i, errs[i])
 		}
 
-		_, _, gateExpired := be.snapshot()
+		hmacPuts, _, gateExpired := be.snapshot()
 		Expect(gateExpired).To(BeFalse(), "cold-start barrier timed out; the cohort did not race")
+		Expect(hmacPuts).To(HaveLen(1), "Put(%s) called %d times; want exactly 1 — the cohort forked the key, and the baseline check below cannot be trusted to catch that", KeyHMACKey, len(hmacPuts))
 
 		later := NewWithBackend(be, "")
 		Expect(later.InitHMAC(ctx)).To(Succeed(), "a replica starting after the cold-start cohort could not verify the inventory HMAC they left behind")

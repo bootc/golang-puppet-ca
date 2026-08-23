@@ -18,8 +18,10 @@
 package storage
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io/fs"
 	"time"
 
@@ -128,6 +130,61 @@ var _ = Describe("EnsureHMACKey", func() {
 			}
 			Expect(be.putCalls).To(Equal(0), "Put called %d times; want 0 (existing valid key must not be overwritten)", be.putCalls)
 		})
+	})
+})
+
+// sequencedHMACBackend answers successive Get(KeyHMACKey) calls from a script,
+// so a test can model "absent when we looked, present once we held the lock" —
+// the state EnsureHMACKey's re-read exists for. hmacStubBackend cannot: it
+// returns the same scripted value on every call, so a fix with the re-read and
+// one without behave identically against it.
+type sequencedHMACBackend struct {
+	hmacStubBackend
+	gets []struct {
+		value []byte
+		err   error
+	}
+	getCalls int
+}
+
+func (b *sequencedHMACBackend) Get(ctx context.Context, key string) ([]byte, error) {
+	if key != KeyHMACKey {
+		return b.hmacStubBackend.Get(ctx, key)
+	}
+	i := b.getCalls
+	b.getCalls++
+	if i >= len(b.gets) {
+		Fail(fmt.Sprintf("Get(%s) called %d times; the script has only %d entries", KeyHMACKey, b.getCalls, len(b.gets)))
+	}
+	return b.gets[i].value, b.gets[i].err
+}
+
+var _ = Describe("EnsureHMACKey when another replica wins the race", func() {
+	// The re-read inside the lock is the load-bearing half of the fix: the lock
+	// alone would only order two overwrites, and it is the second look that
+	// makes the loser adopt the winner's key. hmacrace_test.go covers this
+	// concurrently; this pins it deterministically, so dropping the re-read
+	// fails instantly and without goroutines.
+	It("adopts the key it finds on the re-read instead of overwriting it", func() {
+		winner := bytes.Repeat([]byte{0x5A}, hmacKeyLen)
+		be := &sequencedHMACBackend{
+			gets: []struct {
+				value []byte
+				err   error
+			}{
+				// The unlocked look: absent, so we go on to take the lock.
+				{nil, &fs.PathError{Op: "get", Path: KeyHMACKey, Err: fs.ErrNotExist}},
+				// The re-read, once we hold it: another replica got there.
+				{winner, nil},
+			},
+		}
+		svc := NewWithBackend(be, "")
+
+		key, err := svc.EnsureHMACKey(context.Background())
+		Expect(err).NotTo(HaveOccurred(), "EnsureHMACKey: %v", err)
+		Expect(key).To(Equal(winner), "EnsureHMACKey returned %x; want the key found on the re-read (%x) — the re-read was skipped or its result discarded", key, winner)
+		Expect(be.putCalls).To(Equal(0), "Put called %d times; want 0 (a key found on the re-read must be adopted, not overwritten)", be.putCalls)
+		Expect(be.getCalls).To(Equal(2), "Get(%s) called %d times; want 2 (one unlocked look, one re-read under the lock)", KeyHMACKey, be.getCalls)
 	})
 })
 

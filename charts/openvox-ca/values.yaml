@@ -430,6 +430,15 @@ readinessProbe:
     path: /healthz/ready
     port: https
 
+# failureThreshold x periodSeconds is the whole budget CA.Init gets: the probe
+# path is only served once Init returns, so the kubelet sees connection-refused
+# until then and kills the pod when the budget runs out. Init's worst case is
+# two internal/ca LockTimeout waits in sequence -- `hmac-key` on a cold start
+# and then `bootstrap` -- plus CA key generation, so 30 x 2s = 60s does not
+# cover a contended cold start against a shared backend. Raise failureThreshold
+# if you run several replicas against a fresh shared store; the steady-state
+# start takes neither lock. The systemd unit states the sibling relationship
+# for WatchdogSec.
 startupProbe:
   enabled: true
   failureThreshold: 30
