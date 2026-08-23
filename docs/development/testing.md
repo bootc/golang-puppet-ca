@@ -89,6 +89,31 @@ mage test:puppet
 
 `test:migration` uses `test/compose-migration.yml`, which starts a real OpenVox Server (`voxpupuli/puppetserver:latest`) to create a genuine Puppet CA, then imports its CA material into openvox-ca using `openvox-ca-ctl import` and verifies the full migration path: old certs are fetchable, new certs can be signed, migrated certs can be revoked and cleaned.
 
+Every assertion in that suite reports why it failed, and every HTTP request
+goes through `test/migration/http-helpers.sh` so that curl's exit status, the
+HTTP status code, the byte count and curl's own error text survive into the TAP
+diagnostic. That is not decoration: the suite runs unattended against
+containers that are destroyed the moment it finishes, so an assertion that
+prints only `not ok` has destroyed the evidence for its own failure. `mage
+test:migrationHelpers` is the regression suite for those helpers and for the
+retry bound below; it needs bash, curl and python3, runs on the host in
+seconds, and CI runs it immediately before `test:migration`.
+
+Pre-flight fetches against the old Puppet Server retry, up to
+`HTTP_RETRY_ATTEMPTS` times, `HTTP_RETRY_DELAY` seconds apart, because that
+server is fixture rather than the behaviour under test — and because a
+response from it that arrived unusable once failed a run that a re-run of the
+same commit passed. Truncation is the likeliest explanation, not a confirmed
+one: the assertion discarded the evidence that would have settled it, which is
+what the rest of this change is about. Assertions from Phase 5 onwards are about openvox-ca's own conduct and
+deliberately do not retry: retrying there would convert exactly the
+intermittent fault worth reporting into a green run. Phase 4 is the one
+deliberate exception on that side of the line, and it is not an assertion
+about conduct: it polls `/healthz/ready` until the server has started, which
+is waiting for a precondition rather than re-rolling a verdict. The CSR submission in
+Phase 2 does not retry either, for a different reason — a CSR `PUT` is not
+idempotent, so a second attempt would be rejected rather than retried.
+
 The k6 script (`test/load.js`) runs two concurrent scenarios:
 
 - **reads** — hammers GET /certificate/ca, CRL, and expirations; ramps to 200 VUs
@@ -218,3 +243,12 @@ deliberately skipped in that mode: nothing is being destroyed, so the logs
 are still there to be read. A readiness timeout still prints the timed-out
 service's log either way, since that is the one thing worth reading
 immediately.
+
+`test:migration` dumps on failure too, but what it dumps is not a container
+log. Its old Puppet Server is a compose service whose output already reaches
+CI by stream interleaving; the openvox-ca *under test* is a background process
+inside the test-runner container, so nothing streams it. Its stdout and stderr
+go to a file, and the suite replays the tail to stderr from its `EXIT` trap
+whenever the run exits non-zero or any assertion failed — including the early
+exit taken when the server never becomes ready, which is the case that most
+needs it.

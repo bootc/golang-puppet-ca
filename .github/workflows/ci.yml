@@ -339,6 +339,13 @@ jobs:
           cache: true
       - name: Install Mage
         run: go install github.com/magefile/mage@v1.17.2
+      # Ahead of the suite it supports, and cheap: seconds on the host with no
+      # container runtime. A break in the helpers' retry bound or failure
+      # diagnostics would otherwise surface as a confusing migration failure,
+      # or -- worse for a change whose whole point is reporting -- not surface
+      # at all.
+      - name: Run migration HTTP helper tests
+        run: mage test:migrationHelpers
       - name: Run migration integration tests
         run: mage test:migration
 
