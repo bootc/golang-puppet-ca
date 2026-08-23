@@ -64,7 +64,7 @@ import (
 // Without it a window would make the gap above the common case rather than the
 // exception — every recent renewal would leave a live predecessor — and
 // `revoke --certname` would quietly stop being containment. See
-// dropSupersededForSubjectLocked.
+// retireSupersededForSubjectLocked.
 //
 // The cost is that a revocation now waits for an issuance already under way for
 // that subject — the same trade Clean has always made, so DELETE

@@ -35,7 +35,7 @@ import (
 // supersededEntry records one certificate that a renewal has replaced and that
 // is to be revoked once its delay has elapsed.
 //
-// Subject is functional, not decorative: dropSupersededForSubjectLocked matches
+// Subject is functional, not decorative: retireSupersededForSubjectLocked matches
 // on it by exact string equality, so it is the sole key by which
 // `revoke --certname` and DELETE /certificate_status find a subject's in-window
 // predecessors. It must therefore be the same validated subject string Revoke

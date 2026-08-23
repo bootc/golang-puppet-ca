@@ -258,8 +258,11 @@ sweep is not completing — check the failure counter.
 > **What the failure counter sees.** A supersession the renewal path could not
 > record (the certificate was replaced but nothing scheduled its revocation —
 > the `failed to retire replaced certificate` warning names the serial); a
-> pending list that could not be read or parsed, on the renewal path, in the
-> sweep, or while revoking a subject; a sweep pass that could not take the CRL
+> pending list that could not be *read*, on the renewal path, in the sweep, or
+> while revoking a subject; one that could not be *parsed*, in the sweep or
+> while revoking a subject — a parse failure met on the renewal path refuses
+> that renewal but is left for the sweep to count, so one corrupt blob cannot
+> become a counter storm on a busy CA; a sweep pass that could not take the CRL
 > lock or write the list back; a predecessor a subject revocation could not
 > retire; and each pass that left an entry unrevoked, deferred one for want of
 > budget, or discarded one whose serial it could never revoke. A pass counts
