@@ -151,7 +151,7 @@ jobs:
         # it cannot see is a leg that silently goes stale.
         helm:
           # renovate: datasource=github-releases depName=helm packageName=helm/helm
-          - v3.21.3
+          - v3.21.4
           # renovate: datasource=github-releases depName=helm packageName=helm/helm
           - v4.2.3
     steps:
