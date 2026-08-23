@@ -266,10 +266,21 @@ Output that is operator-facing but not `slog` — such as
 `internal/storage/migrate.go`'s `Logf`, which the CLI writes straight to stderr
 — gets no escaping from anything. Format values that have not passed
 `ca.ValidateSubject` with `%q` there — including values decoded from a server
-response, which nothing re-validates. `cmd/openvox-ca-ctl`'s status table and
-sign/clean summaries are the deliberate exception: they print server-returned
-names with `%s` because quoting would break the column alignment, on the
-judgement that an operator's terminal is not a log pipeline.
+response, which nothing re-validates. `import-cert`'s summary lines are the
+worked example, and `cmd/openvox-ca-ctl/importcert_test.go` pins them.
+
+Two kinds of `%s` are deliberately left alone, for different reasons:
+
+- **`list`'s status table** (`printTable`) is the only column-aligned output in
+  the CLI; quoting would break the alignment that is the point of a table.
+- **The `sign` / `clean` / `revoke` confirmation lines** have no alignment to
+  lose — they are single-value prints. Three of them echo the operator's own
+  `--certname` / `--serial` input rather than anything the server chose; only
+  `sign --all` echoes a server-returned list, and it too is one unaligned line.
+
+Both rest on the judgement that an operator's terminal is not a log pipeline,
+not on any formatting constraint. Revisit that if those names ever reach
+something that parses them.
 
 ## Compatibility contracts (do not rename)
 

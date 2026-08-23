@@ -60,11 +60,15 @@ query-filters:
   #     straight to stderr by the CLI with no escaping, and its key comes from
   #     source directory names, so that call site formats with %q rather than
   #     %s, as does openvox-ca-ctl's import summary, which prints a
-  #     server-returned subject on a free-form line. What is deliberately left
-  #     alone is openvox-ca-ctl's status table and its sign/clean summaries:
-  #     those render names in aligned columns that quoting would wreck, on the
-  #     judgement that an operator's own terminal is not a log pipeline. That
-  #     is a judgement rather than an oversight -- revisit it if those names
-  #     ever reach something that parses them. Lint catches none of this.
+  #     server-returned subject on a free-form line; that one is pinned by
+  #     cmd/openvox-ca-ctl/importcert_test.go. Deliberately left alone: the
+  #     status table (printTable), the only column-aligned output in the CLI,
+  #     where quoting would wreck the alignment; and the sign/clean/revoke
+  #     confirmation lines, which have no alignment to lose and mostly echo the
+  #     operator's own --certname/--serial input rather than server data. Those
+  #     rest on the judgement that an operator's terminal is not a log
+  #     pipeline, not on a formatting constraint -- revisit it if those names
+  #     ever reach something that parses them. AGENTS.md carries the same
+  #     distinction in full; lint catches none of it.
   - exclude:
       id: go/log-injection
