@@ -140,6 +140,27 @@ type serverConfig struct {
 	// which leaves the replaced certificate valid until it naturally expires.
 	RevokeOnAutoRenew bool `yaml:"revoke_on_auto_renew"`
 
+	// SupersededCertRevokeAfterSec delays the revocation of a certificate a
+	// renewal has replaced, instead of revoking it inside the renewal call.
+	// Zero — the default — keeps the behaviour that predates this setting:
+	// the replaced certificate is revoked immediately.
+	//
+	// A positive value grants an overlap window in which both the replaced and
+	// the replacement certificate verify, so relying parties can pick up the
+	// new one without a gap. It is a deliberate weakening: for the length of
+	// the window the replaced certificate — and, on the CSR-based re-key path,
+	// the replaced private key — is still a credential this CA accepts. Set it
+	// no longer than a fleet needs to notice a renewal.
+	//
+	// It governs both renewal paths. RevokeOnAutoRenew still decides whether
+	// the auto-renewal path retires its predecessor at all.
+	SupersededCertRevokeAfterSec int `yaml:"superseded_cert_revoke_after_sec"`
+	// SupersededCertSweepIntervalSec is how often the sweep that performs those
+	// delayed revocations runs; 0 = built-in default (15m). The interval is
+	// added to the effective delay in the worst case, so keep it well below
+	// superseded_cert_revoke_after_sec.
+	SupersededCertSweepIntervalSec int `yaml:"superseded_cert_sweep_interval_sec"`
+
 	// KubernetesExport optionally publishes the CA certificate and/or CRL into
 	// one or more Kubernetes Secrets and ConfigMaps. Disabled when no targets are
 	// configured. File-only: the nested target list, labels, and annotations are
@@ -273,6 +294,14 @@ const (
 	// defaultExpiredCertCleanupInterval is how often the cleanup job runs when no
 	// interval is configured. Daily is ample: expiry is a slow, day-scale event.
 	defaultExpiredCertCleanupInterval = 24 * time.Hour
+	// defaultSupersededCertSweepInterval is how often the delayed-supersession
+	// sweep runs when no interval is configured. The interval is the sweep's
+	// own overshoot past a recorded revoke_at, so it wants to be small relative
+	// to the delays operators will configure — those are pickup windows, which
+	// are hour-scale at the shortest. Fifteen minutes keeps the overshoot
+	// immaterial at that scale while costing one small read per replica per
+	// quarter hour on a CA that has recorded nothing.
+	defaultSupersededCertSweepInterval = 15 * time.Minute
 )
 
 // expiredCertRetention resolves the grace period the cleanup job applies after a
@@ -294,6 +323,26 @@ func (c *serverConfig) expiredCertCleanupInterval() time.Duration {
 		return time.Duration(c.ExpiredCertCleanupIntervalSec) * time.Second
 	}
 	return defaultExpiredCertCleanupInterval
+}
+
+// supersededCertRevokeAfter resolves how long a certificate a renewal has
+// replaced stays valid before it is revoked. Zero (the default, and any
+// negative value, which the YAML type permits but the feature has no meaning
+// for) selects immediate revocation inside the renewal call.
+func (c *serverConfig) supersededCertRevokeAfter() time.Duration {
+	if c.SupersededCertRevokeAfterSec > 0 {
+		return time.Duration(c.SupersededCertRevokeAfterSec) * time.Second
+	}
+	return 0
+}
+
+// supersededCertSweepInterval resolves how often the delayed-supersession sweep
+// runs, falling back to defaultSupersededCertSweepInterval when unset.
+func (c *serverConfig) supersededCertSweepInterval() time.Duration {
+	if c.SupersededCertSweepIntervalSec > 0 {
+		return time.Duration(c.SupersededCertSweepIntervalSec) * time.Second
+	}
+	return defaultSupersededCertSweepInterval
 }
 
 // applyServerEnv overlays PUPPET_CA_* environment variables onto cfg.
@@ -478,6 +527,16 @@ func applyServerEnv(cfg *serverConfig) {
 	if v := os.Getenv("PUPPET_CA_REVOKE_ON_AUTO_RENEW"); v != "" {
 		if b, err := strconv.ParseBool(v); err == nil {
 			cfg.RevokeOnAutoRenew = b
+		}
+	}
+	if v := os.Getenv("PUPPET_CA_SUPERSEDED_CERT_REVOKE_AFTER_SEC"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cfg.SupersededCertRevokeAfterSec = n
+		}
+	}
+	if v := os.Getenv("PUPPET_CA_SUPERSEDED_CERT_SWEEP_INTERVAL_SEC"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cfg.SupersededCertSweepIntervalSec = n
 		}
 	}
 	if v := os.Getenv("PUPPET_CA_KEY_PASSPHRASE_FILE"); v != "" {

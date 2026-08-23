@@ -75,6 +75,8 @@ type Collector struct {
 
 	ocspIndexSyncFailures *prometheus.Desc
 	ocspIndexSerials      *prometheus.Desc
+	supersedeFailures     *prometheus.Desc
+	supersedePending      *prometheus.Desc
 
 	caInfo      *prometheus.Desc
 	caNotBefore *prometheus.Desc
@@ -142,6 +144,27 @@ func NewCollector(c *ca.CA) *Collector {
 				"sharing a backend should converge on the same value within one sync interval; a "+
 				"replica persistently below the others is reporting valid certificates as unknown.",
 			nil, nil),
+		supersedeFailures: prometheus.NewDesc(
+			prometheus.BuildFQName(namespace, "supersede", "failures_total"),
+			"Total failures to schedule or carry out the revocation of a certificate a renewal "+
+				"replaced: a supersession the renewal path could not record, a pending-revocation "+
+				"list that could not be read or parsed, and each sweep pass that left an entry "+
+				"unrevoked or discarded one whose serial it could never revoke. One pass counts "+
+				"once however many entries it failed on. It stays at zero on a CA that has never "+
+				"recorded a supersession — with superseded_cert_revoke_after_sec unset the "+
+				"revocation happens inside the renewal, and a failure there is a CRL failure that "+
+				"lands in puppetca_crl_update_failures_total instead. A rising value means a "+
+				"certificate a renewal replaced may still be a valid credential.",
+			nil, nil),
+		supersedePending: prometheus.NewDesc(
+			prometheus.BuildFQName(namespace, "supersede", "pending"),
+			"Certificates a renewal has replaced that are still inside their overlap window and "+
+				"not yet revoked. Each one is a credential this CA still accepts even though "+
+				"something newer has taken its place, so this is the live measure of the exposure "+
+				"superseded_cert_revoke_after_sec buys. It returns to zero as the sweep drains "+
+				"the list; a value that does not fall means the sweep is not completing — check "+
+				"puppetca_supersede_failures_total.",
+			nil, nil),
 		crlCachedNumber: prometheus.NewDesc(
 			prometheus.BuildFQName(namespace, "crl", "cached_number"),
 			"CRL sequence number of the copy this replica is answering revocation checks from. "+
@@ -208,6 +231,8 @@ func (c *Collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.caReady
 	ch <- c.crlUpdateFailures
 	ch <- c.crlSyncFailures
+	ch <- c.supersedeFailures
+	ch <- c.supersedePending
 	ch <- c.crlCachedNumber
 	ch <- c.ocspIndexSyncFailures
 	ch <- c.ocspIndexSerials
@@ -253,6 +278,8 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 		float64(c.ca.SerialIndexSyncFailures()))
 	ch <- prometheus.MustNewConstMetric(c.ocspIndexSerials, prometheus.GaugeValue,
 		float64(c.ca.SerialIndexSize()))
+	ch <- prometheus.MustNewConstMetric(c.supersedeFailures, prometheus.CounterValue,
+		float64(c.ca.SupersedeFailures()))
 	if cached, ok := c.ca.CachedCRLNumber(); ok {
 		num, _ := new(big.Float).SetInt(cached).Float64()
 		ch <- prometheus.MustNewConstMetric(c.crlCachedNumber, prometheus.GaugeValue, num)
@@ -280,6 +307,9 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 		ch <- prometheus.MustNewConstMetric(c.crlNextUpdate, prometheus.GaugeValue, timestamp(snap.crlNextUpdate))
 		ch <- prometheus.MustNewConstMetric(c.crlRevoked, prometheus.GaugeValue, float64(snap.crlRevokedCount))
 	}
+
+	ch <- prometheus.MustNewConstMetric(c.supersedePending, prometheus.GaugeValue,
+		float64(snap.supersedePending))
 
 	stateCounts := map[string]int{stateRequested: 0, stateSigned: 0, stateRevoked: 0}
 	for _, leaf := range snap.leaves {
@@ -324,6 +354,8 @@ type snapshot struct {
 	crlThisUpdate   time.Time
 	crlNextUpdate   time.Time
 	crlRevokedCount int
+
+	supersedePending int
 
 	leaves []leafCert
 }
@@ -370,6 +402,17 @@ func (c *Collector) gather(ctx context.Context) (snapshot, error) {
 		} else {
 			slog.Warn("Prometheus exporter: failed to parse CRL", "error", perr)
 		}
+	}
+
+	// Certificates awaiting delayed revocation. Absent on any CA that has never
+	// recorded one, which reads as zero. A failure is logged and left at zero
+	// rather than failing the scrape: this gauge is auxiliary, and the failure
+	// it would most likely reflect is already counted into
+	// puppetca_supersede_failures_total by the code that owns the list.
+	if pending, perr := c.ca.PendingSupersessions(ctx); perr != nil {
+		slog.Warn("Prometheus exporter: failed to read pending supersessions", "error", perr)
+	} else {
+		snap.supersedePending = pending
 	}
 
 	// Signed certificates: enumerate the live (non-deleted) signed set. A cleaned

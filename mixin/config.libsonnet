@@ -80,6 +80,20 @@
     // to lengthen the other.
     ocspIndexSyncWindow: '1h',
     ocspIndexSyncFor: '15m',
+    // --- Delayed supersession ---
+    // With superseded_cert_revoke_after_sec set, a renewal records the
+    // certificate it replaced on a durable list and a sweep revokes it once the
+    // window elapses. A failure here is a certificate that a renewal replaced
+    // and that is still a valid credential — either because the supersession
+    // was never recorded, or because the sweep could not carry it out. Same
+    // shape as the CRL-update alert: a counter that resets on restart, so
+    // increase() over a window. Debounced for longer, because the sweep retries
+    // on its own interval (superseded_cert_sweep_interval_sec, 15m by default)
+    // and a single transient storage failure between two passes is not worth
+    // waking anyone for; raise supersedeFor if you have lengthened that
+    // interval.
+    supersedeWindow: '1h',
+    supersedeFor: '30m',
 
     // --- Kubernetes export ---
     // A target alerts while its most recent apply attempt failed (last-error

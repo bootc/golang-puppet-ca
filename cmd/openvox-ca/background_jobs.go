@@ -50,10 +50,11 @@ func sharedStorageBackend(name string) (bool, storage.BackendKind) {
 // literals so a spec asserting which jobs a configuration starts cannot drift
 // from the thing it is asserting about.
 const (
-	jobCRLRefresh    = "crl-refresh"
-	jobCRLSync       = "crl-sync"
-	jobOCSPIndexSync = "ocsp-index-sync"
-	jobCertCleanup   = "expired-cert-cleanup"
+	jobCRLRefresh      = "crl-refresh"
+	jobCRLSync         = "crl-sync"
+	jobOCSPIndexSync   = "ocsp-index-sync"
+	jobCertCleanup     = "expired-cert-cleanup"
+	jobSupersededSweep = "superseded-cert-revocation"
 )
 
 // backgroundJob is one periodic job the serve command runs for the lifetime of
@@ -157,6 +158,16 @@ func backgroundJobs(cfg *serverConfig, myCA *ca.CA) []backgroundJob {
 			runCertCleaner(ctx, myCA, interval, retention)
 		}})
 	}
+
+	// Revokes the certificates renewals have replaced, once the configured
+	// delay has elapsed. Runs unconditionally — including when the delay is
+	// zero — because it is the only thing that drains a list an earlier
+	// configuration may have filled; see runSupersededSweeper. Safe on every
+	// replica: serialised on the shared CRL lock.
+	sweepInterval, revokeAfter := cfg.supersededCertSweepInterval(), cfg.supersededCertRevokeAfter()
+	jobs = append(jobs, backgroundJob{jobSupersededSweep, func(ctx context.Context) {
+		runSupersededSweeper(ctx, myCA, sweepInterval, revokeAfter)
+	}})
 
 	return jobs
 }

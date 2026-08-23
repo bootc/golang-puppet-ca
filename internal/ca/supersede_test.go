@@ -1,0 +1,376 @@
+// Copyright (C) 2026 Chris Boot
+// Copyright (C) 2026 Vox Pupuli and contributors
+//
+// This program is free software; you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation; either version 2 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License along
+// with this program; if not, write to the Free Software Foundation, Inc.,
+// 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+
+package ca_test
+
+import (
+	"context"
+	"crypto/x509"
+	"encoding/json"
+	"encoding/pem"
+	"fmt"
+	"math/big"
+	"os"
+	"time"
+
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
+	"github.com/voxpupuli/openvox-ca/internal/ca"
+	"github.com/voxpupuli/openvox-ca/internal/storage"
+)
+
+// pendingEntry mirrors the JSON the CA writes to storage.KeySuperseded. It is
+// deliberately a separate declaration from the unexported one in package ca:
+// the on-disk shape is shared between replicas and survives restarts, so a
+// field rename that broke it would go unnoticed if this spec simply reused the
+// type doing the writing.
+type pendingEntry struct {
+	Serial   string    `json:"serial"`
+	Subject  string    `json:"subject"`
+	RevokeAt time.Time `json:"revoke_at"`
+}
+
+var _ = Describe("Delayed supersession", func() {
+	var (
+		ctx    = context.Background()
+		tmpDir string
+		myCA   *ca.CA
+		store  *storage.StorageService
+	)
+
+	parseCert := func(certPEM []byte) *x509.Certificate {
+		GinkgoHelper()
+		block, _ := pem.Decode(certPEM)
+		Expect(block).NotTo(BeNil())
+		cert, err := x509.ParseCertificate(block.Bytes)
+		Expect(err).NotTo(HaveOccurred())
+		return cert
+	}
+
+	// issue puts subject through the ordinary SaveRequest+Sign flow.
+	issue := func(subject string) *x509.Certificate {
+		GinkgoHelper()
+		csrPEM, _ := buildCSR(subject)
+		_, err := myCA.SaveRequest(ctx, subject, csrPEM)
+		Expect(err).NotTo(HaveOccurred())
+		certPEM, err := myCA.Sign(ctx, subject)
+		Expect(err).NotTo(HaveOccurred())
+		return parseCert(certPEM)
+	}
+
+	// pending reads the stored pending-revocation list. An absent list is no
+	// entries, which is what a CA that has recorded nothing must show.
+	pending := func() []pendingEntry {
+		GinkgoHelper()
+		data, err := store.GetSuperseded(ctx)
+		if err != nil {
+			Expect(os.IsNotExist(err)).To(BeTrue(), "unexpected error reading the pending list: %v", err)
+			return nil
+		}
+		var entries []pendingEntry
+		Expect(json.Unmarshal(data, &entries)).To(Succeed())
+		return entries
+	}
+
+	// revoked answers from the stored CRL rather than the in-memory copy, so a
+	// spec cannot pass on a cache that was never written through.
+	revoked := func(serial *big.Int) bool {
+		GinkgoHelper()
+		crlPEM, err := store.GetCRL(ctx)
+		Expect(err).NotTo(HaveOccurred())
+		block, _ := pem.Decode(crlPEM)
+		Expect(block).NotTo(BeNil())
+		crl, err := x509.ParseRevocationList(block.Bytes)
+		Expect(err).NotTo(HaveOccurred())
+		for _, e := range crl.RevokedCertificateEntries {
+			if e.SerialNumber.Cmp(serial) == 0 {
+				return true
+			}
+		}
+		return false
+	}
+
+	// writePending installs a pending list directly, so a spec can place an
+	// entry's due time in the past without sleeping through a real delay.
+	writePending := func(entries []pendingEntry) {
+		GinkgoHelper()
+		data, err := json.Marshal(entries)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(store.SaveSuperseded(ctx, data)).To(Succeed())
+	}
+
+	BeforeEach(func() {
+		var err error
+		tmpDir, err = os.MkdirTemp("", "openvox-ca-supersede-test")
+		Expect(err).NotTo(HaveOccurred())
+
+		store = storage.New(tmpDir)
+		myCA = ca.New(store, ca.AutosignConfig{Mode: "off"}, "puppet.test")
+
+		Expect(store.EnsureDirs(ctx)).To(Succeed())
+		Expect(store.SaveCAKey(ctx, cachedKeyPEM)).To(Succeed())
+		Expect(store.SaveCACert(ctx, cachedCrtPEM)).To(Succeed())
+		Expect(store.UpdateCRL(ctx, cachedCrlPEM)).To(Succeed())
+		Expect(store.WriteSerial(ctx, "0001")).To(Succeed())
+		Expect(store.TouchInventory(ctx)).To(Succeed())
+		Expect(myCA.Init(ctx)).To(Succeed())
+	})
+
+	AfterEach(func() {
+		os.RemoveAll(tmpDir)
+	})
+
+	Describe("with no delay configured (the default)", func() {
+		// The compatibility guarantee. Every deployment that does not set
+		// superseded_cert_revoke_after_sec must behave exactly as it did before
+		// the pending list existed: the predecessor is revoked inside the
+		// renewal call, and nothing is written to the list at all.
+		It("revokes the replaced certificate inside Renew, recording nothing", func() {
+			original := issue("node-a")
+
+			csrPEM, _ := buildCSR("node-a")
+			_, err := myCA.Renew(ctx, "node-a", csrPEM, original)
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(revoked(original.SerialNumber)).To(BeTrue(),
+				"with no delay the predecessor must be revoked by the time Renew returns")
+			Expect(pending()).To(BeEmpty(),
+				"an immediate revocation must not leave anything on the pending list")
+		})
+
+		It("revokes the replaced certificate inside AutoRenew, recording nothing", func() {
+			original := issue("node-b")
+
+			_, err := myCA.AutoRenew(ctx, original)
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(revoked(original.SerialNumber)).To(BeTrue())
+			Expect(pending()).To(BeEmpty())
+		})
+	})
+
+	Describe("with a delay configured", func() {
+		BeforeEach(func() {
+			myCA.SupersedeAfter = time.Hour
+		})
+
+		// The point of the whole feature: the predecessor keeps working while
+		// relying parties pick up the replacement.
+		It("leaves the certificate Renew replaced valid and records it as due later", func() {
+			original := issue("node-c")
+
+			csrPEM, _ := buildCSR("node-c")
+			renewedPEM, err := myCA.Renew(ctx, "node-c", csrPEM, original)
+			Expect(err).NotTo(HaveOccurred())
+			renewed := parseCert(renewedPEM)
+
+			Expect(revoked(original.SerialNumber)).To(BeFalse(),
+				"the replaced certificate must stay valid for the length of the window")
+			Expect(revoked(renewed.SerialNumber)).To(BeFalse(),
+				"the replacement must never be the one revoked")
+
+			entries := pending()
+			Expect(entries).To(HaveLen(1))
+			Expect(entries[0].Subject).To(Equal("node-c"))
+			Expect(entries[0].Serial).To(Equal(hexSerial(original.SerialNumber)),
+				"the recorded serial must be the predecessor's, not the replacement's")
+			Expect(entries[0].RevokeAt).To(BeTemporally("~", time.Now().UTC().Add(time.Hour), time.Minute))
+		})
+
+		It("leaves the certificate AutoRenew replaced valid and records it as due later", func() {
+			original := issue("node-d")
+
+			_, err := myCA.AutoRenew(ctx, original)
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(revoked(original.SerialNumber)).To(BeFalse())
+			entries := pending()
+			Expect(entries).To(HaveLen(1))
+			Expect(entries[0].Serial).To(Equal(hexSerial(original.SerialNumber)))
+		})
+
+		// revoke_on_auto_renew is a whether, not a when. With it off, the
+		// predecessor is kept deliberately — so the delay must not smuggle it
+		// onto a list that would revoke it an hour later.
+		It("records nothing on the auto-renewal path when revoke_on_auto_renew is off", func() {
+			myCA.RevokeOnAutoRenew = false
+			original := issue("node-e")
+
+			_, err := myCA.AutoRenew(ctx, original)
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(revoked(original.SerialNumber)).To(BeFalse())
+			Expect(pending()).To(BeEmpty(),
+				"revoke_on_auto_renew=false must keep the predecessor, not defer its revocation")
+		})
+
+		// One list, many subjects. This is the property the issue asks for and
+		// the reason it was cut from main rather than stacked behind the
+		// single-subject serving implementation.
+		It("accumulates entries across different subjects on one list", func() {
+			first := issue("node-f")
+			second := issue("node-g")
+
+			_, err := myCA.AutoRenew(ctx, first)
+			Expect(err).NotTo(HaveOccurred())
+			_, err = myCA.AutoRenew(ctx, second)
+			Expect(err).NotTo(HaveOccurred())
+
+			entries := pending()
+			Expect(entries).To(HaveLen(2), "a second subject's supersession must not overwrite the first")
+			subjects := []string{entries[0].Subject, entries[1].Subject}
+			Expect(subjects).To(ConsistOf("node-f", "node-g"))
+		})
+	})
+
+	Describe("ReconcileSuperseded", func() {
+		It("revokes what is due, leaves what is not, and reports the count", func() {
+			due := issue("node-h")
+			notYet := issue("node-i")
+			writePending([]pendingEntry{
+				{Serial: hexSerial(due.SerialNumber), Subject: "node-h", RevokeAt: time.Now().UTC().Add(-time.Minute)},
+				{Serial: hexSerial(notYet.SerialNumber), Subject: "node-i", RevokeAt: time.Now().UTC().Add(time.Hour)},
+			})
+
+			count, err := myCA.ReconcileSuperseded(ctx)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(count).To(Equal(1))
+
+			Expect(revoked(due.SerialNumber)).To(BeTrue())
+			Expect(revoked(notYet.SerialNumber)).To(BeFalse(),
+				"an entry inside its window must not be revoked early")
+
+			entries := pending()
+			Expect(entries).To(HaveLen(1), "the revoked entry must be dropped from the list")
+			Expect(entries[0].Subject).To(Equal("node-i"))
+		})
+
+		// Each entry's window was fixed when the supersession was recorded.
+		// Turning the delay off afterwards changes what future renewals record;
+		// it must not retroactively expire a window a fleet may be mid-way
+		// through relying on.
+		It("honours a recorded due time even after the delay is set back to zero", func() {
+			cert := issue("node-j")
+			writePending([]pendingEntry{
+				{Serial: hexSerial(cert.SerialNumber), Subject: "node-j", RevokeAt: time.Now().UTC().Add(time.Hour)},
+			})
+			myCA.SupersedeAfter = 0
+
+			count, err := myCA.ReconcileSuperseded(ctx)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(count).To(BeZero())
+			Expect(revoked(cert.SerialNumber)).To(BeFalse())
+			Expect(pending()).To(HaveLen(1), "the entry must still be there, waiting for its own due time")
+		})
+
+		// Idempotence is what lets every replica run the sweep with no leader:
+		// the second pass finds the list already drained and the serial already
+		// on the CRL, and must do nothing rather than append a duplicate entry.
+		It("is a no-op on a second pass", func() {
+			cert := issue("node-k")
+			writePending([]pendingEntry{
+				{Serial: hexSerial(cert.SerialNumber), Subject: "node-k", RevokeAt: time.Now().UTC().Add(-time.Minute)},
+			})
+
+			_, err := myCA.ReconcileSuperseded(ctx)
+			Expect(err).NotTo(HaveOccurred())
+			before, err := store.GetCRL(ctx)
+			Expect(err).NotTo(HaveOccurred())
+
+			count, err := myCA.ReconcileSuperseded(ctx)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(count).To(BeZero())
+			after, err := store.GetCRL(ctx)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(after).To(Equal(before), "a drained list must not cause a CRL re-sign")
+		})
+
+		// A serial that is not parseable hex can never be revoked. Carrying it
+		// forward would retry it on every pass forever, latching the failure
+		// counter with nothing an operator could do to clear it.
+		It("discards an entry whose serial can never be revoked, and counts it", func() {
+			writePending([]pendingEntry{
+				{Serial: "not-hex", Subject: "node-l", RevokeAt: time.Now().UTC().Add(-time.Minute)},
+			})
+			before := myCA.SupersedeFailures()
+
+			count, err := myCA.ReconcileSuperseded(ctx)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(count).To(BeZero())
+			Expect(pending()).To(BeEmpty(), "an unrevocable entry must not be retried forever")
+			Expect(myCA.SupersedeFailures()).To(BeNumerically(">", before),
+				"discarding an entry loses a revocation and must be counted")
+		})
+
+		// Unparseable bytes are not self-clearing. Left alone they would warn,
+		// count and be re-read on every pass forever.
+		It("overwrites an unparseable list instead of re-reading it forever", func() {
+			Expect(store.SaveSuperseded(ctx, []byte("{not json"))).To(Succeed())
+			before := myCA.SupersedeFailures()
+
+			_, err := myCA.ReconcileSuperseded(ctx)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(myCA.SupersedeFailures()).To(BeNumerically(">", before))
+			Expect(pending()).To(BeEmpty())
+
+			// The second pass must find clean bytes, so the warning and the
+			// counter stop rather than latching.
+			steady := myCA.SupersedeFailures()
+			_, err = myCA.ReconcileSuperseded(ctx)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(myCA.SupersedeFailures()).To(Equal(steady))
+		})
+	})
+
+	Describe("PendingSupersessions", func() {
+		It("counts what is on the list and reports zero before anything is recorded", func() {
+			n, err := myCA.PendingSupersessions(ctx)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(n).To(BeZero())
+
+			myCA.SupersedeAfter = time.Hour
+			cert := issue("node-m")
+			_, err = myCA.AutoRenew(ctx, cert)
+			Expect(err).NotTo(HaveOccurred())
+
+			n, err = myCA.PendingSupersessions(ctx)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(n).To(Equal(1))
+		})
+
+		// It is called on a scrape interval, so a blob that will never parse
+		// must not emit a warning and increment the counter every few seconds.
+		It("does not count a corrupt list as a failure", func() {
+			Expect(store.SaveSuperseded(ctx, []byte("{not json"))).To(Succeed())
+			before := myCA.SupersedeFailures()
+
+			n, err := myCA.PendingSupersessions(ctx)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(n).To(BeZero())
+			Expect(myCA.SupersedeFailures()).To(Equal(before),
+				"a scrape-interval reader must not latch the failure counter")
+		})
+	})
+})
+
+// hexSerial renders a serial the way the CA records it on the pending list:
+// uppercase hex with no leading zeros. Spelled out here rather than exported
+// from package ca, so a change to that formatting shows up as a failing
+// assertion about the stored blob instead of both sides moving together.
+func hexSerial(n *big.Int) string {
+	return fmt.Sprintf("%X", n)
+}

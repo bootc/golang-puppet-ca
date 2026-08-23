@@ -135,6 +135,7 @@ func applyCAConfig(myCA *ca.CA, cfg *serverConfig) error {
 	myCA.EncryptCAKey = cfg.EncryptCAKey
 	myCA.PromoteCNToSAN = cfg.PromoteCNToSAN
 	myCA.RevokeOnAutoRenew = cfg.RevokeOnAutoRenew
+	myCA.SupersedeAfter = cfg.supersededCertRevokeAfter()
 	myCA.KeyPassphrase = ca.KeyPassphraseConfig{
 		PassphraseFile: cfg.CAKeyPassphraseFile,
 	}

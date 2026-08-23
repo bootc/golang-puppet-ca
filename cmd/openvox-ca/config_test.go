@@ -726,6 +726,16 @@ var _ = Describe("applyServerEnv each variable", func() {
 		// typo in the env key would then leave it false and fail this entry.
 		Entry("REVOKE_ON_AUTO_RENEW", "PUPPET_CA_REVOKE_ON_AUTO_RENEW", "true",
 			func(c *serverConfig) bool { return c.RevokeOnAutoRenew }, "RevokeOnAutoRenew"),
+		// Distinct values, because these two are adjacent ints with adjacent
+		// names: swapping the destinations would turn a 12-hour overlap window
+		// into a 12-hour sweep interval on a 90-second delay, and both would
+		// still "work".
+		Entry("SUPERSEDED_CERT_REVOKE_AFTER_SEC", "PUPPET_CA_SUPERSEDED_CERT_REVOKE_AFTER_SEC", "43200",
+			func(c *serverConfig) bool { return c.SupersededCertRevokeAfterSec == 43200 },
+			"SupersededCertRevokeAfterSec"),
+		Entry("SUPERSEDED_CERT_SWEEP_INTERVAL_SEC", "PUPPET_CA_SUPERSEDED_CERT_SWEEP_INTERVAL_SEC", "90",
+			func(c *serverConfig) bool { return c.SupersededCertSweepIntervalSec == 90 },
+			"SupersededCertSweepIntervalSec"),
 		// CA key provider selection and OpenBao settings. Each entry uses a
 		// distinct value and asserts the specific destination field, so a
 		// wrong target (e.g. role-id <-> secret-id, or tls_cert <-> tls_key —

@@ -71,6 +71,13 @@ const (
 	KeyInventory     = "inventory"
 	KeyInventoryHMAC = "inventory_hmac"
 	KeyHMACKey       = "hmac_key"
+	// KeySuperseded holds the cross-subject list of certificates that have
+	// been replaced by a renewal and are awaiting delayed revocation. See
+	// ca.CA.ReconcileSuperseded. It is operational state rather than CA
+	// material, but it is written BlobPrivate like the inventory: it names
+	// every subject that has renewed recently, which is not something a
+	// world-readable cadir should volunteer.
+	KeySuperseded = "superseded"
 
 	csrPrefix  = "csr/"
 	certPrefix = "cert/"

@@ -885,9 +885,17 @@ func (c *CA) DeleteRequest(ctx context.Context, subject string) error {
 // Renew issues a replacement certificate for subject from the provided CSR,
 // bypassing the pending-CSR queue and autosign check. The existing certificate
 // (if any) is replaced atomically under the per-subject distributed lock, and
-// revoked once its successor is safely signed and stored: a CSR-based renewal
+// retired once its successor is safely signed and stored: a CSR-based renewal
 // is a genuine re-key, so the old key/cert must not remain a valid credential
 // once the new one takes over.
+//
+// "Retired" is immediate revocation unless CA.SupersedeAfter is set, in which
+// case the replaced serial is recorded for revocation that far in the future
+// and a sweep performs it — see supersedeReplaced. Note what a delay costs on
+// this path in particular: because this is a re-key, the window leaves the
+// *previous private key* usable as well as the previous certificate. That is
+// the price of an overlap in which relying parties can pick up the replacement,
+// and it is why the delay is off by default.
 //
 // presentedCert is the client certificate the caller authenticated with. It is
 // required, and it must be one this CA issued and has not revoked: renewal
@@ -1039,19 +1047,23 @@ func (c *CA) Renew(ctx context.Context, subject string, csrPEM []byte, presented
 		if !hadOldCert {
 			return nil
 		}
-		// Revoke the certificate just replaced so its serial can no longer
-		// pass CRL/OCSP checks now that it is no longer the cert served for
-		// this subject. Best-effort like Clean's revoke-then-delete: a
-		// failure here shouldn't undo the renewal the caller is waiting on.
+		// Retire the certificate just replaced so its serial can no longer pass
+		// CRL/OCSP checks now that it is no longer the cert served for this
+		// subject. With SupersedeAfter unset that is an immediate revocation,
+		// as it always was; with a delay configured the serial is recorded and
+		// the sweep revokes it later — see supersedeReplaced, and note that on
+		// this path the delay leaves the *replaced key* usable for the window
+		// too, since a CSR-based renewal re-keys.
+		//
+		// Best-effort either way, like Clean's revoke-then-delete: a failure
+		// here shouldn't undo the renewal the caller is waiting on.
 		// Lock ordering: subject-lock (held) -> CRL-lock -> c.mu, matching Clean.
-		if err := c.Storage.WithLock(ctx, lockNameCRL, func() error {
-			c.mu.Lock()
-			defer c.mu.Unlock()
-			return c.revokeSerialLocked(ctx, oldSerial)
-		}); err != nil {
-			// revokeSerialLocked/signCRLLocked already count this into
-			// crlUpdateFailures; here we only note it and let the renewal stand.
-			slog.Warn("Renew: failed to revoke replaced certificate", "subject", subject, "serial", oldSerial, "error", err)
+		if err := c.supersedeReplaced(ctx, subject, oldSerial); err != nil {
+			// The failure is already counted — into crlUpdateFailures by
+			// revokeSerialLocked/signCRLLocked on the immediate path, and into
+			// supersedeFailures on the delayed one. Here we only note it and
+			// let the renewal stand.
+			slog.Warn("Renew: failed to retire replaced certificate", "subject", subject, "serial", oldSerial, "error", err)
 		}
 		return nil
 	})
@@ -1089,6 +1101,10 @@ func (c *CA) Renew(ctx context.Context, subject string, csrPEM []byte, presented
 // (renew-certificate! in certificate_authority.clj) does not do this — both
 // the old and new certificates (same key) remain valid until the old one
 // naturally expires; set RevokeOnAutoRenew to false to match that exactly.
+//
+// CA.SupersedeAfter sits between those two: the predecessor is still retired,
+// but after a delay rather than in this call. RevokeOnAutoRenew decides
+// whether; SupersedeAfter decides when.
 //
 // The caller must NOT hold c.mu. Same cross-node guarantees as Sign.
 func (c *CA) AutoRenew(ctx context.Context, presentedCert *x509.Certificate) ([]byte, error) {
@@ -1195,19 +1211,16 @@ func (c *CA) AutoRenew(ctx context.Context, presentedCert *x509.Certificate) ([]
 		if !c.RevokeOnAutoRenew {
 			return nil
 		}
-		// Revoke the certificate just replaced, same as Renew's rekey path:
-		// only the newest serial should ever be valid for a subject. Best
-		// effort: a failure here shouldn't undo the renewal the agent is
-		// waiting on.
+		// Retire the certificate just replaced, same as Renew's rekey path:
+		// only the newest serial should ever be valid for a subject, allowing
+		// for whatever overlap SupersedeAfter grants. Best effort: a failure
+		// here shouldn't undo the renewal the agent is waiting on.
 		// Lock ordering: subject-lock (held) -> CRL-lock -> c.mu, matching Clean.
-		if err := c.Storage.WithLock(ctx, lockNameCRL, func() error {
-			c.mu.Lock()
-			defer c.mu.Unlock()
-			return c.revokeSerialLocked(ctx, oldSerial)
-		}); err != nil {
-			// revokeSerialLocked/signCRLLocked already count this into
-			// crlUpdateFailures; here we only note it and let the renewal stand.
-			slog.Warn("AutoRenew: failed to revoke replaced certificate", "subject", subject, "serial", oldSerial, "error", err)
+		if err := c.supersedeReplaced(ctx, subject, oldSerial); err != nil {
+			// Counted already — crlUpdateFailures on the immediate path,
+			// supersedeFailures on the delayed one. Here we only note it and
+			// let the renewal stand.
+			slog.Warn("AutoRenew: failed to retire replaced certificate", "subject", subject, "serial", oldSerial, "error", err)
 		}
 		return nil
 	})

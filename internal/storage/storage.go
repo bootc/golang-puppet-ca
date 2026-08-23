@@ -817,6 +817,29 @@ func (s *StorageService) CRLModTime(ctx context.Context) (time.Time, error) {
 	return s.backend.ModTime(ctx, KeyCRL)
 }
 
+// --- Pending supersessions ---
+
+// GetSuperseded returns the stored list of certificates awaiting delayed
+// revocation, wrapping fs.ErrNotExist when no supersession has ever been
+// recorded. The bytes are opaque here; ca.CA owns the encoding.
+//
+// Callers must serialise their read-modify-write on the cluster "crl" lock —
+// this mutex only orders goroutines inside one process, and the list is shared
+// across replicas. See ca.CA.ReconcileSuperseded.
+func (s *StorageService) GetSuperseded(ctx context.Context) ([]byte, error) {
+	s.fileMu.RLock()
+	defer s.fileMu.RUnlock()
+	return s.backend.Get(ctx, KeySuperseded)
+}
+
+// SaveSuperseded replaces the stored list of certificates awaiting delayed
+// revocation. See GetSuperseded for the locking the caller still owes.
+func (s *StorageService) SaveSuperseded(ctx context.Context, data []byte) error {
+	s.fileMu.Lock()
+	defer s.fileMu.Unlock()
+	return s.backend.Put(ctx, KeySuperseded, data, BlobPrivate)
+}
+
 // --- CA material ---
 
 func (s *StorageService) GetCACert(ctx context.Context) ([]byte, error) {

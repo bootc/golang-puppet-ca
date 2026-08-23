@@ -125,6 +125,7 @@ var etcdLayout = map[string]string{
 	KeyInventory:     etcdInvDataSub,
 	KeyInventoryHMAC: etcdInvHMACSub,
 	KeyHMACKey:       "private/hmac_key",
+	KeySuperseded:    "superseded",
 }
 
 // NewEtcdBackend connects to the configured etcd cluster and returns a ready

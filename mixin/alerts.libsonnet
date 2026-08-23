@@ -202,7 +202,30 @@
             labels: { severity: 'warning' } + $._config.alertLabels,
             annotations: {
               summary: 'Puppet CA is failing to update its CRL.',
-              description: 'The Puppet CA on {{ $labels.instance }} could not amend its CRL (puppetca_crl_update_failures_total is rising). Revocations may not have taken effect and superseded certificates may still be valid. Check the CA logs to tell the causes apart: "Renew:"/"AutoRenew: failed to revoke replaced certificate"/"Clean:" warnings are a real failure to maintain the CRL, and on filesystem or SQLite a "Revoke failed" warning on a request that took over a minute is instead a revocation that merely queued too long for its subject lock. Then check CRL storage.',
+              description: 'The Puppet CA on {{ $labels.instance }} could not amend its CRL (puppetca_crl_update_failures_total is rising). Revocations may not have taken effect and superseded certificates may still be valid. Check the CA logs to tell the causes apart: "Renew:"/"AutoRenew: failed to retire replaced certificate"/"Clean:" warnings are a real failure to maintain the CRL, and on filesystem or SQLite a "Revoke failed" warning on a request that took over a minute is instead a revocation that merely queued too long for its subject lock. Then check CRL storage.',
+            },
+          },
+          {
+            alert: 'PuppetCASupersedeFailing',
+            // A certificate a renewal replaced is still a valid credential,
+            // because the CA could not schedule or carry out its delayed
+            // revocation: a supersession the renewal path could not record, a
+            // pending-revocation list it could not read or parse, or a sweep
+            // pass that left an entry unrevoked or discarded one whose serial it
+            // could never revoke. Only fires where
+            // superseded_cert_revoke_after_sec is set — with no delay the
+            // revocation happens inside the renewal and a failure there is a
+            // CRL failure, counted by the alert above instead. Counter resets on
+            // restart, so alert on increase() over a window.
+            expr: 'increase(puppetca_supersede_failures_total{%(selector)s}[%(window)s]) > 0' % {
+              selector: $._config.puppetCASelector,
+              window: $._config.supersedeWindow,
+            },
+            'for': $._config.supersedeFor,
+            labels: { severity: 'warning' } + $._config.alertLabels,
+            annotations: {
+              summary: 'Puppet CA is failing to revoke superseded certificates.',
+              description: 'The Puppet CA on {{ $labels.instance }} could not schedule or carry out the revocation of a certificate a renewal replaced (puppetca_supersede_failures_total is rising), so that certificate is still a valid credential. Check the CA logs for "failed to retire replaced certificate" (the supersession was never recorded — the serial is in the warning), "Could not revoke superseded certificate" (recorded, but the sweep could not revoke it; it will retry), and "Discarding" (the entry is gone and will never be retried). Retire anything the sweep will not with openvox-ca-ctl revoke --serial <hex>. puppetca_supersede_pending shows how many are still waiting.',
             },
           },
           {
