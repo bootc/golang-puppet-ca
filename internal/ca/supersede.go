@@ -35,9 +35,18 @@ import (
 // supersededEntry records one certificate that a renewal has replaced and that
 // is to be revoked once its delay has elapsed.
 //
-// Subject is carried for diagnostics only. Revocation is always by Serial:
-// Revoke resolves a subject to its *current* certificate, so revoking by
-// subject here would retire the replacement rather than the thing it replaced.
+// Subject is functional, not decorative: dropSupersededForSubjectLocked matches
+// on it by exact string equality, so it is the sole key by which
+// `revoke --certname` and DELETE /certificate_status find a subject's in-window
+// predecessors. It must therefore be the same validated subject string Revoke
+// will be called with. An entry carrying anything else — a differently-spelled
+// name from a future consumer, or the empty string a partly-decodable list can
+// yield — is skipped by that lookup and stays a working credential until the
+// sweep retires it.
+//
+// Revocation itself is always by Serial, which is a separate point: Revoke
+// resolves a subject to its *current* certificate, so revoking by subject here
+// would retire the replacement rather than the thing it replaced.
 type supersededEntry struct {
 	Serial   string    `json:"serial"`
 	Subject  string    `json:"subject"`
@@ -298,8 +307,8 @@ func (c *CA) ReconcileSuperseded(ctx context.Context) (int, error) {
 
 		var (
 			failed    []supersededEntry
+			deferred  []supersededEntry
 			discarded int
-			deferred  int
 		)
 		func() {
 			c.mu.Lock()
@@ -320,10 +329,25 @@ func (c *CA) ReconcileSuperseded(ctx context.Context) (int, error) {
 				// them. Never silently — a backlog that is not draining has to
 				// be visible, or "the sweep is keeping up" and "the sweep is
 				// falling behind by one interval every interval" look identical.
-				if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) < LockTimeout/2 {
-					deferred = len(due) - i
+				// i > 0 guarantees a pass always attempts at least one entry.
+				// The deadline is set at function entry, before the fast-path
+				// read and before the wait for a CRL lock that every revocation
+				// on every replica contends for — so on a busy cluster the
+				// reserve can already be gone by the time the drain starts.
+				// Without this the pass would revoke nothing, every time,
+				// forever. Entry 0 may then fail on the spent deadline instead,
+				// which carries it forward and counts, rather than looking like
+				// a clean pass that did nothing.
+				if deadline, ok := ctx.Deadline(); ok && i > 0 && time.Until(deadline) < LockTimeout/2 {
+					// due[i:] has to be carried into the write-back below, not
+					// merely stepped over: the list is the only record that
+					// these certificates are owed a revocation, so a pass that
+					// wrote without them would erase exactly what it claimed to
+					// defer — and the pending gauge would fall as though they
+					// had been retired.
+					deferred = due[i:]
 					slog.Warn("Superseded-certificate sweep ran out of budget; deferring the rest "+
-						"to the next pass", "revoked", revoked, "deferred", deferred)
+						"to the next pass", "revoked", revoked, "deferred", len(deferred))
 					break
 				}
 				if _, ok := new(big.Int).SetString(e.Serial, 16); !ok {
@@ -353,7 +377,13 @@ func (c *CA) ReconcileSuperseded(ctx context.Context) (int, error) {
 				slog.Info("Revoked superseded certificate", "subject", e.Subject, "serial", e.Serial)
 			}
 		}()
-		if len(failed) > 0 || discarded > 0 {
+		// Deferrals count too. Once the entries survive the pass, a backlog the
+		// sweep cannot keep up with looks like a high pending gauge that never
+		// falls and nothing else — and the gauge's own guidance sends the
+		// operator to this counter. A pass that left certificates past their
+		// window unrevoked is the condition this counter exists to surface,
+		// whichever of the three reasons it was.
+		if len(failed) > 0 || len(deferred) > 0 || discarded > 0 {
 			c.supersedeFailures.Add(1)
 		}
 		// The drain may have spent most (or, on a deadline error, all) of ctx's
@@ -368,7 +398,14 @@ func (c *CA) ReconcileSuperseded(ctx context.Context) (int, error) {
 		// of its own.
 		writeCtx, cancelWrite := context.WithTimeout(context.WithoutCancel(ctx), LockTimeout/2)
 		defer cancelWrite()
-		return c.writeSuperseded(writeCtx, append(pending, failed...))
+		// Built explicitly rather than by chained appends: pending, failed and
+		// deferred each have their own backing array, and a chained append can
+		// write into one of them. Everything still owed a revocation goes back.
+		keep := make([]supersededEntry, 0, len(pending)+len(failed)+len(deferred))
+		keep = append(keep, pending...)
+		keep = append(keep, failed...)
+		keep = append(keep, deferred...)
+		return c.writeSuperseded(writeCtx, keep)
 	})
 	if err != nil {
 		// A pass that could not take the lock, could not read the list, or
@@ -384,19 +421,19 @@ func (c *CA) ReconcileSuperseded(ctx context.Context) (int, error) {
 	return revoked, err
 }
 
-// dropSupersededForSubjectLocked removes subject's pending entries from the
-// list and returns their serials, so the caller can revoke them in the same
-// pass. It is a no-op when the list is empty or names no such subject.
+// retireSupersededForSubjectLocked revokes every pending entry recorded for
+// subject, using revoke, and rewrites the list without the ones that succeeded.
+// It is a no-op when the list is empty or names no such subject.
 //
-// The cluster CRL lock and c.mu must both be held by the caller.
+// The cluster CRL lock and c.mu must both be held by the caller, which is what
+// lets revoke be revokeSerialLocked.
 //
 // Why revocation of a subject has to reach these: Revoke retires the subject's
 // *latest* serial and no other, so during an overlap window it retires the
 // replacement and leaves the certificate that replacement displaced valid —
 // with, on the re-key path, a private key of its own. An operator containing a
 // compromised node with `revoke --certname` would be told the node was revoked
-// while a second working credential for it stayed in circulation until the
-// sweep happened to catch up.
+// while a second working credential for it stayed in circulation.
 //
 // This is narrower than the open question revokeLocked's godoc scopes out
 // ("retiring every unexpired serial a subject holds ... is a change to what
@@ -405,39 +442,66 @@ func (c *CA) ReconcileSuperseded(ctx context.Context) (int, error) {
 // changes when it happens, not what revocation covers. A serial the subject
 // holds that was never superseded is still none of Revoke's business.
 //
+// Revoke-then-write, never write-then-revoke. An entry is removed from the list
+// only once its serial is on the CRL; one whose revocation failed stays
+// recorded so the sweep retries it. Pruning first would put a failed revocation
+// in the one state nothing recovers from — absent from the CRL and absent from
+// the only record that it is owed one — which is the same trap
+// ReconcileSuperseded's `failed` handling avoids.
+//
 // A read failure is counted and swallowed: the caller's own revocation has
 // either happened or is about to, and failing it because the pending list was
 // unreadable would turn a partial containment into no containment at all. The
 // entries stay on the list and the sweep still retires them.
-func (c *CA) dropSupersededForSubjectLocked(ctx context.Context, subject string) []string {
+func (c *CA) retireSupersededForSubjectLocked(ctx context.Context, subject string, revoke func(string) error) {
 	entries, _, err := c.readSuperseded(ctx)
 	if err != nil {
 		c.supersedeFailures.Add(1)
 		slog.Warn("Revoke: could not read pending supersessions for this subject; any predecessor "+
 			"inside its window stays valid until the sweep retires it", "subject", subject, "error", err)
-		return nil
+		return
 	}
-	var serials []string
+
+	var mine []supersededEntry
 	kept := make([]supersededEntry, 0, len(entries))
 	for _, e := range entries {
 		if e.Subject != subject {
 			kept = append(kept, e)
 			continue
 		}
-		serials = append(serials, e.Serial)
+		mine = append(mine, e)
 	}
-	if len(serials) == 0 {
-		return nil
+	if len(mine) == 0 {
+		return
+	}
+
+	var failed int
+	for _, e := range mine {
+		if err := revoke(e.Serial); err != nil {
+			// Kept, so the sweep retries it. Logged rather than returned: the
+			// revocation the caller asked for has not happened yet and must not
+			// be lost to a predecessor that could not be retired.
+			slog.Warn("Revoke: could not retire a superseded certificate for this subject; "+
+				"it stays a valid credential until the sweep retires it",
+				"subject", subject, "serial", e.Serial, "error", err)
+			kept = append(kept, e)
+			failed++
+			continue
+		}
+		slog.Info("Revoked superseded certificate alongside its subject",
+			"subject", subject, "serial", e.Serial)
+	}
+	if failed > 0 {
+		c.supersedeFailures.Add(1)
 	}
 	if err := c.writeSuperseded(ctx, kept); err != nil {
-		// Left on the list rather than dropped: the caller revokes them anyway,
-		// and a sweep re-revoking a listed serial is a no-op. Dropping them
-		// after a failed write would be the harmful direction.
+		// The revocations already landed on the CRL, so the cost of this is a
+		// list naming serials that are already revoked — which the sweep
+		// re-revokes as a no-op. Harmless, unlike the reverse ordering.
 		c.supersedeFailures.Add(1)
-		slog.Warn("Revoke: could not prune pending supersessions; the sweep will retry them",
+		slog.Warn("Revoke: could not prune pending supersessions; the sweep will re-check them",
 			"subject", subject, "error", err)
 	}
-	return serials
 }
 
 // PendingSupersessions returns the number of certificates currently recorded
@@ -484,9 +548,15 @@ func (c *CA) SupersedeFailures() uint64 {
 //
 // An unparseable list is treated as recoverable-then-empty, deliberately and
 // with a warning: whatever decoded before the failure is real, revocable
-// serials and is returned, while the rest is unrecoverable. Failing closed on
-// corrupt bytes would refuse renewals over a certificate that at worst stays
-// valid until it expires.
+// serials and is returned, while the rest is unrecoverable.
+//
+// That tolerance is scoped to the callers that *maintain* the list — the sweep
+// and subject revocation — which have work to do either way and would otherwise
+// stall on bytes only they can clear. The renewal path does not share it:
+// refuseIfSuperseded reads the same blob and refuses on a parse failure,
+// because an unparseable list may well have named the serial being presented
+// and admitting it is the one decision here that cannot be walked back. See
+// that function's godoc.
 //
 // The corrupt return says the bytes were unusable, as distinct from absent. A
 // caller that can write must overwrite them: an unparseable blob is not

@@ -124,21 +124,13 @@ func (c *CA) revokeLocked(ctx context.Context, subject string) error {
 	// Ahead of the subject's own serial, and best-effort. Any predecessor
 	// inside its overlap window is a second working credential for this
 	// subject, and containment means retiring it too — see
-	// dropSupersededForSubjectLocked. Doing it first means a subject whose
+	// retireSupersededForSubjectLocked. Doing it first means a subject whose
 	// inventory lookup below fails still loses its superseded credentials
 	// rather than none of them; each of these needs only the CRL, which is
-	// already locked. A failure per serial is logged and stepped over, because
-	// the revocation the caller asked for has not happened yet and must not be
-	// lost to a predecessor that could not be retired.
-	for _, serial := range c.dropSupersededForSubjectLocked(ctx, subject) {
-		if err := c.revokeSerialLocked(ctx, serial); err != nil {
-			slog.Warn("Revoke: could not retire a superseded certificate for this subject; "+
-				"it stays a valid credential", "subject", subject, "serial", serial, "error", err)
-			continue
-		}
-		slog.Info("Revoked superseded certificate alongside its subject",
-			"subject", subject, "serial", serial)
-	}
+	// already locked.
+	c.retireSupersededForSubjectLocked(ctx, subject, func(serial string) error {
+		return c.revokeSerialLocked(ctx, serial)
+	})
 
 	serialStr, err := c.findSerialForSubject(ctx, subject)
 	if err != nil {
