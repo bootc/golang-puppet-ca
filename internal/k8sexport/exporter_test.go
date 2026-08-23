@@ -403,4 +403,118 @@ var _ = Describe("Exporter", func() {
 		_, err := client.CoreV1().Secrets("").Get(ctx, "trust", metav1.GetOptions{})
 		Expect(err).To(HaveOccurred()) // never created
 	})
+	// The bug this guards: ExportAll used to return as soon as a material read
+	// failed, before the per-target loop. recordApply then never ran, so no
+	// per-target series was written — and every arm of
+	// PuppetCAKubernetesExportFailing has
+	// puppetca_k8s_export_last_error_timestamp_seconds on the left, so with no
+	// series neither arm could fire. One transient storage blip left every
+	// target holding a stale CA certificate or CRL with nothing alerting.
+	It("still records a per-target error metric when a material cannot be read", func() {
+		cfg := &k8sexport.Config{Targets: []k8sexport.Target{
+			{Kind: "Secret", Metadata: k8sexport.Metadata{Name: "trust", Namespace: "ns1"}, CRL: true},
+			{Kind: "ConfigMap", Metadata: k8sexport.Metadata{Name: "bundle", Namespace: "ns2"}, CRL: true},
+		}}
+		mustValidate(cfg)
+
+		src.crlErr = context.DeadlineExceeded
+		reg := prometheus.NewRegistry()
+		exp := k8sexport.New(client, *cfg, src, "", k8sexport.NewMetrics(reg))
+
+		err := exp.ExportAll(ctx)
+		// Every target is named, not just the first: the read failed once but
+		// it is attributed to each target that asked for that material.
+		Expect(err).To(MatchError(ContainSubstring("Secret/trust: reading CRL")))
+		Expect(err).To(MatchError(ContainSubstring("ConfigMap/bundle: reading CRL")))
+
+		for _, want := range []struct{ kind, ns, name string }{
+			{"Secret", "ns1", "trust"},
+			{"ConfigMap", "ns2", "bundle"},
+		} {
+			labels := map[string]string{"kind": want.kind, "namespace": want.ns, "name": want.name}
+
+			v, found := metricValue(reg, "puppetca_k8s_export_last_error_timestamp_seconds", labels)
+			Expect(found).To(BeTrue(),
+				"no last_error series for %s/%s: the alert cannot fire", want.kind, want.name)
+			Expect(v).To(BeNumerically(">", 0))
+
+			counted := map[string]string{
+				"kind": want.kind, "namespace": want.ns, "name": want.name, "result": "error",
+			}
+			v, found = metricValue(reg, "puppetca_k8s_export_applies_total", counted)
+			Expect(found).To(BeTrue())
+			Expect(v).To(Equal(1.0))
+		}
+	})
+
+	It("fails only the targets that asked for the material that could not be read", func() {
+		// A cert read failure must not take down a CRL-only target. Before the
+		// fix a single unreadable material aborted the whole cycle, so a target
+		// that never wanted it was silenced too.
+		cfg := &k8sexport.Config{Targets: []k8sexport.Target{
+			{Kind: "Secret", Metadata: k8sexport.Metadata{Name: "certonly", Namespace: "ns1"}, Cert: true},
+			{Kind: "ConfigMap", Metadata: k8sexport.Metadata{Name: "crlonly", Namespace: "ns1"}, CRL: true},
+		}}
+		mustValidate(cfg)
+
+		src.certErr = context.DeadlineExceeded
+		reg := prometheus.NewRegistry()
+		exp := k8sexport.New(client, *cfg, src, "", k8sexport.NewMetrics(reg))
+
+		err := exp.ExportAll(ctx)
+		Expect(err).To(MatchError(ContainSubstring("Secret/certonly: reading CA certificate")))
+		Expect(err).NotTo(MatchError(ContainSubstring("crlonly")))
+
+		// The CRL-only target was applied for real, with the CRL it asked for.
+		cm, getErr := client.CoreV1().ConfigMaps("ns1").Get(ctx, "crlonly", metav1.GetOptions{})
+		Expect(getErr).NotTo(HaveOccurred())
+		Expect(cm.Data).To(HaveKeyWithValue("ca.crl", "CRL-PEM"))
+
+		// ...and the cert-only target was not, so nothing empty was published.
+		_, getErr = client.CoreV1().Secrets("ns1").Get(ctx, "certonly", metav1.GetOptions{})
+		Expect(getErr).To(HaveOccurred())
+
+		v, found := metricValue(reg, "puppetca_k8s_export_last_success_timestamp_seconds",
+			map[string]string{"kind": "ConfigMap", "namespace": "ns1", "name": "crlonly"})
+		Expect(found).To(BeTrue())
+		Expect(v).To(BeNumerically(">", 0))
+
+		_, found = metricValue(reg, "puppetca_k8s_export_last_error_timestamp_seconds",
+			map[string]string{"kind": "ConfigMap", "namespace": "ns1", "name": "crlonly"})
+		Expect(found).To(BeFalse())
+	})
+
+	It("creates apply counters at zero for every target before the first export", func() {
+		// Prometheus omits a child that was never touched, so an exporter that
+		// records nothing at all looks exactly like one that is not configured.
+		// Pre-creating these gives PuppetCAKubernetesExportNotRunning a series
+		// to match on. The timestamp gauges must stay absent — see initTargets.
+		cfg := &k8sexport.Config{Targets: []k8sexport.Target{
+			{Kind: "Secret", Metadata: k8sexport.Metadata{Name: "trust"}, Cert: true},
+		}}
+		mustValidate(cfg)
+
+		reg := prometheus.NewRegistry()
+		_ = k8sexport.New(client, *cfg, src, "pod-ns", k8sexport.NewMetrics(reg))
+
+		// The resolved default namespace is used, matching what recordApply
+		// will later label the same series with.
+		for _, result := range []string{"success", "error"} {
+			v, found := metricValue(reg, "puppetca_k8s_export_applies_total", map[string]string{
+				"kind": "Secret", "namespace": "pod-ns", "name": "trust", "result": result,
+			})
+			Expect(found).To(BeTrue(), "applies_total{result=%q} was not pre-created", result)
+			Expect(v).To(Equal(0.0))
+		}
+
+		for _, name := range []string{
+			"puppetca_k8s_export_last_success_timestamp_seconds",
+			"puppetca_k8s_export_last_error_timestamp_seconds",
+		} {
+			_, found := metricValue(reg, name, map[string]string{
+				"kind": "Secret", "namespace": "pod-ns", "name": "trust",
+			})
+			Expect(found).To(BeFalse(), "%s must stay absent until something happens", name)
+		}
+	})
 })

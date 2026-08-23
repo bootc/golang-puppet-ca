@@ -20,10 +20,23 @@ package main
 import (
 	"context"
 	"log/slog"
+	"time"
 
 	"github.com/voxpupuli/openvox-ca/internal/ca"
 	"github.com/voxpupuli/openvox-ca/internal/k8sexport"
 )
+
+// k8sExportRetryInterval is how long a failed export cycle waits before it is
+// retried. Exports are otherwise driven only by startup and CRL updates, which
+// on a low-churn CA can be weeks apart, so without a retry a single transient
+// storage or API-server error leaves every target holding a stale CA
+// certificate or CRL until the CRL next changes.
+//
+// Two minutes sits well inside k8sExportFailingFor (15m), the debounce on
+// PuppetCAKubernetesExportFailing: a cycle that recovers on the first retry
+// resolves before the alert would have paged, while one that keeps failing
+// keeps re-stamping last_error and stays firing.
+const k8sExportRetryInterval = 2 * time.Minute
 
 // runK8sExporter publishes the CA certificate and CRL into the configured
 // Kubernetes Secrets/ConfigMaps. It exports once at startup (reconciling state
@@ -31,14 +44,36 @@ import (
 // the CRL is updated (revoke, reissue, background refresh, or expired-cert
 // cleanup), so CRL-bearing objects stay current.
 //
+// A cycle in which any target failed is retried after retryInterval, and keeps
+// being retried until one succeeds completely. The CRL-update signal alone is
+// not enough: it can be weeks away on a quiet CA, which would leave a target
+// stale for that long after a momentary failure.
+//
 // It runs in the frontend process, reading the cert/CRL through the storage
 // service. Export failures are logged and swallowed: the export is auxiliary
-// and must never take down the CA. A subsequent CRL update — or a restart —
-// retries. It returns when ctx is cancelled (i.e. on shutdown).
-func runK8sExporter(ctx context.Context, c *ca.CA, exporter *k8sexport.Exporter) {
-	slog.Info("Starting Kubernetes export job")
+// and must never take down the CA. It returns when ctx is cancelled (i.e. on
+// shutdown).
+func runK8sExporter(ctx context.Context, c *ca.CA, exporter *k8sexport.Exporter, retryInterval time.Duration) {
+	slog.Info("Starting Kubernetes export job", "retry_interval", retryInterval)
 
-	exportK8sOnce(ctx, exporter)
+	// Created disarmed; armed only while the last cycle failed. Go 1.23+ timer
+	// semantics mean Stop and Reset need no channel drain, and a fire that
+	// races with Stop cannot be received afterwards.
+	retry := time.NewTimer(retryInterval)
+	retry.Stop()
+	defer retry.Stop()
+
+	// runCycle exports once and re-arms (or disarms) the retry timer to match
+	// the outcome, so a recovered cycle stops retrying and a still-failing one
+	// keeps going.
+	runCycle := func() {
+		retry.Stop()
+		if !exportK8sOnce(ctx, exporter) {
+			retry.Reset(retryInterval)
+		}
+	}
+
+	runCycle()
 
 	for {
 		select {
@@ -47,17 +82,22 @@ func runK8sExporter(ctx context.Context, c *ca.CA, exporter *k8sexport.Exporter)
 			return
 		case <-c.CRLUpdated():
 			slog.Debug("CRL updated, re-exporting to Kubernetes")
-			exportK8sOnce(ctx, exporter)
+			runCycle()
+		case <-retry.C:
+			slog.Debug("Retrying failed Kubernetes export cycle")
+			runCycle()
 		}
 	}
 }
 
-// exportK8sOnce runs a single reconcile, logging the outcome. Per-target errors
-// are already logged by ExportAll; here we log only that the cycle had failures.
-func exportK8sOnce(ctx context.Context, exporter *k8sexport.Exporter) {
+// exportK8sOnce runs a single reconcile, logging the outcome, and reports
+// whether every target succeeded. Per-target errors are already logged by
+// ExportAll; here we log only that the cycle had failures.
+func exportK8sOnce(ctx context.Context, exporter *k8sexport.Exporter) bool {
 	if err := exporter.ExportAll(ctx); err != nil {
 		slog.Warn("Kubernetes export cycle completed with errors", "error", err)
-		return
+		return false
 	}
 	slog.Debug("Kubernetes export cycle complete")
+	return true
 }

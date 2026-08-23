@@ -64,6 +64,35 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 	return m
 }
 
+// initTargets creates the applies_total children for every configured target,
+// at zero, before the first export runs. A nil receiver (metrics disabled) is a
+// no-op.
+//
+// Prometheus omits a child that has never been touched, so without this an
+// exporter that records nothing at all — a wedged goroutine, or a regression
+// that returns from ExportAll before the per-target loop — is indistinguishable
+// from an exporter that is not configured. Both look like "no series", and
+// every arm of PuppetCAKubernetesExportFailing needs a series to match on.
+// Pre-creating these at zero gives PuppetCAKubernetesExportNotRunning something
+// to alert on: the target is configured, the process is up, and no apply has
+// ever been attempted.
+//
+// Only applies_total is pre-created. The last_success/last_error gauges must
+// stay absent until something actually happens: initialising them to zero would
+// make last_error{...} unless last_success{...} match nothing, silencing the
+// arm that catches a target which has never succeeded.
+func (m *Metrics) initTargets(targets []Target, namespaceFor func(*Target) string) {
+	if m == nil {
+		return
+	}
+	for i := range targets {
+		t := &targets[i]
+		ns := namespaceFor(t)
+		m.applies.WithLabelValues(t.Kind, ns, t.Metadata.Name, "success")
+		m.applies.WithLabelValues(t.Kind, ns, t.Metadata.Name, "error")
+	}
+}
+
 // recordApply counts one apply attempt for a target in the given (resolved)
 // namespace. A nil receiver (metrics disabled) is a no-op.
 func (m *Metrics) recordApply(t *Target, namespace string, err error) {

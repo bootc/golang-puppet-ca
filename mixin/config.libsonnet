@@ -68,6 +68,14 @@
     // succeeds; 'for' only debounces a failure that is corrected moments later.
     k8sExportFailingFor: '15m',
 
+    // A configured target the exporter has never attempted at all — the gap
+    // that the alert above, which needs an apply result to match on, cannot
+    // see. The apply counters reset on restart and the startup export runs
+    // straight away, so this only has to outlast a slow start (a large target
+    // list, a slow API server); 30m leaves plenty of room without letting a
+    // wedged export job sit unreported for hours.
+    k8sExportNotRunningFor: '30m',
+
     // 'for' durations applied to the expiry alerts to debounce flapping at the
     // threshold boundary.
     expiryFor: '1h',

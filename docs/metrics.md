@@ -213,13 +213,28 @@ configured target (cardinality is bounded by the configuration).
 | `puppetca_k8s_export_last_success_timestamp_seconds` | `kind`, `namespace`, `name` | Time of the last successful apply for each target. |
 | `puppetca_k8s_export_last_error_timestamp_seconds` | `kind`, `namespace`, `name` | Time of the last failed apply for each target. |
 
-> Exports are event-driven (startup and CRL updates) and can be days apart on a
-> quiet CA, so alert by comparing `last_error` against `last_success` (the
-> mixin's `PuppetCAKubernetesExportFailing` does this) rather than with rate
-> windows or staleness thresholds, which misbehave between sparse attempts. A
-> cycle that fails before any target is applied — the cert/CRL cannot be read
-> from storage — touches none of these series, but storage failures already
-> trip `PuppetCAScrapeFailing` via `puppetca_collector_scrape_success`.
+> Exports are event-driven (startup, CRL updates, and a retry a couple of
+> minutes after a failed cycle) and can be days apart on a quiet CA, so alert by
+> comparing `last_error` against `last_success` (the mixin's
+> `PuppetCAKubernetesExportFailing` does this) rather than with rate windows or
+> staleness thresholds, which misbehave between sparse attempts.
+
+Every configured target gets a result recorded on every cycle, including one
+where the CA certificate or CRL could not be read from storage: such a read
+fails the targets that asked for that material and leaves the rest alone. This
+matters for alerting, because `PuppetCAKubernetesExportFailing` has
+`last_error` on the left of both its arms and so can only speak about targets
+that have a series at all.
+
+The two `applies_total` children of each target are created at zero when the
+exporter is constructed, before the first cycle runs. Without that, a target
+that is configured but never attempted — a wedged export job — would be an
+absent series, indistinguishable from a target that is not configured, and no
+threshold can match an absence. The mixin's
+`PuppetCAKubernetesExportNotRunning` alerts on that zero. The timestamp gauges
+are deliberately *not* pre-created: a `last_success` at zero would silence the
+arm of `PuppetCAKubernetesExportFailing` that catches a target which has never
+succeeded.
 
 ## Example queries
 
@@ -242,6 +257,11 @@ puppetca_k8s_export_last_error_timestamp_seconds
 or
 puppetca_k8s_export_last_error_timestamp_seconds
   unless puppetca_k8s_export_last_success_timestamp_seconds
+
+# Kubernetes export targets configured but never attempted
+sum by (job, instance, kind, namespace, name) (
+  puppetca_k8s_export_applies_total
+) == 0
 
 # Replicas enforcing a CRL behind the stored one (see below)
 puppetca_crl_number - puppetca_crl_cached_number > 0

@@ -150,8 +150,17 @@ resources to the minimum above.
   (e.g. openvox-ca is not running in a cluster, or the namespace cannot be
   resolved), the error is logged and the CA continues serving normally.
 - A failure applying one target is logged and does not prevent the other targets
-  from being applied. Transient failures are retried on the next CRL update, or
-  on the next restart.
+  from being applied.
+- A cert or CRL that cannot be read from storage fails only the targets that
+  asked for that material: a CRL-only target is still applied when the CA
+  certificate read fails, and vice versa. Every target still gets a result
+  recorded either way, which is what the alerting below depends on.
+- A cycle in which any target failed is retried two minutes later, and keeps
+  being retried until one succeeds completely. Without that, the next attempt
+  would wait for the next CRL update, which on a low-churn CA can be weeks —
+  long enough for a momentary storage blip to leave every target holding a stale
+  CA certificate or CRL. The interval sits inside the mixin's fifteen-minute
+  alert debounce, so a failure that recovers on retry never pages.
 - Configuration is validated at startup; an invalid `kubernetes_export` block
   (bad `kind`, a `type` on a ConfigMap, neither `cert` nor `crl`, colliding
   keys, …) stops the server with a clear error.
@@ -165,6 +174,13 @@ recent outcomes. Because export failures are only logged, alerting on these
 series is the recommended way to catch a target that persistently fails; the
 [monitoring mixin](../mixin/) ships a `PuppetCAKubernetesExportFailing` alert
 that fires while a target's most recent apply attempt failed.
+
+That alert matches on the `last_error` gauge, so it can only report on a target
+the CA has recorded a result for. The mixin pairs it with
+`PuppetCAKubernetesExportNotRunning`, which fires when a configured target's
+`applies_total` has stayed at zero — the export job never started, or never got
+as far as attempting anything. Deploy both: on their own, either leaves a way
+for the export to go stale silently.
 
 ## Limitations
 

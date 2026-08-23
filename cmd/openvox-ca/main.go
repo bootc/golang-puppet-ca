@@ -751,7 +751,7 @@ func newRootCmd() *cobra.Command {
 				if err != nil {
 					slog.Error("Kubernetes export disabled: failed to initialise client", "error", err)
 				} else {
-					go runK8sExporter(ctx, myCA, k8sExporter)
+					go runK8sExporter(ctx, myCA, k8sExporter, k8sExportRetryInterval)
 				}
 			}
 

@@ -60,7 +60,11 @@ type Exporter struct {
 // that do not set their own; it may be empty if every target sets a namespace.
 // m may be nil to disable instrumentation.
 func New(client kubernetes.Interface, cfg Config, src MaterialSource, defaultNS string, m *Metrics) *Exporter {
-	return &Exporter{client: client, cfg: cfg, src: src, defaultNS: defaultNS, metrics: m}
+	e := &Exporter{client: client, cfg: cfg, src: src, defaultNS: defaultNS, metrics: m}
+	// Create the apply counters at zero now, so "configured but never
+	// attempted" is a visible series rather than an absence. See initTargets.
+	m.initTargets(e.cfg.Targets, e.namespaceFor)
+	return e
 }
 
 // NewInCluster builds an Exporter using in-cluster ServiceAccount credentials,
@@ -99,16 +103,30 @@ func (c *Config) needsDefaultNamespace() bool {
 // reads each material at most once. A failure applying one target is logged and
 // collected but does not prevent the others from being applied; the joined error
 // (or nil) is returned.
+//
+// A material that cannot be read fails only the targets that asked for it. The
+// per-target loop always runs, so every target records a metric on every cycle
+// whatever happened upstream. That is load-bearing rather than tidiness: the
+// shipped PuppetCAKubernetesExportFailing alert has
+// puppetca_k8s_export_last_error_timestamp_seconds on the left of both its
+// arms, so a cycle that returns before recordApply writes no series and the
+// alert cannot fire. Returning early here turns a storage blip into every
+// target silently holding a stale CA certificate or CRL, indefinitely.
 func (e *Exporter) ExportAll(ctx context.Context) error {
-	certPEM, crlPEM, err := e.fetchMaterials(ctx)
-	if err != nil {
-		return err
-	}
+	mats := e.fetchMaterials(ctx)
 
 	var errs []error
 	for i := range e.cfg.Targets {
 		t := &e.cfg.Targets[i]
-		err := e.applyTarget(ctx, t, certPEM, crlPEM)
+		// A material this target requested could not be read: fail the target
+		// with that error rather than calling the API server with material we
+		// know is missing. applyTarget would refuse it anyway, but reporting
+		// "refusing to export an empty CRL" would name the symptom instead of
+		// the read failure that caused it.
+		err := mats.forTarget(t)
+		if err == nil {
+			err = e.applyTarget(ctx, t, mats.certPEM, mats.crlPEM)
+		}
 		e.metrics.recordApply(t, e.namespaceFor(t), err)
 		if err != nil {
 			slog.Warn("Kubernetes export failed for target",
@@ -122,27 +140,52 @@ func (e *Exporter) ExportAll(ctx context.Context) error {
 	return errors.Join(errs...)
 }
 
+// materials holds one cycle's cert and CRL PEM alongside the error from reading
+// each. Read errors are carried per material rather than returned, so a cert
+// that cannot be read does not fail a CRL-only target — and, more importantly,
+// does not skip the per-target loop that writes the export metrics.
+type materials struct {
+	certPEM []byte
+	certErr error
+	crlPEM  []byte
+	crlErr  error
+}
+
+// forTarget returns the read error that should fail t, or nil if every material
+// t asked for was read. A target that requested both materials reports the cert
+// failure first; the joined per-target error names the target either way.
+func (m *materials) forTarget(t *Target) error {
+	if t.Cert && m.certErr != nil {
+		return m.certErr
+	}
+	if t.CRL && m.crlErr != nil {
+		return m.crlErr
+	}
+	return nil
+}
+
 // fetchMaterials reads the cert and CRL PEM, fetching each only if some target
-// requires it.
-func (e *Exporter) fetchMaterials(ctx context.Context) (certPEM, crlPEM []byte, err error) {
+// requires it. It never fails the cycle: a read error is recorded against the
+// material it belongs to and attributed to targets by materials.forTarget.
+func (e *Exporter) fetchMaterials(ctx context.Context) materials {
 	var wantCert, wantCRL bool
 	for i := range e.cfg.Targets {
 		wantCert = wantCert || e.cfg.Targets[i].Cert
 		wantCRL = wantCRL || e.cfg.Targets[i].CRL
 	}
+
+	var m materials
 	if wantCert {
-		certPEM, err = e.src.GetCACert(ctx)
-		if err != nil {
-			return nil, nil, fmt.Errorf("reading CA certificate for export: %w", err)
+		if m.certPEM, m.certErr = e.src.GetCACert(ctx); m.certErr != nil {
+			m.certErr = fmt.Errorf("reading CA certificate for export: %w", m.certErr)
 		}
 	}
 	if wantCRL {
-		crlPEM, err = e.src.GetCRL(ctx)
-		if err != nil {
-			return nil, nil, fmt.Errorf("reading CRL for export: %w", err)
+		if m.crlPEM, m.crlErr = e.src.GetCRL(ctx); m.crlErr != nil {
+			m.crlErr = fmt.Errorf("reading CRL for export: %w", m.crlErr)
 		}
 	}
-	return certPEM, crlPEM, nil
+	return m
 }
 
 // namespaceFor returns the namespace a target should be applied to: its own, or
