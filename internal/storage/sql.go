@@ -19,11 +19,13 @@ package storage
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"database/sql"
+	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
-	"hash/fnv"
 	"io/fs"
 	"log/slog"
 	"net/url"
@@ -780,9 +782,10 @@ func sqliteFilePath(dsn string) (string, bool) {
 }
 
 // acquirePostgresLock takes a session-level PostgreSQL advisory lock on a
-// dedicated connection. The lock name is hashed to the bigint key
-// pg_advisory_lock requires; lock and unlock must run on the same session, so
-// the connection is held until Unlock. A process-local mutex serialises
+// dedicated connection. The lock name is mapped to the bigint key
+// pg_advisory_lock requires by advisoryLockKey, whose key space is partitioned
+// so a caller-supplied name cannot reach a singleton lock's key. Lock and
+// unlock must run on the same session, so the connection is held until Unlock. A process-local mutex serialises
 // in-process callers first so they do not each tie up a connection blocked in
 // pg_advisory_lock. pg_advisory_lock itself blocks until granted or the context
 // is cancelled.
@@ -816,13 +819,116 @@ func (b *SQLBackend) localLockFor(name string) *sync.Mutex {
 	return v.(*sync.Mutex)
 }
 
-// advisoryLockKey hashes a lock name to the int64 key that PostgreSQL's
-// pg_advisory_lock family requires. FNV-1a gives a stable mapping across
-// processes and replicas, which is what matters for cross-node coordination.
+// reservedLockOrdinals assigns an ordinal to each cluster-wide singleton lock
+// name that can reach a SQL backend, taking those names out of the hashed key
+// space entirely. Only names in this table can ever land in the reserved half;
+// every other name is hashed into the derived half (see advisoryLockKey).
+//
+// The scope is deliberately "can reach a SQL backend" rather than "is a
+// singleton": etcdDecomposeLockName ("inventory-decompose") is a cluster-wide
+// singleton too, but only EtcdBackend ever takes it, so reserving it here would
+// claim a key nothing uses.
+//
+// These are protocol, in the same sense as the lock names themselves: every
+// replica must derive the same key or they will not exclude one another, so an
+// assigned ordinal may never be reused or renumbered. Append only.
+//
+// Two of the three names deliberately duplicate the CA-layer constants in
+// internal/ca/init.go rather than importing them — internal/storage must not
+// depend on internal/ca — exactly as migrateLockName already redefines
+// "bootstrap". SQLReservedLockKeys pins this end of that duplication; the other
+// end is rule 7 of docs/development/locking.md, which makes registering a new
+// singleton part of adding one.
+//
+// For names declared in *this* package the obligation is enforced rather than
+// merely documented: SQLLockNameConstantsAreRegistered walks the package source
+// for lock-name constants and requires each to be reserved here or listed as
+// deliberately exempt. That check exists because the previous version of it
+// asserted the two constants that happened to exist when it was written, under
+// a comment claiming every singleton was covered — so a third one was added and
+// nothing failed. CA-layer names remain covered by rule 7 alone, since
+// internal/storage cannot import internal/ca to enumerate them.
+//
+// Forgetting to register one is in any case not a security regression. An
+// unregistered name simply stays in the derived half, where the partition still
+// keeps it away from every reserved key; it merely forfeits the guarantee of
+// not aliasing some *other* derived name, at 2^-63.
+var reservedLockOrdinals = map[string]int64{
+	"bootstrap":          1,
+	"crl":                2,
+	"sql-schema-migrate": 3, // lockNameSQLMigrate, this package's own singleton
+	// hmac-key is a forward reservation for #202/#261, which adds
+	// lockNameHMACKey and takes it through StorageService.WithLock — so it
+	// reaches every backend including SQL and qualifies under the rule above.
+	// Reserved here rather than there because SQLReservedLockKeys pins this map
+	// with an exact match, so registering it from the other branch would mean
+	// editing this branch's spec; doing it here leaves that branch nothing to
+	// do. Until it lands, this is an ordinal with no caller, which costs one
+	// integer out of 2^32 and cannot collide with anything: the table is
+	// append-only, so 4 is spent either way.
+	//
+	// The literal is verified, not guessed, because an append-only table cannot
+	// take back a wrong spelling: #261 declares `const lockNameHMACKey =
+	// "hmac-key"` (storage.go) and its owner confirmed the name is final before
+	// landing. Note the near-miss: `hmac_key` with an underscore is the storage
+	// *blob* key for the same state (see the table in
+	// docs/development/locking.md) and is a different string from the lock name.
+	"hmac-key": 4,
+}
+
+// reservedLockKeyBase namespaces the reserved half of the key space. Advisory
+// locks are database-scoped, not application-scoped: every client of the same
+// PostgreSQL database shares one pg_advisory_lock key space, and a bare ordinal
+// of 1 or 2 is exactly what a co-tenant's migration tool or hand-rolled
+// singleton job would pick. Landing on the same key as one would stall every
+// CRL rewrite for lockTimeout, and stall EnsureReady's migration lock
+// indefinitely — the harm #203 is about, reached from the other direction. The
+// old FNV-1a keys got this property by accident, being pseudorandom; the
+// partition has to ask for it.
+//
+// "ovca" in the high 32 bits, which leaves bit 63 clear (0x6f < 0x80) and so
+// keeps the reserved half on the correct side of the partition, with the low 32
+// bits free for ordinals. A literal rather than a digest of lockKeyDomain on
+// purpose: deriving it would tie every reserved key to that string, so editing
+// a comment-adjacent constant would silently become a protocol break.
+const reservedLockKeyBase int64 = 0x6f76_6361_0000_0000
+
+// lockKeyDomain prefixes the digest input so a lock key cannot be confused with
+// any other SHA-256 this package derives from a caller-supplied string (the
+// same-host lock filename in fileLockFileName is the one that matters).
+const lockKeyDomain = "openvox-ca/sql-advisory-lock/v1\x00"
+
+// advisoryLockKey maps a lock name to the int64 key that PostgreSQL's
+// pg_advisory_lock family requires. The 64-bit key space is partitioned so that
+// a hashed name can never collide with a singleton lock:
+//
+//	bit 63 clear — reserved: reservedLockKeyBase | the name's ordinal from
+//	                         reservedLockOrdinals.
+//	bit 63 set   — derived:  the leading 64 bits of SHA-256 over the
+//	                         domain-separated name, with bit 63 forced set.
+//
+// A subject lock is never in reservedLockOrdinals, so it is always derived and
+// always has bit 63 set; "crl" and "bootstrap" are always reserved and never
+// do. Nothing a caller can supply bridges the two halves, which makes the
+// cross-lock aliasing of #203 structurally impossible rather than merely
+// unlikely — ValidateSubject is no longer load-bearing for it.
+//
+// Within the derived half two distinct names still share a key with birthday
+// probability over 63 bits; that is the floor pg_advisory_lock's bigint key
+// imposes and no derivation can beat it. What changes is that finding such a
+// pair is now a search against SHA-256 rather than against FNV-1a, whose
+// per-byte step is invertible and so admits a meet-in-the-middle preimage on a
+// chosen target. Two aliasing subject locks cost each other contention; a
+// subject aliasing "crl" cost a denial of revocation, and that is the half the
+// partition removes.
 func advisoryLockKey(name string) int64 {
-	h := fnv.New64a()
-	_, _ = h.Write([]byte(name))
-	return int64(h.Sum64()) //nolint:gosec // G115: advisory-lock hash; the bit pattern is the identity, not a magnitude, so signed wraparound is intentional and safe
+	if ordinal, ok := reservedLockOrdinals[name]; ok {
+		return reservedLockKeyBase | ordinal
+	}
+	sum := sha256.Sum256([]byte(lockKeyDomain + name))
+	// The leading 64 bits of the digest, with bit 63 forced set to tag the
+	// derived half; the remaining 63 carry the digest.
+	return int64(binary.BigEndian.Uint64(sum[:8]) | 1<<63) //nolint:gosec // G115: the bit pattern is the lock identity, not a magnitude, so the wrap to a negative bigint is intentional (and is what marks the derived half)
 }
 
 // pgUnlocker releases a PostgreSQL advisory lock on the same connection that
@@ -847,8 +953,8 @@ func (u *pgUnlocker) Unlock() error {
 
 // acquireMySQLLock takes a named MySQL/MariaDB lock via GET_LOCK on a dedicated
 // connection (GET_LOCK is session-scoped, so lock and release must share one
-// connection). The lock name is hashed to a short, stable string to stay within
-// MySQL's 64-character GET_LOCK name limit. GET_LOCK is polled with a 1-second
+// connection). The lock name is mapped to a short, stable, partitioned
+// identifier by mysqlLockName, within MySQL's 64-character GET_LOCK name limit. GET_LOCK is polled with a 1-second
 // server-side wait so caller-context cancellation is honoured between attempts;
 // a process-local mutex serialises in-process callers first.
 func (b *SQLBackend) acquireMySQLLock(ctx context.Context, name string) (Unlocker, error) {
@@ -890,11 +996,48 @@ func (b *SQLBackend) acquireMySQLLock(ctx context.Context, name string) (Unlocke
 	}
 }
 
-// mysqlLockName maps a lock name to a stable, short identifier within MySQL's
-// 64-character GET_LOCK name limit.
+// mysqlLockName maps a lock name to a stable identifier within MySQL's
+// 64-character GET_LOCK name limit, partitioned on the same principle as
+// advisoryLockKey but with room to be stricter:
+//
+//	openvox-ca:0:<name>     reserved: the singleton name, spelled out.
+//	openvox-ca:1:<32 hex>   derived:  SHA-256 of the domain-separated name,
+//	                                  truncated to 128 bits.
+//
+// The class tag is the character between the two colons, so the two forms are
+// disjoint whatever the name contains and a subject lock can never name the
+// "crl" or "bootstrap" lock. Reserved names are spelled out rather than hashed
+// because the set is closed and short, and a legible name is worth having in
+// performance_schema.metadata_locks when diagnosing a stuck lock;
+// SQLMySQLLockName pins every form inside mysqlLockNameLimit.
+//
+// The derived form carries 128 bits rather than the 63 advisoryLockKey is
+// limited to, which puts a collision between two derived names out of reach
+// too, not merely a collision across the partition. GET_LOCK takes a string, so
+// unlike pg_advisory_lock there is no reason to spend the extra entropy.
 func mysqlLockName(name string) string {
-	return fmt.Sprintf("openvox-ca:%016x", uint64(advisoryLockKey(name))) //nolint:gosec // G115: re-reads the same advisory-lock bit pattern as an unsigned value for hex formatting; no magnitude semantics
+	if _, ok := reservedLockOrdinals[name]; ok {
+		return mysqlLockPrefix + "0:" + name
+	}
+	sum := sha256.Sum256([]byte(lockKeyDomain + name))
+	return mysqlLockPrefix + "1:" + hex.EncodeToString(sum[:16])
 }
+
+// mysqlLockPrefix namespaces every GET_LOCK name this process takes, so
+// openvox-ca cannot collide with another application sharing the server.
+//
+// It separates openvox-ca from other applications and no further: GET_LOCK
+// names are scoped to the server instance rather than to a schema, so two
+// independent openvox-ca deployments pointed at different databases on one
+// MySQL server take the same names and do exclude each other. That is
+// unchanged from the previous scheme, which was equally server-global, and
+// docs/storage-backends.md tells operators not to share a server that way.
+const mysqlLockPrefix = "openvox-ca:"
+
+// mysqlLockNameLimit is MySQL's maximum GET_LOCK name length. Every name
+// mysqlLockName produces must fit: the derived form is fixed-width and the
+// reserved forms are a closed set, so this is checkable rather than hopeful.
+const mysqlLockNameLimit = 64
 
 // mysqlUnlocker releases a GET_LOCK on the same connection that acquired it,
 // then returns the connection to the pool and releases the process-local mutex.

@@ -724,6 +724,20 @@ Worth knowing before you upgrade:
   deployments (`persistence.enabled: false`) derive RollingUpdate and roll
   without one. To keep Recreate there, set `strategy: {type: Recreate}`
   explicitly.
+- **Upgrading a SQL-backed deployment that is on RollingUpdate, across the
+  advisory-lock change**, needs `strategy: {type: Recreate}` for that one
+  upgrade, or a scale to zero and back. The PostgreSQL/MySQL lock-key
+  derivation changed, so old and new pods do not exclude one another while
+  both are running — and because the derived RollingUpdate sets
+  `maxUnavailable: 0`, it surges the new pod alongside the old one even at
+  `replicaCount: 1`. One replica is not enough to avoid this. If you take the
+  `strategy` route, clear it again afterwards — remove the key from your
+  values file, or `--set strategy=null` — because
+  `--reset-then-reuse-values` reapplies your overrides on every later
+  upgrade, so a pin set once keeps costing you the Recreate outage the bullet
+  above says you had escaped. Scaling to zero and back leaves no such
+  residue. See the note in
+  [storage backends](storage-backends.md#sql-backends).
 - The pods carry a checksum of the rendered config, so a change to `config`
   restarts them even though the Deployment's pod template is otherwise
   unchanged. Set `configChecksumAnnotation: false` if you would rather manage

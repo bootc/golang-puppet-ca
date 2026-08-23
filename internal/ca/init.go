@@ -36,6 +36,15 @@ import (
 // Named lock identifiers used with StorageService.WithLock. These names
 // are stable across releases since every replica must agree on them for
 // the cross-node coordination to work.
+//
+// Adding a *singleton* name here means adding it to reservedLockOrdinals in
+// internal/storage/sql.go as well. That table is what keeps the singleton locks
+// out of the hashed half of the SQL advisory-lock key space, so an unreserved
+// singleton silently forfeits the guarantee that no other lock name can alias
+// it. See rule 7 and rule 11 of docs/development/locking.md.
+//
+// A subject lock needs no registration: lockSubjectPrefix is precisely what
+// keeps it in the hashed half, where it belongs.
 const (
 	lockNameBootstrap = "bootstrap"
 	lockNameCRL       = "crl"

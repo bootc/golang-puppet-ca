@@ -292,15 +292,24 @@ Lock names, holders, and ordering are documented in
   connection the work inside it needs. The backend also appends
   `_txlock=immediate`, `busy_timeout`, and `journal_mode=WAL` to the DSN unless
   already set.
-- **PostgreSQL** uses session-level advisory locks: the lock name is hashed to
-  the `bigint` key `pg_advisory_lock` requires, taken on a dedicated connection
+- **PostgreSQL** uses session-level advisory locks. The lock name is mapped to
+  the `bigint` key `pg_advisory_lock` requires through a *partitioned* key
+  space, not a uniform hash: a reserved singleton name (`bootstrap`, `crl`,
+  `sql-schema-migrate`) takes a namespaced base plus its hand-assigned ordinal,
+  with bit 63 clear, and every other name — every `subject:<name>` — takes the
+  leading 64 bits of SHA-256 over the domain-separated name with bit 63 set. The
+  two halves cannot meet, so no subject name can reach a singleton's key; see
+  rule 11 of [locking](locking.md) for why. The lock is taken on a dedicated
+  connection
   and released with `pg_advisory_unlock` on that same connection. A crashed
   replica's session ends and the lock releases automatically. A process-local
   mutex serialises in-process callers first so they don't each tie up a blocked
   connection.
 - **MySQL/MariaDB** uses named locks via `GET_LOCK` / `RELEASE_LOCK` on a
-  dedicated connection. The lock name is hashed to a stable identifier within
-  MySQL's 64-character `GET_LOCK` limit; acquisition polls with a one-second
+  dedicated connection. The lock name is mapped to a stable identifier within
+  MySQL's 64-character `GET_LOCK` limit, partitioned on the same principle:
+  `openvox-ca:0:<name>` for a reserved singleton, `openvox-ca:1:<128-bit hex>`
+  for everything else; acquisition polls with a one-second
   server-side wait so caller-context cancellation is honoured. Concurrent
   inventory appends serialise on a `FOR UPDATE` transaction; an InnoDB deadlock
   (the expected outcome when two replicas race to create the same not-yet-

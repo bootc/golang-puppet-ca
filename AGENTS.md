@@ -217,6 +217,14 @@ the inventory, in-memory caches) must follow
 - On `filesystem` and `sqlite` a lock name also derives a lock *filename*
   (`sha256(name).lock` under the operator's store), so adding one creates a file
   in every operator's cadir and the mapping is protocol too.
+- On `postgres` and `mysql` a lock name derives a *key* in a partitioned space,
+  and a new singleton name **that can reach a SQL backend** must be registered
+  in `reservedLockOrdinals` (`internal/storage/sql.go`) or it lands in the
+  hashed half. "Can reach a SQL backend" is the test, not "is a singleton": a
+  backend-internal name like etcd's `inventory-decompose` must *not* be
+  registered, since that would claim a key nothing uses. The ordinals and the
+  derivation are protocol; changing either needs a full cluster restart, not a
+  rolling one.
 - Lock ordering is `subject:<name>` → `crl` → `c.mu`; lock names are a stable
   cross-replica protocol — never invent or rename one casually.
 
