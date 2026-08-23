@@ -259,9 +259,10 @@ type CA struct {
 
 	// supersedeFailures counts failures to schedule or carry out a delayed
 	// revocation: a supersession the renewal path could not record, a
-	// pending-revocation list that could not be read or parsed, and each sweep
-	// pass that left an entry unrevoked or discarded one whose serial it could
-	// never revoke. Distinct from crlUpdateFailures, which counts failures to
+	// pending-revocation list that could not be read or parsed, a sweep pass
+	// that could not take the CRL lock or write the list back, and each pass
+	// that left an entry unrevoked or discarded one whose serial it could never
+	// revoke. A pass counts once however many entries it failed on. Distinct from crlUpdateFailures, which counts failures to
 	// amend the CRL — an entry can be lost here without the CRL ever being
 	// touched. While it rises, a certificate that a renewal replaced may still
 	// be a valid credential, and on a lost entry nothing else records that it

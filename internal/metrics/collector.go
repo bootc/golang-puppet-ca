@@ -148,8 +148,9 @@ func NewCollector(c *ca.CA) *Collector {
 			prometheus.BuildFQName(namespace, "supersede", "failures_total"),
 			"Total failures to schedule or carry out the revocation of a certificate a renewal "+
 				"replaced: a supersession the renewal path could not record, a pending-revocation "+
-				"list that could not be read or parsed, and each sweep pass that left an entry "+
-				"unrevoked or discarded one whose serial it could never revoke. One pass counts "+
+				"list that could not be read or parsed, a sweep pass that could not take the CRL "+
+				"lock or write the list back, and each pass that left an entry unrevoked or "+
+				"discarded one whose serial it could never revoke. One pass counts "+
 				"once however many entries it failed on. It stays at zero on a CA that has never "+
 				"recorded a supersession — with superseded_cert_revoke_after_sec unset the "+
 				"revocation happens inside the renewal, and a failure there is a CRL failure that "+

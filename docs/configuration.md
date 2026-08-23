@@ -572,7 +572,28 @@ Some things worth knowing before you rely on it:
 - **The sweep runs whatever the setting says, including zero.** It is the only
   thing that drains the list, so gating it on the delay would strand every entry
   recorded under an earlier configuration. On a CA that has never recorded a
-  supersession each pass is a single absent-key read.
+  supersession each pass is a single absent-key read taking no cluster lock —
+  the sweep rules the work out before acquiring one, so an idle deployment pays
+  a read per replica per interval and nothing else.
+- **Each due entry costs one CRL re-sign, under the shared CRL lock.** The sweep
+  revokes entries one at a time, and every revocation is a full read, re-sign
+  and write of the CRL. A large backlog coming due at once — after a fleet-wide
+  outage, say — therefore drains at a rate set by CRL re-sign cost rather than
+  by the sweep interval, and it holds the lock that every revocation on every
+  replica needs while it does. A pass stops before its budget is spent and logs
+  what it deferred to the next one, so a backlog that is not draining is visible
+  rather than silent. Batching those re-signs into one is a separate change.
+- **Revoking a subject retires its pending predecessor too.** `revoke --certname`
+  and `DELETE /certificate_status` retire the subject's current certificate
+  *and* anything of that subject's still inside its window, in the same call —
+  otherwise containing a compromised node would leave a second working
+  credential for it in circulation. A predecessor whose supersession was never
+  recorded is not reachable that way; see the failure counter below.
+- **A superseded certificate cannot renew itself.** It is absent from the CRL
+  for the length of its window, so the renewal paths check the pending list as
+  well; without that, the credential the window keeps alive could mint a fresh
+  full-lifetime successor and leave the window behind. If the list cannot be
+  read, renewals are refused rather than admitted.
 - **The sweep interval is added to the window in the worst case.** A certificate
   due at 12:00 is revoked on the first pass after that, so keep
   `superseded_cert_sweep_interval_sec` (15 minutes by default) well below the

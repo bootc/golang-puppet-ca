@@ -162,8 +162,10 @@ func backgroundJobs(cfg *serverConfig, myCA *ca.CA) []backgroundJob {
 	// Revokes the certificates renewals have replaced, once the configured
 	// delay has elapsed. Runs unconditionally — including when the delay is
 	// zero — because it is the only thing that drains a list an earlier
-	// configuration may have filled; see runSupersededSweeper. Safe on every
-	// replica: serialised on the shared CRL lock.
+	// configuration may have filled; see runSupersededSweeper. Idle passes take
+	// no cluster lock, so that costs a read per interval on a CA that never
+	// enables a window. Safe on every replica: the work, when there is any, is
+	// serialised on the shared CRL lock.
 	sweepInterval, revokeAfter := cfg.supersededCertSweepInterval(), cfg.supersededCertRevokeAfter()
 	jobs = append(jobs, backgroundJob{jobSupersededSweep, func(ctx context.Context) {
 		runSupersededSweeper(ctx, myCA, sweepInterval, revokeAfter)

@@ -236,7 +236,7 @@ recorded, and a failure there is a CRL failure counted above instead.
 
 | Metric | Description |
 | --- | --- |
-| `puppetca_supersede_pending` | Certificates a renewal has replaced that are still inside their overlap window and not yet revoked. Read from storage, so identical on every replica. |
+| `puppetca_supersede_pending` | Certificates a renewal has replaced that are still inside their overlap window and not yet revoked. Read from storage, so identical on every replica. **Absent, not zero**, when the list could not be read — zero is what a drained list reports, so an unreadable one must not report it too. |
 | `puppetca_supersede_failures_total` | Counter of failures to schedule or carry out one of those revocations. Per-process, and resets to `0` on process restart. |
 
 `puppetca_supersede_pending` is the live measure of the exposure the window
@@ -247,19 +247,27 @@ sweep is not completing — check the failure counter.
 
 > **What the failure counter sees.** A supersession the renewal path could not
 > record (the certificate was replaced but nothing scheduled its revocation —
-> the `failed to retire replaced certificate` warning names the serial), a
-> pending list that could not be read or parsed, and each sweep pass that left
-> an entry unrevoked or discarded one whose serial it could never revoke. A pass
-> counts once however many entries it failed on, so this is a count of bad
-> passes rather than of lost certificates. The three cases differ in what you
-> have to do about them: a sweep failure retries on the next pass by itself,
-> whereas a supersession that was never recorded and an entry that was discarded
+> the `failed to retire replaced certificate` warning names the serial); a
+> pending list that could not be read or parsed, on the renewal path or in the
+> sweep; a sweep pass that could not take the CRL lock or write the list back;
+> and each pass that left an entry unrevoked or discarded one whose serial it
+> could never revoke. A pass counts once however many entries it failed on, so
+> this is a count of bad passes rather than of lost certificates.
+>
+> The cases differ in what you have to do about them, and the log line is what
+> tells them apart. `Could not revoke superseded certificate` retries on the
+> next pass by itself. `failed to retire replaced certificate` and `Discarding`
 > are both gone for good — nothing will rediscover them, and the certificate
 > stays valid for its full remaining life. Retire those by serial with
 > `openvox-ca-ctl revoke --serial <hex>`; see
-> [revocation by serial](api.md#revocation-by-serial). Revoking by subject
-> cannot reach them: the replacement is what makes it a renewal, so
-> `revoke --certname` would retire that instead.
+> [revocation by serial](api.md#revocation-by-serial). Revoking by subject does
+> reach a predecessor the CA still has *recorded* — that is what makes
+> `revoke --certname` containment during a window — but not one whose record was
+> lost, which is exactly what a rising count here means.
+>
+> A sweep that cannot read the list at all counts once per pass and omits
+> `puppetca_supersede_pending` rather than reporting zero, so the two signals
+> cannot both read clean while the list stops draining.
 
 ### Leaf certificates
 

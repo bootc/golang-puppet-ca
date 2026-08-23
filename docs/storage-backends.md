@@ -131,7 +131,7 @@ Server CA, so you can swap in `openvox-ca` without reorganising your SSL tree:
 ├── ca_pub.pem              CA public key
 ├── ca_crl.pem              Certificate Revocation List (see note)
 ├── inventory.txt           Issued/revoked certificate log
-├── superseded.json         certificates awaiting delayed
+├── superseded.json         Certificates awaiting delayed
 │                           revocation (see note)              0600
 ├── private/
 │   ├── ca_key.pem          CA private key                    0600

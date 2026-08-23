@@ -35,9 +35,13 @@ import (
 // still has certificates on the list, each with its own recorded due time. A
 // sweep gated on the delay would strand exactly those — every one of them a
 // credential the operator believes was retired, kept valid for its full
-// remaining life by the setting change that was meant to tighten things up. On
-// a CA that has never recorded a supersession the pass is one absent-key read,
-// so running it unconditionally costs almost nothing.
+// remaining life by the setting change that was meant to tighten things up.
+//
+// The idle cost that makes running it unconditionally reasonable is one
+// absent-key read per replica per interval, and no cluster lock at all:
+// ReconcileSuperseded rules the work out before acquiring one, precisely so
+// that the deployments which never enable a window do not take a cluster-wide
+// lock four times an hour forever to discover there is nothing to do.
 //
 // Replica safety: CA.ReconcileSuperseded does its list read-modify-write and
 // its revocations under the shared cluster CRL lock, so when this runs on
