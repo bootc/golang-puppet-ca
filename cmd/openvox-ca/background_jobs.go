@@ -114,13 +114,26 @@ func backgroundJobs(cfg *serverConfig, myCA *ca.CA) []backgroundJob {
 	//
 	// Not gated on ocsp_url: the /ocsp endpoint answers whatever that setting
 	// says, so gating on it would leave the responder wrong for anyone
-	// distributing the URL another way. It *is* gated on the backend being one
-	// several processes can share, which is a different question with a
-	// different answer — the staleness needs a second process writing
-	// certificates this one will never hear about, and on filesystem and SQLite
-	// there is no supported way to have one. Running it there would read the
-	// whole inventory every interval, for ever, on the default backend, to
-	// detect something that cannot happen.
+	// distributing the URL another way. It *is* gated on the backend, which is a
+	// different question with a different answer.
+	//
+	// The staleness needs a second process *issuing* certificates this one will
+	// never hear about. Issuing, specifically — not merely writing: since #187
+	// was closed, SameHostLocker coordinates several processes writing to a
+	// filesystem or SQLite store on one host, so second writers there are
+	// supported and expected. What no second writer does today is mint a
+	// certificate. As of main 19c0b7857209, nothing under cmd/ outside the
+	// server calls AppendInventory, issueLeaf, GenerateWithOptions or
+	// SignWithTTL, so no inventory row can appear that a running server did not
+	// write itself, and its index cannot fall behind. Running the job on those
+	// two backends would read the whole inventory every interval, for ever, on
+	// the default backend, to detect something that cannot yet happen.
+	//
+	// That enumeration is the whole justification, so here is what voids it: the
+	// day any command other than the server issues a certificate — an offline
+	// `generate` is the one in flight — this reason is gone and the gate has to
+	// be re-decided, not merely re-worded. Re-run the enumeration above against
+	// the tree in front of you rather than trusting this paragraph.
 	//
 	// An unrecognised backend name runs the job. Being wrong in that direction
 	// costs a periodic read; being wrong in the other costs correct OCSP
