@@ -57,6 +57,15 @@ import (
 // subject holds would close that; it is a change to what revocation means, not
 // to when it happens, so it is not this one's business.
 //
+// One class of predecessor *is* this one's business, and revokeLocked retires
+// it: one that superseded_cert_revoke_after_sec has put on the pending list.
+// Those are already scheduled for revocation by this CA's own decision, so
+// bringing that forward when the subject is revoked changes only when it lands.
+// Without it a window would make the gap above the common case rather than the
+// exception — every recent renewal would leave a live predecessor — and
+// `revoke --certname` would quietly stop being containment. See
+// dropSupersededForSubjectLocked.
+//
 // The cost is that a revocation now waits for an issuance already under way for
 // that subject — the same trade Clean has always made, so DELETE
 // /certificate_status has always paid it. Do not read that wait as short: a
@@ -111,6 +120,25 @@ func (c *CA) Revoke(ctx context.Context, subject string) error {
 // lock and c.mu must both be held by the caller.
 func (c *CA) revokeLocked(ctx context.Context, subject string) error {
 	slog.Debug("Revoking certificate", "subject", subject)
+
+	// Ahead of the subject's own serial, and best-effort. Any predecessor
+	// inside its overlap window is a second working credential for this
+	// subject, and containment means retiring it too — see
+	// dropSupersededForSubjectLocked. Doing it first means a subject whose
+	// inventory lookup below fails still loses its superseded credentials
+	// rather than none of them; each of these needs only the CRL, which is
+	// already locked. A failure per serial is logged and stepped over, because
+	// the revocation the caller asked for has not happened yet and must not be
+	// lost to a predecessor that could not be retired.
+	for _, serial := range c.dropSupersededForSubjectLocked(ctx, subject) {
+		if err := c.revokeSerialLocked(ctx, serial); err != nil {
+			slog.Warn("Revoke: could not retire a superseded certificate for this subject; "+
+				"it stays a valid credential", "subject", subject, "serial", serial, "error", err)
+			continue
+		}
+		slog.Info("Revoked superseded certificate alongside its subject",
+			"subject", subject, "serial", serial)
+	}
 
 	serialStr, err := c.findSerialForSubject(ctx, subject)
 	if err != nil {

@@ -163,7 +163,9 @@ func NewCollector(c *ca.CA) *Collector {
 				"something newer has taken its place, so this is the live measure of the exposure "+
 				"superseded_cert_revoke_after_sec buys. It returns to zero as the sweep drains "+
 				"the list; a value that does not fall means the sweep is not completing — check "+
-				"puppetca_supersede_failures_total.",
+				"puppetca_supersede_failures_total. Absent, rather than zero, when the list could "+
+				"not be read: zero is what a drained list reports, so it must not also be what an "+
+				"unreadable one reports.",
 			nil, nil),
 		crlCachedNumber: prometheus.NewDesc(
 			prometheus.BuildFQName(namespace, "crl", "cached_number"),
@@ -308,8 +310,10 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 		ch <- prometheus.MustNewConstMetric(c.crlRevoked, prometheus.GaugeValue, float64(snap.crlRevokedCount))
 	}
 
-	ch <- prometheus.MustNewConstMetric(c.supersedePending, prometheus.GaugeValue,
-		float64(snap.supersedePending))
+	if snap.haveSupersedePending {
+		ch <- prometheus.MustNewConstMetric(c.supersedePending, prometheus.GaugeValue,
+			float64(snap.supersedePending))
+	}
 
 	stateCounts := map[string]int{stateRequested: 0, stateSigned: 0, stateRevoked: 0}
 	for _, leaf := range snap.leaves {
@@ -355,7 +359,8 @@ type snapshot struct {
 	crlNextUpdate   time.Time
 	crlRevokedCount int
 
-	supersedePending int
+	haveSupersedePending bool
+	supersedePending     int
 
 	leaves []leafCert
 }
@@ -405,14 +410,20 @@ func (c *Collector) gather(ctx context.Context) (snapshot, error) {
 	}
 
 	// Certificates awaiting delayed revocation. Absent on any CA that has never
-	// recorded one, which reads as zero. A failure is logged and left at zero
-	// rather than failing the scrape: this gauge is auxiliary, and the failure
-	// it would most likely reflect is already counted into
-	// puppetca_supersede_failures_total by the code that owns the list.
+	// recorded one, which reads as a genuine zero.
+	//
+	// A read *failure* omits the series rather than reporting zero, the same
+	// way haveCRL omits the CRL series above. Zero is the value this gauge takes
+	// when the exposure it measures is gone, so publishing it on a list nobody
+	// could read would say "drained" about the one state where the list may be
+	// full and the sweep stuck — and would do it while looking healthy. An
+	// omitted series goes stale and is visible as such. The failure itself is
+	// counted by the sweep, which meets the same error once per pass.
 	if pending, perr := c.ca.PendingSupersessions(ctx); perr != nil {
 		slog.Warn("Prometheus exporter: failed to read pending supersessions", "error", perr)
 	} else {
 		snap.supersedePending = pending
+		snap.haveSupersedePending = true
 	}
 
 	// Signed certificates: enumerate the live (non-deleted) signed set. A cleaned

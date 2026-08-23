@@ -472,6 +472,23 @@ func newRootCmd() *cobra.Command {
 				slog.Warn("--puppet-server / --puppet-server-file have no effect without TLS; " +
 					"all endpoints are accessible without authentication in plain HTTP mode.")
 			}
+			// The sweep's interval is added to every overlap window in the worst
+			// case, because a certificate becomes due between two passes and is
+			// revoked on the later one. An operator who follows the advice to set
+			// the window no longer than the pickup takes can easily land below the
+			// 15-minute default interval and get an effective window many times
+			// what they asked for -- on a setting the docs call a deliberate
+			// weakening. Warn rather than refuse: the configuration is coherent,
+			// just not what it looks like.
+			if revokeAfter := cfg.supersededCertRevokeAfter(); revokeAfter > 0 {
+				if sweep := cfg.supersededCertSweepInterval(); sweep >= revokeAfter {
+					slog.Warn("superseded_cert_sweep_interval_sec is not shorter than "+
+						"superseded_cert_revoke_after_sec, so the sweep interval sets the effective "+
+						"overlap window rather than the delay does",
+						"revoke_after", revokeAfter, "sweep_interval", sweep,
+						"worst_case_window", revokeAfter+sweep)
+				}
+			}
 
 			// --- Storage, and the key provider when this role may reach the key ---
 			// The frontend role proxies every signature to the isolated signer

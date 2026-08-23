@@ -22,6 +22,7 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"math/big"
 	"os"
@@ -321,6 +322,27 @@ var _ = Describe("Delayed supersession", func() {
 				"discarding an entry loses a revocation and must be counted")
 		})
 
+		// The recovery arm, which a syntax error cannot reach: encoding/json
+		// validates the whole input before decoding any of it, so truncation and
+		// bad syntax recover nothing. A well-formed list with one badly-typed
+		// field is the shape that does partially decode, and it is what makes
+		// "entries keeps whatever decoded before the failure" a real branch
+		// rather than an unfalsifiable claim.
+		It("still sweeps the entries it could recover from a partly-decodable list", func() {
+			cert := issue("node-t")
+			raw := `[{"serial":"` + hexSerial(cert.SerialNumber) + `","subject":"node-t",` +
+				`"revoke_at":"` + time.Now().UTC().Add(-time.Minute).Format(time.RFC3339Nano) + `"},` +
+				`{"serial":12345,"subject":"node-u","revoke_at":"2026-01-01T00:00:00Z"}]`
+			Expect(store.SaveSuperseded(ctx, []byte(raw))).To(Succeed())
+
+			count, err := myCA.ReconcileSuperseded(ctx)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(count).To(Equal(1),
+				"the entry that decoded must still be revoked, not thrown away with the one that did not")
+			Expect(revoked(cert.SerialNumber)).To(BeTrue())
+			Expect(pending()).To(BeEmpty(), "the write-back must leave clean, parseable bytes")
+		})
+
 		// Unparseable bytes are not self-clearing. Left alone they would warn,
 		// count and be re-read on every pass forever.
 		It("overwrites an unparseable list instead of re-reading it forever", func() {
@@ -338,6 +360,136 @@ var _ = Describe("Delayed supersession", func() {
 			_, err = myCA.ReconcileSuperseded(ctx)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(myCA.SupersedeFailures()).To(Equal(steady))
+		})
+	})
+
+	// The window must bound the exposure it grants, not end it. A certificate
+	// inside its window is deliberately absent from the CRL, so nothing else on
+	// the renewal path turns it away — and a renewal mints a fresh full-lifetime
+	// certificate. Without a gate, the credential the window was keeping alive
+	// for relying parties could mint a successor that outlives the window
+	// entirely, which on the re-key path is the previous private key doing it.
+	Describe("a certificate inside its window", func() {
+		BeforeEach(func() {
+			myCA.SupersedeAfter = time.Hour
+		})
+
+		It("cannot auto-renew itself into a fresh certificate", func() {
+			original := issue("node-n")
+			_, err := myCA.AutoRenew(ctx, original)
+			Expect(err).NotTo(HaveOccurred(), "precondition: the first renewal succeeds")
+			Expect(pending()).To(HaveLen(1), "precondition: the predecessor is inside its window")
+
+			_, err = myCA.AutoRenew(ctx, original)
+			Expect(err).To(MatchError(ca.ErrCertSuperseded),
+				"a superseded certificate must not be able to renew itself")
+			// Wrapping ErrCertRevoked is what makes every existing caller — the
+			// HTTP layer included — answer 403 without being taught about a new
+			// sentinel. If that stops holding, the API starts returning 500 for
+			// a refusal.
+			Expect(err).To(MatchError(ca.ErrCertRevoked),
+				"ErrCertSuperseded must keep wrapping ErrCertRevoked so callers refuse it unchanged")
+			Expect(pending()).To(HaveLen(1), "a refused renewal must not record anything")
+		})
+
+		It("cannot re-key itself, which would also retire the live replacement", func() {
+			original := issue("node-o")
+			csrPEM, _ := buildCSR("node-o")
+			replacementPEM, err := myCA.Renew(ctx, "node-o", csrPEM, original)
+			Expect(err).NotTo(HaveOccurred(), "precondition: the first renewal succeeds")
+			replacement := parseCert(replacementPEM)
+
+			// Presenting the superseded certificate again. Renew retires the
+			// subject's *latest* serial, so an admitted call here would schedule
+			// the live replacement for revocation as well as minting a successor
+			// for the displaced key.
+			csrPEM2, _ := buildCSR("node-o")
+			_, err = myCA.Renew(ctx, "node-o", csrPEM2, original)
+			Expect(err).To(MatchError(ca.ErrCertSuperseded),
+				"a superseded certificate must not be able to re-key")
+
+			entries := pending()
+			Expect(entries).To(HaveLen(1), "a refused renewal must not record anything")
+			Expect(entries[0].Serial).To(Equal(hexSerial(original.SerialNumber)),
+				"the live replacement must not have been scheduled for revocation")
+			Expect(revoked(replacement.SerialNumber)).To(BeFalse())
+		})
+
+		It("does not obstruct the replacement renewing normally", func() {
+			original := issue("node-p")
+			replacementPEM, err := myCA.AutoRenew(ctx, original)
+			Expect(err).NotTo(HaveOccurred())
+			replacement := parseCert(replacementPEM)
+
+			// The legitimate agent holds the replacement and renews with it.
+			// Refusing this would break every fleet that turned the window on.
+			_, err = myCA.AutoRenew(ctx, replacement)
+			Expect(err).NotTo(HaveOccurred(),
+				"the current certificate must still renew while its predecessor waits out the window")
+		})
+	})
+
+	Describe("when the pending list cannot be written", func() {
+		// The delayed path's best-effort contract, in both directions. The
+		// immediate path has the same pair of specs in renew_test.go against
+		// CRLUpdateFailures; the delayed path's consequence is documented as
+		// strictly worse — a supersession that was never recorded is gone for
+		// good, because nothing else records that the certificate was replaced.
+		var failing *ca.CA
+
+		BeforeEach(func() {
+			base := storage.NewFilesystemBackend(tmpDir)
+			failStore := storage.NewWithBackend(
+				&supersededFailBackend{Backend: base, failPut: storage.KeySuperseded}, tmpDir)
+			failing = ca.New(failStore, ca.AutosignConfig{Mode: "off"}, "puppet.test")
+			failing.SupersedeAfter = time.Hour
+			Expect(failing.Init(ctx)).To(Succeed())
+		})
+
+		It("still completes the renewal, and counts the lost supersession", func() {
+			original := issue("node-q")
+			before := failing.SupersedeFailures()
+
+			renewedPEM, err := failing.AutoRenew(ctx, original)
+			Expect(err).NotTo(HaveOccurred(),
+				"a supersession that could not be recorded must not fail the renewal the agent is waiting on")
+			renewed := parseCert(renewedPEM)
+			Expect(renewed.SerialNumber.Cmp(original.SerialNumber)).NotTo(Equal(0))
+
+			Expect(failing.SupersedeFailures()).To(BeNumerically(">", before),
+				"a supersession that was never recorded must be counted; it is the only trace that "+
+					"the replaced certificate is still a valid credential")
+		})
+	})
+
+	Describe("ReconcileSuperseded when a revocation fails", func() {
+		// The retry half of the sweep's failure handling. The alert text tells
+		// operators to distinguish "Could not revoke superseded certificate"
+		// (recorded, will retry) from "Discarding" (gone for good), and only the
+		// second was pinned. A change that dropped failed entries instead of
+		// carrying them forward would turn a retryable failure into a
+		// permanently valid credential and move no assertion.
+		It("carries the entry forward rather than dropping it, and counts the pass once", func() {
+			first := issue("node-r")
+			second := issue("node-s")
+			writePending([]pendingEntry{
+				{Serial: hexSerial(first.SerialNumber), Subject: "node-r", RevokeAt: time.Now().UTC().Add(-time.Minute)},
+				{Serial: hexSerial(second.SerialNumber), Subject: "node-s", RevokeAt: time.Now().UTC().Add(-time.Minute)},
+			})
+			// An unparseable CRL makes revokeSerialLocked fail for every entry
+			// without making any of them unrevocable — the distinction the two
+			// arms turn on.
+			Expect(store.UpdateCRL(ctx, []byte("not a valid CRL"))).To(Succeed())
+			before := myCA.SupersedeFailures()
+
+			count, err := myCA.ReconcileSuperseded(ctx)
+			Expect(err).NotTo(HaveOccurred(), "a failed revocation must not fail the whole pass")
+			Expect(count).To(BeZero())
+
+			Expect(pending()).To(HaveLen(2),
+				"entries whose revocation failed must stay on the list for the next pass")
+			Expect(myCA.SupersedeFailures()).To(Equal(before+1),
+				"one pass counts once, however many entries it failed on")
 		})
 	})
 
@@ -371,6 +523,29 @@ var _ = Describe("Delayed supersession", func() {
 		})
 	})
 })
+
+// supersededFailBackend wraps a real filesystem backend and fails one key's
+// read or write, which is what a store whose pending-supersession blob alone is
+// broken looks like from the CA.
+type supersededFailBackend struct {
+	storage.Backend
+	failPut string
+	failGet string
+}
+
+func (b *supersededFailBackend) Put(ctx context.Context, key string, data []byte, kind storage.BlobKind) error {
+	if b.failPut != "" && key == b.failPut {
+		return errors.New("simulated backend failure writing " + key)
+	}
+	return b.Backend.Put(ctx, key, data, kind)
+}
+
+func (b *supersededFailBackend) Get(ctx context.Context, key string) ([]byte, error) {
+	if b.failGet != "" && key == b.failGet {
+		return nil, errors.New("simulated backend failure reading " + key)
+	}
+	return b.Backend.Get(ctx, key)
+}
 
 // hexSerial renders a serial the way the CA records it on the pending list:
 // uppercase hex with no leading zeros. Spelled out here rather than exported

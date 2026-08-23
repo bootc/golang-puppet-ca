@@ -299,8 +299,10 @@ const (
 	// own overshoot past a recorded revoke_at, so it wants to be small relative
 	// to the delays operators will configure — those are pickup windows, which
 	// are hour-scale at the shortest. Fifteen minutes keeps the overshoot
-	// immaterial at that scale while costing one small read per replica per
-	// quarter hour on a CA that has recorded nothing.
+	// immaterial at that scale while keeping the idle cost — one absent-key read
+	// per replica per quarter hour, taking no cluster lock, because
+	// ReconcileSuperseded rules the work out before acquiring one — negligible
+	// on a CA that has recorded nothing.
 	defaultSupersededCertSweepInterval = 15 * time.Minute
 )
 
@@ -529,8 +531,16 @@ func applyServerEnv(cfg *serverConfig) {
 			cfg.RevokeOnAutoRenew = b
 		}
 	}
+	// n >= 0, unlike every interval setting around it. Those treat 0 as "unset,
+	// use the built-in default", so refusing it costs nothing. Here 0 is the
+	// feature's off switch and a distinct, meaningful value: with a positive
+	// superseded_cert_revoke_after_sec in the config file, a `n > 0` guard would
+	// silently drop an env override of 0 and leave the window open. That is the
+	// one direction this must not fail in — the env channel is how a container
+	// or Helm deployment overrides a baked-in config.yaml, and it would be able
+	// to widen the weakening but never close it.
 	if v := os.Getenv("PUPPET_CA_SUPERSEDED_CERT_REVOKE_AFTER_SEC"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
 			cfg.SupersededCertRevokeAfterSec = n
 		}
 	}

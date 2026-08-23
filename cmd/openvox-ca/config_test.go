@@ -354,6 +354,63 @@ var _ = Describe("expired-cert cleanup resolvers", func() {
 			"expiredCertCleanupInterval() = %v; want %v", cfg.expiredCertCleanupInterval(), 900*time.Second)
 	})
 
+	It("resolves the delayed-supersession settings", func() {
+		clearServerEnv()
+		cfg, err := loadServerConfig("")
+		Expect(err).NotTo(HaveOccurred(), "unexpected error")
+		Expect(cfg.supersededCertRevokeAfter()).To(BeZero(),
+			"an unset window must resolve to 0 — revoke inside the renewal, as before the setting existed")
+		Expect(cfg.supersededCertSweepInterval()).To(Equal(defaultSupersededCertSweepInterval),
+			"supersededCertSweepInterval() = %v; want default %v",
+			cfg.supersededCertSweepInterval(), defaultSupersededCertSweepInterval)
+		// time.NewTicker panics on a non-positive duration and the sweep runs on
+		// every deployment, so the default has to be positive on its own terms
+		// and not merely equal to a constant that could itself become zero.
+		Expect(cfg.supersededCertSweepInterval()).To(BeNumerically(">", 0))
+
+		clearServerEnv()
+		setEnv("PUPPET_CA_SUPERSEDED_CERT_REVOKE_AFTER_SEC", "3600")
+		setEnv("PUPPET_CA_SUPERSEDED_CERT_SWEEP_INTERVAL_SEC", "60")
+		cfg, err = loadServerConfig("")
+		Expect(err).NotTo(HaveOccurred(), "unexpected error")
+		Expect(cfg.supersededCertRevokeAfter()).To(Equal(time.Hour))
+		Expect(cfg.supersededCertSweepInterval()).To(Equal(time.Minute))
+
+		// A negative window is representable in YAML and means nothing; it must
+		// resolve to "revoke immediately" rather than to a negative delay that
+		// would make every entry due the moment it was recorded.
+		clearServerEnv()
+		cfg, err = loadServerConfig("")
+		Expect(err).NotTo(HaveOccurred(), "unexpected error")
+		cfg.SupersededCertRevokeAfterSec = -1
+		Expect(cfg.supersededCertRevokeAfter()).To(BeZero(),
+			"a negative window must resolve to 0, not to a negative delay")
+		cfg.SupersededCertSweepIntervalSec = -1
+		Expect(cfg.supersededCertSweepInterval()).To(Equal(defaultSupersededCertSweepInterval))
+	})
+
+	// The env channel is how a container or Helm deployment overrides a baked-in
+	// config.yaml, and this is the one setting where 0 is a meaningful value
+	// rather than "unset". The `n > 0` guard its neighbours use would silently
+	// drop this override and leave the overlap window open — so the env route
+	// could widen the weakening but never close it.
+	It("lets the environment turn the overlap window off, not just on", func() {
+		clearServerEnv()
+		dir := GinkgoT().TempDir()
+		path := filepath.Join(dir, "config.yaml")
+		Expect(os.WriteFile(path, []byte("superseded_cert_revoke_after_sec: 3600\n"), 0o600)).To(Succeed())
+
+		cfg, err := loadServerConfig(path)
+		Expect(err).NotTo(HaveOccurred(), "unexpected error")
+		Expect(cfg.supersededCertRevokeAfter()).To(Equal(time.Hour), "precondition: the file sets a window")
+
+		setEnv("PUPPET_CA_SUPERSEDED_CERT_REVOKE_AFTER_SEC", "0")
+		cfg, err = loadServerConfig(path)
+		Expect(err).NotTo(HaveOccurred(), "unexpected error")
+		Expect(cfg.supersededCertRevokeAfter()).To(BeZero(),
+			"an env value of 0 must override a positive file value and close the window")
+	})
+
 	It("falls back to defaults for non-positive values", func() {
 		clearServerEnv()
 		setEnv("PUPPET_CA_EXPIRED_CERT_RETENTION_SEC", "0")

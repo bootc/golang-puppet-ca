@@ -100,6 +100,10 @@ var ErrCertRevoked = errors.New("certificate is revoked")
 // are rare, and the alternative is that the propagation window this CA
 // advertises does not actually bound a compromised agent's access.
 //
+// It also refuses a certificate that a previous renewal already replaced and
+// that is waiting out its overlap window — absent from the CRL by design, so
+// the revocation check alone would admit it. See refuseIfSuperseded.
+//
 // A failed refresh is not itself a refusal. The check below still runs against
 // the CRL already held, which is exactly the pre-sync behaviour and no worse, so
 // a storage blip costs freshness rather than every renewal in the fleet. What
@@ -126,7 +130,12 @@ func (c *CA) refuseIfRevoked(ctx context.Context, presentedCert *x509.Certificat
 			"subject", subject, "serial", serialHexStr(presentedCert.SerialNumber))
 		return fmt.Errorf("rejecting renewal for %s: %w", subject, ErrCertRevoked)
 	}
-	return nil
+	// A certificate inside its supersession window is deliberately absent from
+	// the CRL, so the check above cannot see it. It is still a credential on its
+	// way out and must not be able to mint a successor that outlives the window
+	// — see refuseIfSuperseded, which is why this sits inside the function both
+	// renewal paths call twice rather than at either call site.
+	return c.refuseIfSuperseded(ctx, presentedCert, subject)
 }
 
 // ErrNotInitialized is returned by signing helpers when the CA's certificate
