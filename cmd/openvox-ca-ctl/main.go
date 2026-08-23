@@ -34,6 +34,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -315,7 +316,18 @@ func newSignCmd() *cobra.Command {
 				if len(result.Signed) == 0 {
 					fmt.Println("Signed: (none)")
 				} else {
-					fmt.Printf("Signed: %s\n", strings.Join(result.Signed, ", "))
+					// Each name quoted, for the same reason as the import
+					// summary: this list is decoded from the server's response
+					// body, so it is the one confirmation line here whose
+					// contents the server chooses rather than the operator.
+					// Quoting per element rather than the joined string keeps
+					// the separator meaningful -- "a", "b" rather than "a, b",
+					// which would read as a single name containing a comma.
+					quoted := make([]string, len(result.Signed))
+					for i, name := range result.Signed {
+						quoted[i] = strconv.Quote(name)
+					}
+					fmt.Printf("Signed: %s\n", strings.Join(quoted, ", "))
 				}
 				return nil
 			}
@@ -514,6 +526,12 @@ func newGenerateCmd() *cobra.Command {
 				return fmt.Errorf("failed to save private key to %s: %w", keyPath, err)
 			}
 			fmt.Fprintf(os.Stderr, "Private key saved to %s\n", keyPath)
+			// NOT quoted, deliberately, and not an oversight: this is the PEM
+			// itself on stdout, while the human-readable line above goes to
+			// stderr. That split is a contract -- `openvox-ca-ctl generate ...
+			// > cert.pem` has to yield a usable file -- so %q here would
+			// corrupt every consumer that redirects. The escaping convention
+			// in AGENTS.md covers operator-facing *messages*; this is data.
 			fmt.Print(result.Certificate)
 			return nil
 		},

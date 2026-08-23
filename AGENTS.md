@@ -269,18 +269,28 @@ Output that is operator-facing but not `slog` — such as
 response, which nothing re-validates. `import-cert`'s summary lines are the
 worked example, and `cmd/openvox-ca-ctl/importcert_test.go` pins them.
 
-Two kinds of `%s` are deliberately left alone, for different reasons:
+**The rule of thumb: if the server chose the value, quote it.** `import-cert`'s
+summary, `checkHTTP`'s error body and `sign --all`'s list are all quoted for
+that reason, and each has a spec that fails if the quoting is removed.
+
+Three kinds of unquoted output are deliberately left alone, for three
+*different* reasons — they are not one carve-out:
 
 - **`list`'s status table** (`printTable`) is the only column-aligned output in
   the CLI; quoting would break the alignment that is the point of a table.
-- **The `sign` / `clean` / `revoke` confirmation lines** have no alignment to
-  lose — they are single-value prints. Three of them echo the operator's own
-  `--certname` / `--serial` input rather than anything the server chose; only
-  `sign --all` echoes a server-returned list, and it too is one unaligned line.
+- **The `sign` / `clean` / `revoke` single-value confirmations** echo the
+  operator's own `--certname` / `--serial` input, so there is no untrusted
+  value to escape. They have no alignment to lose either; they are simply not
+  in scope.
+- **`generate`'s certificate output** (`fmt.Print(result.Certificate)`) is the
+  PEM itself on stdout, while its human-readable line goes to stderr. That
+  split is a contract — `openvox-ca-ctl generate … > cert.pem` must yield a
+  usable file — so quoting would corrupt every consumer that redirects. This
+  convention covers operator-facing *messages*; that is data.
 
-Both rest on the judgement that an operator's terminal is not a log pipeline,
-not on any formatting constraint. Revisit that if those names ever reach
-something that parses them.
+Only the first two rest on the judgement that an operator's terminal is not a
+log pipeline. Revisit that if those values ever reach something that parses
+them.
 
 ## Compatibility contracts (do not rename)
 

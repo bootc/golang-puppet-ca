@@ -59,16 +59,15 @@ query-filters:
   #     passed ValidateSubject. internal/storage/migrate.go's Logf is written
   #     straight to stderr by the CLI with no escaping, and its key comes from
   #     source directory names, so that call site formats with %q rather than
-  #     %s, as does openvox-ca-ctl's import summary, which prints a
-  #     server-returned subject on a free-form line; that one is pinned by
-  #     cmd/openvox-ca-ctl/importcert_test.go. Deliberately left alone: the
-  #     status table (printTable), the only column-aligned output in the CLI,
-  #     where quoting would wreck the alignment; and the sign/clean/revoke
-  #     confirmation lines, which have no alignment to lose and mostly echo the
-  #     operator's own --certname/--serial input rather than server data. Those
-  #     rest on the judgement that an operator's terminal is not a log
-  #     pipeline, not on a formatting constraint -- revisit it if those names
-  #     ever reach something that parses them. AGENTS.md carries the same
-  #     distinction in full; lint catches none of it.
+  #     %s, as do openvox-ca-ctl's import summary, its checkHTTP error body
+  #     and its sign --all list -- every value the server chooses. Each is
+  #     pinned by a spec in cmd/openvox-ca-ctl. Deliberately left unquoted, for
+  #     three different reasons rather than one: the status table (printTable),
+  #     the only column-aligned output in the CLI; the sign/clean/revoke
+  #     single-value confirmations, which echo the operator's own
+  #     --certname/--serial and so have no untrusted value to escape; and
+  #     generate's PEM on stdout, where quoting would break the redirect
+  #     contract that makes `... > cert.pem` work. AGENTS.md carries the full
+  #     distinction; lint catches none of it.
   - exclude:
       id: go/log-injection
