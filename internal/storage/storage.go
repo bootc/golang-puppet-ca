@@ -280,10 +280,12 @@ func (s *StorageService) InitHMAC(ctx context.Context) error {
 // script refuses to overwrite. All three are true cluster-wide guarantees. The
 // filesystem backend — the only remaining blob one — detects it via an
 // explicit scan performed under the same inventoryMu that already serialises
-// every append within a process, which is NOT a cross-replica guarantee:
-// nothing wraps the whole AppendInventory call in a distributed lock for it
-// (see the blob-fallback HMAC-update comment below, which documents a similar
-// limitation for that path).
+// every append within a process. That is a narrower guarantee rather than a
+// bare gap: filesystem is single-node by construction, so no cross-replica
+// case arises, and SameHostLocker gives its WithLock names cross-process reach
+// on the host. What that reach does not extend to is the AppendInventory call
+// itself, which no lock wraps (see the blob-fallback HMAC-update comment
+// below, which documents a similar limitation for that path).
 var ErrDuplicateSerial = errors.New("serial number already exists in inventory")
 
 // AppendInventory adds entry (a single inventory.txt line, without a trailing

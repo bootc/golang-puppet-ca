@@ -51,6 +51,10 @@ const serialAmbiguous = "ambiguous"
 // inventoryRecordJSON is the stored JSON form of a CertRecord. The field set
 // is spelled out (rather than marshalling CertRecord directly) so the wire
 // format is explicit and stable against refactors of the in-memory structs.
+// not_before and not_after hold the formatted inventory.txt strings verbatim,
+// not RFC3339 times — see InventoryEntry in backend.go. Every decomposed
+// backend must store them identically, or rendering the inventory back to text
+// stops being byte-identical to the legacy blob.
 type inventoryRecordJSON struct {
 	Serial         string            `json:"serial"`
 	NotBefore      string            `json:"not_before"`

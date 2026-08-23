@@ -140,8 +140,10 @@ func (b *RedisBackend) invPhys(sub string) string { return b.prefix + ":" + sub 
 
 // invKeys returns the six inventory keys in the fixed order every script in
 // this file expects as KEYS[1..6]. Keeping one definition of that order is
-// what makes the scripts readable: KEYS[1] is always entries, KEYS[5] always
-// the head, and so on.
+// what makes the scripts readable, and it is the order to preserve if a
+// seventh key is ever added: KEYS[1] entries, [2] seq, [3] by-serial,
+// [4] by-subject, [5] hmac (the chain head), [6] data (the presence marker).
+// The key-layout block at the top of this file says what each one holds.
 func (b *RedisBackend) invKeys() []string {
 	return []string{
 		b.invPhys(redisInvEntriesSub),
