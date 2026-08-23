@@ -260,13 +260,24 @@ func shellVariantList(src []byte) ([]string, error) {
 	return strings.Fields(string(m[1])), nil
 }
 
+// sbomFormatsPerVariant is the number of SBOM documents published for each
+// release variant: SPDX-JSON and CycloneDX-JSON, both emitted from a single
+// Syft scan by .github/actions/generate-sbom. It is the multiplier between
+// distVariants() and release.yml's SBOM-count literal.
+//
+// It is not taken on trust: verifyDistVariantsIn counts the -o formats the
+// action actually emits and refuses a mismatch, so this constant cannot
+// quietly stop describing the action it names.
+const sbomFormatsPerVariant = 2
+
 // verifyDistVariants asserts that every hand-maintained copy of the release
 // variant list in the workflows agrees with distVariants(), the single source
 // of truth. Wired into dev:check so a variant added or renamed in one place
 // but not the others fails CI loudly instead of silently shipping an
 // incomplete release. The checked copies: ci.yml's dist job matrix,
-// release.yml's build job matrix, and release.yml's checksum-step shell loop
-// and tarball-count literal.
+// release.yml's build job matrix, release.yml's checksum-step shell loop and
+// its tarball- and SBOM-count literals, and the generate-sbom action's output
+// format count.
 func verifyDistVariants() error {
 	ciSrc, err := os.ReadFile(filepath.Join(".github", "workflows", "ci.yml"))
 	if err != nil {
@@ -276,13 +287,17 @@ func verifyDistVariants() error {
 	if err != nil {
 		return err
 	}
-	return verifyDistVariantsIn(ciSrc, relSrc)
+	sbomSrc, err := os.ReadFile(filepath.Join(".github", "actions", "generate-sbom", "action.yml"))
+	if err != nil {
+		return err
+	}
+	return verifyDistVariantsIn(ciSrc, relSrc, sbomSrc)
 }
 
 // verifyDistVariantsIn is verifyDistVariants over caller-supplied workflow
 // contents, split out so the mismatch branches are testable without touching
 // the real workflow files.
-func verifyDistVariantsIn(ciSrc, relSrc []byte) error {
+func verifyDistVariantsIn(ciSrc, relSrc, sbomSrc []byte) error {
 	want := make([]string, 0, len(distVariants()))
 	for _, v := range distVariants() {
 		want = append(want, v.name)
@@ -308,14 +323,239 @@ func verifyDistVariantsIn(ciSrc, relSrc []byte) error {
 		}
 	}
 
-	// The checksum step also asserts an exact tarball count.
-	m := regexp.MustCompile(`"\$tarballs" -ne (\d+)`).FindSubmatch(relSrc)
-	if m == nil {
-		return fmt.Errorf("release.yml: tarball-count check not found")
+	// The checksum step also asserts exact artefact counts: one tarball per
+	// variant, and sbomFormatsPerVariant SBOM documents per variant. Both
+	// literals are checked, because a variant added to every list above but
+	// missed here would leave the release publishing fewer artefacts than it
+	// built while every matrix still agreed.
+	counts := []struct {
+		what     string
+		pattern  string
+		expected int
+	}{
+		{"tarballs", `"\$tarballs" -ne (\d+)`, len(want)},
+		{"SBOMs", `"\$sboms" -ne (\d+)`, len(want) * sbomFormatsPerVariant},
 	}
-	if count, _ := strconv.Atoi(string(m[1])); count != len(want) {
-		return fmt.Errorf("release.yml expects %s tarballs, but distVariants() defines %d; update them together",
-			m[1], len(want))
+	for _, c := range counts {
+		m := regexp.MustCompile(c.pattern).FindSubmatch(relSrc)
+		if m == nil {
+			return fmt.Errorf("release.yml: no %s-count check matching %q", c.what, c.pattern)
+		}
+		if count, _ := strconv.Atoi(string(m[1])); count != c.expected {
+			return fmt.Errorf("release.yml expects %s %s, but distVariants() implies %d; update them together",
+				m[1], c.what, c.expected)
+		}
+	}
+
+	// And the multiplier itself. sbomFormatsPerVariant claims to be the number
+	// of formats generate-sbom emits; count the action's -o flags and hold it
+	// to that. Without this the constant is a hand-maintained mirror sitting
+	// inside the very function that exists to check hand-maintained mirrors:
+	// a format added to the action alone would leave every count above
+	// self-consistent and wrong.
+	const sbomOutputPattern = `-o "([a-z0-9-]+)=dist/\$\{base\}(\.[a-z0-9.]+)"`
+	formats := regexp.MustCompile(sbomOutputPattern).FindAllSubmatch(sbomSrc, -1)
+	if len(formats) == 0 {
+		// Distinct from a miscount: the guard could not see any output flags
+		// at all, which usually means the action's shell was reshaped rather
+		// than that it stopped emitting SBOMs. Say which pattern stopped
+		// matching, so the fix is not a hunt.
+		return fmt.Errorf("generate-sbom: no SBOM output flags matching %q", sbomOutputPattern)
+	}
+	emitted := make([]string, 0, len(formats))
+	written := make([]string, 0, len(formats))
+	for _, f := range formats {
+		emitted = append(emitted, string(f[1]))
+		written = append(written, string(f[2]))
+	}
+	if len(formats) != sbomFormatsPerVariant {
+		return fmt.Errorf("generate-sbom emits %d SBOM format(s) %v, but sbomFormatsPerVariant is %d; update them together",
+			len(formats), emitted, sbomFormatsPerVariant)
+	}
+
+	// The count agreeing is not enough. release.yml names the documents by file
+	// extension in five separate places — the build job's upload-artifact list,
+	// the checksum step's per-variant globs, its SBOM-count glob, its sha256sum
+	// operands, and the release step's asset list — every one a hand-maintained
+	// copy of the names the action chooses.
+	//
+	// Two things can go wrong. A format's output file is renamed, so a glob
+	// finds nothing at tag time; that is caught by comparing the per-variant
+	// globs against what the action writes. Or a third format is added and one
+	// of the five sites is missed, which is worse: miss the sha256sum operands
+	// and the document is published but never summed, so it is absent from
+	// checksums.txt and therefore absent from the attestation, whose subjects
+	// are that file's lines. A silently unattested artefact.
+	//
+	// The second is caught without pinning five regexes to release.yml's exact
+	// shape — which would make this guard fragile against anyone reformatting
+	// the workflow — by requiring every extension to be named the same number
+	// of times. Any site that lists one document and not another breaks the
+	// equality, wherever it is and however it is written.
+	globbed := sbomExtensionsIn(relSrc)
+	distinct := slices.Compact(slices.Sorted(slices.Values(globbed)))
+	if !slices.Equal(distinct, slices.Sorted(slices.Values(written))) {
+		return fmt.Errorf("generate-sbom writes %v, but release.yml names %v; update them together",
+			written, distinct)
+	}
+	mentions := make(map[string]int, len(written))
+	for _, ext := range globbed {
+		mentions[ext]++
+	}
+	for _, ext := range written[1:] {
+		if mentions[ext] != mentions[written[0]] {
+			return fmt.Errorf("release.yml names %s %d time(s) but %s %d time(s); every place that lists one SBOM document must list them all",
+				written[0], mentions[written[0]], ext, mentions[ext])
+		}
+	}
+	return nil
+}
+
+// sbomExtensionsIn returns every SBOM file extension named in release.yml, in
+// the two shapes it uses: a glob (`*.spdx.json`, `dist/*.cdx.json`) or a
+// per-variant name (`openvox-ca_*_"$variant".cdx.json`). The tarball extension
+// is dropped, since most of these sites list it alongside the SBOMs and it has
+// its own count check above.
+func sbomExtensionsIn(src []byte) []string {
+	var out []string
+	for _, m := range regexp.MustCompile(`(?:\*|"\$variant")(\.[a-z0-9.]+)`).FindAllSubmatch(src, -1) {
+		if ext := string(m[1]); ext != ".tar.gz" {
+			out = append(out, ext)
+		}
+	}
+	return out
+}
+
+// signingReviewLabel is the label Renovate applies to a bump of the release
+// signing surface -- cosign, Syft, actions/attest and the actions that install
+// them (see renovate.json). ci.yml's auto-merge job must refuse to merge a PR
+// carrying it.
+//
+// The exposure is created by this feature, not inherited: before signing
+// existed there was no cosign in any workflow for a bump to touch. But ci.yml
+// auto-merges any green Renovate PR on author alone, and ci.yml does not run
+// cosign at all -- signing happens in container-images.yml's merge job and in
+// helm-chart.yml, and helm-chart.yml has no pull_request trigger. So a bump
+// that changed signing behaviour would go green on a PR and first misbehave on
+// a tag, which is the worst place to find out.
+const signingReviewLabel = "review-signing-path"
+
+// automergeRequiredClauses are the expressions an auto-merging job's condition
+// must contain, matched against the YAML-parsed `if:` with all whitespace
+// removed from both sides -- so spacing is free, but the shape is not.
+//
+// This is the whole clause rather than its parts, and that is the second
+// tightening. Requiring only the label name, the labels context and a bare
+// "!contains(" is satisfied by a condition that inverts the meaning: flip this
+// clause to `contains(...)` while any unrelated `!contains(...)` sits
+// elsewhere in the expression -- a WIP-label check, say -- and every fragment
+// is still present while the job merges signing bumps and nothing else.
+// Verified: that mutation passed the earlier fragment-based version of this
+// guard. A single keystroke and a plausible neighbouring clause is not a
+// remote failure mode.
+//
+// Exactness costs little here, unlike for a base-branch pin: "does this PR
+// carry label X" has one idiom in a GitHub Actions expression, so there is no
+// benign rewrite to reject. Where a clause's failure mode is inversion rather
+// than weakening, the looser contract is not worth its flexibility.
+//
+// KNOWN LIMIT, stated rather than closed: a negation wrapped around the whole
+// clause -- `!(!contains(...))` -- contains this substring and inverts anyway.
+// Catching that needs an expression parser rather than a match, which is not
+// worth building for a form nobody reaches by accident. The accidents this
+// does catch are deleting the clause and flipping its operator.
+//
+// Matched against the parsed scalar, never the file text, so a comment naming
+// any of this cannot satisfy it. That falls out of parsing the document rather
+// than grepping it, and is asserted by a spec because a later rewrite to a
+// text search would silently lose it.
+//
+// NOTE for whoever rebases this onto #218: that branch's verifyAutomergeBasePinIn
+// checks the same jobs in the same file the same way, and its automergeBasePin
+// is now "github.event.pull_request.base.ref ==" -- operator included, for
+// exactly the inversion reason above. These should become one guard over one
+// list: append it here and drop the duplicate walk. Two guards walking the
+// same jobs is how one is later deleted as redundant along with the clause it
+// protected. Do not relax this entry to fragments while folding.
+var automergeRequiredClauses = []string{
+	"!contains(github.event.pull_request.labels.*.name, '" + signingReviewLabel + "')",
+}
+
+// stripSpace removes all whitespace, so a required clause matches however the
+// condition happens to be wrapped or indented across a YAML block scalar.
+func stripSpace(s string) string {
+	return strings.Join(strings.Fields(s), "")
+}
+
+// verifyAutomergeLabelExclusion asserts that every job in ci.yml which merges
+// pull requests refuses ones labelled signingReviewLabel. Without it the label
+// is decoration: renovate.json can apply it, but nothing reads it, and
+// Renovate's own automerge setting does not govern this merge -- ci.yml does.
+func verifyAutomergeLabelExclusion() error {
+	src, err := os.ReadFile(filepath.Join(".github", "workflows", "ci.yml"))
+	if err != nil {
+		return err
+	}
+	return verifyAutomergeLabelExclusionIn("ci.yml", src)
+}
+
+// verifyAutomergeLabelExclusionIn is verifyAutomergeLabelExclusion over
+// caller-supplied workflow contents, split out so the failure branches are
+// testable without touching the real workflow file.
+func verifyAutomergeLabelExclusionIn(name string, src []byte) error {
+	var doc struct {
+		Jobs map[string]struct {
+			If    string `yaml:"if"`
+			Steps []struct {
+				Run string `yaml:"run"`
+			} `yaml:"steps"`
+		} `yaml:"jobs"`
+	}
+	if err := yaml.Unmarshal(src, &doc); err != nil {
+		return fmt.Errorf("%s: %w", name, err)
+	}
+	merging := 0
+	for _, job := range slices.Sorted(maps.Keys(doc.Jobs)) {
+		j := doc.Jobs[job]
+		if !slices.ContainsFunc(j.Steps, func(s struct {
+			Run string `yaml:"run"`
+		},
+		) bool {
+			return strings.Contains(s.Run, "gh pr merge")
+		}) {
+			continue
+		}
+		merging++
+		// All missing clauses at once, not just the first: fixing them one
+		// red run at a time is a poor way to learn what the condition owes.
+		var missing []string
+		for _, clause := range automergeRequiredClauses {
+			if !strings.Contains(stripSpace(j.If), stripSpace(clause)) {
+				missing = append(missing, clause)
+			}
+		}
+		if len(missing) > 0 {
+			return fmt.Errorf("%s job %q merges pull requests but its 'if:' never consults %q; "+
+				"a Renovate bump to the release signing surface would merge unattended, and no PR check runs cosign",
+				name, job, missing)
+		}
+	}
+	// A guard that found nothing to guard has not passed, it has abstained.
+	//
+	// This cuts both ways and the direction is a judgement, not an oversight.
+	// Failing here means that legitimately removing auto-merge one day makes
+	// dev:check demand a job nobody wants, until someone deletes this guard
+	// too. Accepted, because the alternative is worse in a way that is silent:
+	// rename the job, or rewrite it to merge through an action rather than
+	// `gh pr merge`, and the exclusion stops being checked with every check
+	// still green. The loud failure is a one-line fix made deliberately at the
+	// moment auto-merge is removed -- which is also the moment renovate.json's
+	// label becomes dead config and wants removing anyway. The quiet one is a
+	// signing bump merging unattended months later.
+	if merging == 0 {
+		return fmt.Errorf("%s: no job runs `gh pr merge`, so the auto-merge label exclusion is unverified; "+
+			"if auto-merge was removed, drop this guard and %q from renovate.json; if it moved or now merges "+
+			"another way, teach verifyAutomergeLabelExclusionIn to find it", name, signingReviewLabel)
 	}
 	return nil
 }
@@ -3245,6 +3485,10 @@ func (Dev) Check() error {
 	}
 	fmt.Println("Checking chart version pins...")
 	if err := verifyChartPins(); err != nil {
+		return err
+	}
+	fmt.Println("Checking the auto-merge label exclusion...")
+	if err := verifyAutomergeLabelExclusion(); err != nil {
 		return err
 	}
 	// Vet the one package with a non-Linux build-tagged file. Every CI check

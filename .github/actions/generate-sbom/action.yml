@@ -1,0 +1,111 @@
+name: Generate dist SBOM
+description: >
+  Generates the SBOM pair for one built dist tarball, shared by CI's dist job
+  and the Release workflow's build job so the documents actually published are
+  produced by the same code path CI rehearses on every pull request. Scans the
+  built binaries rather than the source tree, so the SBOM reflects what
+  actually linked rather than what go.mod permits. Emits both SPDX-JSON and
+  CycloneDX-JSON from a single scan into dist/, alongside the tarball.
+  Requires the repository to be checked out and the variant's tarball to
+  already exist under dist/.
+
+inputs:
+  variant:
+    description: "Variant short name, e.g. linux_arm64_fips"
+    required: true
+
+runs:
+  using: composite
+  steps:
+    # Pinned rather than floating: the SBOM is a published artefact, so the
+    # tool that produces it is part of the release's reproducibility surface.
+    - name: Install Syft
+      id: syft
+      uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+      with:
+        syft-version: v1.51.0
+
+    - name: Generate SBOMs (${{ inputs.variant }})
+      shell: bash
+      env:
+        VARIANT: ${{ inputs.variant }}
+        SYFT: ${{ steps.syft.outputs.cmd }}
+      run: |
+        # The version parse matches verify-dist-artifact and verify-release-tag.
+        ver="$(sed -n 's/^const Version = "\(.*\)"$/\1/p' internal/version/version.go)"
+        if [ -z "$ver" ]; then
+          echo "::error::Could not parse the Version constant from internal/version/version.go"
+          exit 1
+        fi
+        base="openvox-ca_${ver}_${VARIANT}"
+        tarball="dist/${base}.tar.gz"
+        if [ ! -f "$tarball" ]; then
+          echo "::error::Expected artefact $tarball is missing"
+          exit 1
+        fi
+
+        # Scan the binaries, not the source tree: a directory holding only the
+        # two executables, so Syft's Go binary cataloguer reports the modules
+        # that were actually linked into them rather than everything go.mod
+        # permits. The systemd unit is removed after extraction so it does not
+        # appear as a catalogued file.
+        #
+        # The directory is named for the artefact because Syft names its
+        # CycloneDX "file" components by absolute path, and that path reaches
+        # the published document. It cannot be made relative (--base-path does
+        # not affect these names), so it is made informative and stable
+        # instead: the runner's temp path plus the artefact name. Nothing
+        # secret is on that path, but it should at least say what it is.
+        scan="$RUNNER_TEMP/$base"
+        rm -rf "$scan"
+        mkdir -p "$scan"
+        tar xzf "$tarball" -C "$scan"
+        rm -f "$scan/openvox-ca.service"
+
+        # One scan, both formats: -o may be repeated, so the two documents
+        # describe the same walk rather than two separate ones.
+        "$SYFT" scan "dir:$scan" \
+          --source-name openvox-ca \
+          --source-version "$ver" \
+          -o "spdx-json=dist/${base}.spdx.json" \
+          -o "cyclonedx-json=dist/${base}.cdx.json"
+
+        # Assert the documents are usable rather than merely present. An SBOM
+        # that parses but catalogues nothing is worse than no SBOM: it looks
+        # like a provenance answer and is not one.
+        #
+        # The comparison is over Go package URLs, not raw entry counts. The
+        # two formats legitimately disagree on totals — CycloneDX emits a
+        # "file" component per binary while SPDX emits one directory-root
+        # package — so an equality check on lengths fails on a correct pair.
+        # The purl sets are the part that must agree, and they are also the
+        # part consumers actually read.
+        module="pkg:golang/github.com/voxpupuli/openvox-ca"
+        jq -r '[.components[]? | select((.purl // "") | startswith("pkg:golang/")) | .purl]
+               | sort | .[]' "dist/${base}.cdx.json" > "$RUNNER_TEMP/purls.cdx"
+        jq -r '[.packages[]?.externalRefs[]? | .referenceLocator
+                | select(startswith("pkg:golang/"))] | sort | .[]' \
+               "dist/${base}.spdx.json" > "$RUNNER_TEMP/purls.spdx"
+
+        # tr strips the padding wc emits on some platforms, so the counts
+        # read cleanly in the log and in the error messages below.
+        cdx_n="$(wc -l < "$RUNNER_TEMP/purls.cdx" | tr -d '[:space:]')"
+        spdx_n="$(wc -l < "$RUNNER_TEMP/purls.spdx" | tr -d '[:space:]')"
+        echo "Go packages: $cdx_n (CycloneDX), $spdx_n (SPDX)"
+
+        if ! diff -u "$RUNNER_TEMP/purls.spdx" "$RUNNER_TEMP/purls.cdx"; then
+          echo "::error::${base}: the SPDX and CycloneDX documents disagree about which Go packages were found"
+          exit 1
+        fi
+        # A floor rather than an exact number: the dependency count changes
+        # with every go.mod edit, but a cataloguer that has stopped working
+        # returns a handful, not scores. The binaries link well over a hundred
+        # modules, so 50 is far below the true value and far above a failure.
+        if [ "$cdx_n" -lt 50 ]; then
+          echo "::error::${base}: only $cdx_n Go packages catalogued; the binary cataloguer is not working"
+          exit 1
+        fi
+        if ! grep -q -- "^${module}@" "$RUNNER_TEMP/purls.cdx"; then
+          echo "::error::${base}: the main module $module is absent; this SBOM does not describe openvox-ca"
+          exit 1
+        fi

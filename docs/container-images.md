@@ -33,6 +33,27 @@ $ docker pull ghcr.io/voxpupuli/openvox-ca:latest-alpine   # Alpine
 Pin to a specific semver tag (e.g. `1.2.3`) for reproducible deployments;
 `edge` tracks unreleased changes and can break at any time.
 
+## Verifying an image
+
+Every published image is signed and carries SLSA v1.0 build provenance, through
+Sigstore — there is no long-lived signing key involved. Pin the identity to the
+release shape rather than accepting anything this repository signed, because
+pull-request builds are signed too:
+
+```console
+$ cosign verify ghcr.io/voxpupuli/openvox-ca:1.2.3 \
+    --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+    --certificate-identity-regexp '^https://github\.com/voxpupuli/openvox-ca/\.github/workflows/container-images\.yml@refs/tags/v'
+```
+
+Each per-architecture image also carries an SBOM in both SPDX-JSON and
+CycloneDX-JSON, catalogued from the image itself so the base-layer packages are
+included as well as the Go modules. Those are attached to the architecture
+digests, not to the multi-arch index a tag resolves to; see [verifying what you
+downloaded](../README.md#verifying-what-you-downloaded) for the two-step form,
+and [verifying a release](development/releasing.md#verifying-a-release) for what
+each check does and does not prove.
+
 ## Running
 
 The image's entrypoint is `openvox-ca`; any arguments you pass are appended to

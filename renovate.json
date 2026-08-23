@@ -61,10 +61,50 @@
       "matchStrings": [
         "# renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+)(?: packageName=(?<packageName>\\S+))?\\s+- (?<currentValue>\\S+)"
       ]
+    },
+    {
+      "customType": "regex",
+      "description": "Syft, pinned as a download-syft input rather than a uses: ref, in the generate-sbom action and the container images workflow",
+      "managerFilePatterns": [
+        "/^\\.github/workflows/.*\\.ya?ml$/",
+        "/^\\.github/actions/.*/action\\.ya?ml$/"
+      ],
+      "matchStrings": [
+        "syft-version: (?<currentValue>v\\d+\\.\\d+\\.\\d+)"
+      ],
+      "depNameTemplate": "anchore/syft",
+      "datasourceTemplate": "github-releases"
+    },
+    {
+      "customType": "regex",
+      "description": "cosign, pinned as a cosign-installer input rather than a uses: ref",
+      "managerFilePatterns": [
+        "/^\\.github/workflows/.*\\.ya?ml$/",
+        "/^\\.github/actions/.*/action\\.ya?ml$/"
+      ],
+      "matchStrings": [
+        "cosign-release: (?<currentValue>v\\d+\\.\\d+\\.\\d+)"
+      ],
+      "depNameTemplate": "sigstore/cosign",
+      "datasourceTemplate": "github-releases"
     }
   ],
 
   "packageRules": [
+    {
+      "description": "Labels the release-signing surface so ci.yml's auto-merge job refuses to merge a bump to it unattended. The label is what does the work: merging is performed by that job, which never reads this file, and its condition excludes this label (enforced by verifyAutomergeLabelExclusion in mage dev:check). automerge:false is Renovate's own default and is recorded here as intent only. This matters because no PR check runs cosign — signing happens in container-images.yml's merge job and in helm-chart.yml, which has no pull_request trigger — so a bump that changed signing behaviour would go green on a PR and first misbehave on a tag.",
+      "matchPackageNames": [
+        "sigstore/cosign",
+        "sigstore/cosign-installer",
+        "anchore/syft",
+        "anchore/sbom-action",
+        "actions/attest"
+      ],
+      "automerge": false,
+      "addLabels": [
+        "review-signing-path"
+      ]
+    },
     {
       "description": "openvox-ca-integ is built locally by mage and not published to any registry",
       "matchPackageNames": [

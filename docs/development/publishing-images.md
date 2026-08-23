@@ -31,6 +31,62 @@ Architecture builds run on native GitHub-hosted runners — `ubuntu-latest`
 merged into the final manifest. No QEMU emulation is involved, so arm64 builds
 run at native speed.
 
+## Provenance, SBOMs and signatures
+
+Every push — release tags, `edge`/`main`, and same-repo PR tags alike — is
+signed. Fork PRs push nothing and so sign nothing; their token could not mint a
+certificate in any case. Everything is keyed off the same `setup.outputs.push`
+output as the build itself, so "was it published" and "was it signed" cannot
+diverge.
+
+| Where | What is attached | Attached to |
+| --- | --- | --- |
+| `build` (×4) | SLSA v1.0 provenance; SBOMs in SPDX-JSON and CycloneDX-JSON | The per-architecture digest |
+| `merge` (×2) | SLSA v1.0 provenance; a `cosign sign` signature, `--recursive` | The index digest — and, via `--recursive`, each child manifest |
+
+The per-architecture images are the ones worth cataloguing: each has its own
+binary and its own base package set, so the SBOM records the CentOS Stream or
+Alpine packages — `curl`, `openssl` and the rest — as well as the Go modules.
+Syft reads the image back out of the registry by digest rather than scanning a
+local rebuild, so the document describes what was actually pushed. The merged
+index carries provenance only; an SBOM of an index would just be the union of
+documents already attached to its children.
+
+Attestations are pushed to the registry (`push-to-registry: true`), so they are
+discoverable through the OCI 1.1 referrers API and readable with `cosign` as
+well as `gh attestation verify`. `cosign sign` runs in addition to the
+attestations because an admission policy that asserts "this image is signed"
+wants a signature, not a predicate — `cosign verify` and
+`cosign verify-attestation` are different checks.
+
+**BuildKit's own attestations remain disabled** (`provenance: false`). They are
+unsigned, so they do not establish authenticity on their own, and the extra
+manifests they create are what breaks the push-by-digest + `imagetools create`
+merge in the first place. The attestations above replace them rather than
+supplement them.
+
+### Nothing re-resolves a tag
+
+A tag is mutable, so re-reading one between publishing and signing would open a
+window in which the thing signed is not the thing published. The workflow avoids
+that end to end:
+
+- Per-architecture images are pushed with `push-by-digest=true` and never receive
+  a tag at all; `docker/build-push-action` reports the digest it pushed, and that
+  digest is what crosses the job boundary.
+- `imagetools create --metadata-file` reports the digest of the index it just
+  pushed. The obvious alternative — `imagetools inspect <tag>` — is a fresh tag
+  resolution and is exactly the race being avoided.
+- `actions/attest` is given `subject-digest`; `cosign sign` is given
+  `${IMAGE}@${digest}`. `cosign sign` will accept a tag, which is why this is
+  worth stating: signing one would be the mistake.
+- After signing, the job asserts that every tag it published still resolves to
+  the digest that was signed, and fails if not. That does not prevent a race — it
+  converts one from a silently unsigned tag into a red build.
+
+See [verifying a release](releasing.md#verifying-a-release) for the verification
+commands and what each of them proves.
+
 ## One-time repository setup (for the repository owner)
 
 These steps must be performed once by someone with admin access to the upstream

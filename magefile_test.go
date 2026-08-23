@@ -308,6 +308,119 @@ var _ = Describe("shellVariantList", func() {
 	})
 })
 
+var _ = Describe("verifyAutomergeLabelExclusion", func() {
+	// Against the repository's real ci.yml: the clause must actually be there.
+	It("finds the real auto-merge job excluding the signing-review label", func() {
+		Expect(verifyAutomergeLabelExclusion()).To(Succeed())
+	})
+
+	Describe("drift detection", func() {
+		good := []byte(`
+jobs:
+  automerge:
+    if: >-
+      github.event_name == 'pull_request'
+      && !contains(github.event.pull_request.labels.*.name, 'review-signing-path')
+      && github.event.pull_request.user.login == 'renovate[bot]'
+    steps:
+      - run: gh pr merge --auto --merge "$PR_URL"
+`)
+
+		It("accepts a merging job that excludes the label", func() {
+			Expect(verifyAutomergeLabelExclusionIn("ci.yml", good)).To(Succeed())
+		})
+
+		// The whole point: the clause is droppable in a tidy-up, and nothing
+		// else in the repository would notice it had gone.
+		It("rejects a merging job whose condition drops the label clause", func() {
+			bad := bytes.Replace(good,
+				[]byte("      && !contains(github.event.pull_request.labels.*.name, 'review-signing-path')\n"), nil, 1)
+			// Both clauses are gone, and the error must name both — this is
+			// the spec that distinguishes "clause deleted" from the
+			// partial-match case below.
+			Expect(verifyAutomergeLabelExclusionIn("ci.yml", bad)).To(MatchError(
+				And(ContainSubstring(`job "automerge"`),
+					ContainSubstring("github.event.pull_request.labels"),
+					ContainSubstring("review-signing-path"))))
+		})
+
+		// Naming the label but not reading it from the PR's labels is not an
+		// exclusion, however plausibly it reads.
+		It("rejects a condition that names the label without consulting the PR's labels", func() {
+			bad := bytes.Replace(good,
+				[]byte("!contains(github.event.pull_request.labels.*.name, 'review-signing-path')"),
+				[]byte("github.event.pull_request.title != 'review-signing-path'"), 1)
+			Expect(verifyAutomergeLabelExclusionIn("ci.yml", bad)).To(MatchError(
+				ContainSubstring("never consults")))
+		})
+
+		// The clause is required whole, not in fragments. Flipping it while an
+		// unrelated !contains(...) sits elsewhere leaves every fragment present
+		// — the label name, the labels context, a negation — and inverts the
+		// meaning anyway. This mutation passed an earlier fragment-based
+		// version of the guard, which is why the contract is the whole clause.
+		It("rejects an inverted clause even when another negation is present", func() {
+			bad := bytes.Replace(good,
+				[]byte("      && !contains(github.event.pull_request.labels.*.name, 'review-signing-path')"),
+				[]byte("      && contains(github.event.pull_request.labels.*.name, 'review-signing-path')\n"+
+					"      && !contains(github.event.pull_request.title, 'WIP')"), 1)
+			Expect(verifyAutomergeLabelExclusionIn("ci.yml", bad)).To(MatchError(
+				ContainSubstring("never consults")))
+		})
+
+		// Exact on shape, free on spacing: the condition is a YAML block
+		// scalar that people wrap and indent to taste, and a guard that failed
+		// on a reflow would be reformatted away rather than obeyed.
+		It("accepts the clause however it is spaced", func() {
+			spaced := bytes.Replace(good,
+				[]byte("!contains(github.event.pull_request.labels.*.name, 'review-signing-path')"),
+				[]byte("!contains(  github.event.pull_request.labels.*.name,   'review-signing-path'  )"), 1)
+			Expect(verifyAutomergeLabelExclusionIn("ci.yml", spaced)).To(Succeed())
+		})
+
+		// Dropping the '!' does not weaken the exclusion, it reverses it: the
+		// job would then merge signing bumps unattended and nothing else. A
+		// guard that passes the exact inversion of what it checks for is not
+		// worth having, which is why the negation is a required clause and
+		// not left to "consults, not constrains".
+		It("rejects a condition whose label check is not negated", func() {
+			bad := bytes.Replace(good, []byte("&& !contains("), []byte("&& contains("), 1)
+			Expect(verifyAutomergeLabelExclusionIn("ci.yml", bad)).To(MatchError(
+				And(ContainSubstring(`job "automerge"`), ContainSubstring("!contains("))))
+			// And the reported clause is the whole expression a maintainer
+			// must restore, not a fragment of it.
+			Expect(verifyAutomergeLabelExclusionIn("ci.yml", bad)).To(MatchError(
+				ContainSubstring("labels.*.name, 'review-signing-path')")))
+		})
+
+		// Comments never reach the parsed `if:` scalar, so naming the clauses
+		// in one cannot satisfy the guard. Asserted rather than assumed: the
+		// immunity comes from parsing the document instead of grepping it,
+		// and a future rewrite to a text search would silently lose it.
+		It("is not satisfied by a comment naming the required clauses", func() {
+			bad := bytes.Replace(good,
+				[]byte("      && !contains(github.event.pull_request.labels.*.name, 'review-signing-path')\n"),
+				[]byte(""), 1)
+			bad = bytes.Replace(bad, []byte("jobs:\n"),
+				[]byte("jobs:\n  # github.event.pull_request.labels review-signing-path !contains(\n"), 1)
+			Expect(verifyAutomergeLabelExclusionIn("ci.yml", bad)).To(MatchError(
+				ContainSubstring("never consults")))
+		})
+
+		// A guard that finds nothing to guard has abstained, not passed. If
+		// auto-merge is renamed or rewritten to merge some other way, this
+		// must go red rather than quiet — that is the failure mode where a
+		// green check is actively misleading. The cost is accepted knowingly:
+		// legitimately removing auto-merge will fail this until the guard goes
+		// too. See the note at the merging == 0 branch.
+		It("refuses to pass when no job merges pull requests at all", func() {
+			bad := bytes.Replace(good, []byte("gh pr merge --auto --merge"), []byte("echo nothing to do"), 1)
+			Expect(verifyAutomergeLabelExclusionIn("ci.yml", bad)).To(MatchError(
+				ContainSubstring("no job runs `gh pr merge`")))
+		})
+	})
+})
+
 var _ = Describe("verifyDistVariants", func() {
 	// Runs against the repository's real workflow files: this is the
 	// cross-check that keeps ci.yml, release.yml, and distVariants() from
@@ -347,35 +460,125 @@ jobs:
     steps:
       - run: |
           for variant in linux_amd64 linux_arm64 linux_amd64_fips linux_arm64_fips; do
-            ls
+            ls -- openvox-ca_*_"$variant".tar.gz > /dev/null
+            ls -- openvox-ca_*_"$variant".spdx.json > /dev/null
+            ls -- openvox-ca_*_"$variant".cdx.json > /dev/null
           done
           if [ "$tarballs" -ne 4 ]; then
             exit 1
           fi
+          if [ "$sboms" -ne 8 ]; then
+            exit 1
+          fi
+          sha256sum -- *.tar.gz *.spdx.json *.cdx.json > checksums.txt
+`)
+
+		// The generate-sbom action's output formats, whose count must equal
+		// sbomFormatsPerVariant.
+		goodSBOM := []byte(`
+        "$SYFT" scan "dir:$scan" \
+          -o "spdx-json=dist/${base}.spdx.json" \
+          -o "cyclonedx-json=dist/${base}.cdx.json"
 `)
 
 		It("accepts synthetic workflows that agree with distVariants", func() {
-			Expect(verifyDistVariantsIn(goodCI, goodRel)).To(Succeed())
+			Expect(verifyDistVariantsIn(goodCI, goodRel, goodSBOM)).To(Succeed())
 		})
 
 		It("rejects a drifted ci.yml dist matrix and names it", func() {
 			badCI := bytes.Replace(goodCI, []byte("- variant: linux_arm64_fips"), []byte("- variant: linux_riscv64_fips"), 1)
-			Expect(verifyDistVariantsIn(badCI, goodRel)).To(MatchError(ContainSubstring("ci.yml dist job matrix")))
+			Expect(verifyDistVariantsIn(badCI, goodRel, goodSBOM)).To(MatchError(ContainSubstring("ci.yml dist job matrix")))
 		})
 
 		It("rejects a drifted release.yml build matrix and names it", func() {
 			badRel := bytes.Replace(goodRel, []byte("          - variant: linux_amd64_fips\n"), nil, 1)
-			Expect(verifyDistVariantsIn(goodCI, badRel)).To(MatchError(ContainSubstring("release.yml build job matrix")))
+			Expect(verifyDistVariantsIn(goodCI, badRel, goodSBOM)).To(MatchError(ContainSubstring("release.yml build job matrix")))
 		})
 
 		It("rejects a drifted checksum-step shell loop and names it", func() {
 			badRel := bytes.Replace(goodRel, []byte("for variant in linux_amd64 "), []byte("for variant in "), 1)
-			Expect(verifyDistVariantsIn(goodCI, badRel)).To(MatchError(ContainSubstring("checksum-step shell loop")))
+			Expect(verifyDistVariantsIn(goodCI, badRel, goodSBOM)).To(MatchError(ContainSubstring("checksum-step shell loop")))
 		})
 
 		It("rejects a stale tarball-count literal and names the counts", func() {
 			badRel := bytes.Replace(goodRel, []byte(`-ne 4`), []byte(`-ne 3`), 1)
-			Expect(verifyDistVariantsIn(goodCI, badRel)).To(MatchError(ContainSubstring("expects 3 tarballs")))
+			Expect(verifyDistVariantsIn(goodCI, badRel, goodSBOM)).To(MatchError(ContainSubstring("expects 3 tarballs")))
+		})
+
+		// The SBOM count is a multiple of the variant count rather than equal
+		// to it, so it drifts independently of the tarball count: a variant
+		// added everywhere else but missed in this literal lands here. (A
+		// format added to generate-sbom is caught by the format-count specs
+		// below, not by this one.)
+		It("rejects a stale SBOM-count literal and names the counts", func() {
+			badRel := bytes.Replace(goodRel, []byte(`-ne 8`), []byte(`-ne 4`), 1)
+			Expect(verifyDistVariantsIn(goodCI, badRel, goodSBOM)).To(MatchError(ContainSubstring("expects 4 SBOMs")))
+		})
+
+		// -lt rather than -ne: the check is present but no longer the shape
+		// the guard parses, which is the same branch a deleted line takes.
+		// The message quotes the pattern it wanted, so the operator mismatch
+		// is visible rather than leaving a maintainer staring at a check that
+		// is plainly on screen.
+		It("rejects an SBOM-count check the guard cannot parse", func() {
+			badRel := bytes.Replace(goodRel, []byte(`"$sboms" -ne 8`), []byte(`"$sboms" -lt 8`), 1)
+			Expect(verifyDistVariantsIn(goodCI, badRel, goodSBOM)).To(MatchError(ContainSubstring(`no SBOMs-count check matching`)))
+		})
+
+		// sbomFormatsPerVariant is the multiplier the SBOM count is derived
+		// from, and it mirrors the generate-sbom action. These two specs are
+		// what stop it becoming an unchecked copy: they are the reason a
+		// format added to the action alone cannot leave every other count
+		// self-consistent and wrong.
+		It("rejects a generate-sbom action emitting more formats than the constant", func() {
+			badSBOM := bytes.Replace(goodSBOM, []byte(`-o "cyclonedx-json=dist/${base}.cdx.json"`),
+				[]byte("-o \"cyclonedx-json=dist/${base}.cdx.json\" \\\n          -o \"syft-json=dist/${base}.syft.json\""), 1)
+			Expect(verifyDistVariantsIn(goodCI, goodRel, badSBOM)).To(MatchError(
+				And(ContainSubstring("emits 3 SBOM format(s)"), ContainSubstring("syft-json"))))
+		})
+
+		It("rejects a generate-sbom action emitting fewer formats than the constant", func() {
+			badSBOM := bytes.Replace(goodSBOM, []byte(`          -o "cyclonedx-json=dist/${base}.cdx.json"`), nil, 1)
+			Expect(verifyDistVariantsIn(goodCI, goodRel, badSBOM)).To(MatchError(ContainSubstring("emits 1 SBOM format(s)")))
+		})
+
+		// Zero matches is not a miscount: the guard's own pattern stopped
+		// matching, which is a different problem with a different fix, so it
+		// gets a message naming the pattern rather than "emits 0".
+		It("says which pattern stopped matching when it can see no output flags", func() {
+			badSBOM := bytes.ReplaceAll(goodSBOM, []byte(`-o "`), []byte("--output "))
+			Expect(verifyDistVariantsIn(goodCI, goodRel, badSBOM)).To(MatchError(
+				And(ContainSubstring("no SBOM output flags matching"), ContainSubstring("[a-z0-9-]"))))
+		})
+
+		// The counts can agree while the names do not. Renaming one format's
+		// output file leaves sbomFormatsPerVariant satisfied and still breaks
+		// the release, because release.yml globs for the old extension — and
+		// it breaks it at tag time, which is the failure this whole guard
+		// family exists to move earlier.
+		It("rejects a renamed SBOM output whose extension release.yml never globs for", func() {
+			badSBOM := bytes.Replace(goodSBOM, []byte(`${base}.cdx.json`), []byte(`${base}.bom.json`), 1)
+			Expect(verifyDistVariantsIn(goodCI, goodRel, badSBOM)).To(MatchError(
+				And(ContainSubstring(".bom.json"), ContainSubstring("but release.yml names"))))
+		})
+
+		It("rejects a release.yml that globs for an extension the action never writes", func() {
+			badRel := bytes.Replace(goodRel, []byte(`"$variant".cdx.json`), []byte(`"$variant".bom.json`), 1)
+			Expect(verifyDistVariantsIn(goodCI, badRel, goodSBOM)).To(MatchError(
+				ContainSubstring("but release.yml names")))
+		})
+
+		// release.yml names each document in five places. Dropping one of them
+		// keeps every name valid and every count above satisfied, so nothing
+		// else here would notice — but the document would go unlisted at that
+		// site. Drop it from the sha256sum operands and it is published without
+		// a checksum line, which means it is also missing from the attestation,
+		// whose subjects are exactly those lines.
+		It("rejects a release.yml that lists one SBOM document at a site but not the other", func() {
+			badRel := bytes.Replace(goodRel, []byte(`sha256sum -- *.tar.gz *.spdx.json *.cdx.json`),
+				[]byte(`sha256sum -- *.tar.gz *.spdx.json`), 1)
+			Expect(verifyDistVariantsIn(goodCI, badRel, goodSBOM)).To(MatchError(
+				ContainSubstring("every place that lists one SBOM document must list them all")))
 		})
 	})
 })

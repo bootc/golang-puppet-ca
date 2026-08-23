@@ -46,6 +46,30 @@ is mutable — each push overwrites it — and its `appVersion` resolves to the
 rolling `edge-alpine` image, so the two stay consistent. Use it to try
 unreleased changes; never pin production to it.
 
+## Verifying the chart
+
+The chart is signed and carries SLSA v1.0 build provenance, like the images.
+Pin the identity to the release shape rather than accepting anything this
+repository signed:
+
+```console
+$ cosign verify ghcr.io/voxpupuli/openvox-ca-charts/openvox-ca:X.Y.Z \
+    --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+    --certificate-identity-regexp '^https://github\.com/voxpupuli/openvox-ca/\.github/workflows/helm-chart\.yml@refs/tags/v'
+```
+
+The rolling development chart is signed too, but from `main` rather than from a
+tag, so its certificate identity ends `@refs/heads/main` and the pattern above
+will not match it. Substitute that suffix if you are deliberately verifying a
+development chart.
+
+There is no `.prov` file, so `helm verify` has nothing to check — Helm's own
+provenance mechanism is PGP and wants a long-lived keyring, which is what
+Sigstore's short-lived certificates exist to avoid. The chart carries no SBOM
+either: it declares no dependencies, so there would be nothing to catalogue. The
+software it installs is the container image, which carries its own — see
+[verifying an image](container-images.md#verifying-an-image).
+
 ## How the chart is configured
 
 openvox-ca has a large configuration surface, and the chart deliberately does
