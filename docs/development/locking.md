@@ -289,8 +289,10 @@ be atomic with the issuance.
 because it used to be.** `AnswerOCSP` reads what it needs under `c.mu.RLock` —
 whether the serial is in `serialIndex`, the `cachedCRL` pointer, `CACert` and
 `CAKey` — releases, and signs holding no CA lock at all; it re-takes the write
-lock only to store the finished response. It can do this and issuance cannot
-because the two guard different things. An issuance *mutates* storage, so its
+lock only to store the finished response, and only when there is one to store —
+a nonced or `unknown` answer is never cached, so those take no write lock at
+all. It can do this and issuance cannot because the two guard different
+things. An issuance *mutates* storage, so its
 cache update has to be atomic with the write. A response is *derived* from
 state the responder only reads, so the equivalent obligation is weaker: not
 "nothing may change while I sign", but "do not cache an answer that stopped
@@ -418,12 +420,15 @@ replica holds a lock. The pattern:
 
 - **Authentication revocation checks** (`IsRevokedSerial`) and **OCSP**
   (`AnswerOCSP`) answer from `cachedCRL`/`ocspCache`/`serialIndex` under
-  `c.mu.RLock`. A cache miss is *not* wholly a read path — it ends by taking the
-  write lock to re-check and store — but it takes its snapshot under the same
-  `RLock` and signs outside it, so what it holds these readers off across is a
-  map write rather than a signer round trip. Go's `RWMutex` gives a waiting
-  writer priority, so that store does briefly stall new `RLock` acquisitions;
-  the guarantee is about the signature, not about never blocking.
+  `c.mu.RLock`. A *cacheable* miss — no nonce, and a definite status — is not
+  wholly a read path: it ends by taking the write lock to re-check and store.
+  It still takes its snapshot under the same `RLock` and signs outside it, so
+  what it holds these readers off across is a map write rather than a signer
+  round trip; Go's `RWMutex` gives that waiting writer priority, so the store
+  does briefly stall new `RLock` acquisitions. The guarantee is about the
+  signature, not about never blocking. A nonced miss and an `unknown` are never
+  cached, so they take no write lock at all — which matters, because the nonced
+  request is the motivating case: it misses on every request.
 - **HTTP GETs** (certificate, CRL, status listings) read straight through
   `StorageService` getters, which take only the relevant tier-2 read lock.
 - `ReadInventory` verifies the integrity HMAC under `inventoryMu.RLock` but
@@ -631,16 +636,23 @@ state when the document was last updated and is not guaranteed exhaustive.
   (which always miss the cache) serialise process-wide behind the signing
   round trip.~~ Fixed. `AnswerOCSP` now snapshots the decision inputs under
   `c.mu.RLock`, signs holding no CA lock, and re-takes the write lock only to
-  store the result. Concurrent responses sign in parallel, and neither they nor
-  the `c.mu.RLock` readers on the authentication path queue behind **the
-  responder's** signer round trip.
+  store the result — and only when there is a result to store, since a nonced
+  or `unknown` answer is never cached and so takes no write lock at all.
+  Concurrent responses sign in parallel, and neither they nor the `c.mu.RLock`
+  readers on the authentication path queue behind **the responder's** signer
+  round trip.
 
   That qualifier is not decoration. **Issuance still holds `c.mu` exclusively
   across its signature** — deliberately, see Tier 3 — so an authentication-path
   `IsRevokedSerial` can still queue behind a signer round trip; it is just an
-  issuance's rather than a responder's, bounded by `LoginTimeout`. An unnonced
-  OCSP request can likewise block on `c.mu.Lock()` for its optional cache write
-  while an issuance holds the lock. Anyone diagnosing a stalled authentication
+  issuance's rather than a responder's. Do not assume that wait is short:
+  under `ca_key_provider: openbao` it is bounded by roughly *twice* the
+  configured login timeout, not once — `openbao.Signer.Sign` records why, the
+  403 path's `Reauth` taking a mutex that does not honour a context — and under
+  the isolated signer `RemoteSigner.Sign` issues a `net/rpc` call carrying no
+  deadline at all, so it is not bounded. An unnonced OCSP request can likewise
+  block on `c.mu.Lock()` for its optional cache write while an issuance holds
+  the lock. Anyone diagnosing a stalled authentication
   path should still look at the signer.
 
   **What the restructure had to add, and why anything else narrowing a lock
@@ -666,10 +678,16 @@ state when the document was last updated and is not guaranteed exhaustive.
   shape, and the #183 entry below says why the index sync has to use it —
   that path cannot re-check its own predicate, and this one can.
 
-- **Unbounded concurrent signing on `/ocsp` — opened by the #197 fix above, not
-  yet tracked by an issue.** Recorded here because closing one gap opened
-  another, and a known-gaps list that only records what was closed is
-  misleading.
+- **Unbounded concurrent signing on `/ocsp` — opened by the #197 fix above.**
+
+  > **This entry has no issue behind it yet — one of only two here that do
+  > not**, the other being the blob-backend inventory-append bullet at the end
+  > of this section. Every other bullet is anchored to an issue, and the section
+  > preamble says these gaps are *tracked*. This is recorded now so that closing
+  > #197 did not quietly drop what it opened; **it still needs an issue filed
+  > and linked from here**, because the open question below — what bounds
+  > concurrent signing, and at what size — is a design decision, and a paragraph
+  > in a developer document is not where that gets decided.
 
   Before #197, `c.mu` capped CA-key use at **one signature in flight
   process-wide**: every `CAKey.Sign` call site — `issueLeafLocked`,
@@ -687,8 +705,10 @@ state when the document was last updated and is not guaranteed exhaustive.
   concurrent operations on the CA key with no aggregate cap, and that signer is
   shared with issuance and CRL re-signing. A mutex queue drains; a saturated
   signing backend serving other consumers does not, and it takes issuance down
-  with it. `openbao.Signer.Sign` bounds each call by `loginTimeout` but has no
-  bound on how many run at once.
+  with it. `openbao.Signer.Sign` bounds each call — by roughly twice the login
+  timeout, as the #197 entry above sets out — but nothing bounds how many run at
+  once, and under the isolated signer `RemoteSigner.Sign` carries no per-call
+  deadline either.
 
   The missing half is a cap on concurrent signing — a semaphore around the
   signature sized to the signer's capacity — which is deliberately not attempted
@@ -881,14 +901,27 @@ on, and it is asserted rather than assumed.
 The opposite property — that a lock is *not* held — is automated in
 [ocsplockscope_test.go](../../internal/ca/ocsplockscope_test.go), which is what
 rule 3 points at when it calls the OCSP responder "the shape to copy". It parks
-a wrapped `crypto.Signer` inside `Sign` and, while the signature is held open,
-requires an unrelated `c.mu.RLock` reader and a `Revoke` (which needs the write
-lock) to complete anyway — asserting they finished *while* the signature was
+a wrapped `crypto.Signer` inside `Sign` so a signature can be held open, and
+splits into two pairs.
+
+Two specs pin the **scope**: an unrelated `c.mu.RLock` reader
+(`IsRevokedSerial`) must complete while a signature is parked, and two
+responses must sign concurrently rather than queueing — asserted as a parked
+peak of two. Both assert the other work finished *while* the signature was
 still in flight, since an end-state assertion is equally satisfied by a late
-unblock. A third spec pins the guard rather than the scope: a revocation lands
-mid-signature and the response must be neither cached nor given a reusable
-`MaxAge`. Two of the three were run against the pre-#197 arrangement and fail
-there; the third's mutation is the guard itself.
+unblock. Both were run against the pre-#197 arrangement and fail there.
+
+Two more pin the **guard**, and they cannot fail against pre-#197 code because
+there the racing operation simply waits for the lock, making the interleave
+unreachable. One lands a revocation mid-signature; the other an index-sync
+prune, which reaches `decideOCSPStatus`'s `!known` early return rather than the
+CRL scan, and so resurrects an entry `dropSerialLocked` removed rather than one
+a CRL install evicted. Each requires an operation needing the *write* lock to
+complete while the signature is parked, which is what makes the claim "no CA
+lock" rather than "no read lock". Their mutations are the guard itself, and
+there are two: dropping the re-validation before the cache write, and
+decoupling `MaxAge` from whether the response was actually cached. Each fails
+both guard specs on its own assertion and leaves the two scope specs green.
 
 That a given path takes its lock *at all* is automated for five of them, all in
 the same shape: park the operation on a held `subject:<name>` and require it to

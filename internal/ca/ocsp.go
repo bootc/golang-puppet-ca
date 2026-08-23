@@ -32,9 +32,15 @@ import (
 	"golang.org/x/crypto/ocsp"
 )
 
-// ErrInternal is returned by OCSPResponse when a server-side failure (e.g. a
-// CRL read error) prevents determining certificate status. The HTTP handler
-// uses this to write an OCSP InternalError response instead of MalformedRequest.
+// ErrInternal marks a server-side failure in AnswerOCSP (and so in
+// OCSPResponse, which wraps it). The HTTP handler uses it to write an OCSP
+// InternalError response instead of MalformedRequest, which matters because
+// MalformedRequest tells a verifier its request was at fault and not to retry.
+//
+// Two kinds of failure carry it, and they are not the same kind: the status
+// could not be determined (a CRL read error), or the status was determined and
+// the response could not be produced (the CA signature failed). The second is
+// the one an external signer makes reachable under load.
 var ErrInternal = errors.New("internal CA error")
 
 // OCSPValidity is the NextUpdate window written into a definite OCSP response —
@@ -459,6 +465,21 @@ func (c *CA) AnswerOCSP(_ context.Context, reqDER []byte) (OCSPAnswer, error) {
 	// ever stored, so neither is ever reusable.
 	answer := OCSPAnswer{DER: respDER}
 	if cached {
+		// The nominal constant, not time.Until(now.Add(OCSPValidity)). The two
+		// differ by however long signing took, because `now` is sampled before
+		// the signature — so this advertises a window fractionally longer than
+		// the entry just stored and than the response's own NextUpdate, where
+		// the cache-hit path above derives its MaxAge from the entry's expiry
+		// and does not.
+		//
+		// Left as it was, deliberately. The asymmetry predates #197, the
+		// overshoot is one signature against a four-hour window, and a verifier
+		// enforces NextUpdate for itself. Against that,
+		// internal/api/ocsp_test.go's "GET response carries Cache-Control" spec
+		// asserts this value equals OCSPValidity *exactly* — and that spec is on
+		// main, not on any branch in flight, so it states a settled intent
+		// rather than one still open to negotiation. Deriving the value would be
+		// a behaviour change made to satisfy a symmetry no client can observe.
 		answer.MaxAge = OCSPValidity
 	}
 	return answer, nil
@@ -467,9 +488,10 @@ func (c *CA) AnswerOCSP(_ context.Context, reqDER []byte) (OCSPAnswer, error) {
 // decideOCSPStatus decides what an OCSP response should say about serial, given
 // whether the serial index recognises it and a CRL to check it against.
 //
-// Named for the decision rather than the status because ocsp_test.go's sibling
-// package already has an ocspStatusFor, which issues a request and parses what
-// comes back — a different question with a confusingly similar name.
+// Named for the decision rather than the status because the sibling ca_test
+// package already has an ocspStatusFor — in serialsync_test.go — which issues a
+// request and parses what comes back, a different question with a confusingly
+// similar name.
 //
 // A free function over an explicit CRL rather than a method reading
 // c.cachedCRL, because AnswerOCSP asks this question twice and from different

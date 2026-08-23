@@ -145,10 +145,10 @@ func (p *parkingSigner) Release() {
 // Those two guard the hazard the fix introduces rather than one it removes, so
 // they have their own mutations, and both were run:
 //
-//   - dropping the re-validation before the cache write fails both, on the
-//     cached status;
-//   - decoupling MaxAge from whether the response was actually cached fails
-//     both, on the advertised reuse window.
+//   - dropping the re-validation before the cache write fails both on the
+//     cached status, which is asserted first for exactly that reason;
+//   - decoupling MaxAge from whether the response was actually cached leaves
+//     the cache correct and fails both on the advertised reuse window.
 //
 // Each mutation kills the specs that guard it and leaves the other two green.
 var _ = Describe("OCSP response signing and the CA lock", func() {
@@ -331,9 +331,14 @@ var _ = Describe("OCSP response signing and the CA lock", func() {
 
 		var answer ca.OCSPAnswer
 		Eventually(answered, 5*time.Second).Should(Receive(&answer))
-		Expect(answer.MaxAge).To(BeZero(),
-			"a response a revocation overtook must not be advertised as reusable")
 
+		// Assert the cache before the reuse window, so the two mutations this
+		// spec records die on different lines: dropping the re-validation
+		// poisons the cache and fails here, while decoupling MaxAge from
+		// whether the write survived leaves the cache correct and fails below.
+		// Ordered the other way, both would stop at the same assertion and
+		// neither would demonstrate what the other guards.
+		//
 		// The request carries no nonce, so this second call is served from
 		// ocspCache if anything was left there. It must not have been.
 		respDER, err := myCA.OCSPResponse(ctx, reqDER)
@@ -342,6 +347,21 @@ var _ = Describe("OCSP response signing and the CA lock", func() {
 		Expect(err).NotTo(HaveOccurred())
 		Expect(parsed.Status).To(Equal(xocsp.Revoked),
 			"a response signed before the revocation must not be cached after it")
+
+		// The overtaken response is still handed to the caller that asked for
+		// it — AnswerOCSP says so, and this race is the only place that
+		// contract is reachable, so nothing else can pin it. Without this an
+		// over-correction that withheld the response entirely would satisfy
+		// every other assertion here and reach the handler as an empty body.
+		Expect(answer.DER).NotTo(BeEmpty(),
+			"the overtaken response should still be returned to its caller")
+		overtaken, err := xocsp.ParseResponse(answer.DER, myCA.CACert)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(overtaken.Status).To(Equal(xocsp.Good),
+			"the overtaken response should say what was true when it was signed")
+
+		Expect(answer.MaxAge).To(BeZero(),
+			"a response a revocation overtook must not be advertised as reusable")
 	})
 
 	// The prune half of the same guard, and not a duplicate of the revocation
@@ -391,9 +411,10 @@ var _ = Describe("OCSP response signing and the CA lock", func() {
 
 		var answer ca.OCSPAnswer
 		Eventually(answered, 5*time.Second).Should(Receive(&answer))
-		Expect(answer.MaxAge).To(BeZero(),
-			"a response a prune overtook must not be advertised as reusable")
 
+		// Cache first, then the reuse window — see the sibling spec above for
+		// why the order is what keeps the two mutations distinguishable.
+		//
 		// The serial is no longer in the index, so a fresh answer is `unknown`.
 		// A resurrected cache entry would report Good instead.
 		respDER, err := myCA.OCSPResponse(ctx, reqDER)
@@ -402,5 +423,15 @@ var _ = Describe("OCSP response signing and the CA lock", func() {
 		Expect(err).NotTo(HaveOccurred())
 		Expect(parsed.Status).To(Equal(xocsp.Unknown),
 			"a response signed before the prune must not be cached after it")
+
+		Expect(answer.DER).NotTo(BeEmpty(),
+			"the overtaken response should still be returned to its caller")
+		overtaken, err := xocsp.ParseResponse(answer.DER, myCA.CACert)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(overtaken.Status).To(Equal(xocsp.Good),
+			"the overtaken response should say what was true when it was signed")
+
+		Expect(answer.MaxAge).To(BeZero(),
+			"a response a prune overtook must not be advertised as reusable")
 	})
 })
