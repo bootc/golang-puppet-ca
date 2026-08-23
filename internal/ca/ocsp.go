@@ -501,10 +501,17 @@ func (c *CA) AnswerOCSP(_ context.Context, reqDER []byte) (OCSPAnswer, error) {
 // two copies of the decision that drifted apart would make the guard test a
 // different question from the one the response answered.
 //
-// The deliberate twin of serialInCRL in revoke.go, which every caller needing
-// only a yes or no uses: this one exists because OCSP must return the entry's
-// RevocationTime, which a bool cannot carry. Change the predicate there and
-// change it here too.
+// Its CRL scan — and only that part — is the deliberate twin of serialInCRL in
+// revoke.go, which every caller needing only a yes or no uses: the scan exists
+// separately here because OCSP must return the entry's RevocationTime, which a
+// bool cannot carry. **Change the revocation predicate there and change the
+// scan here too.**
+//
+// The obligation is worth stating narrowly, because this function grew past the
+// twin when it absorbed the whole status decision: the !known early return and
+// the not-loaded error have no counterpart in serialInCRL and nothing about
+// them needs mirroring. It is the loop, not the function, that has to stay in
+// step.
 //
 // Returns (ocsp.Unknown, zero, nil) when the index does not recognise the
 // serial — checked first, so an unrecognised serial does not depend on a CRL
