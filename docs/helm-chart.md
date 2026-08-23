@@ -351,8 +351,9 @@ The annotation is controller-specific: HAProxy uses
 `ingress.kubernetes.io/ssl-passthrough`, ingress-nginx uses
 `nginx.ingress.kubernetes.io/ssl-passthrough` (and needs the controller started
 with `--enable-ssl-passthrough`). Note that `ingress.tls` is *not* how you
-serve TLS here — the CA's own certificate does that. Only set it if your
-controller needs a certificate for SNI routing.
+serve TLS here — the serving certificate openvox-ca presents does that, from
+the `tls` Secret or from `config.tls_cert`/`config.tls_key`. Only set it if
+your controller needs a certificate for SNI routing.
 
 If you deliberately terminate TLS at the edge, set `config.no_tls_required:
 true` and accept that mTLS-authenticated endpoints are unreachable.

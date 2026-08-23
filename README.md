@@ -232,10 +232,55 @@ network, serve HTTPS as below.
 ```bash
 ./bin/openvox-ca \
   --cadir /etc/puppetlabs/puppet/ssl/ca \
-  --tls-cert /etc/puppetlabs/puppet/ssl/ca/ca_crt.pem \
-  --tls-key  /etc/puppetlabs/puppet/ssl/ca/private/ca_key.pem \
+  --tls-cert /etc/puppetlabs/puppet/ssl/ca/signed/puppet.example.com.pem \
+  --tls-key  /etc/puppetlabs/puppet/ssl/ca/private/puppet.example.com_key.pem \
   --puppet-server puppet.example.com
 ```
+
+`--tls-cert` needs a serving certificate the CA has issued to itself. The CA's
+own `ca_crt.pem` is not one — its `keyUsage` is `certSign, cRLSign` and it
+carries no `subjectAltName`, so a server presenting it completes the handshake
+and is then rejected by every agent, and the server says so at startup. Issue
+one by starting the CA on loopback with TLS off and asking it for a
+certificate:
+
+```bash
+# Stop any CA already listening on 8140 first, or this one cannot bind.
+./bin/openvox-ca --tls-cert= --tls-key= \
+  --cadir /etc/puppetlabs/puppet/ssl/ca --host 127.0.0.1 --hostname puppet.example.com &
+PCA_PID=$!
+
+# Wait for it to serve: a cold cadir generates an RSA-4096 key first.
+for _ in $(seq 1 300); do
+  curl -sf http://127.0.0.1:8140/puppet-ca/v1/certificate/ca >/dev/null && break; sleep 1
+done
+
+./bin/openvox-ca-ctl generate \
+  --server-url http://127.0.0.1:8140 \
+  --certname   puppet.example.com \
+  --dns        puppet.example.com \
+  --out-dir    /etc/puppetlabs/puppet/ssl/ca/private
+
+kill $PCA_PID; wait $PCA_PID 2>/dev/null
+```
+
+**While that server is up its whole admin API is unauthenticated** — the
+authorisation middleware is only installed when `tls_cert` and `tls_key` are
+both set, and that includes `POST /generate/<subject>`, which hands back a
+signed certificate and its private key. `--host 127.0.0.1` is required rather
+than advisable, and the `kill` above is part of the procedure, not tidying.
+
+`--server-url` is needed because it defaults to HTTPS while that server speaks
+plain HTTP, and the empty `--tls-cert=`/`--tls-key=` keep the start from
+picking up a `tls_cert` in `/etc/puppet-ca/config.yaml` — which would name the
+file this step is about to create. `--out-dir` points at the directory the CA
+writes the key to anyway, so no second copy of it is left lying around; omit it
+and one lands in the current directory. The certificate is printed on stdout,
+and with the default filesystem backend the CA also writes both halves under
+`cadir`, at the two paths `--tls-cert`/`--tls-key` point at above, so once the
+temporary server is stopped you can start again with the TLS flags. [Serving
+certificate](docs/configuration.md#serving-certificate) has the full procedure,
+including the other storage backends and running it under systemd.
 
 When `--tls-cert` and `--tls-key` are both set, the server:
 
@@ -253,7 +298,7 @@ The complete flag, environment-variable, and config-file reference is in
 
 | Guide | What it covers |
 | --- | --- |
-| [Configuring the server](docs/configuration.md) | Every flag, environment variable, config-file key; autosigning; directory layout; graceful shutdown; reloading configuration |
+| [Configuring the server](docs/configuration.md) | Every flag, environment variable, config-file key; the serving certificate; autosigning; directory layout; graceful shutdown; reloading configuration |
 | [HTTP API reference](docs/api.md) | All endpoints, authorization tiers, and admin credential resolution |
 | [Operator CLI (`openvox-ca-ctl`)](docs/operator-cli.md) | The `openvox-ca-ctl` command reference, and the offline `openvox-ca` subcommands (`csr`, `import-ca-cert`) that run against the server's own configuration |
 | [Storage backends](docs/storage-backends.md) | filesystem, SQLite, PostgreSQL, MySQL, etcd, Redis/Valkey; migrating between them |

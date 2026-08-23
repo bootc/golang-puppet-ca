@@ -63,8 +63,10 @@ cadir: /etc/puppetlabs/puppet/ssl/ca
 host: 0.0.0.0
 port: 8140
 hostname: puppet.example.com
-tls_cert: /etc/puppetlabs/puppet/ssl/ca/ca_crt.pem
-tls_key:  /etc/puppetlabs/puppet/ssl/ca/private/ca_key.pem
+# A serving certificate issued by this CA — not the CA's own ca_crt.pem and
+# ca_key.pem, which cannot serve TLS. See "Serving certificate" below.
+tls_cert: /etc/puppetlabs/puppet/ssl/ca/signed/puppet.example.com.pem
+tls_key:  /etc/puppetlabs/puppet/ssl/ca/private/puppet.example.com_key.pem
 puppet_server: puppet.example.com
 puppet_server_file: ""
 no_pp_cli_auth: false
@@ -207,6 +209,168 @@ The CA key passphrase can also be provided via `PUPPET_CA_KEY_PASSPHRASE` (env v
 
 Boolean env vars accept any value accepted by `strconv.ParseBool`: `1`, `t`, `true`,
 `yes`, `on` (case-insensitive) to enable; `0`, `f`, `false`, `no`, `off` to disable.
+
+## Serving certificate
+
+`tls_cert` and `tls_key` name a **serving certificate issued by this CA**, not
+the CA's own `ca_crt.pem` and `ca_key.pem`. The CA certificate exists to sign
+other certificates, not to identify a server: its `keyUsage` is
+`certSign, cRLSign` — neither of the two bits a TLS server needs — and it has
+no `subjectAltName`. Pointed at it, the CA starts, logs `TLS enabled`, and
+completes the handshake, and then every client that verifies the certificate
+rejects it:
+
+```console
+$ openssl s_client -connect puppet.example.com:8140 -CAfile ca_crt.pem -verify_hostname puppet.example.com
+verify error:num=26:unsuitable certificate purpose
+verify error:num=62:hostname mismatch
+```
+
+`hostname` does not repair this. It only names a CA at bootstrap, so on a CA
+that already exists it changes nothing at all, and even at bootstrap it sets
+the subject and adds no SAN — and clients have matched SANs rather than the
+common name for years.
+
+### Issuing one
+
+`generate` needs a running server, so the first serving certificate is issued
+against this CA started temporarily on loopback with TLS switched off. Stop the
+service first if one is already running on port 8140, then:
+
+```bash
+# Your configured cadir. The CA writes the serving key under it, and pointing
+# --out-dir at the same place keeps a second copy from being left elsewhere.
+# The systemd unit's default is /var/lib/puppet-ca, not the path below.
+CADIR=/etc/puppetlabs/puppet/ssl/ca
+
+openvox-ca --tls-cert= --tls-key= --host 127.0.0.1 --port 8140 &
+PCA_PID=$!
+
+# Poll rather than sleep: bootstrapping a cold cadir generates an RSA-4096 key
+# first, which is not a fixed-length wait on a slow or entropy-starved machine.
+# 300s matches the TimeoutStartSec the shipped systemd unit allows for it.
+for _ in $(seq 1 300); do
+  curl -sf http://127.0.0.1:8140/puppet-ca/v1/certificate/ca >/dev/null && break
+  sleep 1
+done
+curl -sf http://127.0.0.1:8140/puppet-ca/v1/certificate/ca >/dev/null || {
+  echo "the CA did not become ready" >&2; kill $PCA_PID; exit 1; }
+
+openvox-ca-ctl generate \
+  --server-url http://127.0.0.1:8140 \
+  --certname   puppet.example.com \
+  --dns        puppet.example.com \
+  --out-dir    "$CADIR/private"
+
+kill $PCA_PID; wait $PCA_PID 2>/dev/null
+```
+
+Empty `--tls-cert=` and `--tls-key=` override the config file for this one
+start, and switching TLS off is all they do — every other setting stays in
+force, which matters more than it looks.
+
+> **Warning:** do not reach for `--config /dev/null` here. It switches TLS off
+> too, but it discards `storage_backend`, `sql_dsn` and `ca_key_provider` along
+> with everything else. On any backend other than `filesystem` the temporary CA
+> then finds nothing under `cadir` and **bootstraps a second CA**, with the same
+> subject as the real one and no warning that it has done so. The serving
+> certificate would be issued by that impostor, every agent would reject it, and
+> a stray signing key would be left in `cadir`.
+
+If you are not using a config file at all, pass `--cadir` (and, on a cold
+`cadir`, `--hostname` — it is the CN *suffix* a CA is bootstrapped with, once
+and permanently, giving `CN=Puppet CA: <hostname>` and defaulting to `puppet`)
+plus whatever storage flags the deployment uses. `--dns` is passed explicitly
+so the result does not depend on `promote_cn_to_san`, which promotes the CN to
+a SAN and is on by default but can be turned off.
+
+### After it is issued
+
+The CA writes the private key to `<cadir>/private/puppet.example.com_key.pem`
+on **every** backend: server-generated per-subject keys always go to local disk
+and never to the configured store (see [storage
+backends](storage-backends.md)), so a CA on Postgres or etcd still keeps a copy
+of its serving key on its own filesystem — worth knowing when deciding what to
+back up and what to protect. `openvox-ca-ctl` saves its own copy into
+`--out-dir`, which is why the command above points that at the same directory:
+it lands on the file the CA just wrote, with the same contents, instead of
+leaving a second private key somewhere else. That is also why `CADIR` has to
+match the `cadir` the server is actually using — `openvox-ca-ctl` does not
+create the directory, and it writes the key only after the certificate has been
+issued, so a wrong path fails late and needs `clean --certname` before a retry.
+Left at its default, `--out-dir` writes into the current working directory.
+
+Only the certificate depends on the backend. It is printed on stdout, and with
+the **filesystem** backend the CA also keeps it at
+`<cadir>/signed/puppet.example.com.pem` — so there both paths in the example
+config already exist, and `tls_cert`/`tls_key` can be set and the service
+started. On any other backend the certificate is in the store rather than on
+disk, so capture what `generate` prints, put it somewhere the service can read,
+and point `tls_cert` at that before starting.
+
+> **Note:** capture it somewhere other than `<cadir>/signed/`. A shell
+> redirection creates the file before the request is made, the CA reads that
+> as a certificate already issued for the name, and `generate` fails with
+> `certificate already exists` — which is also what a second run for the same
+> name gets. Use `openvox-ca-ctl clean --certname` first to reissue.
+
+While TLS is off, the whole admin API is unauthenticated: the authorisation
+middleware is only installed when `tls_cert` and `tls_key` are both set. So
+`--host 127.0.0.1` is not decoration — treat it as required, and keep the
+window short. On an ordinary configuration the server would refuse to serve
+plain HTTP off loopback anyway, so forgetting it fails safe. On one carrying
+`no_tls_required: true` — the documented setup behind a TLS-terminating proxy —
+that refusal is already switched off, and so is the block on handing a private
+key over plain HTTP. There, the loopback bind is the only thing standing
+between an unauthenticated `POST /generate/<subject>` and every interface on
+the host.
+
+[Migrating from Puppet
+Server](migrating-from-puppet-server.md#step-7-start-openvox-ca) mints a
+serving certificate for the CA at Step 7 as well, in a context where no
+configuration file exists yet — so it passes `--cadir` explicitly rather than
+relying on one.
+
+The block above assumes a shell that owns the CA process, which is not how the
+two production deployments in these docs work:
+
+- Under [systemd](systemd.md) the unit is already bound to 8140, so stop it
+  first. It also runs as a dedicated user, so run both commands as that user
+  rather than under plain `sudo` — `sudo -u puppet-ca openvox-ca --tls-cert=
+  ...`. Anything created as `root` is left behind for a service that is not
+  root: directories most of all, since they are created `0750` and the service
+  then cannot write in them at all, and the private key, which is written
+  directly at `0600` and would simply be unreadable. Note that running the CA
+  by hand this way gets none of the unit's hardening — including the `LimitCORE=0`
+  that keeps a crash from writing the decrypted CA key into a core dump — so
+  keep it to the length of this procedure.
+- Under Kubernetes it does not apply: the chart takes the serving certificate
+  from a Secret — see [Helm chart](helm-chart.md).
+
+### When the certificate cannot serve
+
+A serving certificate is not checked by the TLS stack that presents it, so a
+wrong one is silent on this side and fatal on the other. The server therefore
+inspects the keypair itself, at startup and on every reload, and warns rather
+than refusing — a CA that will not start is worse than one agents distrust,
+since the CRL and the public endpoints keep working either way:
+
+```text
+level=WARN msg="The TLS certificate just loaded cannot serve TLS to a client that verifies it; issue a serving certificate with `openvox-ca-ctl generate` and point tls_cert/tls_key at that" cert=/etc/puppetlabs/puppet/ssl/ca/ca_crt.pem subject="Puppet CA: puppet.example.com" problems="it has no subjectAltName, and clients match the hostname against SANs only; its keyUsage allows neither digitalSignature nor keyEncipherment"
+```
+
+A second, separate line covers a certificate that *can* serve TLS but should
+not be the one doing it — a CA certificate has a signing key attached, and
+serving from it puts that key on the network-facing listener:
+
+```text
+level=WARN msg="The TLS certificate just loaded is a CA certificate; serving from it puts a signing key on the network-facing listener. Issue an end-entity certificate with `openvox-ca-ctl generate` and point tls_cert/tls_key at that" cert=/etc/puppetlabs/puppet/ssl/ca/ca_crt.pem subject="Puppet CA: puppet.example.com"
+```
+
+Pointing `tls_cert` at `ca_crt.pem` produces both. Two ways of being rejected
+by agents still pass every check here, because neither is visible from the
+server: a certificate issued by some other CA, and one whose SANs name a host
+other than the one agents dial — the `hostname mismatch` above.
 
 ## Revocation across replicas
 

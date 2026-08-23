@@ -20,6 +20,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -92,8 +93,97 @@ func (c *certReloader) reload() error {
 			slog.Warn("The TLS certificate just loaded is not valid yet; clients will reject it until then",
 				"cert", c.certFile, "not_before", cert.Leaf.NotBefore)
 		}
+
+		// The same blind spot, one level up: a certificate can be current and
+		// still be the wrong kind of certificate. Pointing tls_cert at the
+		// CA's own ca_crt.pem is the case this exists for -- it loads, the
+		// server logs "TLS enabled", the handshake completes, and every
+		// client that verifies the certificate rejects it.
+		if problems := servingCertProblems(cert.Leaf); len(problems) > 0 {
+			slog.Warn("The TLS certificate just loaded cannot serve TLS to a client that verifies it; issue a serving certificate with `openvox-ca-ctl generate` and point tls_cert/tls_key at that",
+				"cert", c.certFile,
+				"subject", cert.Leaf.Subject.CommonName,
+				"problems", strings.Join(problems, "; "))
+		}
+
+		// Kept separate from the faults above, and worded as advice rather
+		// than as a fact about the handshake, because it is not one: a
+		// self-signed certificate with CA:TRUE, a SAN and serverAuth -- what
+		// `openssl req -x509` produces by default -- verifies and serves
+		// perfectly well. OpenSSL applies its CA checks to a certificate in
+		// the issuer position, not the end-entity one, and Go never rejects a
+		// CA leaf. What is wrong with it is custodial, not protocol.
+		if cert.Leaf.IsCA {
+			slog.Warn("The TLS certificate just loaded is a CA certificate; serving from it puts a signing key on the network-facing listener. Issue an end-entity certificate with `openvox-ca-ctl generate` and point tls_cert/tls_key at that",
+				"cert", c.certFile,
+				"subject", cert.Leaf.Subject.CommonName)
+		}
 	}
 	return nil
+}
+
+// servingCertProblems reports the reasons leaf cannot authenticate this server
+// to a client that verifies it, as phrases to be joined into one log line.
+//
+// Every check here is for something neither tls.LoadX509KeyPair nor a Go TLS
+// server looks at: crypto/tls presents whatever keypair it was handed, so an
+// unusable certificate is silent on this side and fatal on the other. The set
+// is the ways the certificate is wrong *in itself*; whether it names the host
+// the agent dialled is the client's business and cannot be checked from here.
+//
+// Absent extensions are deliberately not faults. A certificate with no
+// extendedKeyUsage at all is unconstrained, and both Go and OpenSSL accept it
+// for serverAuth; only an extendedKeyUsage that is present and excludes
+// serverAuth rules the certificate out. keyUsage is treated the same way, with
+// one acknowledged imprecision: Go surfaces it as a bit set, so an extension
+// that is present with every bit clear is indistinguishable here from one that
+// is absent, and is let through. That certificate permits nothing and would be
+// a genuine fault, but nothing issues one.
+//
+// basicConstraints is not consulted. CA:TRUE on a leaf does not stop a client
+// verifying it -- reload() warns about that separately, as custody advice.
+func servingCertProblems(leaf *x509.Certificate) []string {
+	var problems []string
+
+	if len(leaf.DNSNames) == 0 && len(leaf.IPAddresses) == 0 {
+		// Go dropped the commonName fallback in 1.15 and the browsers before
+		// that, so there is no name here for a client to match, whatever the
+		// subject says and whatever hostname is set to.
+		problems = append(problems, "it has no subjectAltName, and clients match the hostname against SANs only")
+	}
+
+	// A keyUsage of certSign|cRLSign -- what a CA certificate carries -- has
+	// neither of the bits a TLS server needs: digitalSignature for the
+	// handshake signature, keyEncipherment for RSA key exchange.
+	if leaf.KeyUsage != 0 && leaf.KeyUsage&(x509.KeyUsageDigitalSignature|x509.KeyUsageKeyEncipherment) == 0 {
+		problems = append(problems, "its keyUsage allows neither digitalSignature nor keyEncipherment")
+	}
+
+	if ekuPresent(leaf) && !ekuPermitsServerAuth(leaf) {
+		problems = append(problems, "its extendedKeyUsage is present but does not include serverAuth")
+	}
+
+	return problems
+}
+
+// ekuPresent reports whether the certificate carries an extendedKeyUsage
+// extension at all. Go splits it across two fields -- recognised usages in
+// ExtKeyUsage, unrecognised OIDs in UnknownExtKeyUsage -- so a certificate
+// constrained solely to some OID Go has no constant for is only visible in the
+// second.
+func ekuPresent(leaf *x509.Certificate) bool {
+	return len(leaf.ExtKeyUsage) > 0 || len(leaf.UnknownExtKeyUsage) > 0
+}
+
+// ekuPermitsServerAuth reports whether the extendedKeyUsage admits serving
+// TLS. anyExtendedKeyUsage counts: it is the explicit "no constraint".
+func ekuPermitsServerAuth(leaf *x509.Certificate) bool {
+	for _, eku := range leaf.ExtKeyUsage {
+		if eku == x509.ExtKeyUsageServerAuth || eku == x509.ExtKeyUsageAny {
+			return true
+		}
+	}
+	return false
 }
 
 // GetCertificate satisfies tls.Config.GetCertificate.
