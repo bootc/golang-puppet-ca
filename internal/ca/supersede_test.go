@@ -82,7 +82,12 @@ var _ = Describe("Delayed supersession", func() {
 			return nil
 		}
 		var entries []pendingEntry
-		Expect(json.Unmarshal(data, &entries)).To(Succeed())
+		// Annotated rather than bare: a spec that expected the sweep to
+		// overwrite unparseable bytes and finds them still there fails here,
+		// and "invalid character" alone would not say which promise broke.
+		// Returning nil instead would let that spec pass.
+		Expect(json.Unmarshal(data, &entries)).To(Succeed(),
+			"the stored pending list must be parseable JSON; got %q", string(data))
 		return entries
 	}
 
