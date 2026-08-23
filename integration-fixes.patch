@@ -1,0 +1,29 @@
+diff --git a/internal/storage/capability_test.go b/internal/storage/capability_test.go
+index 81c83449da03..4250b2a4915f 100644
+--- a/internal/storage/capability_test.go
++++ b/internal/storage/capability_test.go
+@@ -177,10 +177,6 @@ var _ = Describe("Backend capability reporting", func() {
+ 				Expect(svc(build()).SupportsAtomicInventory()).To(BeFalse())
+ 			},
+ 			Entry("filesystem", func() Backend { return NewFilesystemBackend(GinkgoT().TempDir()) }),
+-			// Redis stays here until #212 decomposes its inventory the way #154
+-			// did etcd's; that branch moves this entry to the table below rather
+-			// than pre-empting it here.
+-			Entry("redis", func() Backend { return &RedisBackend{} }),
+ 		)
+ 
+ 		DescribeTable("is true for every backend with a structured inventory",
+@@ -192,6 +188,13 @@ var _ = Describe("Backend capability reporting", func() {
+ 			// InventoryStore, so it follows the implementation rather than the
+ 			// backend's name.
+ 			Entry("etcd", func() Backend { return &EtcdBackend{} }),
++			// INTEGRATION-BRANCH FIX, not part of either PR. This file's own
++			// comment said "Redis stays [in the false table] until #212
++			// decomposes its inventory the way #154 did etcd's; that branch
++			// moves this entry to the table below" — and #212 is merged here,
++			// so the move is due. #212 does not make it because the file does
++			// not exist on that branch; it lives only on #189's.
++			Entry("redis", func() Backend { return &RedisBackend{} }),
+ 		)
+ 
+ 		It("is true for a SQL backend", func() {
