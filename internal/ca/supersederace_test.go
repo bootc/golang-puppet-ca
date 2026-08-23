@@ -141,6 +141,44 @@ var _ = Describe("The pending-supersession list and the CRL lock", func() {
 			"the renewal must have reached the CRL-locked append it is being checked for")
 	})
 
+	// The inverse, and the promise the fast path exists to keep: an idle sweep
+	// takes no cluster lock at all. Every deployment that never enables a window
+	// runs this job on every replica, forever, and background_jobs.go and
+	// docs/configuration.md both justify that by its cost. A refactor moving the
+	// emptiness check inside WithLock would keep every other spec green while
+	// quietly reinstating a cluster-lock acquisition per replica per interval.
+	It("takes no lock at all when the list is empty", func() {
+		Expect(store.SaveSuperseded(ctx, []byte("[]"))).To(Succeed())
+
+		locked, release := make(chan struct{}), make(chan struct{})
+		held := make(chan error, 1)
+		var releaseOnce sync.Once
+		DeferCleanup(func() { releaseOnce.Do(func() { close(release) }) })
+		go func() {
+			defer GinkgoRecover()
+			held <- store.WithLock(ctx, lockNameCRL, func() error {
+				close(locked)
+				<-release
+				return nil
+			})
+		}()
+		Eventually(locked).Should(BeClosed())
+
+		done := make(chan error, 1)
+		go func() {
+			defer GinkgoRecover()
+			_, err := myCA.ReconcileSuperseded(ctx)
+			done <- err
+		}()
+
+		// While the lock is still held by someone else.
+		Eventually(done).Should(Receive(BeNil()),
+			"an idle sweep must return without waiting for the CRL lock")
+
+		releaseOnce.Do(func() { close(release) })
+		Expect(<-held).To(Succeed())
+	})
+
 	It("makes the sweep wait for the lock before rewriting the list", func() {
 		// Seeded so the sweep gets past its lock-free fast path, which exists to
 		// keep an idle CA from taking a cluster lock every interval and would

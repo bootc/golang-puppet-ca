@@ -429,6 +429,35 @@ var _ = Describe("Delayed supersession", func() {
 		})
 	})
 
+	// The fail-closed arms of the renewal gate. Its godoc argues at length that
+	// refusing renewals is the right trade when the list is unreadable; flipping
+	// either arm to fail open moved no assertion before these.
+	Describe("when the renewal gate cannot read the pending list", func() {
+		It("refuses the renewal rather than admitting it, and counts the read failure", func() {
+			original := issue("node-aa")
+			base := storage.NewFilesystemBackend(tmpDir)
+			failStore := storage.NewWithBackend(
+				&supersededFailBackend{Backend: base, failGet: storage.KeySuperseded}, tmpDir)
+			failing := ca.New(failStore, ca.AutosignConfig{Mode: "off"}, "puppet.test")
+			Expect(failing.Init(ctx)).To(Succeed())
+			before := failing.SupersedeFailures()
+
+			_, err := failing.AutoRenew(ctx, original)
+			Expect(err).To(HaveOccurred(),
+				"a list that cannot be read must refuse the renewal, not admit it")
+			Expect(failing.SupersedeFailures()).To(Equal(before + 1))
+		})
+
+		It("refuses on an unparseable list, which may have named this very serial", func() {
+			original := issue("node-ab")
+			Expect(store.SaveSuperseded(ctx, []byte("{not json"))).To(Succeed())
+
+			_, err := myCA.AutoRenew(ctx, original)
+			Expect(err).To(MatchError(ca.ErrCertSuperseded),
+				"an unparseable list must refuse the renewal")
+		})
+	})
+
 	Describe("when the pending list cannot be written", func() {
 		// The delayed path's best-effort contract, in both directions. The
 		// immediate path has the same pair of specs in renew_test.go against
@@ -540,6 +569,47 @@ var _ = Describe("Delayed supersession", func() {
 		})
 	})
 
+	Describe("revoking a subject when the pending list misbehaves", func() {
+		It("still revokes the subject when the list cannot be read", func() {
+			original := issue("node-ac")
+			base := storage.NewFilesystemBackend(tmpDir)
+			failStore := storage.NewWithBackend(
+				&supersededFailBackend{Backend: base, failGet: storage.KeySuperseded}, tmpDir)
+			failing := ca.New(failStore, ca.AutosignConfig{Mode: "off"}, "puppet.test")
+			Expect(failing.Init(ctx)).To(Succeed())
+			before := failing.SupersedeFailures()
+
+			// Partial containment beats none: turning the read failure into a
+			// returned error would make `revoke --certname` fail outright during
+			// a storage blip.
+			Expect(failing.Revoke(ctx, "node-ac")).To(Succeed(),
+				"an unreadable pending list must not stop the subject being revoked")
+			Expect(revoked(original.SerialNumber)).To(BeTrue())
+			Expect(failing.SupersedeFailures()).To(Equal(before + 1))
+		})
+
+		It("keeps a predecessor on the list when its revocation fails", func() {
+			myCA.SupersedeAfter = time.Hour
+			original := issue("node-ad")
+			_, err := myCA.AutoRenew(ctx, original)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(pending()).To(HaveLen(1))
+
+			// An unparseable CRL makes every revocation fail. The predecessor
+			// must stay recorded: absent from the CRL *and* absent from the list
+			// is the one state nothing recovers from.
+			Expect(store.UpdateCRL(ctx, []byte("not a valid CRL"))).To(Succeed())
+			before := myCA.SupersedeFailures()
+			Expect(myCA.Revoke(ctx, "node-ad")).NotTo(Succeed())
+
+			entries := pending()
+			Expect(entries).To(HaveLen(1),
+				"a predecessor whose revocation failed must stay on the list for the sweep")
+			Expect(entries[0].Serial).To(Equal(hexSerial(original.SerialNumber)))
+			Expect(myCA.SupersedeFailures()).To(BeNumerically(">", before))
+		})
+	})
+
 	Describe("ReconcileSuperseded when the list itself is unreadable", func() {
 		// The whole-pass failure modes — a lock it could not take, a list it
 		// could not read, a write-back that failed — leave every entry
@@ -564,6 +634,48 @@ var _ = Describe("Delayed supersession", func() {
 			_, perr := failing.PendingSupersessions(ctx)
 			Expect(perr).To(HaveOccurred(),
 				"an unreadable list must surface as an error, not as a count of zero")
+		})
+	})
+
+	// The deferral arm. Every other sweep spec runs on context.Background(), so
+	// the reserve is never reached and this path shipped untested in round 1 —
+	// which is how it shipped erasing the entries it claimed to defer.
+	// ReconcileSuperseded's own WithTimeout keeps an earlier parent deadline, so
+	// a caller deadline below the reserve reaches the branch with no sleeping.
+	Describe("ReconcileSuperseded when the budget runs low", func() {
+		It("leaves the entries it defers on the list rather than erasing them", func() {
+			first := issue("node-y")
+			second := issue("node-z")
+			writePending([]pendingEntry{
+				{Serial: hexSerial(first.SerialNumber), Subject: "node-y", RevokeAt: time.Now().UTC().Add(-2 * time.Hour)},
+				{Serial: hexSerial(second.SerialNumber), Subject: "node-z", RevokeAt: time.Now().UTC().Add(-time.Minute)},
+			})
+			before := myCA.SupersedeFailures()
+
+			// Below the reserve, so the loop breaks after the first entry.
+			shortCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			defer cancel()
+			count, err := myCA.ReconcileSuperseded(shortCtx)
+			Expect(err).NotTo(HaveOccurred())
+
+			// Always at least one: a pass that revoked nothing while entries
+			// were due would make no progress, every time, forever.
+			Expect(count).To(Equal(1), "a pass must attempt at least one entry even with no budget left")
+			Expect(revoked(first.SerialNumber)).To(BeTrue(),
+				"oldest-first: the entry superseded longest ago is the one retired")
+
+			// The deferred entry is the whole point. Anchored on its serial, so
+			// this fails for the deferral and not for some other survivor.
+			entries := pending()
+			Expect(entries).To(HaveLen(1))
+			Expect(entries[0].Serial).To(Equal(hexSerial(second.SerialNumber)),
+				"an entry the budget deferred must still be on the list for the next pass; "+
+					"nothing else records that it is owed a revocation")
+			Expect(revoked(second.SerialNumber)).To(BeFalse())
+
+			Expect(myCA.SupersedeFailures()).To(Equal(before+1),
+				"a deferred backlog must be counted, or a sweep that cannot keep up looks "+
+					"identical to one that is keeping up")
 		})
 	})
 
