@@ -493,6 +493,53 @@ var _ = Describe("Delayed supersession", func() {
 		})
 	})
 
+	// Containment. `revoke --certname` retires the subject's latest serial and
+	// no other, so during an overlap window it would retire the replacement and
+	// leave the certificate that replacement displaced valid — on the re-key
+	// path with a private key of its own. An operator responding to a
+	// compromised node would be told it was revoked while a second working
+	// credential for it stayed in circulation.
+	Describe("revoking a subject that has a predecessor inside its window", func() {
+		BeforeEach(func() {
+			myCA.SupersedeAfter = time.Hour
+		})
+
+		It("retires the predecessor as well as the current certificate", func() {
+			original := issue("node-v")
+			replacementPEM, err := myCA.AutoRenew(ctx, original)
+			Expect(err).NotTo(HaveOccurred())
+			replacement := parseCert(replacementPEM)
+			Expect(pending()).To(HaveLen(1), "precondition: the predecessor is inside its window")
+
+			Expect(myCA.Revoke(ctx, "node-v")).To(Succeed())
+
+			Expect(revoked(replacement.SerialNumber)).To(BeTrue(),
+				"the subject's current certificate must be revoked, as it always was")
+			Expect(revoked(original.SerialNumber)).To(BeTrue(),
+				"a predecessor inside its window is a second working credential for this subject "+
+					"and must be retired by the same revocation")
+			Expect(pending()).To(BeEmpty(),
+				"the entry must leave the list, so the sweep does not carry a serial already revoked")
+		})
+
+		It("leaves another subject's pending entry alone", func() {
+			mine := issue("node-w")
+			theirs := issue("node-x")
+			_, err := myCA.AutoRenew(ctx, mine)
+			Expect(err).NotTo(HaveOccurred())
+			_, err = myCA.AutoRenew(ctx, theirs)
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(myCA.Revoke(ctx, "node-w")).To(Succeed())
+
+			Expect(revoked(theirs.SerialNumber)).To(BeFalse(),
+				"revoking one subject must not retire another's superseded certificate")
+			entries := pending()
+			Expect(entries).To(HaveLen(1))
+			Expect(entries[0].Subject).To(Equal("node-x"))
+		})
+	})
+
 	Describe("ReconcileSuperseded when the list itself is unreadable", func() {
 		// The whole-pass failure modes — a lock it could not take, a list it
 		// could not read, a write-back that failed — leave every entry
