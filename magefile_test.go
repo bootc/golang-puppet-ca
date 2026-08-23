@@ -894,6 +894,17 @@ jobs:
 			Expect(verifyAutomergeBasePinIn("ci.yml", filtered)).To(MatchError(ContainSubstring(`job "automerge"`)))
 		})
 
+		// The parse-error branch, which only a direct call reaches:
+		// verifyWorkflowBaseScopingIn runs verifyPullRequestUnfilteredIn first
+		// on the same bytes, so malformed YAML always fails there in practice.
+		// Specced anyway because the branch exists and the test surface can
+		// reach it -- and asserted on `yaml:` rather than the file name, since
+		// every error this function returns leads with the workflow name.
+		It("reports malformed YAML, though only a direct call reaches this", func() {
+			Expect(verifyAutomergeBasePinIn("ci.yml", []byte("on: [\n"))).To(
+				MatchError(ContainSubstring("ci.yml: yaml:")))
+		})
+
 		It("ignores jobs that do not merge pull requests", func() {
 			noMerge := bytes.Replace(unfiltered,
 				[]byte(`      - run: gh pr merge --auto --merge "$PR_URL"`),
