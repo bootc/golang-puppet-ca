@@ -493,6 +493,33 @@ var _ = Describe("Delayed supersession", func() {
 		})
 	})
 
+	Describe("ReconcileSuperseded when the list itself is unreadable", func() {
+		// The whole-pass failure modes — a lock it could not take, a list it
+		// could not read, a write-back that failed — leave every entry
+		// unrevoked. If they are not counted, a storage fault that blocks the
+		// sweep indefinitely leaves both new signals reading clean: a flat
+		// counter, and a pending gauge that would report a healthy zero. The one
+		// alert that bounds this exposure could then never fire.
+		It("reports the failure and counts the pass", func() {
+			base := storage.NewFilesystemBackend(tmpDir)
+			failStore := storage.NewWithBackend(
+				&supersededFailBackend{Backend: base, failGet: storage.KeySuperseded}, tmpDir)
+			failing := ca.New(failStore, ca.AutosignConfig{Mode: "off"}, "puppet.test")
+			Expect(failing.Init(ctx)).To(Succeed())
+			before := failing.SupersedeFailures()
+
+			_, err := failing.ReconcileSuperseded(ctx)
+			Expect(err).To(HaveOccurred(), "a sweep that cannot read the list must say so")
+			Expect(failing.SupersedeFailures()).To(Equal(before+1),
+				"a pass that left every entry unrevoked must be counted, or the alert cannot fire")
+
+			// And the count must not present as a drained list.
+			_, perr := failing.PendingSupersessions(ctx)
+			Expect(perr).To(HaveOccurred(),
+				"an unreadable list must surface as an error, not as a count of zero")
+		})
+	})
+
 	Describe("PendingSupersessions", func() {
 		It("counts what is on the list and reports zero before anything is recorded", func() {
 			n, err := myCA.PendingSupersessions(ctx)

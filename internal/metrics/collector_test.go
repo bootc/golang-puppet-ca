@@ -19,8 +19,12 @@ package metrics_test
 
 import (
 	"context"
+	"crypto/x509"
+	"encoding/pem"
+	"errors"
 	"os"
 	"path/filepath"
+	"time"
 
 	dto "github.com/prometheus/client_model/go"
 
@@ -248,6 +252,60 @@ var _ = Describe("Collector", func() {
 			To(Equal(0.0), "a failed reload is not a failed amendment")
 	})
 
+	// Both delayed-supersession series, asserted by value. Their descriptors are
+	// declared adjacent to each other and to the CRL pair, and a counter and a
+	// gauge transposed between them would still gather cleanly — while silently
+	// breaking the mixin expression and the gauge the docs tell operators to
+	// watch.
+	It("reports the delayed-supersession series", func() {
+		g := gather(metrics.NewCollector(myCA))
+		Expect(counterValue(g.findByLabels("puppetca_supersede_failures_total", nil))).
+			To(Equal(0.0), "a CA that has recorded nothing has lost nothing")
+		Expect(gaugeValue(g.findByLabels("puppetca_supersede_pending", nil))).
+			To(Equal(0.0), "an absent list is a genuine zero, and must be reported as one")
+
+		// One certificate inside its overlap window is one credential this CA
+		// still accepts after something newer replaced it, which is exactly what
+		// the gauge is for.
+		myCA.SupersedeAfter = time.Hour
+		signCert("supersede-node")
+		certPEM, err := store.GetCert(ctx, "supersede-node")
+		Expect(err).NotTo(HaveOccurred())
+		block, _ := pem.Decode(certPEM)
+		Expect(block).NotTo(BeNil())
+		leaf, err := x509.ParseCertificate(block.Bytes)
+		Expect(err).NotTo(HaveOccurred())
+		_, err = myCA.AutoRenew(ctx, leaf)
+		Expect(err).NotTo(HaveOccurred())
+
+		g = gather(metrics.NewCollector(myCA))
+		Expect(gaugeValue(g.findByLabels("puppetca_supersede_pending", nil))).To(Equal(1.0))
+		Expect(counterValue(g.findByLabels("puppetca_supersede_failures_total", nil))).
+			To(Equal(0.0), "a recorded supersession is not a failure")
+		Expect(counterValue(g.findByLabels("puppetca_crl_update_failures_total", nil))).
+			To(Equal(0.0), "a deferred revocation is not a failed CRL amendment")
+	})
+
+	// Zero is what this gauge reports when the exposure it measures is gone, so
+	// it must not also be what it reports when nobody could read the list —
+	// that state is the one where the list may be full and the sweep stuck, and
+	// publishing zero would make it look healthy. Omitted instead, the way
+	// haveCRL omits the CRL series.
+	It("omits the pending gauge when the list cannot be read", func() {
+		failing := ca.New(
+			storage.NewWithBackend(
+				&supersededReadFailBackend{Backend: storage.NewFilesystemBackend(store.CADir())},
+				store.CADir()),
+			ca.AutosignConfig{Mode: "off"}, "puppet.test")
+		Expect(failing.Init(ctx)).To(Succeed())
+
+		g := gather(metrics.NewCollector(failing))
+		Expect(g.findByLabels("puppetca_supersede_pending", nil)).To(BeNil(),
+			"an unreadable list must omit the gauge rather than report a healthy zero")
+		// The rest of the scrape is unaffected: this is one auxiliary series.
+		Expect(gaugeValue(g.findByLabels("puppetca_collector_scrape_success", nil))).To(Equal(1.0))
+	})
+
 	// The whole reason these two are emitted ahead of the gather's error return
 	// is that a storage outage is when an operator most needs them: it is what
 	// makes a replica fall behind in the first place. Worth a spec, since the
@@ -380,3 +438,17 @@ var _ = Describe("Collector", func() {
 		Expect(names).To(HaveKey("puppetca_http_requests_in_flight"))
 	})
 })
+
+// supersededReadFailBackend fails only the pending-supersession key's read,
+// which is what a store whose superseded blob alone is broken looks like from
+// the collector.
+type supersededReadFailBackend struct {
+	storage.Backend
+}
+
+func (b *supersededReadFailBackend) Get(ctx context.Context, key string) ([]byte, error) {
+	if key == storage.KeySuperseded {
+		return nil, errors.New("simulated backend failure reading " + key)
+	}
+	return b.Backend.Get(ctx, key)
+}
