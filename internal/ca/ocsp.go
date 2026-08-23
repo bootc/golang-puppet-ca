@@ -286,10 +286,17 @@ func (c *CA) AnswerOCSP(_ context.Context, reqDER []byte) (OCSPAnswer, error) {
 	//
 	// The snapshot is safe to use unlocked, for a different reason per field:
 	//
-	//   - CACert/CAKey are written only on the Init path and never afterwards;
-	//     there is no rotation and no reload, which parseStoredCRL documents
-	//     from the other side ("picked up by restarting"). Both are read under
-	//     the one RLock above, so they cannot be a mismatched cert/key pair.
+	//   - CACert/CAKey are not rewritten while the server is serving. There is
+	//     no rotation and no reload — parseStoredCRL documents the same thing
+	//     from the other side, that a replaced CA certificate is picked up by
+	//     restarting. Two other methods do write them through the same helpers
+	//     Init uses, LoadKey and LoadOrCreateCAKey, but neither is reachable
+	//     from a serving process: the first has no non-test caller and the
+	//     second is the `csr` and `import-ca-cert` CLI paths. The load-bearing
+	//     half is anyway the next clause, which does not depend on that being
+	//     true: every writer holds c.mu, and both fields are read under the one
+	//     RLock above, so this cannot observe a mismatched cert/key pair even
+	//     if one of those paths did run concurrently.
 	//   - cachedCRL is replaced by pointer and never mutated in place — see
 	//     installCachedCRLLocked — so holding the pointer is holding an
 	//     immutable view of one CRL, not a window onto a changing one.
@@ -301,7 +308,7 @@ func (c *CA) AnswerOCSP(_ context.Context, reqDER []byte) (OCSPAnswer, error) {
 		ThisUpdate:   now,
 	}
 
-	status, revokedAt, err := ocspStatusFor(crlSnapshot, req.SerialNumber, known)
+	status, revokedAt, err := decideOCSPStatus(crlSnapshot, req.SerialNumber, known)
 	if err != nil {
 		return OCSPAnswer{}, fmt.Errorf("%w: %w", ErrInternal, err)
 	}
@@ -322,7 +329,17 @@ func (c *CA) AnswerOCSP(_ context.Context, reqDER []byte) (OCSPAnswer, error) {
 
 	respDER, err := ocsp.CreateResponse(caCert, caCert, template, caKey)
 	if err != nil {
-		return OCSPAnswer{}, fmt.Errorf("creating OCSP response: %w", err)
+		// ErrInternal, so the handler answers RFC 6960 `internalError` rather
+		// than `malformedRequest`. A failed CA signature is a server fault and
+		// nothing about the request provoked it; `malformedRequest` tells a
+		// verifier not to retry, and logs the outage as a client error.
+		//
+		// The classification was always wrong here, but it used to be close to
+		// unreachable. Signing outside c.mu means an external signer's per-call
+		// deadline is now the expected failure under load rather than a rarity,
+		// so this is the routine degradation path — see the concurrency gap in
+		// docs/development/locking.md.
+		return OCSPAnswer{}, fmt.Errorf("%w: creating OCSP response: %w", ErrInternal, err)
 	}
 
 	// Cache the response only when there is no nonce (RFC 8954 §3), and never
@@ -399,34 +416,60 @@ func (c *CA) AnswerOCSP(_ context.Context, reqDER []byte) (OCSPAnswer, error) {
 	// stays correct if a third eviction path is added later. The index sync uses
 	// a counter only because it genuinely cannot re-check its own predicate — it
 	// cannot tell "pruned elsewhere" from "issued here since I read".
+	var cached bool
 	if !hasNonce && template.Status != ocsp.Unknown {
 		c.mu.Lock()
 		_, stillKnown := c.serialIndex[serialHex]
-		stillStatus, stillRevokedAt, statusErr := ocspStatusFor(c.cachedCRL, req.SerialNumber, stillKnown)
+		stillStatus, stillRevokedAt, statusErr := decideOCSPStatus(c.cachedCRL, req.SerialNumber, stillKnown)
 		if statusErr == nil && stillStatus == template.Status && stillRevokedAt.Equal(template.RevokedAt) {
 			c.ocspCache[serialHex] = ocspCacheEntry{
 				der:       bytes.Clone(respDER),
 				expiresAt: now.Add(OCSPValidity),
 			}
+			cached = true
 		} else {
-			slog.Debug("not caching an OCSP response the CA state moved under",
-				"serial", serialHex, "signed_status", template.Status, "current_status", stillStatus)
+			// Info, not Debug: the default verbosity is Info, and this is the
+			// record an incident review wants when reconstructing why a client
+			// accepted a certificate that was revoked at the time. It cannot
+			// become noisy by construction — it fires only when a revocation or
+			// prune lands inside the duration of one signature.
+			slog.Info("not caching an OCSP response the CA state moved under it",
+				"serial", serialHex, "signed_status", template.Status,
+				"current_status", stillStatus, "signed_at", now)
 		}
 		c.mu.Unlock()
 	}
 
-	// A nonced response answers one request and no other (RFC 8954 §3), and an
-	// unknown carries no NextUpdate to derive a window from; both are zero, which
-	// the HTTP layer turns into "do not store".
+	// MaxAge is whether the response was *actually* cached, not whether it was
+	// the kind of response that may be cached. The two differ on exactly one
+	// path, and it is the one that matters: a response the guard above refused
+	// to store because a revocation overtook it.
+	//
+	// Getting this wrong would leave the guard half-built. Declining to store it
+	// in ocspCache stops this process replaying it; a non-zero MaxAge would then
+	// hand the same answer to every shared proxy in front of the responder with
+	// four hours of licence to serve it on to third parties — see the
+	// Cache-Control block in internal/api/ocsp_handler.go, which reasons exactly
+	// this way about `unknown`. One door closed and the other left open is not a
+	// guard.
+	//
+	// The other two zero cases fall out of the same condition rather than being
+	// restated: a nonced response answers one request and no other (RFC 8954 §3),
+	// and an unknown carries no NextUpdate to derive a window from. Neither is
+	// ever stored, so neither is ever reusable.
 	answer := OCSPAnswer{DER: respDER}
-	if !hasNonce && template.Status != ocsp.Unknown {
+	if cached {
 		answer.MaxAge = OCSPValidity
 	}
 	return answer, nil
 }
 
-// ocspStatusFor decides what an OCSP response should say about serial, given
+// decideOCSPStatus decides what an OCSP response should say about serial, given
 // whether the serial index recognises it and a CRL to check it against.
+//
+// Named for the decision rather than the status because ocsp_test.go's sibling
+// package already has an ocspStatusFor, which issues a request and parses what
+// comes back — a different question with a confusingly similar name.
 //
 // A free function over an explicit CRL rather than a method reading
 // c.cachedCRL, because AnswerOCSP asks this question twice and from different
@@ -446,7 +489,7 @@ func (c *CA) AnswerOCSP(_ context.Context, reqDER []byte) (OCSPAnswer, error) {
 // being loaded — (ocsp.Revoked, revocationTime, nil) when it appears on crl,
 // (ocsp.Good, zero, nil) when it does not, and an error when the serial is
 // known but no CRL is loaded, which the caller reports as ErrInternal.
-func ocspStatusFor(crl *x509.RevocationList, serial *big.Int, known bool) (int, time.Time, error) {
+func decideOCSPStatus(crl *x509.RevocationList, serial *big.Int, known bool) (int, time.Time, error) {
 	if !known {
 		return ocsp.Unknown, time.Time{}, nil
 	}
