@@ -452,44 +452,82 @@ var _ = Describe("Exporter", func() {
 		Expect(err).To(MatchError(ContainSubstring("ConfigMap/bundle: reading CRL")))
 	})
 
-	It("fails only the targets that asked for the material that could not be read", func() {
-		// A cert read failure must not take down a CRL-only target. Before the
-		// fix a single unreadable material aborted the whole cycle, so a target
-		// that never wanted it was silenced too.
-		cfg := &k8sexport.Config{Targets: []k8sexport.Target{
-			{Kind: "Secret", Metadata: k8sexport.Metadata{Name: "certonly", Namespace: "ns1"}, Cert: true},
-			{Kind: "ConfigMap", Metadata: k8sexport.Metadata{Name: "crlonly", Namespace: "ns1"}, CRL: true},
-		}}
+	// Both directions, because the two guards in forTarget are independent: a
+	// spec that only ever fails the cert read leaves `t.CRL &&` unprotected, and
+	// dropping it reintroduces exactly the cross-target contamination this
+	// branch exists to remove. The failing material and the surviving target
+	// swap places between entries; nothing else does.
+	DescribeTable("fails only the targets that asked for the material that could not be read",
+		func(breaks func(*stubSource), survivorKind, survivor, casualty, wantErr, wantKey, wantVal string) {
+			cfg := &k8sexport.Config{Targets: []k8sexport.Target{
+				{Kind: "Secret", Metadata: k8sexport.Metadata{Name: "certonly", Namespace: "ns1"}, Cert: true},
+				{Kind: "ConfigMap", Metadata: k8sexport.Metadata{Name: "crlonly", Namespace: "ns1"}, CRL: true},
+			}}
+			mustValidate(cfg)
+
+			breaks(&src)
+			reg := prometheus.NewRegistry()
+			exp := k8sexport.New(client, *cfg, src, "", k8sexport.NewMetrics(reg))
+
+			err := exp.ExportAll(ctx)
+
+			// The surviving target was applied for real, with the material it
+			// asked for. Asserted first: this is the isolation the spec is
+			// named for, and an early return breaks it and the error text
+			// together.
+			switch survivorKind {
+			case "ConfigMap":
+				cm, getErr := client.CoreV1().ConfigMaps("ns1").Get(ctx, survivor, metav1.GetOptions{})
+				Expect(getErr).NotTo(HaveOccurred(), "%s was not applied despite not wanting the failed material", survivor)
+				Expect(cm.Data).To(HaveKeyWithValue(wantKey, wantVal))
+			default:
+				sec, getErr := client.CoreV1().Secrets("ns1").Get(ctx, survivor, metav1.GetOptions{})
+				Expect(getErr).NotTo(HaveOccurred(), "%s was not applied despite not wanting the failed material", survivor)
+				Expect(sec.Data).To(HaveKeyWithValue(wantKey, []byte(wantVal)))
+			}
+
+			v, found := metricValue(reg, "puppetca_k8s_export_last_success_timestamp_seconds",
+				map[string]string{"kind": survivorKind, "namespace": "ns1", "name": survivor})
+			Expect(found).To(BeTrue())
+			Expect(v).To(BeNumerically(">", 0))
+
+			_, found = metricValue(reg, "puppetca_k8s_export_last_error_timestamp_seconds",
+				map[string]string{"kind": survivorKind, "namespace": "ns1", "name": survivor})
+			Expect(found).To(BeFalse(), "%s recorded an error for a material it never requested", survivor)
+
+			// Symmetric: the casualty is named in the joined error and the
+			// survivor is not, so neither half can drift into the other.
+			Expect(err).To(MatchError(ContainSubstring(wantErr)))
+			Expect(err).To(MatchError(ContainSubstring(casualty)))
+			Expect(err).NotTo(MatchError(ContainSubstring(survivor)))
+		},
+		Entry("an unreadable cert leaves the CRL-only target alone",
+			func(s *stubSource) { s.certErr = context.DeadlineExceeded },
+			"ConfigMap", "crlonly", "certonly",
+			"Secret/certonly: reading CA certificate", "ca.crl", "CRL-PEM"),
+		Entry("an unreadable CRL leaves the cert-only target alone",
+			func(s *stubSource) { s.crlErr = context.DeadlineExceeded },
+			"Secret", "certonly", "crlonly",
+			"ConfigMap/crlonly: reading CRL", "ca.crt", "CERT-PEM"),
+	)
+
+	It("reports the cert failure for a target that asked for both materials", func() {
+		// forTarget checks Cert before CRL, so a target wanting both reports the
+		// cert read failure. Documented precedence with nothing behind it is
+		// just a comment; this is the assertion.
+		cfg := &k8sexport.Config{Targets: []k8sexport.Target{{
+			Kind: "Secret", Metadata: k8sexport.Metadata{Name: "both", Namespace: "ns1"},
+			Cert: true, CRL: true,
+		}}}
 		mustValidate(cfg)
 
 		src.certErr = context.DeadlineExceeded
-		reg := prometheus.NewRegistry()
-		exp := k8sexport.New(client, *cfg, src, "", k8sexport.NewMetrics(reg))
+		src.crlErr = context.Canceled
+		exp := k8sexport.New(client, *cfg, src, "", nil)
 
 		err := exp.ExportAll(ctx)
-
-		// The CRL-only target was applied for real, with the CRL it asked for.
-		// Asserted first: this is the isolation the spec is named for, and an
-		// early return breaks it and the error text together.
-		cm, getErr := client.CoreV1().ConfigMaps("ns1").Get(ctx, "crlonly", metav1.GetOptions{})
-		Expect(getErr).NotTo(HaveOccurred())
-		Expect(cm.Data).To(HaveKeyWithValue("ca.crl", "CRL-PEM"))
-
-		// ...and the cert-only target was not, so nothing empty was published.
-		_, getErr = client.CoreV1().Secrets("ns1").Get(ctx, "certonly", metav1.GetOptions{})
-		Expect(getErr).To(HaveOccurred())
-
-		v, found := metricValue(reg, "puppetca_k8s_export_last_success_timestamp_seconds",
-			map[string]string{"kind": "ConfigMap", "namespace": "ns1", "name": "crlonly"})
-		Expect(found).To(BeTrue())
-		Expect(v).To(BeNumerically(">", 0))
-
-		_, found = metricValue(reg, "puppetca_k8s_export_last_error_timestamp_seconds",
-			map[string]string{"kind": "ConfigMap", "namespace": "ns1", "name": "crlonly"})
-		Expect(found).To(BeFalse())
-
-		Expect(err).To(MatchError(ContainSubstring("Secret/certonly: reading CA certificate")))
-		Expect(err).NotTo(MatchError(ContainSubstring("crlonly")))
+		Expect(err).To(MatchError(ContainSubstring("Secret/both: reading CA certificate")))
+		Expect(err).NotTo(MatchError(ContainSubstring("reading CRL")))
 	})
 
 	It("creates apply counters at zero for every target before the first export", func() {
@@ -524,5 +562,46 @@ var _ = Describe("Exporter", func() {
 			})
 			Expect(found).To(BeFalse(), "%s must stay absent until something happens", name)
 		}
+	})
+	It("publishes zeroed counters for an export that never starts", func() {
+		// The path where NewInCluster fails: no Exporter is ever constructed,
+		// so New never runs and nothing will ever record an apply. Without
+		// these series the CA stays up with readiness green, the targets freeze
+		// at whatever they last held, and neither export alert has anything to
+		// match. InitTargetMetrics is what makes that state reportable.
+		cfg := &k8sexport.Config{Targets: []k8sexport.Target{
+			{Kind: "Secret", Metadata: k8sexport.Metadata{Name: "trust", Namespace: "ns1"}, Cert: true},
+			// No namespace of its own: the pod namespace may be exactly what
+			// could not be resolved, so this is labelled with an empty one.
+			{Kind: "ConfigMap", Metadata: k8sexport.Metadata{Name: "bundle"}, CRL: true},
+		}}
+		mustValidate(cfg)
+
+		reg := prometheus.NewRegistry()
+		k8sexport.InitTargetMetrics(*cfg, k8sexport.NewMetrics(reg))
+
+		for _, want := range []struct{ kind, ns, name string }{
+			{"Secret", "ns1", "trust"},
+			{"ConfigMap", "", "bundle"},
+		} {
+			for _, result := range []string{"success", "error"} {
+				v, found := metricValue(reg, "puppetca_k8s_export_applies_total", map[string]string{
+					"kind": want.kind, "namespace": want.ns, "name": want.name, "result": result,
+				})
+				Expect(found).To(BeTrue(),
+					"no applies_total{name=%q,result=%q}: a dead export is unreportable", want.name, result)
+				Expect(v).To(Equal(0.0))
+			}
+		}
+	})
+
+	It("tolerates a nil Metrics when the export never starts", func() {
+		// Metrics are disabled whenever the Prometheus exporter is off, and
+		// that path runs before anything has checked.
+		cfg := &k8sexport.Config{Targets: []k8sexport.Target{{
+			Kind: "Secret", Metadata: k8sexport.Metadata{Name: "trust", Namespace: "ns1"}, Cert: true,
+		}}}
+		mustValidate(cfg)
+		Expect(func() { k8sexport.InitTargetMetrics(*cfg, nil) }).NotTo(Panic())
 	})
 })

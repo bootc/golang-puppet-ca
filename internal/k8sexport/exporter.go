@@ -33,8 +33,8 @@ import (
 // timeout, so without this a black-holed API-server connection could block the
 // single exporter goroutine (and thus re-export of every target) for as long as
 // the OS transport takes to give up. A per-apply deadline surfaces a stuck call
-// as a counted, logged error and lets the loop proceed to the next wake-up; the
-// next CRL update or a restart re-reconciles.
+// as a counted, logged error and lets the loop proceed to the next wake-up: the
+// retry the caller runs after a failed cycle, the next CRL update, or a restart.
 const applyTimeout = 30 * time.Second
 
 // MaterialSource provides the current CA certificate and CRL in PEM form. It is
@@ -61,10 +61,30 @@ type Exporter struct {
 // m may be nil to disable instrumentation.
 func New(client kubernetes.Interface, cfg Config, src MaterialSource, defaultNS string, m *Metrics) *Exporter {
 	e := &Exporter{client: client, cfg: cfg, src: src, defaultNS: defaultNS, metrics: m}
-	// Create the apply counters at zero now, so "configured but never
-	// attempted" is a visible series rather than an absence. See initTargets.
-	m.initTargets(e.cfg.Targets, e.namespaceFor)
+	// Publish the apply counters at zero now, so "configured but never
+	// attempted" is a series rather than an absence. See initTargets.
+	m.initTargets(cfg.Targets, defaultNS)
 	return e
+}
+
+// InitTargetMetrics publishes every configured target's apply counters at zero
+// without constructing an Exporter, for the case where the export cannot start
+// at all: NewInCluster fails, the caller logs it, and no cycle ever runs.
+//
+// That case is why this is exported rather than left inside New: it is the one
+// door New cannot cover, and the CA stays up and healthy while the exported
+// objects quietly stop being updated. See PuppetCAKubernetesExportNotRunning in
+// mixin/alerts.libsonnet.
+//
+// Call it only when the export is known not to be starting. Targets without
+// their own namespace are labelled with an empty one, since the pod namespace
+// may be exactly what could not be resolved. That placeholder is harmless here
+// only because nothing will ever record an apply for them. On a path where the
+// exporter might still start, it would strand a second series at zero under the
+// wrong label and make PuppetCAKubernetesExportNotRunning fire for a healthy
+// target for ever.
+func InitTargetMetrics(cfg Config, m *Metrics) {
+	m.initTargets(cfg.Targets, "")
 }
 
 // NewInCluster builds an Exporter using in-cluster ServiceAccount credentials,
@@ -104,14 +124,12 @@ func (c *Config) needsDefaultNamespace() bool {
 // collected but does not prevent the others from being applied; the joined error
 // (or nil) is returned.
 //
-// A material that cannot be read fails only the targets that asked for it. The
-// per-target loop always runs, so every target records a metric on every cycle
-// whatever happened upstream. That is load-bearing rather than tidiness: the
-// shipped PuppetCAKubernetesExportFailing alert has
-// puppetca_k8s_export_last_error_timestamp_seconds on the left of both its
-// arms, so a cycle that returns before recordApply writes no series and the
-// alert cannot fire. Returning early here turns a storage blip into every
-// target silently holding a stale CA certificate or CRL, indefinitely.
+// A material that cannot be read fails only the targets that asked for it, and
+// the per-target loop always runs. The invariant this function must hold: every
+// configured target records a result on every cycle, whatever failed upstream.
+// Returning before the loop leaves the export alerts nothing to match on and a
+// stale CA certificate or CRL that nothing can report -- see
+// PuppetCAKubernetesExportNotRunning in mixin/alerts.libsonnet for why.
 func (e *Exporter) ExportAll(ctx context.Context) error {
 	mats := e.fetchMaterials(ctx)
 
@@ -191,10 +209,16 @@ func (e *Exporter) fetchMaterials(ctx context.Context) materials {
 // namespaceFor returns the namespace a target should be applied to: its own, or
 // the resolved default.
 func (e *Exporter) namespaceFor(t *Target) string {
+	return namespaceForTarget(t, e.defaultNS)
+}
+
+// namespaceForTarget is namespaceFor without an Exporter, so the metric labels
+// can be computed before one is constructed (see InitTargetMetrics).
+func namespaceForTarget(t *Target, defaultNS string) string {
 	if t.Metadata.Namespace != "" {
 		return t.Metadata.Namespace
 	}
-	return e.defaultNS
+	return defaultNS
 }
 
 // applyTarget server-side applies a single target. Force is set so the exporter

@@ -33,10 +33,42 @@ import (
 // certificate or CRL until the CRL next changes.
 //
 // Two minutes sits well inside k8sExportFailingFor (15m), the debounce on
-// PuppetCAKubernetesExportFailing: a cycle that recovers on the first retry
-// resolves before the alert would have paged, while one that keeps failing
-// keeps re-stamping last_error and stays firing.
+// PuppetCAKubernetesExportFailing: a cycle that recovers on the first retry or
+// two resolves before the alert would have paged, while one that keeps failing
+// keeps re-stamping last_error and stays firing. A failure that outlasts the
+// debounce still pages, as it should.
+//
+// Deliberate consequence, not an oversight: a target that fails its first
+// attempt and succeeds on retry every cycle never pages, because last_success
+// always overtakes last_error inside the debounce. Before this retry existed
+// such a target did page. See docs/kubernetes-export.md.
 const k8sExportRetryInterval = 2 * time.Minute
+
+// startK8sExport constructs the exporter and starts its job, or -- if it cannot
+// be constructed -- makes that failure reportable.
+//
+// The failure branch is why this is a function rather than wiring in its
+// caller. newExporter fails when there is no in-cluster client to build or no
+// pod namespace to resolve, and the CA then carries on serving with readiness
+// green while the configured targets silently freeze at whatever they last
+// held. Publishing the apply counters at zero is what turns that into something
+// PuppetCAKubernetesExportNotRunning can match; the log line alone reaches
+// nobody who is not already reading logs.
+//
+// newExporter is a parameter so a spec can drive both branches. This lived
+// inside a cobra RunE before, which meant the one line closing that alerting
+// gap could be deleted without a single test noticing.
+func startK8sExport(ctx context.Context, c *ca.CA, cfg k8sexport.Config, m *k8sexport.Metrics,
+	newExporter func() (*k8sexport.Exporter, error),
+) {
+	exporter, err := newExporter()
+	if err != nil {
+		k8sexport.InitTargetMetrics(cfg, m)
+		slog.Error("Kubernetes export disabled: failed to initialise client", "error", err)
+		return
+	}
+	go runK8sExporter(ctx, c, exporter, k8sExportRetryInterval)
+}
 
 // runK8sExporter publishes the CA certificate and CRL into the configured
 // Kubernetes Secrets/ConfigMaps. It exports once at startup (reconciling state

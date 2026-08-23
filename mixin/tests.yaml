@@ -14,7 +14,8 @@
 #     which between them have to cover a target that fails and a target that is
 #     never attempted. The first cannot see the second — every arm of it needs a
 #     last_error series to match on — so the cases below pin which rule owns
-#     which shape, and that neither double-pages for the other's.
+#     which shape, that neither double-pages for the other's, and that a CA not
+#     using the feature at all stays silent under both.
 #
 # The firing behaviour is the contract here; the annotation prose is not, so
 # repeating it below is a maintenance cost rather than an assertion worth
@@ -193,20 +194,29 @@ tests:
         alertname: PuppetCAKubernetesExportNotRunning
         exp_alerts: []
 
-  # ...and the hole that leaves. With no per-target series at all — the shape
-  # the pre-fix exporter produced on a failed read — neither arm of Failing has
-  # a left operand, so it cannot fire however long the outage lasts. This case
-  # asserts the blind spot rather than a fix for it: the fix is in the exporter,
-  # which writes a series per target per cycle, and NotRunning is the backstop
-  # for when it manages not to.
+  # A CA with no export series at all. Both rules need a series to match on, so
+  # neither can fire here — and after the exporter changes that shape means
+  # exactly one thing: the feature is not configured on this CA. A configured
+  # target always has an applies_total series, published at zero before the
+  # first cycle and even when the export fails to start at all, which is what
+  # NotRunning above matches.
+  #
+  # So this asserts silence is correct, not that a gap is tolerated. It is also
+  # the guard against closing that gap the wrong way: an `absent()` arm or an
+  # `or vector(0)` on either rule would make every CA that does not use the
+  # Kubernetes export page for a feature it has not switched on. Both rules are
+  # evaluated, because a fix to one that forgot the other would otherwise pass.
   - interval: 1m
-    name: no export series at all leaves the failure alert blind
+    name: a CA not using the export feature is silent
     input_series:
       - series: 'puppetca_collector_scrape_success{job="openvox-ca",instance="ca-1:9140"}'
         values: "1+0x60"
     alert_rule_test:
       - eval_time: 60m
         alertname: PuppetCAKubernetesExportFailing
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: PuppetCAKubernetesExportNotRunning
         exp_alerts: []
 
   # The backstop. The CA creates the apply counters at zero for every configured
@@ -244,7 +254,7 @@ tests:
         exp_alerts: []
 
   # A target that succeeded and then failed: the '>' arm, and the proof that a
-  # later success clears it. The bounded retry the exporter runs after a failed
+  # later success clears it. The two-minute retry the exporter runs after a failed
   # cycle is what produces the second half of this timeline on a quiet CA, where
   # the next CRL update could be weeks away.
   - interval: 1m

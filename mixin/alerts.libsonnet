@@ -312,22 +312,48 @@
           },
           {
             alert: 'PuppetCAKubernetesExportNotRunning',
-            // A configured target that has never been attempted at all.
+            // A configured target that has never been attempted at all. This
+            // is where the two export rules' division of labour is argued;
+            // ExportAll and InitTargetMetrics in internal/k8sexport state the
+            // invariant they enforce and point here. The separate decision to
+            // leave the last_success/last_error gauges unpublished is argued
+            // where it is made, at initTargets in internal/k8sexport/metrics.go
+            // and, for operators, in docs/metrics.md.
             //
-            // PuppetCAKubernetesExportFailing can only speak about targets the
-            // exporter has reported on; it is silent when the exporter reports
-            // nothing. This covers that gap. The CA creates
-            // puppetca_k8s_export_applies_total at zero for every configured
-            // target as it constructs the exporter, before the first cycle, so
-            // a target that is configured but never attempted is a series at
-            // zero rather than an absence — which is a thing PromQL can match.
+            // Every arm of PuppetCAKubernetesExportFailing has last_error on
+            // its left, so that rule can only speak about a target the CA has
+            // recorded a result for. It is structurally silent when the CA
+            // records nothing — and no PromQL comparison matches an absence, so
+            // no reshaping of that expression can fix it from this side. The
+            // answer has to come from the CA: publish a series for a target
+            // that has done nothing, and "nothing has happened" becomes a value
+            // that can be tested.
+            //
+            // So the CA publishes puppetca_k8s_export_applies_total at zero for
+            // every configured target before the first cycle runs, and also on
+            // the path where the export gives up before starting — an
+            // in-cluster client it cannot build, a pod namespace it cannot
+            // resolve. That path is the one worth the trouble: the CA stays up,
+            // readiness stays green, the exported objects quietly stop being
+            // updated, and a single log line is otherwise the only trace.
             //
             // Summing over 'result' collapses the success/error pair, so a
             // target that is attempted and always fails is not caught here
-            // (that is Failing's job); only one attempted zero times is. The
-            // counter resets to zero on restart and the startup export runs
-            // immediately, so k8sExportNotRunningFor only has to outlast a
-            // slow start.
+            // (that is Failing's job, and the two cannot both fire: a zero sum
+            // means no result was ever recorded, so there is no last_error for
+            // Failing to match). Only a target attempted zero times matches.
+            // The counter resets to zero on restart and the startup export runs
+            // immediately, so k8sExportNotRunningFor only has to outlast a slow
+            // start.
+            //
+            // It does not cover a crashlooping CA, and must not be read as
+            // doing so. A pod that keeps restarting fails scrapes; Prometheus
+            // writes staleness markers, the instance stops being returned, and
+            // this rule's 'for' clock resets rather than accumulating. That is
+            // PuppetCAExporterDown's job (downFor, 5m), and it is the better
+            // alert for it. What this rule covers is the opposite shape: a CA
+            // that stays up, scrapes cleanly, and reports readiness while its
+            // export job does nothing.
             expr: |||
               sum by (job, instance, kind, namespace, name) (
                 puppetca_k8s_export_applies_total{%(selector)s}
