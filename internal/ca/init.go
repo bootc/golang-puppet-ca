@@ -54,12 +54,16 @@ const (
 )
 
 // LockTimeout bounds how long Init/Sign/Revoke will wait to acquire a
-// distributed lock before giving up — and, at Init, the whole inventory-HMAC
-// step: the `hmac-key` lock EnsureHMACKey may wait on plus the verification
-// scan that follows it. That is a second job for this constant, and the derived
-// budgets below reason from it, so it is named here as well as at the call site. Long enough to ride out a brief
+// distributed lock before giving up. Long enough to ride out a brief
 // leader election, short enough that a stuck lease on a crashed replica
 // does not hang startup past the lease TTL on the etcd backend.
+//
+// At Init it covers more than an acquisition: it is the budget for the whole
+// inventory-HMAC step — the `hmac-key` lock EnsureHMACKey may wait on, plus the
+// verification scan that follows it. Other budgets are derived from this
+// constant (the shipped unit's WatchdogSec below, the chart's startupProbe,
+// CleanupExpiredCerts' LockTimeout/2), so that second job is named here and not
+// only at the call site.
 //
 // Read "distributed" strictly: it bounds the cross-node half of an acquisition
 // and not a wait on another goroutine in this process, which no deadline ends.
