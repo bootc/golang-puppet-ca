@@ -92,9 +92,21 @@ func (c *CA) Init(ctx context.Context) error {
 		return err
 	}
 
-	// Initialize inventory HMAC integrity checking.
-	if err := c.Storage.InitHMAC(ctx); err != nil {
-		return fmt.Errorf("inventory integrity check failed: %w", err)
+	// Initialize inventory HMAC integrity checking. On a cold start against a
+	// fresh shared backend, EnsureHMACKey generates the key under its own
+	// cluster lock so two replicas cannot fork it, which means this call can
+	// now wait on a peer. Bound that wait exactly as the bootstrap lock below
+	// is bounded, so a stuck lease cannot hang startup indefinitely. The
+	// timeout lives here and not inside EnsureHMACKey because the other caller
+	// of that path, storage.MigrateService, deliberately applies none — a
+	// migration waits for its store rather than abandoning it. Startup is the
+	// caller that must not wait forever. Once the key exists no lock is taken
+	// at all, which is every start after the first.
+	hmacCtx, cancelHMAC := context.WithTimeout(ctx, LockTimeout)
+	errHMAC := c.Storage.InitHMAC(hmacCtx)
+	cancelHMAC()
+	if errHMAC != nil {
+		return fmt.Errorf("inventory integrity check failed: %w", errHMAC)
 	}
 
 	// Fast path: load an already-bootstrapped CA without taking a

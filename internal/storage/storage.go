@@ -1044,6 +1044,19 @@ func (s *StorageService) SignedDir() string {
 
 const hmacKeyLen = 32
 
+// lockNameHMACKey is the lock name EnsureHMACKey holds while it generates and
+// persists a fresh inventory HMAC key. Like every other name passed to
+// WithLock it has to stay stable across releases, since replicas exclude one
+// another only by agreeing on the string.
+//
+// Deliberately *not* "bootstrap", the name CA.Init and MigrateService use.
+// WithLock is not reentrant at any tier (issue #201), and MigrateService
+// already reaches RebuildInventoryHMAC -> EnsureHMACKey from inside
+// WithLock(ctx, migrateLockName), which is "bootstrap". Sharing the name would
+// turn a corrupt stored key met during a migration into a hang. The two names
+// are never taken in the other order, so this introduces no lock inversion.
+const lockNameHMACKey = "hmac-key"
+
 // EnsureHMACKey loads or generates the HMAC key used for inventory integrity.
 // The key is stored via the backend under KeyHMACKey.
 //
@@ -1051,29 +1064,88 @@ const hmacKeyLen = 32
 // distinguished from a genuine "not present" via fs.ErrNotExist; otherwise a
 // momentary failure on Get would silently regenerate the key and invalidate
 // every existing inventory MAC.
+//
+// Generation is a read-modify-write, so it runs under WithLock(lockNameHMACKey)
+// and reads the key *again* after winning the lock. Without that, two replicas
+// cold-starting against a fresh shared backend both see the key absent, both
+// generate and both Put: last write wins, and the loser goes on to MAC its
+// inventory under a key no other replica can reproduce. The second read is the
+// half that matters — the lock only orders the two attempts, and it is the
+// re-read that makes the loser adopt the winner's key rather than write over
+// it.
+//
+// The lock is taken only on the path that would write. A store whose key is
+// already present takes no lock at all, so every restart after the first still
+// costs one Get and no cross-replica round trip.
+//
+// How much of a cross-replica promise that lock is depends on the backend, and
+// WithLock's tiers are the whole answer: etcd, Redis and the server SQL
+// dialects exclude every replica; filesystem and SQLite exclude every process
+// on the host; an in-memory SQLite database or a platform without flock(2)
+// falls back to a process-local mutex. The two weaker tiers are single-node
+// backends, which have no second replica to fork against — shared storage
+// across hosts is unsupported for them, as docs/storage-backends.md scopes it.
+//
+// ctx bounds the wait for the lock, but only its cross-process half; see
+// WithLock. Callers that must not hang on a peer's cold start should pass a
+// deadline, as ca.Init does.
 func (s *StorageService) EnsureHMACKey(ctx context.Context) ([]byte, error) {
+	key, usable, err := s.loadHMACKey(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if usable {
+		return key, nil
+	}
+
+	var out []byte
+	if err := s.WithLock(ctx, lockNameHMACKey, func() error {
+		// Another replica may have generated and persisted a key between our
+		// first look and our winning the lock. Adopting theirs is what keeps
+		// the two from forking.
+		key, usable, err := s.loadHMACKey(ctx)
+		if err != nil {
+			return err
+		}
+		if usable {
+			out = key
+			return nil
+		}
+
+		fresh := make([]byte, hmacKeyLen)
+		if _, err := rand.Read(fresh); err != nil {
+			return fmt.Errorf("generating HMAC key: %w", err)
+		}
+		if err := s.backend.Put(ctx, KeyHMACKey, fresh, BlobPrivate); err != nil {
+			return fmt.Errorf("writing HMAC key: %w", err)
+		}
+		out = fresh
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// loadHMACKey reads the stored inventory HMAC key. It reports usable=false with
+// a nil error for the two states that call for generating a fresh one: the key
+// is absent (first boot), or the stored blob is the wrong length (truncated or
+// corrupted — operators see the new key on the next read). Every other backend
+// failure comes back as an error, so a momentary outage is never mistaken for
+// absence.
+func (s *StorageService) loadHMACKey(ctx context.Context) (key []byte, usable bool, err error) {
 	data, err := s.backend.Get(ctx, KeyHMACKey)
 	switch {
 	case err == nil:
 		if len(data) == hmacKeyLen {
-			return data, nil
+			return data, true, nil
 		}
-		// Stored blob is the wrong length (truncated / corrupted): fall
-		// through to regeneration. Operators see the new key on next read.
+		return nil, false, nil
 	case errors.Is(err, fs.ErrNotExist):
-		// First boot: fall through to generate and persist a fresh key.
+		return nil, false, nil
 	default:
-		return nil, fmt.Errorf("reading HMAC key: %w", err)
+		return nil, false, fmt.Errorf("reading HMAC key: %w", err)
 	}
-
-	key := make([]byte, hmacKeyLen)
-	if _, err := rand.Read(key); err != nil {
-		return nil, fmt.Errorf("generating HMAC key: %w", err)
-	}
-	if err := s.backend.Put(ctx, KeyHMACKey, key, BlobPrivate); err != nil {
-		return nil, fmt.Errorf("writing HMAC key: %w", err)
-	}
-	return key, nil
 }
 
 // computeInventoryHMAC computes the integrity value for the current inventory.
