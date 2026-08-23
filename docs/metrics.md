@@ -229,10 +229,20 @@ not, and has to be added by hand if you want it.
 
 ### Delayed supersession
 
-Present on every CA, and flat at zero unless
-[`superseded_cert_revoke_after_sec`](configuration.md#delayed-supersession) is
-set: with no delay a renewal revokes its predecessor inside the call, nothing is
-recorded, and a failure there is a CRL failure counted above instead.
+Present on every CA. With no
+[`superseded_cert_revoke_after_sec`](configuration.md#delayed-supersession) set,
+nothing is ever recorded — a renewal revokes its predecessor inside the call and
+a failure there is a CRL failure counted above instead — so the gauge sits at
+zero and the counter stays flat.
+
+With one exception, and it is the one an operator without the feature will
+actually hit: three code paths read the pending list whatever the setting says —
+the sweep, every renewal, and every subject revocation — and each counts a list
+it could not read. A store that cannot serve the `superseded` key therefore
+raises the counter, and fires `PuppetCASupersedeFailing`, on a CA that has never
+enabled a window. The log line says which path: `Superseded-certificate
+revocation sweep failed`, `cannot determine supersession status`, or `Revoke:
+could not read pending supersessions`.
 
 | Metric | Description |
 | --- | --- |
@@ -248,11 +258,13 @@ sweep is not completing — check the failure counter.
 > **What the failure counter sees.** A supersession the renewal path could not
 > record (the certificate was replaced but nothing scheduled its revocation —
 > the `failed to retire replaced certificate` warning names the serial); a
-> pending list that could not be read or parsed, on the renewal path or in the
-> sweep; a sweep pass that could not take the CRL lock or write the list back;
-> and each pass that left an entry unrevoked or discarded one whose serial it
-> could never revoke. A pass counts once however many entries it failed on, so
-> this is a count of bad passes rather than of lost certificates.
+> pending list that could not be read or parsed, on the renewal path, in the
+> sweep, or while revoking a subject; a sweep pass that could not take the CRL
+> lock or write the list back; a predecessor a subject revocation could not
+> retire; and each pass that left an entry unrevoked, deferred one for want of
+> budget, or discarded one whose serial it could never revoke. A pass counts
+> once however many entries it failed on, so this is a count of bad passes
+> rather than of lost certificates.
 >
 > The cases differ in what you have to do about them, and the log line is what
 > tells them apart. `Could not revoke superseded certificate` retries on the
@@ -267,7 +279,10 @@ sweep is not completing — check the failure counter.
 >
 > A sweep that cannot read the list at all counts once per pass and omits
 > `puppetca_supersede_pending` rather than reporting zero, so the two signals
-> cannot both read clean while the list stops draining.
+> cannot both read clean while the list stops draining. A sweep that *can* read
+> it but runs out of budget counts too, and logs `ran out of budget; deferring
+> the rest to the next pass` — that is the shape a backlog draining slower than
+> it accrues takes, and the entries it defers stay on the list.
 
 ### Leaf certificates
 

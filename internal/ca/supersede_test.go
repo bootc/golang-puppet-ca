@@ -667,10 +667,11 @@ var _ = Describe("Delayed supersession", func() {
 			// The deferred entry is the whole point. Anchored on its serial, so
 			// this fails for the deferral and not for some other survivor.
 			entries := pending()
-			Expect(entries).To(HaveLen(1))
-			Expect(entries[0].Serial).To(Equal(hexSerial(second.SerialNumber)),
+			Expect(entries).To(HaveLen(1),
 				"an entry the budget deferred must still be on the list for the next pass; "+
 					"nothing else records that it is owed a revocation")
+			Expect(entries[0].Serial).To(Equal(hexSerial(second.SerialNumber)),
+				"and it must be the deferred entry, not some other survivor")
 			Expect(revoked(second.SerialNumber)).To(BeFalse())
 
 			Expect(myCA.SupersedeFailures()).To(Equal(before+1),

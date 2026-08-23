@@ -151,10 +151,12 @@ func NewCollector(c *ca.CA) *Collector {
 				"list that could not be read or parsed, a sweep pass that could not take the CRL "+
 				"lock or write the list back, and each pass that left an entry unrevoked or "+
 				"discarded one whose serial it could never revoke. One pass counts "+
-				"once however many entries it failed on. It stays at zero on a CA that has never "+
-				"recorded a supersession — with superseded_cert_revoke_after_sec unset the "+
-				"revocation happens inside the renewal, and a failure there is a CRL failure that "+
-				"lands in puppetca_crl_update_failures_total instead. A rising value means a "+
+				"once however many entries it failed on. With superseded_cert_revoke_after_sec "+
+				"unset nothing is recorded — the revocation happens inside the renewal, and a "+
+				"failure there lands in puppetca_crl_update_failures_total instead — so this stays "+
+				"flat, with one exception: the sweep, every renewal and every subject revocation "+
+				"read the pending list whatever the setting says, and a store that cannot serve "+
+				"that key raises this on a CA that never enabled a window. A rising value means a "+
 				"certificate a renewal replaced may still be a valid credential.",
 			nil, nil),
 		supersedePending: prometheus.NewDesc(
@@ -164,9 +166,10 @@ func NewCollector(c *ca.CA) *Collector {
 				"something newer has taken its place, so this is the live measure of the exposure "+
 				"superseded_cert_revoke_after_sec buys. It returns to zero as the sweep drains "+
 				"the list; a value that does not fall means the sweep is not completing — check "+
-				"puppetca_supersede_failures_total. Absent, rather than zero, when the list could "+
-				"not be read: zero is what a drained list reports, so it must not also be what an "+
-				"unreadable one reports.",
+				"puppetca_supersede_failures_total, which a pass that failed or ran out of budget "+
+				"both raise, and the log for 'ran out of budget; deferring the rest'. Absent, "+
+				"rather than zero, when the list could not be read: zero is what a drained list "+
+				"reports, so it must not also be what an unreadable one reports.",
 			nil, nil),
 		crlCachedNumber: prometheus.NewDesc(
 			prometheus.BuildFQName(namespace, "crl", "cached_number"),

@@ -582,7 +582,9 @@ Some things worth knowing before you rely on it:
   by the sweep interval, and it holds the lock that every revocation on every
   replica needs while it does. A pass stops before its budget is spent and logs
   what it deferred to the next one, so a backlog that is not draining is visible
-  rather than silent. Batching those re-signs into one is a separate change.
+  rather than silent: a deferred pass raises `puppetca_supersede_failures_total`
+  and logs `ran out of budget; deferring the rest`, and the entries it defers
+  stay on the list. Batching those re-signs into one is a separate change.
 - **Revoking a subject retires its pending predecessor too.** `revoke --certname`
   and `DELETE /certificate_status` retire the subject's current certificate
   *and* anything of that subject's still inside its window, in the same call —
@@ -593,11 +595,15 @@ Some things worth knowing before you rely on it:
   for the length of its window, so the renewal paths check the pending list as
   well; without that, the credential the window keeps alive could mint a fresh
   full-lifetime successor and leave the window behind. If the list cannot be
-  read, renewals are refused rather than admitted.
+  read, renewals are refused rather than admitted — and that check runs whatever
+  the window setting says, so a store that cannot serve the
+  `superseded` key refuses renewals even on a CA that never enabled one.
 - **The sweep interval is added to the window in the worst case.** A certificate
   due at 12:00 is revoked on the first pass after that, so keep
   `superseded_cert_sweep_interval_sec` (15 minutes by default) well below the
-  window.
+  window. The server warns at startup when it is not shorter than the window,
+  naming the worst-case effective window — with the default interval, any window
+  of 15 minutes or less trips it.
 - **Safe on every replica.** The list rewrite and the revocations it drives run
   under the shared cluster CRL lock, so only the first replica to take it
   revokes and the others find the list already drained. No leader election.

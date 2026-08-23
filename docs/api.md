@@ -77,9 +77,17 @@ A revocation takes the per-subject lock that signing and [renewal](#certificate-
 `PUT /certificate_status/{subject}` with `desired_state: revoked` revokes
 whichever serial is *newest* for that subject. That is what an operator almost
 always wants, but it leaves one state unreachable: a certificate that a later
-issuance for the same subject displaced without retiring. Asking for the subject
-then revokes the live replacement and leaves the superseded certificate valid —
-worse than doing nothing. `PUT /certificate_status_by_serial/{serial}` names the
+issuance for the same subject displaced without retiring, and *without the CA
+recording that it owes it a revocation*. Asking for the subject then revokes the
+live replacement and leaves the superseded certificate valid — worse than doing
+nothing.
+
+A predecessor inside an overlap window is not in that state: it is on the
+pending-supersession list, and revoking the subject retires everything of that
+subject's the list names, in the same call. What stays unreachable is a
+predecessor whose retirement was never recorded at all — an immediate-path
+revoke that failed, or a supersession the CA could not write down.
+`puppetca_supersede_failures_total` is what tells you one exists. `PUT /certificate_status_by_serial/{serial}` names the
 certificate instead of the subject, so it can reach that one.
 
 The serial is hexadecimal, in any case and with or without leading zeros; it is
@@ -229,7 +237,7 @@ The presented client certificate must be one **this CA** issued, must not be rev
 
 The revocation condition is reached in ordinary operation: the CA re-reads the CRL from storage before renewing, so a replica whose in-memory copy has not yet caught up — up to `crl_sync_interval_sec`, see [revocation across replicas](configuration.md#revocation-across-replicas) — admits the certificate at the middleware and then refuses it here, with `403 access denied`. That is what stops renewal being a way out of a lockout during the propagation window.
 
-The supersession condition exists only where an overlap window is configured, and it is what keeps that window a grace period for relying parties rather than a reprieve for the credential. A superseded certificate is deliberately absent from the CRL, so the revocation check above cannot see it — and a renewal mints a fresh full-lifetime certificate. Without this condition the replaced credential could renew itself out of the window entirely, which on the re-key path means the *previous private key* doing it. It answers `403 access denied`, like the revocation condition. A list that cannot be read is treated the same way, deliberately: there is no cached copy to fall back on, so this one fails closed where the CRL re-read fails open.
+The supersession condition can only *refuse* where an overlap window is configured — nothing is ever recorded without one — and it is what keeps that window a grace period for relying parties rather than a reprieve for the credential. A superseded certificate is deliberately absent from the CRL, so the revocation check above cannot see it — and a renewal mints a fresh full-lifetime certificate. Without this condition the replaced credential could renew itself out of the window entirely, which on the re-key path means the *previous private key* doing it. A match, and an unparseable list, both answer `403 access denied`, like the revocation condition. A list that cannot be *read* fails closed too, but answers `500 internal server error`: the CA cannot determine the certificate's status, which is not an authorisation decision, and the same is true of the revocation check when its storage read fails. Note that this check runs on every renewal whatever `superseded_cert_revoke_after_sec` says — a store that cannot serve the pending-supersession key refuses renewals on a CA that never enabled a window, and raises `puppetca_supersede_failures_total`.
 
 The other two are not reachable today. The authorisation middleware trusts exactly this CA's certificate, so a foreign certificate is refused before the handler runs; that changes once a second issuer can be trusted for client authentication, which is when the issuer check starts earning its place and answers `403 certificate not eligible for renewal`. The subject condition cannot be reached from HTTP at all, because the handler derives the subject from the presented certificate; it guards future callers of the internal API.
 
