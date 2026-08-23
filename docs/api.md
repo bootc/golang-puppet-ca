@@ -166,13 +166,6 @@ subject that already has a certificate. What the lock rules out is the case
 that made this a bug: a `204` telling the operator the request was rejected
 while a certificate was being issued for it.
 
-While [#195](https://github.com/voxpupuli/openvox-ca/issues/195) is open,
-`POST /generate/{subject}` is the exception: it takes no per-subject lock at
-all, so a deletion can still land inside the sequence in which it saves a CSR
-and signs it — within a single process as well as across replicas. Close off
-server-side generation before rejecting requests you are containing. This
-paragraph retires with that issue.
-
 The endpoint answers `400 Bad Request` for a subject that fails validation,
 `404 Not Found` when there is no pending CSR for the subject, and `503 Service
 Unavailable` when the deletion could not be carried out — a storage fault, or a

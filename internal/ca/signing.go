@@ -864,12 +864,6 @@ var ErrNoCSR = errors.New("no pending CSR")
 // already has a certificate. What the lock rules out is the case that made
 // this a bug: a 204 concurrent with an issuance for the same request.
 //
-// While #195 is open, Generate is the exception, and not one this method can
-// close: it saves a CSR and signs it under c.mu alone, taking no distributed
-// lock, so a delete can still land inside that sequence. Closing it means
-// giving Generate the subject lock, not widening this method's — and when that
-// lands, this paragraph goes with it.
-//
 // The caller must NOT hold c.mu, and this takes no CA-level lock: a pending CSR
 // backs no in-memory cache, so there is nothing to keep in step with the write.
 //

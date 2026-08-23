@@ -267,9 +267,9 @@ with what the same process just wrote. Read paths take `c.mu.RLock` only.
 
 `DeleteRequest` is the one mutation that takes no `c.mu` at all: a pending CSR
 backs none of these caches, so there is nothing to keep in step with the write.
-That is worth knowing beyond cache coherence — it is why a rejection does not
-serialise against `Generate` even within a single process, where `c.mu` is what
-the two would otherwise have in common.
+That costs nothing in ordering: a rejection and a `Generate` for the same name
+serialise on `subject:<name>`, which both take, in every process rather than
+merely within one. `c.mu` was never what stood between them.
 
 `c.mu` is also held across the signing call itself. Every issuance path (`Sign`,
 `SignWithTTL`, `SaveRequest`'s autosign, `Renew`, `AutoRenew`,
@@ -723,9 +723,7 @@ state when the document was last updated and is not guaranteed exhaustive.
   rejection orders against an in-flight sign instead of racing it. The HTTP
   layer also stopped reporting a failed deletion as `404`, which had told the
   operator the request was gone at the moment it was still queued; it answers
-  `503` now. The one issuance a rejection still cannot wait for is `Generate`,
-  which saves and signs a CSR under `c.mu` alone — see the `Generate` gap
-  above.
+  `503` now.
 - ~~[#173](https://github.com/voxpupuli/openvox-ca/issues/173) — renewal
   re-checked revocation before acquiring the subject lock.~~ Fixed: both
   renewal paths now call `refuseIfRevoked` again as the first statement inside
