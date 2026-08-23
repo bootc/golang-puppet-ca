@@ -606,7 +606,33 @@ var _ = Describe("Delayed supersession", func() {
 			Expect(entries).To(HaveLen(1),
 				"a predecessor whose revocation failed must stay on the list for the sweep")
 			Expect(entries[0].Serial).To(Equal(hexSerial(original.SerialNumber)))
-			Expect(myCA.SupersedeFailures()).To(BeNumerically(">", before))
+			// Equal, not ">": this function can increment twice in one call —
+			// once for a failed revocation and once for a failed write — so a
+			// loose matcher could not tell the intended single increment from
+			// an accidental double.
+			Expect(myCA.SupersedeFailures()).To(Equal(before + 1))
+		})
+
+		It("still revokes, and counts, when the pruned list cannot be written back", func() {
+			original := issue("node-ae")
+			// Seeded through the working store, then revoked through a CA whose
+			// writes of this key fail: read-OK, revoke-OK, write-fail.
+			writePending([]pendingEntry{
+				{Serial: hexSerial(original.SerialNumber), Subject: "node-ae", RevokeAt: time.Now().UTC().Add(time.Hour)},
+			})
+			base := storage.NewFilesystemBackend(tmpDir)
+			failStore := storage.NewWithBackend(
+				&supersededFailBackend{Backend: base, failPut: storage.KeySuperseded}, tmpDir)
+			failing := ca.New(failStore, ca.AutosignConfig{Mode: "off"}, "puppet.test")
+			Expect(failing.Init(ctx)).To(Succeed())
+			before := failing.SupersedeFailures()
+
+			Expect(failing.Revoke(ctx, "node-ae")).To(Succeed(),
+				"a list that cannot be pruned must not fail the revocation the caller asked for")
+			Expect(revoked(original.SerialNumber)).To(BeTrue(),
+				"the predecessor must still be retired; the unprunable list is the lesser problem")
+			Expect(failing.SupersedeFailures()).To(Equal(before+1),
+				"an unprunable list must be counted; that counter is the alert's only input")
 		})
 	})
 
