@@ -54,7 +54,10 @@ const (
 )
 
 // LockTimeout bounds how long Init/Sign/Revoke will wait to acquire a
-// distributed lock before giving up. Long enough to ride out a brief
+// distributed lock before giving up — and, at Init, the whole inventory-HMAC
+// step: the `hmac-key` lock EnsureHMACKey may wait on plus the verification
+// scan that follows it. That is a second job for this constant, and the derived
+// budgets below reason from it, so it is named here as well as at the call site. Long enough to ride out a brief
 // leader election, short enough that a stuck lease on a crashed replica
 // does not hang startup past the lease TTL on the etcd backend.
 //

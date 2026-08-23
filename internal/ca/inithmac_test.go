@@ -21,6 +21,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io/fs"
 	"path/filepath"
 	"time"
@@ -68,7 +69,14 @@ func (b *hmacInitBackend) AcquireLock(_ context.Context, name string) (storage.U
 	if b.lockErr != nil {
 		return nil, b.lockErr
 	}
-	return nil, storage.ErrDistributedLockingUnsupported
+	// No spec here needs a lock that succeeds, and quietly reporting the tier
+	// unsupported would be worse than useless: this double embeds the
+	// storage.Backend *interface*, so AcquireSameHostLock is not promoted, and
+	// WithLock would fall past both lock tiers to a process-local mutex. A
+	// later spec would then read as exercising cross-replica locking while
+	// exercising none. Fail loudly instead of degrading silently.
+	Fail(fmt.Sprintf("hmacInitBackend.AcquireLock(%q) reached with no lockErr configured: this double models lock *failure* only", name))
+	return nil, nil
 }
 
 var _ = Describe("CA.Init and the inventory HMAC key", func() {

@@ -23,6 +23,8 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"log/slog"
+	"strings"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -158,6 +160,45 @@ func (b *sequencedHMACBackend) Get(ctx context.Context, key string) ([]byte, err
 	}
 	return b.gets[i].value, b.gets[i].err
 }
+
+var _ = Describe("EnsureHMACKey when the stored key is corrupt", func() {
+	// Regenerating a wrong-length key invalidates every existing inventory
+	// MAC, so VerifyInventoryHMAC reports ErrInventoryTampered — "possible
+	// tampering" — a moment later, for something the CA itself just did. This
+	// warning is the only thing standing between an operator and a phantom
+	// compromise, which is the same misattribution internal/ca/inithmac_test.go
+	// spends two specs policing in the error wording.
+	//
+	// The nil case is not hypothetical padding: it is what pins loadHMACKey's
+	// normalisation of a nil blob read with no error. Without that, an empty
+	// blob reads as first boot, the warning never fires, and the operator gets
+	// the tamper alarm with nothing to explain it.
+	DescribeTable("warns once, naming the length it found",
+		func(stored []byte, wantLength string) {
+			be := &hmacStubBackend{getValue: stored}
+			svc := NewWithBackend(be, "")
+
+			var buf bytes.Buffer
+			orig := slog.Default()
+			slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+			defer slog.SetDefault(orig)
+
+			key, err := svc.EnsureHMACKey(context.Background())
+			Expect(err).NotTo(HaveOccurred(), "EnsureHMACKey: %v", err)
+			Expect(key).To(HaveLen(hmacKeyLen), "the corrupt key was not replaced")
+			Expect(be.putCalls).To(Equal(1), "Put called %d times; want 1", be.putCalls)
+
+			// Once, not twice: loadHMACKey runs on both the unlocked look and
+			// the re-read under the lock, and only the second is a decision.
+			Expect(strings.Count(buf.String(), "wrong length")).To(Equal(1),
+				"want exactly one wrong-length warning, got: %s", buf.String())
+			Expect(buf.String()).To(ContainSubstring(wantLength),
+				"the warning does not name the length found: %s", buf.String())
+		},
+		Entry("a truncated blob", []byte("too-short"), "length=9"),
+		Entry("a blob the backend returns as nil with no error", nil, "length=0"),
+	)
+})
 
 var _ = Describe("EnsureHMACKey when another replica wins the race", func() {
 	// The re-read inside the lock is the load-bearing half of the fix: the lock

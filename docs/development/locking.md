@@ -231,8 +231,9 @@ One shared-state key is absent from this table for a reason worth stating:
 (`EnsureHMACKey`) is a read-modify-write, and the replicas that can fork the key
 are in different processes, so a process-local mutex would never have been the
 answer — the generating path takes the Tier 1 `hmac-key` lock and reads the key
-again after winning it. The read-only path, which is every start after the
-first, takes no lock at all. That was
+again after winning it. The read-only path — a key already present *and* of the
+expected length, which is every start after the first — takes no lock at all; a
+present-but-wrong-length blob regenerates, and so locks. That was
 [#202](https://github.com/voxpupuli/openvox-ca/issues/202); how far the
 guarantee reaches is `WithLock`'s tiers and nothing more, so see the known gaps
 below for the one configuration where two processes can still fork it.
@@ -327,10 +328,16 @@ written as two.
   while serving. Init also has a *separate*, unfixed hazard on the same lock —
   its slow path can re-enter `bootstrap` and deadlock startup
   ([#201](https://github.com/voxpupuli/openvox-ca/issues/201)); see known gaps.
-- `bootstrap` → `hmac-key` is the one place two *different* `WithLock` names
-  nest on one backend. `MigrateService` holds `bootstrap` on the destination
-  across `RebuildInventoryHMAC`, which reaches `EnsureHMACKey`; if the copied
-  `hmac_key` is absent or the wrong length, that takes `hmac-key` inside it.
+- `bootstrap` → `hmac-key` is the first nesting in which a name owned by
+  `StorageService` sits inside one owned by the CA layer. It is not the only
+  nesting of two different `WithLock` names — `subject:<name>` → `crl` above is
+  one — but it is the only one the order at the top of this section does not
+  cover, which is why it is written out here. `MigrateService` holds
+  `bootstrap` on the destination across `RebuildInventoryHMAC`, which reaches
+  `EnsureHMACKey`; if the copied `hmac_key` is the wrong length, that takes
+  `hmac-key` inside it. An *absent* key does not: `RebuildInventoryHMAC`
+  short-circuits on an `Exists` check before it calls `EnsureHMACKey`, so
+  corruption is the only route to this nesting.
   This order is one-way and must stay so — nothing may acquire `bootstrap` from
   inside an `hmac-key` critical section, and `WithLock` is not reentrant at any
   tier, so the two names must also never be made equal.
