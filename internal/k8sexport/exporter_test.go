@@ -422,11 +422,11 @@ var _ = Describe("Exporter", func() {
 		exp := k8sexport.New(client, *cfg, src, "", k8sexport.NewMetrics(reg))
 
 		err := exp.ExportAll(ctx)
-		// Every target is named, not just the first: the read failed once but
-		// it is attributed to each target that asked for that material.
-		Expect(err).To(MatchError(ContainSubstring("Secret/trust: reading CRL")))
-		Expect(err).To(MatchError(ContainSubstring("ConfigMap/bundle: reading CRL")))
 
+		// The metrics are asserted before the error text, deliberately. A
+		// regression that reinstates the early return fails both, and whichever
+		// is checked first is the message the next reader sees; the series
+		// existing is what the alert depends on, so let that be the one.
 		for _, want := range []struct{ kind, ns, name string }{
 			{"Secret", "ns1", "trust"},
 			{"ConfigMap", "ns2", "bundle"},
@@ -445,6 +445,11 @@ var _ = Describe("Exporter", func() {
 			Expect(found).To(BeTrue())
 			Expect(v).To(Equal(1.0))
 		}
+
+		// Every target is named, not just the first: the read failed once but
+		// it is attributed to each target that asked for that material.
+		Expect(err).To(MatchError(ContainSubstring("Secret/trust: reading CRL")))
+		Expect(err).To(MatchError(ContainSubstring("ConfigMap/bundle: reading CRL")))
 	})
 
 	It("fails only the targets that asked for the material that could not be read", func() {
@@ -462,10 +467,10 @@ var _ = Describe("Exporter", func() {
 		exp := k8sexport.New(client, *cfg, src, "", k8sexport.NewMetrics(reg))
 
 		err := exp.ExportAll(ctx)
-		Expect(err).To(MatchError(ContainSubstring("Secret/certonly: reading CA certificate")))
-		Expect(err).NotTo(MatchError(ContainSubstring("crlonly")))
 
 		// The CRL-only target was applied for real, with the CRL it asked for.
+		// Asserted first: this is the isolation the spec is named for, and an
+		// early return breaks it and the error text together.
 		cm, getErr := client.CoreV1().ConfigMaps("ns1").Get(ctx, "crlonly", metav1.GetOptions{})
 		Expect(getErr).NotTo(HaveOccurred())
 		Expect(cm.Data).To(HaveKeyWithValue("ca.crl", "CRL-PEM"))
@@ -482,6 +487,9 @@ var _ = Describe("Exporter", func() {
 		_, found = metricValue(reg, "puppetca_k8s_export_last_error_timestamp_seconds",
 			map[string]string{"kind": "ConfigMap", "namespace": "ns1", "name": "crlonly"})
 		Expect(found).To(BeFalse())
+
+		Expect(err).To(MatchError(ContainSubstring("Secret/certonly: reading CA certificate")))
+		Expect(err).NotTo(MatchError(ContainSubstring("crlonly")))
 	})
 
 	It("creates apply counters at zero for every target before the first export", func() {
