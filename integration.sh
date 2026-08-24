@@ -143,6 +143,34 @@ set -eu -o pipefail
 # #264, read allowedLockNesting against the lock graph rather than trusting a
 # green suite.
 #
+# Two more found in the 2026-08-24 build, both prose, both silent, and both
+# pointing the same way: a branch that predates another carries the OLD claim
+# unchanged, in a region the newer branch never touches, so there is no conflict.
+#
+#   #264 x #189  docs/development/locking.md says `Generate` "takes no
+#                distributed lock at all and is the `#195` gap above", and counts
+#                20 WithLock sites + 2 in caImport.go = 22. After #189 Generate
+#                DOES take the per-subject lock (internal/ca/generate.go:229) and
+#                there are 23 sites. internal/ca/lockorder_test.go:88 repeats the
+#                count in a comment. Neither is an assertion: green either way.
+#
+#   #267 x main  docs/metrics.md says `openvox-ca-ctl revoke --serial` "is the
+#                only way to retire a superseded certificate". #267's sweep is a
+#                second way. The adjacent "not counted on that arm at all" is now
+#                true only where superseded_cert_revoke_after_sec is 0.
+#
+# Reported to the coordinator; the edits belong on the PRs, not carried here —
+# nothing about them breaks a build, which is exactly why they need writing down.
+#
+# THE GENERAL FORM, worth applying to every doc conflict in this repo: when one
+# side of a hunk is a branch's own new prose and the other is the same paragraph
+# from an older base, taking either side whole is wrong. #267 alone carried FOUR
+# such paragraphs — api.md's Generate sentence (pre-#189), locking.md's lock-name
+# table (pre-#212 redis, pre-#189 capability-probe, no hmac-key or
+# sql-schema-migrate), metrics.md's mixin alert list (pre-#168 chain, pre-#221
+# OCSP), and background_jobs_test.go's ConsistOf assertions. Union the content,
+# then re-check every claim against the merged CODE.
+#
 # ---------------------------------------------------------------------------
 # TWO THINGS A BUILD MUST NOT BE READ AS EVIDENCE FOR
 #
@@ -218,6 +246,37 @@ set -eu -o pipefail
 # rewrites — 29 in one file, all noise. This form cut the same case to five, all
 # genuine. integration-verify-merge.sh answers the merge-time version of that
 # question from the index stages; this is the rebase-time one.
+#
+# A CONFLICT BLOCK DOES NOT HAVE TO START OR END ON A COMPLETE CONSTRUCT, and a
+# marker-strip union is only valid when it does. Three times in the 2026-08-24
+# build the two sides ended MID-construct, with the closing token sitting in the
+# shared context AFTER the end marker, where it closes one side only:
+#
+#   internal/metrics/collector.go  both sides ended mid struct-literal field; the
+#       shared `nil, nil),` closed theirs, leaving ours' last field unterminated.
+#       A second block had ours opening `for ... {` and theirs `if ... {` around a
+#       SHARED closing `}` — the union nested theirs inside ours' loop.
+#
+#   mixin/tests.yaml  twice, on #267 and again on #166, identically. Two conflict
+#       blocks separated by five lines that look like shared context and are in
+#       fact the common PREFIX of each side's final alert expectation
+#       (exp_alerts: / - exp_labels: / severity / job / instance). git aligns them
+#       because both sides' last alert opens the same way.
+#
+# The tell is cheap: print the FIRST and LAST line of each side and the first
+# lines after the end marker. If either side's last line is not a complete
+# statement, block or list item, the shared tail belongs to one side and the
+# other needs its own copy. Reconstruct each side WHOLE — ours1 + shared + ours2
+# + tail, and the same for theirs — and only then union at the level the file is
+# actually made of: whole test groups by name, whole struct fields, whole
+# sections. Two markers in one file are not necessarily two independent
+# conflicts.
+#
+# gofmt/`go build` catch the Go version of this instantly; nothing catches the
+# YAML one except parsing the result and counting the groups. `mage test:mixin`
+# does run `promtool test rules` against tests.yaml, so it is a real check —
+# but a malformed union can still parse. Assert the group count and that no two
+# groups share a name.
 
 BRANCHES=(
   # Always keep
