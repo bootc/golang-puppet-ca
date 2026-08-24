@@ -229,20 +229,21 @@ not, and has to be added by hand if you want it.
 
 ### Delayed supersession
 
-Present on every CA. With no
-[`superseded_cert_revoke_after_sec`](configuration.md#delayed-supersession) set,
-nothing is ever recorded — a renewal revokes its predecessor inside the call and
-a failure there is a CRL failure counted above instead — so the gauge sits at
-zero and the counter stays flat.
+Present on every CA, and live on any CA that renews certificates, since
+[`superseded_cert_revoke_after_sec`](configuration.md#delayed-supersession)
+defaults to 24 hours. Only where it is set to `0` is nothing ever recorded — a
+renewal then revokes its predecessor inside the call, and a failure there is a
+CRL failure counted above instead — so there the gauge sits at zero and the
+counter stays flat.
 
-With one exception, and it is the one an operator without the feature will
+Even there, one exception, and it is the one an operator who set `0` will
 actually hit: three code paths read the pending list whatever the setting says —
 the sweep, every renewal, and every subject revocation — and each counts a list
 it could not read. A store that cannot serve the `superseded` key therefore
-raises the counter, and fires `PuppetCASupersedeFailing`, on a CA that has never
-enabled a window. The log line says which path: `Superseded-certificate
-revocation sweep failed`, `cannot determine supersession status`, or `Revoke:
-could not read pending supersessions`.
+raises the counter, and fires `PuppetCASupersedeFailing`, even with the window
+closed. The log line says which path: `Superseded-certificate revocation sweep
+failed`, `cannot determine supersession status`, or `Revoke: could not read
+pending supersessions`.
 
 | Metric | Description |
 | --- | --- |

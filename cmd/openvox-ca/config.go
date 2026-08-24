@@ -140,17 +140,32 @@ type serverConfig struct {
 	// which leaves the replaced certificate valid until it naturally expires.
 	RevokeOnAutoRenew bool `yaml:"revoke_on_auto_renew"`
 
-	// SupersededCertRevokeAfterSec delays the revocation of a certificate a
-	// renewal has replaced, instead of revoking it inside the renewal call.
-	// Zero — the default — keeps the behaviour that predates this setting:
-	// the replaced certificate is revoked immediately.
+	// SupersededCertRevokeAfterSec is how long a certificate a renewal has
+	// replaced stays valid before it is revoked, instead of being revoked
+	// inside the renewal call. Three states, per the CSRRateLimit convention:
 	//
-	// A positive value grants an overlap window in which both the replaced and
-	// the replacement certificate verify, so relying parties can pick up the
-	// new one without a gap. It is a deliberate weakening: for the length of
-	// the window the replaced certificate — and, on the CSR-based re-key path,
-	// the replaced private key — is still a credential this CA accepts. Set it
-	// no longer than a fleet needs to notice a renewal.
+	//	 0  revoke immediately, inside the renewal — an explicit operator choice,
+	//	    and the behaviour of every release before this setting existed
+	//	>0  that duration
+	//	-1  unset: the built-in default (24h)
+	//
+	// The default grants an overlap window in which both the replaced and the
+	// replacement certificate verify, so relying parties can pick up the new
+	// one without a gap — which is what makes a certificate other parties are
+	// actively verifying safe to renew at all.
+	//
+	// It is also a deliberate weakening, and since it is the default it is one
+	// every deployment inherits on upgrade: for the length of the window the
+	// replaced certificate — and, on the CSR-based re-key path, the replaced
+	// private key — is still a credential this CA accepts. Set 0 to restore the
+	// previous behaviour. What keeps the window bounded rather than open-ended
+	// is ca.CA.refuseIfSuperseded, which stops a certificate inside its window
+	// renewing itself into a fresh full-lifetime successor.
+	//
+	// 24h matches tls_self_provision_revoke_after_sec's default for the serving
+	// certificate (defaultServingRevokeAfter on the serving-certificate work).
+	// The two are the same question asked about different subjects, and the
+	// answer is deliberately the same rather than coincidentally so.
 	//
 	// It governs both renewal paths. RevokeOnAutoRenew still decides whether
 	// the auto-renewal path retires its predecessor at all.
@@ -195,6 +210,9 @@ func loadServerConfig(configFile string) (*serverConfig, error) {
 		CSRRateLimit:      -1,   // unset sentinel; 0 disables, -1 falls back to defaultCSRRateLimit
 		PromoteCNToSAN:    true, // RFC 2818: add CN as SAN when CSR has no SANs
 		RevokeOnAutoRenew: true, // only the newest serial per subject should be valid
+		// unset sentinel; 0 revokes inside the renewal, -1 falls back to
+		// defaultSupersededCertRevokeAfter
+		SupersededCertRevokeAfterSec: -1,
 	}
 
 	if configFile != "" {
@@ -294,6 +312,13 @@ const (
 	// defaultExpiredCertCleanupInterval is how often the cleanup job runs when no
 	// interval is configured. Daily is ample: expiry is a slow, day-scale event.
 	defaultExpiredCertCleanupInterval = 24 * time.Hour
+	// defaultSupersededCertRevokeAfter is how long a certificate a renewal has
+	// replaced stays valid before revocation when the operator has not chosen
+	// otherwise. 24 hours is the same answer tls_self_provision_revoke_after_sec
+	// gives for the serving certificate, and for the same reason: it comfortably
+	// exceeds the interval on which a fleet picks up a replacement, while
+	// staying short enough that a replaced credential is not a standing one.
+	defaultSupersededCertRevokeAfter = 24 * time.Hour
 	// defaultSupersededCertSweepInterval is how often the delayed-supersession
 	// sweep runs when no interval is configured. The interval is the sweep's
 	// own overshoot past a recorded revoke_at, so it wants to be small relative
@@ -328,14 +353,19 @@ func (c *serverConfig) expiredCertCleanupInterval() time.Duration {
 }
 
 // supersededCertRevokeAfter resolves how long a certificate a renewal has
-// replaced stays valid before it is revoked. Zero (the default, and any
-// negative value, which the YAML type permits but the feature has no meaning
-// for) selects immediate revocation inside the renewal call.
+// replaced stays valid before it is revoked.
+//
+// Zero is an operator's explicit "revoke immediately", not an absent value, so
+// it is honoured rather than replaced by the default — which is the whole point
+// of the -1 unset sentinel and the reason this cannot use the `> 0` shape its
+// interval neighbours use. Any other negative value is treated as unset too:
+// nothing else is representable in the YAML int, and reading a typo as the
+// default is the same answer an absent key gets.
 func (c *serverConfig) supersededCertRevokeAfter() time.Duration {
-	if c.SupersededCertRevokeAfterSec > 0 {
+	if c.SupersededCertRevokeAfterSec >= 0 {
 		return time.Duration(c.SupersededCertRevokeAfterSec) * time.Second
 	}
-	return 0
+	return defaultSupersededCertRevokeAfter
 }
 
 // supersededCertSweepInterval resolves how often the delayed-supersession sweep

@@ -151,13 +151,14 @@ func NewCollector(c *ca.CA) *Collector {
 				"list that could not be read or parsed, a sweep pass that could not take the CRL "+
 				"lock or write the list back, and each pass that left an entry unrevoked or "+
 				"discarded one whose serial it could never revoke. One pass counts "+
-				"once however many entries it failed on. With superseded_cert_revoke_after_sec "+
-				"unset nothing is recorded — the revocation happens inside the renewal, and a "+
-				"failure there lands in puppetca_crl_update_failures_total instead — so this stays "+
-				"flat, with one exception: the sweep, every renewal and every subject revocation "+
-				"read the pending list whatever the setting says, and a store that cannot serve "+
-				"that key raises this on a CA that never enabled a window. A rising value means a "+
-				"certificate a renewal replaced may still be a valid credential.",
+				"once however many entries it failed on. Only where "+
+				"superseded_cert_revoke_after_sec is 0 is nothing recorded — the revocation then "+
+				"happens inside the renewal, and a failure there lands in "+
+				"puppetca_crl_update_failures_total instead — so this stays flat there, with one "+
+				"exception: the sweep, every renewal and every subject revocation read the pending "+
+				"list whatever the setting says, and a store that cannot serve that key raises "+
+				"this even with the window closed. A rising value means a certificate a renewal "+
+				"replaced may still be a valid credential.",
 			nil, nil),
 		supersedePending: prometheus.NewDesc(
 			prometheus.BuildFQName(namespace, "supersede", "pending"),

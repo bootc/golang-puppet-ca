@@ -33,12 +33,13 @@ alerting rules for the openvox-ca exporter. It alerts on:
   [configuration](../docs/configuration.md).
 - **Delayed-revocation failures** — the CA failing to schedule or carry out the
   revocation of a certificate a renewal replaced, which leaves that certificate
-  a valid credential. Mostly scoped to deployments where
-  `superseded_cert_revoke_after_sec` grants an overlap window — with no window
-  the revocation happens inside the renewal and a failure is counted by the
-  CRL-update alert above — but a store that cannot serve the pending-supersession
-  key fires it anywhere, because the sweep, every renewal and every subject
-  revocation read that key whatever the setting says. See
+  a valid credential. Live on any CA that renews certificates, since
+  `superseded_cert_revoke_after_sec` defaults to 24 hours; only where it is set
+  to `0` does the revocation happen inside the renewal instead, and a failure
+  there is counted by the CRL-update alert above. Even then a store that cannot
+  serve the pending-supersession key fires this, because the sweep, every
+  renewal and every subject revocation read that key whatever the setting says.
+  See
   [delayed supersession](../docs/configuration.md#delayed-supersession).
 - **Kubernetes export** targets whose applies keep failing, and targets that are
   configured but never attempted at all (only when the

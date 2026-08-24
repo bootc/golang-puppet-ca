@@ -358,8 +358,10 @@ var _ = Describe("expired-cert cleanup resolvers", func() {
 		clearServerEnv()
 		cfg, err := loadServerConfig("")
 		Expect(err).NotTo(HaveOccurred(), "unexpected error")
-		Expect(cfg.supersededCertRevokeAfter()).To(BeZero(),
-			"an unset window must resolve to 0 — revoke inside the renewal, as before the setting existed")
+		Expect(cfg.supersededCertRevokeAfter()).To(Equal(defaultSupersededCertRevokeAfter),
+			"an unset window must resolve to the built-in default, not to zero")
+		Expect(cfg.supersededCertRevokeAfter()).To(Equal(24*time.Hour),
+			"and that default is 24h, matching tls_self_provision_revoke_after_sec")
 		Expect(cfg.supersededCertSweepInterval()).To(Equal(defaultSupersededCertSweepInterval),
 			"supersededCertSweepInterval() = %v; want default %v",
 			cfg.supersededCertSweepInterval(), defaultSupersededCertSweepInterval)
@@ -376,15 +378,20 @@ var _ = Describe("expired-cert cleanup resolvers", func() {
 		Expect(cfg.supersededCertRevokeAfter()).To(Equal(time.Hour))
 		Expect(cfg.supersededCertSweepInterval()).To(Equal(time.Minute))
 
-		// A negative window is representable in YAML and means nothing; it must
-		// resolve to "revoke immediately" rather than to a negative delay that
-		// would make every entry due the moment it was recorded.
+		// Zero is an operator's explicit "revoke immediately", not an absent
+		// value. This is the one setting here where the `> 0` shape its
+		// neighbours use would be wrong: it would swallow the off switch and
+		// hand back a 24-hour window to someone who asked for none.
 		clearServerEnv()
 		cfg, err = loadServerConfig("")
 		Expect(err).NotTo(HaveOccurred(), "unexpected error")
-		cfg.SupersededCertRevokeAfterSec = -1
+		cfg.SupersededCertRevokeAfterSec = 0
 		Expect(cfg.supersededCertRevokeAfter()).To(BeZero(),
-			"a negative window must resolve to 0, not to a negative delay")
+			"an explicit 0 must mean revoke-inside-the-renewal, not fall back to the default")
+
+		// Any other negative reads as unset, like an absent key.
+		cfg.SupersededCertRevokeAfterSec = -5
+		Expect(cfg.supersededCertRevokeAfter()).To(Equal(defaultSupersededCertRevokeAfter))
 		cfg.SupersededCertSweepIntervalSec = -1
 		Expect(cfg.supersededCertSweepInterval()).To(Equal(defaultSupersededCertSweepInterval))
 	})
@@ -409,6 +416,16 @@ var _ = Describe("expired-cert cleanup resolvers", func() {
 		Expect(err).NotTo(HaveOccurred(), "unexpected error")
 		Expect(cfg.supersededCertRevokeAfter()).To(BeZero(),
 			"an env value of 0 must override a positive file value and close the window")
+
+		// And it must close it against the *default* too, not only against a
+		// file value — that is now the case an operator restoring the previous
+		// behaviour on upgrade actually hits.
+		clearServerEnv()
+		setEnv("PUPPET_CA_SUPERSEDED_CERT_REVOKE_AFTER_SEC", "0")
+		cfg, err = loadServerConfig("")
+		Expect(err).NotTo(HaveOccurred(), "unexpected error")
+		Expect(cfg.supersededCertRevokeAfter()).To(BeZero(),
+			"an env value of 0 must also override the built-in 24h default")
 	})
 
 	It("falls back to defaults for non-positive values", func() {

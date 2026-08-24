@@ -158,9 +158,16 @@ type CA struct {
 	// replaced serial is recorded on a durable, cross-subject list and a
 	// periodic sweep (ReconcileSuperseded) revokes it once the delay elapses.
 	//
-	// Zero — the default — is the behaviour that predates the list: the
-	// replaced certificate is revoked immediately, inside the renewal. Nothing
-	// is recorded, and a deployment that never sets this never grows the list.
+	// Zero is the behaviour that predates the list: the replaced certificate is
+	// revoked immediately, inside the renewal, and nothing is recorded. It is
+	// this type's zero value, so a CA constructed without setting it — the
+	// offline commands and openvox-ca-ctl — retires immediately, which is the
+	// right default for a deliberate operator action at a terminal.
+	//
+	// It is *not* what the server does. `openvox-ca serve` sets this from
+	// superseded_cert_revoke_after_sec, which defaults to 24h, so an ordinary
+	// deployment grants a window. The two differ deliberately: a fleet renewing
+	// on a timer needs the overlap, and an operator revoking by hand does not.
 	//
 	// A positive value is a deliberate weakening of that: for the length of the
 	// window the replaced certificate — and, on the CSR-based re-key path, the
