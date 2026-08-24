@@ -305,85 +305,20 @@ func (c *CA) ReconcileSuperseded(ctx context.Context) (int, error) {
 		// retired the certificates that have been superseded longest.
 		sort.Slice(due, func(i, j int) bool { return due[i].RevokeAt.Before(due[j].RevokeAt) })
 
-		var (
-			failed    []supersededEntry
-			deferred  []supersededEntry
-			discarded int
-		)
-		func() {
+		outcome := func() drainOutcome {
 			c.mu.Lock()
 			defer c.mu.Unlock()
-			for i, e := range due {
-				// Each revokeSerialLocked below is a whole CRL read, re-sign and
-				// write — over IPC to the isolated signer where one is
-				// configured — so a pass with a large backlog costs one of those
-				// per entry, all under the CRL lock every revocation on every
-				// replica is waiting for. Batching them into a single re-sign is
-				// issue #176, deliberately not this change.
-				//
-				// Until it lands, stop while there is budget left rather than
-				// running until the deadline cuts the pass off mid-loop. The
-				// reserve is what pays for the write-back, and the oldest-first
-				// order above is what makes stopping safe: the entries left are
-				// the ones superseded most recently, and the next tick takes
-				// them. Never silently — a backlog that is not draining has to
-				// be visible, or "the sweep is keeping up" and "the sweep is
-				// falling behind by one interval every interval" look identical.
-				// i > 0 guarantees a pass always attempts at least one entry.
-				// The deadline is set at function entry, before the fast-path
-				// read and before the wait for a CRL lock that every revocation
-				// on every replica contends for — so on a busy cluster the
-				// reserve can already be gone by the time the drain starts.
-				// Without this the pass would revoke nothing, every time,
-				// forever. Entry 0 may then fail on the spent deadline instead,
-				// which carries it forward and counts, rather than looking like
-				// a clean pass that did nothing.
-				if deadline, ok := ctx.Deadline(); ok && i > 0 && time.Until(deadline) < LockTimeout/2 {
-					// due[i:] has to be carried into the write-back below, not
-					// merely stepped over: the list is the only record that
-					// these certificates are owed a revocation, so a pass that
-					// wrote without them would erase exactly what it claimed to
-					// defer — and the pending gauge would fall as though they
-					// had been retired.
-					deferred = due[i:]
-					slog.Warn("Superseded-certificate sweep ran out of budget; deferring the rest "+
-						"to the next pass", "revoked", revoked, "deferred", len(deferred))
-					break
-				}
-				if _, ok := new(big.Int).SetString(e.Serial, 16); !ok {
-					// Retrying is right for a transient failure and wrong for a
-					// permanent one. A serial that is not parseable hex can
-					// never be revoked, so carrying it forward would retry it
-					// on every pass forever, latching both this counter's alert
-					// and the CRL one with nothing an operator could do to clear
-					// them. Discarded, loudly — and never handed to
-					// revokeSerialLocked, so it does not count as a CRL failure
-					// as well.
-					slog.Error("Discarding superseded-certificate entry with a malformed serial; "+
-						"it can never be revoked", "serial", e.Serial, "subject", e.Subject)
-					discarded++
-					continue
-				}
-				if err := c.revokeSerialLocked(ctx, e.Serial); err != nil {
-					// Per entry, not all-or-nothing: one failure must not stall
-					// the revocations behind it, which would leave each of those
-					// certificates a valid credential indefinitely.
-					slog.Warn("Could not revoke superseded certificate; will retry",
-						"subject", e.Subject, "serial", e.Serial, "error", err)
-					failed = append(failed, e)
-					continue
-				}
-				revoked++
-				slog.Info("Revoked superseded certificate", "subject", e.Subject, "serial", e.Serial)
-			}
+			return c.drainDueLocked(ctx, due)
 		}()
+		revoked = outcome.revoked
+
 		// Deferrals count too. Once the entries survive the pass, a backlog the
 		// sweep cannot keep up with looks like a high pending gauge that never
 		// falls and nothing else — and the gauge's own guidance sends the
 		// operator to this counter. A pass that left certificates past their
 		// window unrevoked is the condition this counter exists to surface,
 		// whichever of the three reasons it was.
-		if len(failed) > 0 || len(deferred) > 0 || discarded > 0 {
+		if len(outcome.failed) > 0 || len(outcome.deferred) > 0 || outcome.discarded > 0 {
 			c.supersedeFailures.Add(1)
 		}
 		// The drain may have spent most (or, on a deadline error, all) of ctx's
@@ -401,10 +336,10 @@ func (c *CA) ReconcileSuperseded(ctx context.Context) (int, error) {
 		// Built explicitly rather than by chained appends: pending, failed and
 		// deferred each have their own backing array, and a chained append can
 		// write into one of them. Everything still owed a revocation goes back.
-		keep := make([]supersededEntry, 0, len(pending)+len(failed)+len(deferred))
+		keep := make([]supersededEntry, 0, len(pending)+len(outcome.failed)+len(outcome.deferred))
 		keep = append(keep, pending...)
-		keep = append(keep, failed...)
-		keep = append(keep, deferred...)
+		keep = append(keep, outcome.failed...)
+		keep = append(keep, outcome.deferred...)
 		return c.writeSuperseded(writeCtx, keep)
 	})
 	if err != nil {
@@ -502,6 +437,131 @@ func (c *CA) retireSupersededForSubjectLocked(ctx context.Context, subject strin
 		slog.Warn("Revoke: could not prune pending supersessions; the sweep will re-check them",
 			"subject", subject, "error", err)
 	}
+}
+
+// drainOutcome is what one drain pass did to the entries it was given. Every
+// due entry lands in exactly one disposition, and the four together account for
+// all of them:
+//
+//	revoked   — on the CRL now
+//	failed    — revocation was attempted and refused; stays listed, retried
+//	deferred  — never attempted, the pass ran out of budget; stays listed
+//	discarded — can never be revoked; dropped from the list, loudly
+//
+// That total is not bookkeeping pedantry. The list is the only record that a
+// replaced certificate is owed a revocation, so an entry that falls out of all
+// four is a credential left valid with nothing tracking it — which is exactly
+// the defect review round 2 found here, where deferred entries were counted in
+// the log line and then dropped from the write-back.
+type drainOutcome struct {
+	revoked   int
+	failed    []supersededEntry
+	deferred  []supersededEntry
+	discarded int
+}
+
+// drainDueLocked revokes the due entries, oldest first, and reports what
+// happened to each. The cluster CRL lock and c.mu must both be held.
+//
+// # This is the seam for #176
+//
+// #176 batches the CRL re-sign, and this function is the only thing it has to
+// replace. The contract it must keep is drainOutcome's: every entry it is given
+// comes back in exactly one disposition. Everything around it — the due/pending
+// split, the failure counting, the write-back that carries failed and deferred
+// entries back to the list — reads only that struct and does not care how the
+// revocations happened.
+//
+// Two things a batched implementation gets to simplify, both of which exist
+// here only because each revocation is its own CRL read-modify-write:
+//
+//   - `deferred` becomes dead. It exists because N entries cost N re-signs, so
+//     a large backlog cannot fit in one lock hold. One re-sign for all of them
+//     removes the budget problem, and with it the reserve check and the
+//     oldest-first sort that makes stopping early safe. Leave the field in
+//     place, always empty, rather than reshaping the caller.
+//   - `failed` becomes all-or-nothing. A batched re-sign either lands or does
+//     not, so the per-entry retry list collapses to "every entry it tried".
+//     That is a simplification, not a regression: the entries still stay
+//     listed and are still retried on the next pass.
+//
+// What a batched implementation must NOT drop is the malformed-serial split.
+// `discarded` entries must never reach the batch — a serial that is not
+// parseable hex can never be revoked, and including one would fail the whole
+// re-sign and take every valid entry down with it. Partition first, then batch.
+func (c *CA) drainDueLocked(ctx context.Context, due []supersededEntry) drainOutcome {
+	var out drainOutcome
+	for i, e := range due {
+		// Each revokeSerialLocked below is a whole CRL read, re-sign and
+		// write — over IPC to the isolated signer where one is
+		// configured — so a pass with a large backlog costs one of those
+		// per entry, all under the CRL lock every revocation on every
+		// replica is waiting for. Batching them into a single re-sign is
+		// issue #176, deliberately not this change.
+		//
+		// Until it lands, stop while there is budget left rather than
+		// running until the deadline cuts the pass off mid-loop. The
+		// reserve is what pays for the caller's write-back, and the
+		// caller's oldest-first sort is what makes stopping safe: the
+		// entries left are the ones superseded most recently, and the
+		// next tick takes them. Never silently — a backlog that is not
+		// draining has to be visible, or "the sweep is keeping up" and
+		// "the sweep is falling behind by one interval every interval"
+		// look identical.
+		//
+		// i > 0 guarantees a pass always attempts at least one entry.
+		// ReconcileSuperseded sets the deadline at its own entry, before
+		// the fast-path read and before the wait for a CRL lock that
+		// every revocation on every replica contends for — so on a busy
+		// cluster the reserve can already be gone by the time the drain
+		// starts. Without this the pass would revoke nothing, every
+		// time, forever. Entry 0 may then fail on the spent deadline
+		// instead, which carries it forward and counts, rather than
+		// looking like a clean pass that did nothing.
+		if deadline, ok := ctx.Deadline(); ok && i > 0 && time.Until(deadline) < LockTimeout/2 {
+			// due[i:] is returned, not merely stepped over: the list is
+			// the only record that these certificates are owed a
+			// revocation, so a caller that wrote back without them would
+			// erase exactly what this claimed to defer — and the pending
+			// gauge would fall as though they had been retired. That is
+			// the drainOutcome contract, and it is the defect review
+			// round 2 found.
+			//
+			// due[i:] aliases due rather than copying it, which is safe
+			// because the caller does not mutate due after sorting and
+			// writeSuperseded only marshals what it is given.
+			out.deferred = due[i:]
+			slog.Warn("Superseded-certificate sweep ran out of budget; deferring the rest "+
+				"to the next pass", "revoked", out.revoked, "deferred", len(out.deferred))
+			break
+		}
+		if _, ok := new(big.Int).SetString(e.Serial, 16); !ok {
+			// Retrying is right for a transient failure and wrong for a
+			// permanent one. A serial that is not parseable hex can
+			// never be revoked, so carrying it forward would retry it
+			// on every pass forever, latching both this counter's alert
+			// and the CRL one with nothing an operator could do to clear
+			// them. Discarded, loudly — and never handed to
+			// revokeSerialLocked, so it does not count as a CRL failure
+			// as well.
+			slog.Error("Discarding superseded-certificate entry with a malformed serial; "+
+				"it can never be revoked", "serial", e.Serial, "subject", e.Subject)
+			out.discarded++
+			continue
+		}
+		if err := c.revokeSerialLocked(ctx, e.Serial); err != nil {
+			// Per entry, not all-or-nothing: one failure must not stall
+			// the revocations behind it, which would leave each of those
+			// certificates a valid credential indefinitely.
+			slog.Warn("Could not revoke superseded certificate; will retry",
+				"subject", e.Subject, "serial", e.Serial, "error", err)
+			out.failed = append(out.failed, e)
+			continue
+		}
+		out.revoked++
+		slog.Info("Revoked superseded certificate", "subject", e.Subject, "serial", e.Serial)
+	}
+	return out
 }
 
 // PendingSupersessions returns the number of certificates currently recorded
