@@ -82,14 +82,20 @@ services:
       # Authorise replica 2's service cert as a peer admin so cross-replica
       # admin calls work in tests.
       - PUPPET_CA_PEER_HOSTNAMES=openvox-ca-2
+      # Prometheus exporter, for the same reason as compose-puppet.yml: the
+      # shared puppet-stack.sh asserts on puppetca_supersede_pending, and on
+      # this backend there is no superseded.json to read instead.
+      - PUPPET_CA_METRICS_LISTEN=:9140
     volumes:
       - ../docker/puppet/ca-entrypoint-redis.sh:/etc/puppet-ca/entrypoint.sh:ro,z
       - ca-data-redis:/data
     expose:
       - "8140"
-    # Distinct host port from compose-puppet.yml so both stacks can coexist.
+      - "9140"
+    # Distinct host ports from compose-puppet.yml so both stacks can coexist.
     ports:
       - "8241:8140"
+      - "9241:9140"
     # Both replicas race to bootstrap the shared CA on first start. If this one
     # loses that race and its Phase 1 entrypoint aborts (or the loopback CA is
     # slow to answer under CI load), restart it: on the next attempt the CA

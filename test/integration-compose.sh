@@ -2020,8 +2020,13 @@ if _wait_ren_ca "$_REN_CA_URL"; then
         > "$WORK_DIR/ren-other.crt" 2>/dev/null
 
     # Dedicated node cert for the bare-path renewal test. A successful CSR
-    # renewal now revokes the cert it replaces, so the bare-path test can't
-    # reuse ren-node (already renewed and thus revoked by the happy-path test).
+    # renewal retires the cert it replaces, so the bare-path test can't reuse
+    # ren-node. Note *how* it is retired changed: with
+    # superseded_cert_revoke_after_sec defaulting to 24h it is recorded for
+    # delayed revocation rather than revoked inline, so it is absent from the
+    # CRL — but the renewal paths refuse a superseded certificate outright, so
+    # reusing ren-node would still fail, just with a different cause. Do not
+    # "simplify" this away on noticing the CRL no longer lists it.
     openvox-ca-ctl --server-url "$_REN_CA_URL" \
         generate --certname "$_REN_BARE" --out-dir "$WORK_DIR" \
         > "$WORK_DIR/ren-bare.crt" 2>/dev/null
@@ -2079,7 +2084,8 @@ if _wait_ren_ca "https://127.0.0.1:${_REN_PORT}"; then
 
     # Invalid CSR body → 400. Authenticate with ren-other: the request is
     # rejected during CSR parsing, before any CN check, so any still-valid
-    # client cert works — and ren-node has been revoked by its renewal above.
+    # client cert works — and ren-node is no longer usable here, having been
+    # superseded by its renewal above.
     assert_http 400 "renewal: invalid CSR body returns 400" \
         -sk \
         --cert "$WORK_DIR/ren-other.crt" \
@@ -2090,7 +2096,7 @@ if _wait_ren_ca "https://127.0.0.1:${_REN_PORT}"; then
 
     # Bare-path alias /certificate_renewal (without /puppet-ca/v1) also works.
     # Uses the dedicated ren-bare cert: this is a successful renewal that
-    # revokes its own presented cert, so it must not reuse ren-node.
+    # retires its own presented cert, so it must not reuse ren-node.
     make_csr "$_REN_BARE" "$WORK_DIR/ren-renewal2.csr"
     assert_http 200 "renewal: bare-path /certificate_renewal returns 200" \
         -sk \

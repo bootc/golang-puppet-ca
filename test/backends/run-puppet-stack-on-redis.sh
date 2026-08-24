@@ -24,19 +24,21 @@ trap 'rm -rf "$WORK"' EXIT
 # Substitutions (literal-string replacements only):
 #  1. Compose file               -> test/compose-backends-redis.yml
 #  2. Host CA URL                -> https://localhost:8241
-#  3. Host master health URL     -> https://localhost:8240/...
-#  4. --resolve / --connect-to   -> add --connect-to redirecting host:8240
+#  3. Host CA metrics URL        -> http://localhost:9241/metrics
+#  4. Host master health URL     -> https://localhost:8240/...
+#  5. --resolve / --connect-to   -> add --connect-to redirecting host:8240
 #     This pair lets curl keep doing TLS hostname verification against
 #     "puppet-master" while the actual TCP connect lands on host port 8240.
 sed \
     -e 's|test/compose-puppet\.yml|test/compose-backends-redis.yml|g' \
     -e 's|https://localhost:8141|https://localhost:8241|g' \
+    -e 's|http://localhost:9141/metrics|http://localhost:9241/metrics|g' \
     -e 's|https://localhost:8140/status/v1/simple|https://localhost:8240/status/v1/simple|g' \
     -e 's|--resolve "puppet-master:8140:127\.0\.0\.1"|--resolve "puppet-master:8140:127.0.0.1" --connect-to "puppet-master:8140:127.0.0.1:8240"|g' \
     "$UPSTREAM" > "$WORK/puppet-stack-redis.sh"
 chmod +x "$WORK/puppet-stack-redis.sh"
 
-# Sanity check that all four substitutions actually fired -- if puppet-stack.sh
+# Sanity check that all five substitutions actually fired -- if puppet-stack.sh
 # is later refactored away from these literals the wrapper would silently run
 # against the wrong stack, which is much harder to diagnose than a hard fail
 # here.
@@ -52,6 +54,7 @@ require_count() {  # description  expected-count  pattern  file
 }
 require_count "compose-backends-redis.yml"  3 "compose-backends-redis.yml"        "$WORK/puppet-stack-redis.sh"
 require_count "redis-mapped CA host port"   1 "https://localhost:8241"             "$WORK/puppet-stack-redis.sh"
+require_count "redis-mapped CA metrics port" 1 "http://localhost:9241/metrics"      "$WORK/puppet-stack-redis.sh"
 require_count "redis-mapped master health"  1 "https://localhost:8240/status/v1/simple" "$WORK/puppet-stack-redis.sh"
 require_count "redis-mapped master port"    1 "127.0.0.1:8240"                     "$WORK/puppet-stack-redis.sh"
 
