@@ -62,6 +62,7 @@ type parkingSigner struct {
 
 	parked atomic.Int64 // calls currently stopped inside Sign
 	remain atomic.Int64 // parks left to hand out
+	calls  atomic.Int64 // every Sign entry, parked or not
 
 	mu   sync.Mutex
 	peak int64 // high-water mark of parked, for the concurrency spec
@@ -82,6 +83,7 @@ func newParkingSigner(inner crypto.Signer, parkFor int) *parkingSigner {
 func (p *parkingSigner) Public() crypto.PublicKey { return p.inner.Public() }
 
 func (p *parkingSigner) Sign(r io.Reader, digest []byte, opts crypto.SignerOpts) ([]byte, error) {
+	p.calls.Add(1)
 	if p.remain.Add(-1) >= 0 {
 		n := p.parked.Add(1)
 		p.mu.Lock()
@@ -102,6 +104,13 @@ func (p *parkingSigner) Sign(r io.Reader, digest []byte, opts crypto.SignerOpts)
 // signature was still in flight, rather than after a late unblock — an
 // end-state assertion alone is satisfied by both.
 func (p *parkingSigner) Parked() int64 { return p.parked.Load() }
+
+// Calls reports how many signatures were entered at all, parked or not. A spec
+// asserting a signature did *not* happen must use this rather than Peak: with a
+// park budget Peak would answer the question, but only by parking the signature
+// it is trying to prove never occurred, which turns a failure into a deadlock
+// instead of an assertion.
+func (p *parkingSigner) Calls() int64 { return p.calls.Load() }
 
 // Peak reports the most signatures ever parked at once.
 func (p *parkingSigner) Peak() int64 {
@@ -362,6 +371,32 @@ var _ = Describe("OCSP response signing and the CA lock", func() {
 
 		Expect(answer.MaxAge).To(BeZero(),
 			"a response a revocation overtook must not be advertised as reusable")
+	})
+
+	// The signature is the expensive step, so an abandoned request should not
+	// reach it.
+	//
+	// A park budget of zero, deliberately: the signer only counts here. Parking
+	// the signature would make the guard's absence show up as a deadlock — the
+	// spec blocks inside Sign until go test's timeout, with a goroutine dump
+	// instead of an assertion — which is the same trap the raced-revocation spec
+	// above had to be rewritten to avoid. Counting makes the mutation fail on a
+	// named line in under a second.
+	It("does not sign for a request whose context is already cancelled", func() {
+		reqDER := issueFor("ocsp-lock-cancelled")
+		signer := park(0)
+
+		cancelled, cancel := context.WithCancel(ctx)
+		cancel()
+
+		_, err := myCA.AnswerOCSP(cancelled, reqDER)
+		Expect(err).To(HaveOccurred())
+		Expect(err).To(MatchError(context.Canceled))
+		Expect(err).To(MatchError(ca.ErrInternal),
+			"a cancelled request is a server-side failure, not a malformed one — "+
+				"the handler must answer internalError rather than malformedRequest")
+		Expect(signer.Calls()).To(BeZero(),
+			"the signer should never have been entered for an abandoned request")
 	})
 
 	// The prune half of the same guard, and not a duplicate of the revocation

@@ -715,7 +715,23 @@ state when the document was last updated and is not guaranteed exhaustive.
   in the #197 change: the right size is a property of the deployment's signer,
   so it is configuration and a design decision rather than a lock-scope fix. A
   rate limit in front of `/ocsp` would address the same exposure from the other
-  end.
+  end; extending the existing CSR limiter to that route was raised in review and
+  declined for the same reason, since throttling a public revocation-status
+  endpoint changes what verifiers see and is a decision in its own right.
+
+  What #197 *did* take is the cheap half that needs no size: `AnswerOCSP` checks
+  `ctx.Err()` immediately before signing, so a request whose client has already
+  disconnected — or whose server deadline has expired — does not spend a signer
+  round trip on an answer nobody can receive. That sheds load; it does not bound
+  it, and it is not offered as a substitute.
+
+  **No metric covers either of these.** The raced cache write logs, and nothing
+  counts it; concurrent signing has no gauge at all. An operator cannot tell
+  "this never happens" from "this happens throughout every CRL update", and the
+  same is true of a caller saturating the signer. Raised in review and left out
+  of #197 as scope — this repository ships a Prometheus mixin and adding series
+  to it is its own change — but it belongs with whatever closes the gap above,
+  because a bound nobody can observe being approached is only half an answer.
 
   Two smaller consequences of the same restructure, both deliberate:
 

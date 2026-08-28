@@ -234,12 +234,10 @@ type OCSPAnswer struct {
 // snapshot comment in the body — so a slow signer no longer serialises the
 // process (#197).
 //
-// ctx is unused: everything this answers from is already in memory, and it was
-// only ever passed to a CRL scan that ignored it. It stays in the signature
-// because this is a request-scoped entry point reached from an HTTP handler,
-// and a public method that may later need to reach storage should not change
-// shape to acquire a context.
-func (c *CA) AnswerOCSP(_ context.Context, reqDER []byte) (OCSPAnswer, error) {
+// ctx is checked once, immediately before the signature, and not otherwise:
+// everything the answer is built from is already in memory, so there is nothing
+// else here that can block on it.
+func (c *CA) AnswerOCSP(ctx context.Context, reqDER []byte) (OCSPAnswer, error) {
 	// Extract nonce before acquiring any lock (pure DER parse, no shared state).
 	nonce, hasNonce := extractNonce(reqDER)
 
@@ -306,8 +304,9 @@ func (c *CA) AnswerOCSP(_ context.Context, reqDER []byte) (OCSPAnswer, error) {
 	//   - cachedCRL is replaced by pointer and never mutated in place — see
 	//     installCachedCRLLocked — so holding the pointer is holding an
 	//     immutable view of one CRL, not a window onto a changing one.
-	//   - serialIndex is consulted here and nowhere else in this function; the
-	//     bool is a value, and staleness in it is handled at the cache write.
+	//   - serialIndex is not consulted again while no lock is held; the bool is
+	//     a value, and staleness in it is handled at the cache write, which
+	//     re-reads the map under the write lock rather than trusting this.
 	now := time.Now().UTC()
 	template := ocsp.Response{
 		SerialNumber: req.SerialNumber,
@@ -331,6 +330,22 @@ func (c *CA) AnswerOCSP(_ context.Context, reqDER []byte) (OCSPAnswer, error) {
 	// Echo the nonce extension into the response's singleExtensions.
 	if hasNonce {
 		template.ExtraExtensions = append(template.ExtraExtensions, nonce)
+	}
+
+	// Shed abandoned requests before signing rather than after. Under an
+	// external signer this is the one expensive step, and a client that has
+	// already disconnected — or a server deadline that has already expired —
+	// makes it work whose result nobody can receive. Cheap load-shedding on the
+	// path that lost its concurrency bound when the signature left c.mu (see the
+	// gap in docs/development/locking.md); it does not replace a bound, it just
+	// declines to spend a signer round trip on an answer that cannot be
+	// delivered.
+	//
+	// ErrInternal, so a request cancelled by a *server* deadline is reported as
+	// RFC 6960 internalError, which a verifier may retry. Nothing about the
+	// request was malformed. A client that has gone away receives neither.
+	if err := ctx.Err(); err != nil {
+		return OCSPAnswer{}, fmt.Errorf("%w: %w", ErrInternal, err)
 	}
 
 	respDER, err := ocsp.CreateResponse(caCert, caCert, template, caKey)
@@ -433,6 +448,16 @@ func (c *CA) AnswerOCSP(_ context.Context, reqDER []byte) (OCSPAnswer, error) {
 				expiresAt: now.Add(OCSPValidity),
 			}
 			cached = true
+		} else if statusErr != nil {
+			// Distinguished from the raced case below, because they are not the
+			// same event and the log is what an incident review reads. A failed
+			// re-decision returns ocsp.Unknown as its status, so folding it into
+			// the other branch would report a CRL that vanished as though it
+			// were an ordinary prune — the one input that audience would be
+			// silently misled about.
+			slog.Warn("not caching an OCSP response: could not re-decide its status",
+				"serial", serialHex, "signed_status", template.Status,
+				"error", statusErr)
 		} else {
 			// Info, not Debug: the default verbosity is Info, and this is the
 			// record an incident review wants when reconstructing why a client
