@@ -143,6 +143,29 @@ set -eu -o pipefail
 # #264, read allowedLockNesting against the lock graph rather than trusting a
 # green suite.
 #
+# #259 x #261 OWE A SECOND CHECK, in docs/development/locking.md, and this one
+# has a positive test rather than an absence. Each branch retires a different
+# known gap and the two retirements INTERLEAVE across the conflict boundary:
+#
+#     #259 (fix/sql-lock-key-aliasing)  retires #203 -> `~~[#203]`
+#     #261 (fix/hmac-key-init-race)     retires #202 -> `~~[#202]`
+#     main has NEITHER marker.
+#
+# Taking either side of that hunk whole reverts the other's retirement to an open
+# gap. Verified here on 2026-08-28 by counting the markers per ref, after the
+# coordinator raised it; three sessions derived it independently.
+#
+# The check is BOTH MARKERS PRESENT, not zero conflict markers — either wrong
+# resolution satisfies the second. After merging #259 and #261:
+#
+#     grep -cF -- '~~[#202]' docs/development/locking.md   # want 1
+#     grep -cF -- '~~[#203]' docs/development/locking.md   # want 1
+#
+# Note -F: both needles contain [ ] and would otherwise be a character class
+# matching neither. This is the general shape worth stealing — an obligation
+# stated as "this string must be present" is checkable in one command, where
+# "resolve it correctly" is not.
+#
 # Two more found in the 2026-08-24 build, both prose, both silent, and both
 # pointing the same way: a branch that predates another carries the OLD claim
 # unchanged, in a region the newer branch never touches, so there is no conflict.
