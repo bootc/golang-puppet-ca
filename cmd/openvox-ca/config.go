@@ -162,10 +162,10 @@ type serverConfig struct {
 	// is ca.CA.refuseIfSuperseded, which stops a certificate inside its window
 	// renewing itself into a fresh full-lifetime successor.
 	//
-	// 24h matches tls_self_provision_revoke_after_sec's default for the serving
-	// certificate (defaultServingRevokeAfter on the serving-certificate work).
-	// The two are the same question asked about different subjects, and the
-	// answer is deliberately the same rather than coincidentally so.
+	// 24h is the same window the serving-certificate work settled on for the
+	// same question asked about a different subject. That work is not in this
+	// repository, so this deliberately does not name its setting: a comment
+	// pointing at a config key nobody can grep for is worse than no pointer.
 	//
 	// It governs both renewal paths. RevokeOnAutoRenew still decides whether
 	// the auto-renewal path retires its predecessor at all.
@@ -314,10 +314,10 @@ const (
 	defaultExpiredCertCleanupInterval = 24 * time.Hour
 	// defaultSupersededCertRevokeAfter is how long a certificate a renewal has
 	// replaced stays valid before revocation when the operator has not chosen
-	// otherwise. 24 hours is the same answer tls_self_provision_revoke_after_sec
-	// gives for the serving certificate, and for the same reason: it comfortably
-	// exceeds the interval on which a fleet picks up a replacement, while
-	// staying short enough that a replaced credential is not a standing one.
+	// otherwise. 24 hours comfortably exceeds the interval on which a fleet picks
+	// up a replacement, while staying short enough that a replaced credential is
+	// not a standing one — the same reasoning, and the same answer, the
+	// serving-certificate work reached for its own subject.
 	defaultSupersededCertRevokeAfter = 24 * time.Hour
 	// defaultSupersededCertSweepInterval is how often the delayed-supersession
 	// sweep runs when no interval is configured. The interval is the sweep's
@@ -570,7 +570,12 @@ func applyServerEnv(cfg *serverConfig) {
 	// or Helm deployment overrides a baked-in config.yaml, and it would be able
 	// to widen the weakening but never close it.
 	if v := os.Getenv("PUPPET_CA_SUPERSEDED_CERT_REVOKE_AFTER_SEC"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+		// Any integer, including negatives. supersededCertRevokeAfter already
+		// reads a negative as unset, so -1 — the value this setting documents
+		// as "unset" — has to reach it rather than being filtered out here. A
+		// bound of n >= 0 would silently drop exactly the documented way to say
+		// "go back to the default" when a config file has set a window.
+		if n, err := strconv.Atoi(v); err == nil {
 			cfg.SupersededCertRevokeAfterSec = n
 		}
 	}

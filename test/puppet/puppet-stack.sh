@@ -696,7 +696,8 @@ fi
 
 # ...and it must be on the pending list, not merely un-revoked. The gauge is the
 # backend-agnostic way to see that: this script also runs against the Redis and
-# SQL stacks, where there is no superseded.json to read.
+# Redis stack (test/backends/redis-stack.sh runs this same script), where there
+# is no superseded.json to read.
 _pending=$(curl -sf "$CA_METRICS_URL" 2>/dev/null \
     | awk '$1 == "puppetca_supersede_pending" { print $2 }') || true
 [[ -n "$_pending" ]] \

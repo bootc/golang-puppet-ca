@@ -1,4 +1,5 @@
-# promtool rule tests for the CRL-propagation and Kubernetes-export alerts.
+# promtool rule tests for the CRL-propagation, Kubernetes-export and
+# delayed-supersession alerts.
 #
 # Run with `mage test:mixin` from the repository root, which renders the mixin
 # to the path below and then runs both promtool checks over it.
@@ -16,6 +17,9 @@
 #     last_error series to match on — so the cases below pin which rule owns
 #     which shape, that neither double-pages for the other's, and that a CA not
 #     using the feature at all stays silent under both.
+#   * PuppetCASupersedeFailing, where what needs pinning is the debounce: it is
+#     deliberately slower than its neighbours because the sweep retries on its
+#     own interval, so a case asserts it is quiet at 20m and firing at 40m.
 #
 # The firing behaviour is the contract here; the annotation prose is not, so
 # repeating it below is a maintenance cost rather than an assertion worth
@@ -426,7 +430,7 @@ tests:
               instance: ca-1:9140
             exp_annotations:
               summary: "Puppet CA is failing to revoke superseded certificates."
-              description: "The Puppet CA on ca-1:9140 could not schedule or carry out the revocation of a certificate a renewal replaced (puppetca_supersede_failures_total is rising), so that certificate is still a valid credential. Check the CA logs to tell the causes apart: \"failed to retire replaced certificate\" means the supersession was never recorded and the serial is in the warning; \"Could not revoke superseded certificate\" means it was recorded but the sweep could not revoke it, and it will retry; \"ran out of budget; deferring the rest\" means the backlog is draining slower than it accrues, and the entries are still listed; \"Discarding\" means the entry is gone and will never be retried. A store that cannot serve the superseded key raises this even where the overlap window is closed (superseded_cert_revoke_after_sec: 0) — look for \"cannot determine supersession status\" or \"Revoke: could not read pending supersessions\", which also mean renewals are being refused. Retire anything the sweep will not with openvox-ca-ctl revoke --serial <hex>. puppetca_supersede_pending shows how many are still waiting."
+              description: "The Puppet CA on ca-1:9140 could not schedule or carry out the revocation of a certificate a renewal replaced (puppetca_supersede_failures_total is rising), so that certificate is still a valid credential. Check the CA logs to tell the causes apart: \"Superseded-certificate revocation sweep failed\" means the sweep could not read the list, take the CRL lock or write the list back, which is the likeliest cause and blocks every pending revocation at once; \"failed to retire replaced certificate\" means the supersession was never recorded and the serial is in the warning; \"Could not revoke superseded certificate\" means it was recorded but the sweep could not revoke it, and it will retry; \"ran out of budget; deferring the rest\" means the backlog is draining slower than it accrues, and the entries are still listed; \"Discarding\" means the entry is gone and will never be retried. A store that cannot serve the superseded key raises this even where the overlap window is closed (superseded_cert_revoke_after_sec: 0) — look for \"cannot determine supersession status\" or \"Revoke: could not read pending supersessions\", which also mean renewals are being refused. Retire anything the sweep will not with openvox-ca-ctl revoke --serial <hex>. puppetca_supersede_pending shows how many are still waiting."
       - eval_time: 40m
         alertname: PuppetCACRLUpdateFailing
         exp_alerts: []

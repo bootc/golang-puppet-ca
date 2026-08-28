@@ -93,7 +93,7 @@ var _ = Describe("runSupersededSweeper", func() {
 		go func() {
 			// An interval far longer than the spec's lifetime, so anything
 			// observed here came from the startup pass and not from a tick.
-			runSupersededSweeper(ctx, c, time.Hour, time.Hour)
+			runSupersededSweeper(ctx, c, time.Hour)
 			close(done)
 		}()
 
@@ -121,7 +121,7 @@ var _ = Describe("runSupersededSweeper", func() {
 		ctx, cancel := context.WithCancel(context.Background())
 		done := make(chan struct{})
 		go func() {
-			runSupersededSweeper(ctx, c, interval, 0)
+			runSupersededSweeper(ctx, c, interval)
 			close(done)
 		}()
 		cancel()

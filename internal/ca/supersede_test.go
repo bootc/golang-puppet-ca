@@ -611,6 +611,40 @@ var _ = Describe("Delayed supersession", func() {
 			Expect(failing.SupersedeFailures()).To(Equal(before + 1))
 		})
 
+		// revokeLocked calls retireSupersededForSubjectLocked *before* looking up
+		// the subject's own serial, and its comment gives this as the reason: a
+		// subject whose inventory lookup fails must still lose its superseded
+		// credentials rather than none of them. Nothing exercised that ordering,
+		// so moving the call after the lookup would have moved no assertion —
+		// on a containment path.
+		It("retires the predecessor even when the subject's own lookup fails", func() {
+			myCA.SupersedeAfter = time.Hour
+			original := issue("node-af")
+			_, err := myCA.AutoRenew(ctx, original)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(pending()).To(HaveLen(1), "precondition: a predecessor is inside its window")
+
+			// Only the inventory read fails, so the pending list is readable and
+			// the CRL is writable; what breaks is the lookup of the subject's
+			// current serial, which is the step the ordering protects against.
+			// Armed *after* Init: Init verifies the inventory HMAC, which reads
+			// the inventory, so a backend already failing that read cannot get
+			// a CA constructed at all.
+			fb := &supersededFailBackend{Backend: storage.NewFilesystemBackend(tmpDir)}
+			failing := ca.New(storage.NewWithBackend(fb, tmpDir), ca.AutosignConfig{Mode: "off"}, "puppet.test")
+			Expect(failing.Init(ctx)).To(Succeed())
+			fb.failGet = storage.KeyInventory
+
+			// Revoke itself fails: it could not find the subject's certificate.
+			Expect(failing.Revoke(ctx, "node-af")).NotTo(Succeed())
+
+			Expect(revoked(original.SerialNumber)).To(BeTrue(),
+				"the superseded predecessor must be retired even though the revocation that "+
+					"followed it could not complete; partial containment beats none")
+			Expect(pending()).To(BeEmpty(),
+				"and it must leave the list, having actually been revoked")
+		})
+
 		It("keeps a predecessor on the list when its revocation fails", func() {
 			myCA.SupersedeAfter = time.Hour
 			original := issue("node-ad")

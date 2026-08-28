@@ -50,9 +50,12 @@ import (
 // required.
 //
 // It returns when ctx is cancelled (i.e. on shutdown).
-func runSupersededSweeper(ctx context.Context, c *ca.CA, interval, revokeAfter time.Duration) {
-	slog.Info("Starting superseded-certificate revocation sweep",
-		"interval", interval, "revoke_after", revokeAfter)
+func runSupersededSweeper(ctx context.Context, c *ca.CA, interval time.Duration) {
+	// The configured window is deliberately not a parameter here. It would be
+	// log-only — the sweep honours each entry's own recorded revoke_at, not a
+	// current setting — and a second copy of a value this function does not act
+	// on can only ever drift from the one that is actually in force.
+	slog.Info("Starting superseded-certificate revocation sweep", "interval", interval)
 
 	// Run immediately at startup so a backlog that came due while every replica
 	// was down is cleared without waiting a full interval — that backlog is the

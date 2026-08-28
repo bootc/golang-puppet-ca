@@ -166,9 +166,9 @@ func backgroundJobs(cfg *serverConfig, myCA *ca.CA) []backgroundJob {
 	// no cluster lock, so that costs a read per interval on a CA that never
 	// enables a window. Safe on every replica: the work, when there is any, is
 	// serialised on the shared CRL lock.
-	sweepInterval, revokeAfter := cfg.supersededCertSweepInterval(), cfg.supersededCertRevokeAfter()
+	sweepInterval := cfg.supersededCertSweepInterval()
 	jobs = append(jobs, backgroundJob{jobSupersededSweep, func(ctx context.Context) {
-		runSupersededSweeper(ctx, myCA, sweepInterval, revokeAfter)
+		runSupersededSweeper(ctx, myCA, sweepInterval)
 	}})
 
 	return jobs

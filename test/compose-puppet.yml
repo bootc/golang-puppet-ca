@@ -44,8 +44,8 @@ services:
     # with superseded_cert_revoke_after_sec defaulting to 24h, a renewal's
     # predecessor is deliberately absent from the CRL, and that gauge is the only
     # backend-agnostic evidence the supersession was *recorded* rather than
-    # silently dropped. Checking a file would not work on the Redis and SQL
-    # stacks, which run this same script.
+    # silently dropped. Checking a file would not work on the Redis stack,
+    # which runs this same script against a backend that has no cadir.
     environment:
       PUPPET_CA_METRICS_LISTEN: ":9140"
     expose:
@@ -55,7 +55,10 @@ services:
     # 9141 reaches the exporter, which is plain HTTP on its own listener.
     ports:
       - "8141:8140"
-      - "9141:9140"
+      # Loopback-only: the exporter reveals certificate subjects, and the CA's
+      # own documentation says to keep it off a shared interface. Nothing
+      # outside this host needs it.
+      - "127.0.0.1:9141:9140"
     healthcheck:
       # Use -k (insecure) so the healthcheck works before any other container
       # has downloaded the CA cert.  The TLS cert is valid; we just skip CN

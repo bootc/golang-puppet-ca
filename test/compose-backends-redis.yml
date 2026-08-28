@@ -95,7 +95,8 @@ services:
     # Distinct host ports from compose-puppet.yml so both stacks can coexist.
     ports:
       - "8241:8140"
-      - "9241:9140"
+      # Loopback-only, for the reason given in compose-puppet.yml.
+      - "127.0.0.1:9241:9140"
     # Both replicas race to bootstrap the shared CA on first start. If this one
     # loses that race and its Phase 1 entrypoint aborts (or the loopback CA is
     # slow to answer under CI load), restart it: on the next attempt the CA

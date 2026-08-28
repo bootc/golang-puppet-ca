@@ -19,6 +19,14 @@
 // lock the code under test must acquire, and lockNameCRL is the only thing that
 // knows what it is called. Spelling the string a second time from outside would
 // let a spec hold the wrong lock, block nothing, and still pass.
+//
+// "race" describes what these specs are about, not how they work. They do not
+// run two operations concurrently and hope to catch an interleaving — that is
+// non-deterministic and a green run would prove nothing. Instead each holds the
+// contended lock from a second goroutine and asserts the operation under test
+// blocks until it is released, which pins the same property (this code path
+// takes that lock) as a decision rather than as a coincidence of timing. The
+// suite's -race runs cover the detector's half.
 package ca
 
 import (

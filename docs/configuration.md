@@ -132,7 +132,7 @@ revoke_on_auto_renew: true      # false matches OpenVox Server's Clojure CA (no 
 # revokes it once the overlap window elapses, so both verify in the meantime and
 # relying parties can pick up the replacement without a gap. The window is a
 # deliberate weakening and it is on by default — read "Delayed supersession"
-# below, and set 0 to restore the pre-1.0 behaviour of revoking inside the call.
+# below, and set 0 for the earlier behaviour of revoking inside the call.
 superseded_cert_revoke_after_sec: -1   # overlap window; 0 = revoke inside the renewal; -1/unset = 24h
 superseded_cert_sweep_interval_sec: 0  # how often the sweep runs; 0 = built-in default (15m)
 ```
@@ -539,9 +539,11 @@ replacement is published — the verifiers do not all learn about it at once. An
 agent renewing its own credential does not need it: it holds both and simply
 stops presenting the old one. The default is set for the harder case.
 
-24 hours is the same answer `tls_self_provision_revoke_after_sec` gives for the
-CA's own serving certificate. That is deliberate rather than coincidental: it is
-the same question asked about a different subject.
+24 hours is chosen to comfortably exceed the interval on which a fleet notices a
+renewal, while staying short enough that a replaced credential is not a standing
+one. The same window is what the CA's own serving-certificate work settled on
+for the same question asked about a different subject; that work is not in this
+release, so there is no companion setting to compare against yet.
 
 > **Upgrading.** This changes behaviour without any config change. Before this
 > setting existed, every renewal revoked its predecessor before returning; now
@@ -549,8 +551,9 @@ the same question asked about a different subject.
 > behaviour — because your threat model does not tolerate a replaced credential
 > outliving its replacement at all — set `superseded_cert_revoke_after_sec: 0`,
 > which is an explicit choice and not the same as leaving it unset. You will
-> also see a new `superseded.json` in the cadir, a `superseded-cert-revocation`
-> job in the logs, and `puppetca_supersede_pending` rising and falling.
+> also see a new `superseded.json` in the cadir, a
+> `Starting superseded-certificate revocation sweep` line in the logs at
+> startup, and `puppetca_supersede_pending` rising and falling.
 
 **The window is a deliberate weakening, and because it is the default it is one
 you inherit rather than choose.** For its whole length the replaced certificate

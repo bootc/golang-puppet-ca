@@ -2105,10 +2105,28 @@ if _wait_ren_ca "https://127.0.0.1:${_REN_PORT}"; then
         -X POST -H "Content-Type: text/plain" \
         --data-binary @"$WORK_DIR/ren-renewal2.csr" \
         "https://127.0.0.1:${_REN_PORT}/certificate_renewal"
+
+    # A superseded certificate must not be able to renew itself. ren-node was
+    # renewed by the happy-path test above, so it is now inside its overlap
+    # window: absent from the CRL by design, and refused here by the pending-list
+    # check instead. This is the assertion the PR's safety story rests on — that
+    # the window bounds the exposure rather than ending it — and without it a
+    # regression letting the replaced credential mint a fresh full-lifetime
+    # successor would pass CI, since every other assertion here uses a
+    # different cert precisely to avoid this state.
+    make_csr "$_REN_NODE" "$WORK_DIR/ren-renewal3.csr"
+    assert_http 403 "renewal: a superseded cert cannot renew itself" \
+        -sk \
+        --cert "$WORK_DIR/ren-node.crt" \
+        --key  "$WORK_DIR/${_REN_NODE}_key.pem" \
+        -X POST -H "Content-Type: text/plain" \
+        --data-binary @"$WORK_DIR/ren-renewal3.csr" \
+        "https://127.0.0.1:${_REN_PORT}/puppet-ca/v1/certificate_renewal"
 else
     fail "renewal: Phase 2 CA started (TLS)" "timed out waiting for health"
     for _skip in \
         "renewal: POST /certificate_renewal returns PEM certificate" \
+        "renewal: a superseded cert cannot renew itself" \
         "renewal: CN mismatch returns 403" \
         "renewal: no client cert returns 403" \
         "renewal: invalid CSR body returns 400" \

@@ -426,6 +426,18 @@ var _ = Describe("expired-cert cleanup resolvers", func() {
 		Expect(err).NotTo(HaveOccurred(), "unexpected error")
 		Expect(cfg.supersededCertRevokeAfter()).To(BeZero(),
 			"an env value of 0 must also override the built-in 24h default")
+
+		// -1 is the documented way to say "unset". A bound of n >= 0 in
+		// applyServerEnv would silently drop it, so an operator whose config
+		// file sets a window could not use the env channel to go back to the
+		// default — only to some other explicit number.
+		clearServerEnv()
+		Expect(os.WriteFile(path, []byte("superseded_cert_revoke_after_sec: 3600\n"), 0o600)).To(Succeed())
+		setEnv("PUPPET_CA_SUPERSEDED_CERT_REVOKE_AFTER_SEC", "-1")
+		cfg, err = loadServerConfig(path)
+		Expect(err).NotTo(HaveOccurred(), "unexpected error")
+		Expect(cfg.supersededCertRevokeAfter()).To(Equal(defaultSupersededCertRevokeAfter),
+			"an env value of -1 must reach the resolver and mean the built-in default")
 	})
 
 	It("falls back to defaults for non-positive values", func() {
