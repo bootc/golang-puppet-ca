@@ -112,11 +112,14 @@ One gap remains, and it is worth knowing before running an issuing command
 beside a live server: the inventory append is guarded within a process but not
 between them, so two processes issuing for **different** subjects hold
 different locks and can still interleave the append with its integrity update.
-On the blob backends (`filesystem`, `redis`) that can leave an integrity value
-covering an inventory that never existed, which the *next* start rejects. It is
-tracked as [#204](https://github.com/voxpupuli/openvox-ca/issues/204). Until it
-is closed, stop the server before issuing certificates from a second process —
-the advice this section otherwise makes optional.
+On the filesystem backend — the only remaining blob one — that can leave an
+integrity value covering an inventory that never existed, which the *next*
+start rejects. It is tracked as
+[#204](https://github.com/voxpupuli/openvox-ca/issues/204). Until it is closed,
+stop the server before issuing certificates from a second process against a
+filesystem store — the advice this section otherwise makes optional. Redis is
+no longer affected: its append writes the entry and the integrity head in a
+single atomic script, so no second process can interleave them.
 
 ---
 

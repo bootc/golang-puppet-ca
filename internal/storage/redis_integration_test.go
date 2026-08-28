@@ -325,7 +325,24 @@ var _ = Describe("RedisIntegrationInventoryStore", func() {
 		for i, svc := range []*StorageService{a, b} {
 			got, err := svc.ReadInventory(ctx)
 			Expect(err).NotTo(HaveOccurred(), "ReadInventory from replica %d", i)
-			Expect(strings.Count(string(got), "\n")).To(Equal(writers*perWriter), "no appends lost")
+			lines := bytes.Split(bytes.TrimRight(got, "\n"), []byte{'\n'})
+			Expect(lines).To(HaveLen(writers*perWriter),
+				"replica %d: got %d lines, want %d", i, len(lines), writers*perWriter)
+
+			// Counting is not enough: one entry clobbering another nets to the
+			// same total, which is the exact corruption #204 produced. Assert
+			// every expected entry appears exactly once, as the sibling
+			// AppendLine storm above does.
+			seen := make(map[string]int, writers*perWriter)
+			for _, l := range lines {
+				seen[string(l)]++
+			}
+			for n := 0; n < writers*perWriter; n++ {
+				want := fmt.Sprintf(
+					"%04d 2024-01-01T00:00:00UTC 2029-01-01T00:00:00UTC /node%d", n, n)
+				Expect(seen[want]).To(Equal(1),
+					"replica %d: entry %q appeared %d times, want exactly 1", i, want, seen[want])
+			}
 		}
 	})
 
