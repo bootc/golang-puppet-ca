@@ -226,15 +226,18 @@ the inventory, in-memory caches) must follow
   derivation are protocol; changing either needs a full cluster restart, not a
   rolling one.
 - Lock ordering is `subject:<name>` → `crl` → `c.mu`, plus `bootstrap` → `crl`
-  on the CA-import path; both are one-way and `bootstrap` is never held with a
-  subject lock. Lock names are a stable cross-replica protocol — never invent or
+  on the CA-import path and `bootstrap` → `hmac-key` on the migration path; all
+  are one-way and `bootstrap` is never held with a subject lock. Lock names are a stable cross-replica protocol — never invent or
   rename one casually.
 - Holding two *different* named locks at once is protocol as well, not just the
   names. Such a pair must appear in locking.md's **Lock ordering** section and
   in `allowedLockNesting` (`internal/ca/lockorder_test.go`), added together. A
   spec catches an unlisted pair *when it drives the caller that takes it* — it
   drives a minority of them, so a green suite is not confirmation you had
-  nothing to add.
+  nothing to add. One documented exception: `bootstrap` → `hmac-key` is taken
+  only by `MigrateService`, in `internal/storage`. `allowedLockNesting` keys
+  pairs by lock name rather than (store, name), so that path is out of its scope
+  by design — locking.md carries it in prose and the table must not gain it.
 
 ## Compatibility contracts (do not rename)
 

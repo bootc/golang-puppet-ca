@@ -198,6 +198,29 @@ var _ = Describe("EnsureHMACKey when the stored key is corrupt", func() {
 		Entry("a truncated blob", []byte("too-short"), "length=9"),
 		Entry("a blob the backend returns as nil with no error", nil, "length=0"),
 	)
+
+	// The negative case, and the reason it is worth having: the warning is
+	// tamper-adjacent, and a length check that misfired on the valid-key path
+	// — an off-by-one on hmacKeyLen, say — would satisfy every other assertion
+	// in this file (the key is returned verbatim, nothing is written) while
+	// emitting "possible tampering" wording on every restart of a healthy CA.
+	// Nothing else pins the silence.
+	It("says nothing when the stored key is the expected length", func() {
+		stored := bytes.Repeat([]byte{0x7E}, hmacKeyLen)
+		be := &hmacStubBackend{getValue: stored}
+		svc := NewWithBackend(be, "")
+
+		var buf bytes.Buffer
+		orig := slog.Default()
+		slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+		defer slog.SetDefault(orig)
+
+		key, err := svc.EnsureHMACKey(context.Background())
+		Expect(err).NotTo(HaveOccurred(), "EnsureHMACKey: %v", err)
+		Expect(key).To(Equal(stored), "stored key not returned verbatim")
+		Expect(buf.String()).NotTo(ContainSubstring("wrong length"),
+			"a valid key warned about its length: %s", buf.String())
+	})
 })
 
 var _ = Describe("EnsureHMACKey when another replica wins the race", func() {
