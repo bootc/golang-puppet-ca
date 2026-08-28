@@ -337,8 +337,25 @@
             // readiness stays green, the exported objects quietly stop being
             // updated, and a single log line is otherwise the only trace.
             //
-            // Summing over 'result' collapses the success/error pair, so a
-            // target that is attempted and always fails is not caught here
+            // `without (result)` rather than a `by` allowlist. Both collapse
+            // the success/error pair, but an allowlist also discards every
+            // label it does not name -- and under the chart's own defaults the
+            // label it would keep is not the one it looks like. The shipped
+            // ServiceMonitor sets honorLabels: false, so Prometheus resolves
+            // the collision on `namespace` in the target's favour and renames
+            // the exporter's to `exported_namespace`. A `by (… namespace …)`
+            // clause would then group on the CA pod's namespace, identical for
+            // every target, and drop the export namespace entirely -- so two
+            // targets differing only by namespace, which is the documented way
+            // to publish one trust bundle into several, would share a group and
+            // an attempted sibling would mask a never-attempted one. `without`
+            // keeps whatever labels the deployment actually attached, and
+            // leaves this rule carrying the same label set as
+            // PuppetCAKubernetesExportFailing so the pair routes and silences
+            // alike.
+            //
+            // Collapsing 'result' means a target that is attempted and always
+            // fails is not caught here
             // (that is Failing's job, and the two cannot both fire: a zero sum
             // means no result was ever recorded, so there is no last_error for
             // Failing to match). Only a target attempted zero times matches.
@@ -355,7 +372,7 @@
             // that stays up, scrapes cleanly, and reports readiness while its
             // export job does nothing.
             expr: |||
-              sum by (job, instance, kind, namespace, name) (
+              sum without (result) (
                 puppetca_k8s_export_applies_total{%(selector)s}
               ) == 0
             ||| % {

@@ -285,3 +285,39 @@ tests:
       - eval_time: 30m
         alertname: PuppetCAKubernetesExportFailing
         exp_alerts: []
+
+  # Deployment-added labels must not be aggregated away. Under the shipped
+  # ServiceMonitor (honorLabels: false) Prometheus renames the exporter's
+  # `namespace` to `exported_namespace`, so two targets that differ only by
+  # export namespace -- the documented way to publish one trust bundle into
+  # several -- carry identical job/instance/kind/name. A `by` allowlist naming
+  # `namespace` would group them together and let the attempted one hide the
+  # never-attempted one; `without (result)` keeps them apart.
+  - interval: 1m
+    name: a sibling target does not mask a never-attempted one
+    input_series:
+      # ns1 is being exported normally.
+      - series: 'puppetca_k8s_export_applies_total{job="openvox-ca",instance="ca-1:9140",namespace="pki",exported_namespace="ns1",kind="Secret",name="trust",result="success"}'
+        values: "5+0x60"
+      - series: 'puppetca_k8s_export_applies_total{job="openvox-ca",instance="ca-1:9140",namespace="pki",exported_namespace="ns1",kind="Secret",name="trust",result="error"}'
+        values: "0+0x60"
+      # ns2 is configured and has never been attempted.
+      - series: 'puppetca_k8s_export_applies_total{job="openvox-ca",instance="ca-1:9140",namespace="pki",exported_namespace="ns2",kind="Secret",name="trust",result="success"}'
+        values: "0+0x60"
+      - series: 'puppetca_k8s_export_applies_total{job="openvox-ca",instance="ca-1:9140",namespace="pki",exported_namespace="ns2",kind="Secret",name="trust",result="error"}'
+        values: "0+0x60"
+    alert_rule_test:
+      - eval_time: 40m
+        alertname: PuppetCAKubernetesExportNotRunning
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: openvox-ca
+              instance: ca-1:9140
+              namespace: pki
+              exported_namespace: ns2
+              kind: Secret
+              name: trust
+            exp_annotations:
+              summary: "A Kubernetes export target has never been attempted."
+              description: "The Puppet CA on ca-1:9140 has Secret/trust in namespace pki configured for export but has not attempted a single apply in 30m. The exported object holds whatever it held before, and PuppetCAKubernetesExportFailing cannot report on a target with no apply results. Check the CA logs for the Kubernetes export job starting, and for errors initialising the in-cluster client."

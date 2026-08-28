@@ -120,4 +120,5 @@ jsonnet -J vendor -m . mixin.jsonnet
 | `crlSyncFor` | `5m` | `for:` debounce for the CRL-reload-failure alert. Keep it below `crlLagFor` so the warning precedes the page it explains. |
 | `crlLagFor` | `10m` | How long a replica may keep enforcing a CRL behind the stored one before it is paged on. Raise it if you have raised `crl_sync_interval_sec`. |
 | `k8sExportNotRunningFor` | `30m` | How long a configured export target may go with no apply attempt at all before alerting. Only has to outlast a slow start: the counters reset on restart and the startup export runs immediately. |
-| `expiryFor` / `scrapeFor` / `readyFor` / `downFor` / `k8sExportFailingFor` | `1h` / `15m` / `10m` / `5m` / `15m` | `for:` debounce durations. |
+| `k8sExportFailingFor` | `15m` | How long a target's most recent apply may stay failed before alerting. Keep it above the CA's export retry interval, a compile-time constant of two minutes: below that, every blip the retry would have cleared by itself pages. It cannot reach a target that fails once and succeeds on retry every cycle — see [metrics](../docs/metrics.md) for the query that can. |
+| `expiryFor` / `scrapeFor` / `readyFor` / `downFor` | `1h` / `15m` / `10m` / `5m` | `for:` debounce durations. |

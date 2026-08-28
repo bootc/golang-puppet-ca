@@ -266,7 +266,7 @@ puppetca_k8s_export_last_error_timestamp_seconds
   unless puppetca_k8s_export_last_success_timestamp_seconds
 
 # Kubernetes export targets configured but never attempted
-sum by (job, instance, kind, namespace, name) (
+sum without (result) (
   puppetca_k8s_export_applies_total
 ) == 0
 
