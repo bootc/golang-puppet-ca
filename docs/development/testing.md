@@ -103,15 +103,47 @@ behind a Go build tag and driven by a `mage` target:
 
 | Command | What it does |
 | --- | --- |
-| `mage test:backendsPostgres` | SQL backend integration suite against PostgreSQL |
-| `mage test:backendsMySQL` | SQL backend integration suite against MySQL |
-| `mage test:backendsEtcd` | etcd backend integration suite (embedded etcd) |
+| `mage test:backendsPostgres` | SQL backend integration suite against PostgreSQL — under `-race`; needs cgo and a C compiler |
+| `mage test:backendsMySQL` | SQL backend integration suite against MySQL — under `-race`; needs cgo and a C compiler |
+| `mage test:backendsEtcd` | etcd backend integration suite (embedded etcd) — under `-race`; needs cgo and a C compiler |
 | `mage test:backendsRedis` | Redis backend full-stack bash TAP suite (Puppet topology) |
 | `mage test:backendsRedisGo` | Redis backend Go integration suite (build tag `redis_integration`) |
 | `mage test:backendsOpenBao` | OpenBao Transit signer integration suite (build tag `openbao_integration`) |
 
 See [storage backends](../storage-backends.md) and
 [`AGENTS.md`](../../AGENTS.md) for the build tags and per-backend detail.
+
+### Which suites run under `-race`
+
+Every `go test` a `mage` target invokes, and whether it is raced. The table is
+exhaustive on purpose: a prose list has to restate its own scope each time it is
+edited, and twice now a claim about a *subset* has been generalised to the whole
+set. If you add a target that runs `go test`, add a row.
+
+The pre-push hook (`.lefthook.yml`) is the one caller outside this table: it runs
+`go test -race ./...` and `go test -tags mage .` directly rather than through a
+target. Both match their rows here — raced and unraced respectively.
+
+| Target | `go test` | `-race` | Why not |
+| --- | --- | --- | --- |
+| `mage test:unit` | yes | **yes** | — |
+| `mage test:backendsEtcd` | yes | **yes** | — |
+| `mage test:backendsPostgres` | yes | **yes** | — |
+| `mage test:backendsMySQL` | yes | **yes** | — |
+| `mage test:backendsRedisGo` | yes | no | not done yet; [PR #212](https://github.com/voxpupuli/openvox-ca/pull/212) adds it |
+| `mage test:backendsOpenBao` | yes | no | exercises `internal/signer/openbao`, not storage locking |
+| `mage test:magefile` | yes | no | exercises the magefile's own build logic; no concurrency to watch |
+| `mage test:backendsRedis` | **no** | n/a | bash TAP suite; there is no `go test` to add the flag to |
+
+The residue is tracked as
+[#205](https://github.com/voxpupuli/openvox-ca/issues/205).
+
+The raced ones are raced for the reason `test:unit` is: what they assert about
+concurrency is a coarse outcome — a row count after two backends contend on
+`AppendLine`, an advisory lock excluding a second holder — and a coarse outcome
+cannot observe an unsynchronised write sitting behind it. MySQL has the most to
+gain, because its InnoDB deadlock retry means an append spec can pass by
+*retrying over* a race rather than by excluding it.
 
 ## Container identity guards
 

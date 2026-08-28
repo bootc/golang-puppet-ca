@@ -3452,8 +3452,23 @@ func (Test) BackendsRedisGo() error {
 // AppendLine atomicity across two backends, and pg_advisory_lock mutual
 // exclusion.
 //
-// Requires podman-compose (or docker compose) and network access to pull
-// docker.io/postgres:16-alpine.
+// Runs under the race detector, like BackendsEtcd and the unit suite: the
+// dialect specs it covers are the concurrent ones — two backends contending on
+// AppendLine, and pg_advisory_lock mutual exclusion — and they assert coarse
+// outcomes (a row count, an exclusion) that cannot observe an unsynchronised
+// write behind them. -race needs cgo, which is on by default everywhere this
+// runs -- CGO_ENABLED=1 is set rather than inherited because the standard build
+// is CGO_ENABLED=0 (CONTRIBUTING.md, both Dockerfiles), so a developer who has
+// exported it would get a build failure instead of a test run. Test.Unit sets
+// it for the same reason.
+//
+// Cost, since Test.Unit quotes one: immaterial here. The whole job -- container
+// start, schema, suite -- ran 118s under -race on CI, against 154s for the
+// already-raced etcd job, and the suite itself is seconds. Unlike test:unit,
+// where the 15% is worth naming, the container dominates.
+//
+// Requires podman-compose (or docker compose), a C compiler (for -race), and
+// network access to pull docker.io/postgres:16-alpine.
 func (Test) BackendsPostgres() error {
 	const dsn = "postgres://puppetca:puppetca@127.0.0.1:55432/puppetca?sslmode=disable"
 
@@ -3468,8 +3483,8 @@ func (Test) BackendsPostgres() error {
 
 	fmt.Println("Running PostgreSQL-backend integration tests...")
 	return sh.RunWithV(
-		map[string]string{"PUPPET_CA_TEST_POSTGRES_DSN": dsn},
-		"go", "test", "-tags", "postgres_integration", "-count=1", "./internal/storage/...",
+		map[string]string{"PUPPET_CA_TEST_POSTGRES_DSN": dsn, "CGO_ENABLED": "1"},
+		"go", "test", "-tags", "postgres_integration", "-race", "-count=1", "./internal/storage/...",
 	)
 }
 
@@ -3480,8 +3495,18 @@ func (Test) BackendsPostgres() error {
 // AppendLine atomicity (with InnoDB deadlock retry) across two backends, and
 // GET_LOCK mutual exclusion.
 //
-// Requires podman-compose (or docker compose) and network access to pull
-// docker.io/mysql:8.
+// Runs under the race detector for the same reason BackendsPostgres does, and
+// with more to catch: the InnoDB deadlock retry means an AppendLine spec can
+// pass by retrying over a race rather than by excluding it. -race needs cgo,
+// which is on by default everywhere this runs -- CGO_ENABLED=1 is set rather
+// than inherited because the standard build is CGO_ENABLED=0, so a developer
+// who has exported it would get a build failure instead of a test run.
+//
+// Cost: 141s for the whole CI job under -race, container start included, so the
+// race detector is not the term that matters here either.
+//
+// Requires podman-compose (or docker compose), a C compiler (for -race), and
+// network access to pull docker.io/mysql:8.
 func (Test) BackendsMySQL() error {
 	const dsn = "puppetca:puppetca@tcp(127.0.0.1:53306)/puppetca"
 
@@ -3496,8 +3521,8 @@ func (Test) BackendsMySQL() error {
 
 	fmt.Println("Running MySQL-backend integration tests...")
 	return sh.RunWithV(
-		map[string]string{"PUPPET_CA_TEST_MYSQL_DSN": dsn},
-		"go", "test", "-tags", "mysql_integration", "-count=1", "./internal/storage/...",
+		map[string]string{"PUPPET_CA_TEST_MYSQL_DSN": dsn, "CGO_ENABLED": "1"},
+		"go", "test", "-tags", "mysql_integration", "-race", "-count=1", "./internal/storage/...",
 	)
 }
 
@@ -3643,8 +3668,10 @@ path "transit/sign/test-*" { capabilities = ["update"] }
 // Redis suite it needs no external service, compose stack, or network pulls.
 // The suite is heavily concurrent by design (cross-replica append races,
 // concurrent decompositions, contended locks), so it runs under the race
-// detector; -race needs cgo, hence the explicit CGO_ENABLED override of the
-// repository's CGO_ENABLED=0 default.
+// detector; -race needs cgo, which is on by default everywhere this runs --
+// CGO_ENABLED=1 is set rather than inherited because the standard build is
+// CGO_ENABLED=0, so a developer who has exported it would get a build failure
+// instead of a test run.
 func (Test) BackendsEtcd() error {
 	fmt.Println("Running etcd-backend integration tests...")
 	return sh.RunWithV(map[string]string{"CGO_ENABLED": "1"},
