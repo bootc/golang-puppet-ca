@@ -678,16 +678,10 @@ state when the document was last updated and is not guaranteed exhaustive.
   shape, and the #183 entry below says why the index sync has to use it —
   that path cannot re-check its own predicate, and this one can.
 
-- **Unbounded concurrent signing on `/ocsp` — opened by the #197 fix above.**
-
-  > **This entry has no issue behind it yet — one of only two here that do
-  > not**, the other being the blob-backend inventory-append bullet at the end
-  > of this section. Every other bullet is anchored to an issue, and the section
-  > preamble says these gaps are *tracked*. This is recorded now so that closing
-  > #197 did not quietly drop what it opened; **it still needs an issue filed
-  > and linked from here**, because the open question below — what bounds
-  > concurrent signing, and at what size — is a design decision, and a paragraph
-  > in a developer document is not where that gets decided.
+- [#274](https://github.com/voxpupuli/openvox-ca/issues/274) — unbounded
+  concurrent signing on `/ocsp`, opened by the #197 fix above. Recorded here
+  because closing one gap opened another, and a known-gaps list that only
+  records what was closed is misleading.
 
   Before #197, `c.mu` capped CA-key use at **one signature in flight
   process-wide**: every `CAKey.Sign` call site — `issueLeafLocked`,

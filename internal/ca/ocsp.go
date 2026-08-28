@@ -336,8 +336,8 @@ func (c *CA) AnswerOCSP(ctx context.Context, reqDER []byte) (OCSPAnswer, error) 
 	// external signer this is the one expensive step, and a client that has
 	// already disconnected — or a server deadline that has already expired —
 	// makes it work whose result nobody can receive. Cheap load-shedding on the
-	// path that lost its concurrency bound when the signature left c.mu (see the
-	// gap in docs/development/locking.md); it does not replace a bound, it just
+	// path that lost its concurrency bound when the signature left c.mu (#274,
+	// in docs/development/locking.md); it does not replace a bound, it just
 	// declines to spend a signer round trip on an answer that cannot be
 	// delivered.
 	//
@@ -358,8 +358,8 @@ func (c *CA) AnswerOCSP(ctx context.Context, reqDER []byte) (OCSPAnswer, error) 
 		// The classification was always wrong here, but it used to be close to
 		// unreachable. Signing outside c.mu means an external signer's per-call
 		// deadline is now the expected failure under load rather than a rarity,
-		// so this is the routine degradation path — see the concurrency gap in
-		// docs/development/locking.md.
+		// so this is the routine degradation path — see #274 and the concurrency
+		// gap it tracks in docs/development/locking.md.
 		return OCSPAnswer{}, fmt.Errorf("%w: creating OCSP response: %w", ErrInternal, err)
 	}
 
