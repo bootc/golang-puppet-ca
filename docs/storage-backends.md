@@ -108,18 +108,22 @@ NFS, so sharing a cadir or a SQLite file between hosts remains unsupported on
 these backends whatever the locking does — use an HA backend for that. The
 scope is unchanged: it is still one active `openvox-ca` per store.
 
-One gap remains, and it is worth knowing before running an issuing command
-beside a live server: the inventory append is guarded within a process but not
-between them, so two processes issuing for **different** subjects hold
-different locks and can still interleave the append with its integrity update.
-On the filesystem backend — the only remaining blob one — that can leave an
-integrity value covering an inventory that never existed, which the *next*
-start rejects. It is tracked as
-[#204](https://github.com/voxpupuli/openvox-ca/issues/204). Until it is closed,
-stop the server before issuing certificates from a second process against a
-filesystem store — the advice this section otherwise makes optional. Redis is
-no longer affected: its append writes the entry and the integrity head in a
-single atomic script, so no second process can interleave them.
+One consequence is worth knowing before running an issuing command beside a
+live server. `SameHostLocker` excludes another process per lock *name*, and the
+inventory append takes no cluster lock of its own — it is serialised by a
+process-local mutex. Two processes issuing for **different** subjects therefore
+hold different `subject:<name>` locks, and can still interleave an append with
+its integrity update, leaving an integrity value covering an inventory that
+never existed — which the *next* start rejects.
+
+This is not a tracked defect, because **two processes writing to one filesystem
+store is not a supported configuration**. The filesystem backend is single-node
+by design and the supported shape is one active `openvox-ca` per store, so stop
+the server before issuing certificates from a second process — the advice this
+section otherwise makes optional. A deployment that genuinely needs concurrent
+writers wants a structured backend, where the entry and its integrity head are
+written in one step: SQL in one transaction, redis in one atomic script, etcd
+in one transaction.
 
 ---
 

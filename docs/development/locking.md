@@ -659,20 +659,21 @@ state when the document was last updated and is not guaranteed exhaustive.
   locks and can still interleave an `AppendInventory` and its HMAC rewrite.
   That is the blob-backend gap below, and closing it closes the filesystem case
   with it.
-- [#204](https://github.com/voxpupuli/openvox-ca/issues/204) — nothing wraps
+- ~~[#204](https://github.com/voxpupuli/openvox-ca/issues/204) — nothing wraps
   `AppendInventory` in a cluster lock, so on a blob backend its
   duplicate-serial check is not cross-writer and the whole-blob HMAC rewrite
-  can cover a blob that never existed. Both distributed halves are now closed
-  by their decomposed inventories' atomic `by-serial` guards
+  can cover a blob that never existed.~~ Fixed: #204's scope is the
+  *distributed* blob backends, and both halves are closed by their decomposed
+  inventories' atomic `by-serial` guards
   ([#138](https://github.com/voxpupuli/openvox-ca/issues/138) for etcd,
   [#139](https://github.com/voxpupuli/openvox-ca/issues/139) for Redis); the
   Redis half also removed the read-compute-write whole-blob HMAC update that
-  made #204 a live CI flake rather than a theoretical gap. What remains is
-  filesystem, the only blob backend left. It is single-node by construction, so
-  no cross-replica case arises, and `SameHostLocker` now gives its `WithLock`
-  names cross-process reach on the host — but as the #187 note above says, that
-  does not extend to the inventory append itself, which is still guarded by
-  `inventoryMu` alone.
+  made it a live CI flake rather than a theoretical gap. The filesystem backend
+  still takes no cluster lock around the append — `SameHostLocker` excludes per
+  lock *name*, and two processes issuing for different subjects hold different
+  `subject:<name>` locks — but that is outside #204's scope and is not a
+  tracked gap: two processes writing one filesystem store is an unsupported
+  configuration. See [storage backends](../storage-backends.md).
   The offline `generate` still reports both capabilities in its pre-flight, via
   `SupportsDistributedLocking`/`SupportsAtomicInventory`, and still tells the
   operator to stop the server: neither is made true by the same-host tier, and
@@ -745,10 +746,19 @@ state when the document was last updated and is not guaranteed exhaustive.
   certificate someone presented, so a revoked certificate for that name is
   evicted and replaced rather than refused.
 - On the filesystem backend, an inventory append and its HMAC update are two
-  writes, not one atomic unit; the failure window is documented at the write
-  site in `AppendInventory` and the structured inventory — SQL and etcd commit
-  the entry and its integrity head in one transaction, redis in one Lua script
-  — is the durable answer. See [the inventory store](inventory-store.md).
+  writes to two files (`inventory.txt` and `.inventory.hmac`). `Put` is already
+  atomic per file — write to a temporary and `rename(2)` — but no POSIX
+  primitive makes a *pair* of renames atomic, so a crash between them leaves the
+  digest covering the previous state. This is a structural consequence of
+  keeping the Puppet-compatible on-disk layout, not a defect awaiting a fix:
+  one file would break that format, and reordering fails either way round —
+  HMAC-first covers content that does not exist yet, inventory-first leaves a
+  digest covering the previous state.
+  [#188](https://github.com/voxpupuli/openvox-ca/issues/188) is the mitigation,
+  a supported way to rebuild the HMAC; it does not close the window. The
+  structured inventory is the durable answer — SQL and etcd commit the entry and
+  its integrity head in one transaction, redis in one Lua script. See
+  [the inventory store](inventory-store.md).
 
 ## Tests
 
