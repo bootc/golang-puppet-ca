@@ -20,9 +20,9 @@ Task. Invoke targets with `go run mage.go <Target>` or the `mage` binary:
 | `mage test:unit` | Run the unit suite (all packages, coverage to `coverage.out`), under `-race` — needs cgo and a C compiler |
 | `mage test:magefile` | Run the magefile's own build-tagged suite (invisible to `go test ./...`) |
 | `mage dev:lint` | Run `golangci-lint` (gate; see `.golangci.yml`) |
-| `mage test:backendsPostgres` | SQL backend integration suite against PostgreSQL |
-| `mage test:backendsMySQL` | SQL backend integration suite against MySQL |
-| `mage test:backendsEtcd` | etcd backend integration suite (embedded etcd) |
+| `mage test:backendsPostgres` | SQL backend integration suite against PostgreSQL, under `-race` — needs cgo and a C compiler |
+| `mage test:backendsMySQL` | SQL backend integration suite against MySQL, under `-race` — needs cgo and a C compiler |
+| `mage test:backendsEtcd` | etcd backend integration suite (embedded etcd), under `-race` — needs cgo and a C compiler |
 | `mage test:backendsRedis` | Redis backend full-stack bash TAP suite (Puppet topology) |
 | `mage test:backendsRedisGo` | Redis backend Go integration suite (build tag `redis_integration`) |
 | `mage test:backendsOpenBao` | OpenBao Transit signer integration suite (build tag `openbao_integration`, `test/compose-backends-openbao.yml`) |
@@ -225,8 +225,16 @@ the inventory, in-memory caches) must follow
   registered, since that would claim a key nothing uses. The ordinals and the
   derivation are protocol; changing either needs a full cluster restart, not a
   rolling one.
-- Lock ordering is `subject:<name>` → `crl` → `c.mu`; lock names are a stable
-  cross-replica protocol — never invent or rename one casually.
+- Lock ordering is `subject:<name>` → `crl` → `c.mu`, plus `bootstrap` → `crl`
+  on the CA-import path; both are one-way and `bootstrap` is never held with a
+  subject lock. Lock names are a stable cross-replica protocol — never invent or
+  rename one casually.
+- Holding two *different* named locks at once is protocol as well, not just the
+  names. Such a pair must appear in locking.md's **Lock ordering** section and
+  in `allowedLockNesting` (`internal/ca/lockorder_test.go`), added together. A
+  spec catches an unlisted pair *when it drives the caller that takes it* — it
+  drives a minority of them, so a green suite is not confirmation you had
+  nothing to add.
 
 ## Compatibility contracts (do not rename)
 
