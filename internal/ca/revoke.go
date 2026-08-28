@@ -128,9 +128,7 @@ func (c *CA) revokeLocked(ctx context.Context, subject string) error {
 	// inventory lookup below fails still loses its superseded credentials
 	// rather than none of them; each of these needs only the CRL, which is
 	// already locked.
-	c.retireSupersededForSubjectLocked(ctx, subject, func(serial string) error {
-		return c.revokeSerialLocked(ctx, serial)
-	})
+	c.retireSupersededForSubjectLocked(ctx, subject)
 
 	serialStr, err := c.findSerialForSubject(ctx, subject)
 	if err != nil {

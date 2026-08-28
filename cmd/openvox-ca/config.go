@@ -810,3 +810,36 @@ func loadPuppetServerFile(path string) ([]string, error) {
 
 // resolveConfigFile delegates to the shared config.ResolveConfigFile.
 var resolveConfigFile = config.ResolveConfigFile
+
+// supersededWindowWarning reports whether the configured sweep interval makes
+// the overlap window meaningfully longer than the operator asked for, and the
+// log line to emit when it does.
+//
+// The interval is added to every window in the worst case: a certificate
+// becomes due between two passes and is revoked on the later one. An operator
+// following the docs' advice to set the window no longer than a fleet's pickup
+// takes can easily land below the 15-minute default interval and get an
+// effective window several times what they asked for — on a setting the docs
+// call a deliberate weakening.
+//
+// It warns rather than refuses, because the configuration is coherent, just not
+// what it looks like. Split out of the serve command so it can be asserted:
+// inside a cobra RunE it was a branch nothing could reach.
+func supersededWindowWarning(c *serverConfig) (string, []any, bool) {
+	revokeAfter := c.supersededCertRevokeAfter()
+	if revokeAfter <= 0 {
+		return "", nil, false
+	}
+	sweep := c.supersededCertSweepInterval()
+	if sweep < revokeAfter {
+		return "", nil, false
+	}
+	return "superseded_cert_sweep_interval_sec is not shorter than " +
+			"superseded_cert_revoke_after_sec, so the sweep interval sets the effective " +
+			"overlap window rather than the delay does",
+		[]any{
+			"revoke_after", revokeAfter,
+			"sweep_interval", sweep,
+			"worst_case_window", revokeAfter + sweep,
+		}, true
+}

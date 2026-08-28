@@ -354,6 +354,42 @@ var _ = Describe("expired-cert cleanup resolvers", func() {
 			"expiredCertCleanupInterval() = %v; want %v", cfg.expiredCertCleanupInterval(), 900*time.Second)
 	})
 
+	// The warning exists because an operator who follows the docs' advice — set
+	// the window no longer than the pickup takes — can land below the 15-minute
+	// default sweep interval and silently get an effective window several times
+	// what they asked for. Inside the serve command it was a branch nothing
+	// could reach.
+	DescribeTable("warns when the sweep interval swamps the overlap window",
+		func(revokeAfterSec, sweepSec int, wantWarn bool) {
+			cfg := &serverConfig{
+				SupersededCertRevokeAfterSec:   revokeAfterSec,
+				SupersededCertSweepIntervalSec: sweepSec,
+			}
+			msg, args, warn := supersededWindowWarning(cfg)
+			Expect(warn).To(Equal(wantWarn))
+			if !wantWarn {
+				Expect(msg).To(BeEmpty())
+				return
+			}
+			Expect(msg).To(ContainSubstring("superseded_cert_sweep_interval_sec"))
+			// The worst case is what the operator actually gets, so it has to be
+			// in the line rather than left for them to work out.
+			Expect(args).To(ContainElement("worst_case_window"))
+			Expect(args).To(ContainElement(
+				time.Duration(revokeAfterSec)*time.Second + time.Duration(sweepSec)*time.Second))
+		},
+		Entry("interval longer than the window", 60, 900, true),
+		Entry("interval equal to the window", 900, 900, true),
+		Entry("interval shorter than the window", 86400, 900, false),
+		// 0 is an explicit "revoke inside the renewal": there is no window for
+		// an interval to swamp, so warning would be noise on the one setting
+		// that turns the feature off.
+		Entry("window closed", 0, 900, false),
+		// Unset resolves to the 24h default, comfortably above the 15m default
+		// interval — the shipped configuration must not warn.
+		Entry("both unset (the shipped default)", -1, 0, false),
+	)
+
 	It("resolves the delayed-supersession settings", func() {
 		clearServerEnv()
 		cfg, err := loadServerConfig("")

@@ -34,10 +34,13 @@
     // --- CRL update failures ---
     // The CA may fail to amend its CRL (a revocation it cannot record, or a CRL
     // it cannot re-sign or write). Some of these are best-effort and swallowed
-    // — e.g. revoking the certificate a renewal supersedes — leaving the old
-    // certificate valid for its key. The counter resets on restart, so the
-    // alert looks at increase() over crlUpdateWindow and debounces with
-    // crlUpdateFor.
+    // — e.g. the revoke step of a clean, or of a renewal on a deployment that
+    // has set superseded_cert_revoke_after_sec to 0 — leaving the old
+    // certificate valid for its key. Note the default case is NOT here: with a
+    // window configured, a renewal records the supersession instead and its
+    // failures are counted by PuppetCASupersedeFailing. The counter resets on
+    // restart, so the alert looks at increase() over crlUpdateWindow and
+    // debounces with crlUpdateFor.
     crlUpdateWindow: '1h',
     crlUpdateFor: '15m',
 

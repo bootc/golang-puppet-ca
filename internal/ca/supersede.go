@@ -399,7 +399,7 @@ func (c *CA) ReconcileSuperseded(ctx context.Context) (int, error) {
 // It is a no-op when the list is empty or names no such subject.
 //
 // The cluster CRL lock and c.mu must both be held by the caller, which is what
-// lets revoke be revokeSerialLocked.
+// lets this call revokeSerialLocked directly.
 //
 // Why revocation of a subject has to reach these: Revoke retires the subject's
 // *latest* serial and no other, so during an overlap window it retires the
@@ -426,7 +426,7 @@ func (c *CA) ReconcileSuperseded(ctx context.Context) (int, error) {
 // either happened or is about to, and failing it because the pending list was
 // unreadable would turn a partial containment into no containment at all. The
 // entries stay on the list and the sweep still retires them.
-func (c *CA) retireSupersededForSubjectLocked(ctx context.Context, subject string, revoke func(string) error) {
+func (c *CA) retireSupersededForSubjectLocked(ctx context.Context, subject string) {
 	entries, _, err := c.readSuperseded(ctx)
 	if err != nil {
 		c.supersedeFailures.Add(1)
@@ -450,7 +450,7 @@ func (c *CA) retireSupersededForSubjectLocked(ctx context.Context, subject strin
 
 	var failed int
 	for _, e := range mine {
-		if err := revoke(e.Serial); err != nil {
+		if err := c.revokeSerialLocked(ctx, e.Serial); err != nil {
 			// Kept, so the sweep retries it. Logged rather than returned: the
 			// revocation the caller asked for has not happened yet and must not
 			// be lost to a predecessor that could not be retired.
