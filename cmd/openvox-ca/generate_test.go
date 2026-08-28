@@ -999,3 +999,59 @@ var _ = Describe("reportBackendCapabilities", func() {
 		Expect(out).NotTo(ContainSubstring("safe to run alongside"))
 	})
 })
+
+var _ = Describe("generate's output-path handling", func() {
+	It("reports a removal it could not perform after a failed mint", func() {
+		// The other half of the post-failure cleanup. Its happy path is
+		// covered by the ErrCertExists spec, which asserts the leftover key is
+		// gone; nothing exercised the branch that reports a removal that
+		// failed. Called directly because within one run the atomic write and
+		// os.Remove need the same directory permission, so no end-to-end spec
+		// can have the first succeed and the second fail.
+		if os.Geteuid() == 0 {
+			Skip("root ignores directory permissions")
+		}
+		dir := GinkgoT().TempDir()
+		keyPath := filepath.Join(dir, "orphan_key.pem")
+		Expect(os.WriteFile(keyPath, []byte("key"), 0o600)).To(Succeed())
+		Expect(os.Chmod(dir, 0o500)).To(Succeed())
+		DeferCleanup(func() { _ = os.Chmod(dir, 0o700) })
+
+		var out bytes.Buffer
+		removeUnusedKey(&out, keyPath)
+
+		Expect(out.String()).To(ContainSubstring("could not remove the unused private key"))
+		Expect(out.String()).To(ContainSubstring(keyPath))
+		Expect(keyPath).To(BeAnExistingFile(), "the key is still there; that is what the warning is for")
+	})
+
+	It("says nothing when there is no key to remove", func() {
+		// --key-out was not given, or the key was never written. An empty path
+		// must not produce a warning about failing to remove nothing.
+		var out bytes.Buffer
+		removeUnusedKey(&out, "")
+		Expect(out.String()).To(BeEmpty())
+
+		removeUnusedKey(&out, filepath.Join(GinkgoT().TempDir(), "never-written.pem"))
+		Expect(out.String()).To(BeEmpty(), "an absent key is the normal case, not a warning")
+	})
+
+	It("distinguishes an unreadable path from an absent one", func() {
+		// prepareOutputPath's third stat outcome. "Does not exist" is the path
+		// it proceeds past, so collapsing any stat failure into it would have
+		// the command carry on and mint against a path it cannot actually
+		// write, discovering that only after the certificate is committed.
+		if os.Geteuid() == 0 {
+			Skip("root ignores directory permissions")
+		}
+		locked := filepath.Join(GinkgoT().TempDir(), "locked")
+		Expect(os.Mkdir(locked, 0o700)).To(Succeed())
+		Expect(os.Chmod(locked, 0o000)).To(Succeed())
+		DeferCleanup(func() { _ = os.Chmod(locked, 0o700) })
+
+		_, err := prepareOutputPath(filepath.Join(locked, "sub", "key.pem"))
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("checking "),
+			"an unsearchable parent must not be reported as 'already exists' or silently accepted")
+	})
+})

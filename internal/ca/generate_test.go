@@ -927,24 +927,45 @@ var _ = Describe("CA GenerateWithOptions replacement", func() {
 			"the inventory's newest row is not the credential being replaced")
 	})
 
-	It("aborts without revoking when the stored certificate cannot be parsed", func() {
-		_, err := myCA.GenerateWithOptions(ctx, "corrupt-node", ca.GenerateOptions{})
-		Expect(err).NotTo(HaveOccurred())
-		before := len(revokedSerials())
+	// storedCertSerialLocked has two distinct read failures and they must be
+	// covered separately. Both emit the same "openvox-ca-ctl clean" remedy, so
+	// asserting on that alone cannot tell them apart -- one spec named for the
+	// parse branch while exercising the decode branch would look like coverage
+	// of both and be coverage of neither. Each asserts the substring only its
+	// own branch produces.
+	DescribeTable("aborts without revoking when the stored certificate cannot be read",
+		func(stored func() []byte, wantSubstring string) {
+			_, err := myCA.GenerateWithOptions(ctx, "corrupt-node", ca.GenerateOptions{})
+			Expect(err).NotTo(HaveOccurred())
+			before := len(revokedSerials())
 
-		Expect(store.SaveCert(ctx, "corrupt-node", []byte("not a certificate"))).To(Succeed())
+			Expect(store.SaveCert(ctx, "corrupt-node", stored())).To(Succeed())
 
-		_, err = myCA.GenerateWithOptions(ctx, "corrupt-node", ca.GenerateOptions{
-			ReplaceExisting: true,
-		})
-		Expect(err).To(HaveOccurred())
-		// Not ErrCertExists: that error tells the operator to pass --force,
-		// which is exactly what they did. A dead-end loop is worse than a
-		// blunt message.
-		Expect(err).NotTo(MatchError(ca.ErrCertExists))
-		Expect(err.Error()).To(ContainSubstring("openvox-ca-ctl clean"))
-		Expect(revokedSerials()).To(HaveLen(before), "nothing may be revoked when the read fails")
-	})
+			_, err = myCA.GenerateWithOptions(ctx, "corrupt-node", ca.GenerateOptions{
+				ReplaceExisting: true,
+			})
+			Expect(err).To(HaveOccurred())
+			// Not ErrCertExists: that error tells the operator to pass --force,
+			// which is exactly what they did. A dead-end loop is worse than a
+			// blunt message.
+			Expect(err).NotTo(MatchError(ca.ErrCertExists))
+			Expect(err.Error()).To(ContainSubstring(wantSubstring))
+			Expect(err.Error()).To(ContainSubstring("openvox-ca-ctl clean"))
+			Expect(revokedSerials()).To(HaveLen(before), "nothing may be revoked when the read fails")
+		},
+
+		// No PEM header at all, so pem.Decode returns a nil block.
+		Entry("no PEM block", func() []byte { return []byte("not a certificate") },
+			"cannot be decoded"),
+
+		// A well-formed PEM envelope whose payload is not DER, so pem.Decode
+		// succeeds and x509.ParseCertificate is what fails. This is the branch
+		// that decides whether --force proceeds to revoke, and a revoke of the
+		// wrong serial cannot be undone.
+		Entry("a PEM block wrapping invalid DER", func() []byte {
+			return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: []byte("not valid der")})
+		}, "cannot be parsed"),
+	)
 
 	It("issues nothing when the revoke fails, rather than leaving two live certificates", func() {
 		// The fail-closed half of the replacement path, and the one the two

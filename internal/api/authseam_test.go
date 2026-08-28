@@ -243,6 +243,30 @@ import "github.com/voxpupuli/openvox-ca/internal/ca"
 func handler(s *Server) { _ = ca.GenerateOptions{} }
 `, true, "GenerateOptions"),
 
+		// AuthGrant is the identifier this gate exists for: the SECURITY note
+		// above calls it the deliberate in-process exception, so a rule that
+		// silently stopped matching it would be the one failure here that
+		// mattered. Nothing else exercises it -- the compile-time binding at
+		// the top of this file proves only that the identifier exists, and the
+		// whole-package walk below passes vacuously while no handler names it.
+		// A mistyped map key would leave both of those green.
+		Entry("the grant type, package-qualified", `package api
+
+import "github.com/voxpupuli/openvox-ca/internal/ca"
+
+func handler(s *Server) { _ = ca.AuthGrant{} }
+`, true, "AuthGrant"),
+
+		// Same identifier behind an alias, because the map key is shared with
+		// the qualified-receiver rule and a regression could be specific to
+		// either path.
+		Entry("the grant type behind an import alias", `package api
+
+import pca "github.com/voxpupuli/openvox-ca/internal/ca"
+
+func handler(s *Server) { _ = pca.AuthGrant{} }
+`, true, "AuthGrant"),
+
 		// Why GenerateWithOptions is matched on the name alone: the receiver is
 		// s.CA, so no package-qualified rule would ever see it.
 		Entry("the options form, reached through a receiver", `package api
@@ -268,6 +292,21 @@ func admin(domain TrustDomain, cn string) bool {
 	return domain.IsAdminCN(cn) || domain.PpCliAuth
 }
 `, false, ""),
+
+		// The known breadth of the name-only rule, pinned rather than left to
+		// be discovered. GenerateWithOptions is matched whatever the receiver,
+		// so an unrelated api-local type exposing that name is caught too. That
+		// is deliberate and fail-safe -- it over-blocks, costing a rename
+		// rather than reopening the seam -- but it is a real cost, and this
+		// entry is where someone hitting it will find out it was a choice.
+		Entry("an api-local method that happens to share the name", `package api
+
+type exporter struct{}
+
+func (e *exporter) GenerateWithOptions(o Options) error { return nil }
+
+func run(e *exporter) { _ = e.GenerateWithOptions(Options{}) }
+`, true, "GenerateWithOptions"),
 
 		// Near-misses: neither is the forbidden identifier, and an exact map
 		// lookup is what keeps them out.

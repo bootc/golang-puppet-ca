@@ -400,30 +400,35 @@ require you to do.
 The command prints whether the resolved backend can coordinate writes with other
 processes, and warns when it cannot.
 
-Two independent capabilities matter, and no backend has both except PostgreSQL
-and MySQL:
+Two independent capabilities matter, and the command reports safe to run
+alongside a live server only when a backend has **both**:
 
-| Backend | Cross-process locking | Atomic inventory append |
-| --- | --- | --- |
-| `postgres`, `mysql` | yes | yes |
-| `sqlite` | no (single-node) | yes |
-| `etcd`, `redis` | yes | no |
-| `filesystem` (default) | no (single-node) | no |
+| Backend | Cross-node locking | Atomic inventory append | Verdict |
+| --- | --- | --- | --- |
+| `postgres`, `mysql` | yes | yes | safe |
+| `etcd` | yes | yes | safe |
+| `redis` | yes | no | stop the server |
+| `sqlite` | no (single-node) | yes | stop the server |
+| `filesystem` (default) | no (single-node) | no | stop the server |
 
-The command reports safe to run alongside a live server only when **both** are
-present, so everything except PostgreSQL and MySQL gets the stop-the-server
-warning — including etcd and Redis, which lock correctly but still append to the
-inventory non-atomically.
+Note which lock the first column measures: the **cross-node** one, which is what
+`SupportsDistributedLocking` probes and the only one that helps when the other
+writer is on another host. `filesystem` and `sqlite` do coordinate across
+processes *on one host* — they take an `flock(2)`, so an `openvox-ca-ctl`
+command cannot interleave with a server on the same machine — but that is a
+different guarantee and the probe deliberately does not report it as this one.
 
-What each missing capability costs is different. Without cross-process locking,
-two writers can each decide a subject has no certificate and both issue one.
-Without an atomic inventory append — the blob backends, `filesystem`, `etcd` and
-`redis` — the integrity record is recomputed from a snapshot, so an interleaved
-append leaves an HMAC covering a state that never existed, after which the
-server refuses to start and there is no supported repair
+What each missing capability costs is different. Without cross-node locking, two
+writers on different hosts can each decide a subject has no certificate and both
+issue one. Without an atomic inventory append — `filesystem` and `redis` — the
+integrity record is recomputed from a snapshot, so an interleaved append leaves
+an HMAC covering a state that never existed, after which the server refuses to
+start and there is no supported repair
 ([#188](https://github.com/voxpupuli/openvox-ca/issues/188)). That second
-failure is the reason to take this seriously; it does not apply to `sqlite`,
-which is single-node but does append atomically.
+failure is the reason to take this seriously. It does not apply to `sqlite`,
+which is single-node but appends atomically, nor to `etcd`, whose inventory is
+decomposed into per-entry keys and whose append commits the entry and the
+integrity head in one transaction.
 
 On a fresh install this costs nothing, because there is no server running yet.
 It is re-minting on an established CA that forces a real outage.
@@ -456,7 +461,7 @@ restarts, the inventory and its integrity record among it, so a version
 difference here is between two writers of the same data rather than between a
 client and a server. The image must be fully qualified — an unqualified name
 will not resolve without registry search configured. The images run as
-`USER puppet`, so under rootless podman a bind mount owned by your host user is
+uid 1000 (the `puppet` user), so under rootless podman a bind mount owned by your host user is
 not writable inside the container — the mint then fails at the key write,
 cleanly but confusingly. Hence the `podman unshare chown`: it sets the
 directory's owner to whatever container uid 1000 maps to on the host, which is

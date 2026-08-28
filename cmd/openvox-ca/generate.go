@@ -242,12 +242,7 @@ before a server exists.`,
 				// The key is on disk but nothing was issued. Remove it rather
 				// than leaving a private key with no certificate at a path the
 				// operator will not think to clean up.
-				if keyPath != "" {
-					if rmErr := os.Remove(keyPath); rmErr != nil && !os.IsNotExist(rmErr) {
-						_, _ = fmt.Fprintf(out, "Warning: could not remove the unused private key at %s: %v\n",
-							keyPath, rmErr)
-					}
-				}
+				removeUnusedKey(out, keyPath)
 				return annotateGenerateError(err, certname)
 			}
 
@@ -295,6 +290,28 @@ before a server exists.`,
 
 // prepareOutputPath validates an operator-supplied output path before anything
 // is issued, returning it cleaned. Refusing here rather than after the mint
+// removeUnusedKey deletes a private key that was written ahead of issuance for
+// an issuance that then failed, so a key with no certificate is not left at a
+// path the operator will not think to clean up. A no-op when no --key-out was
+// given.
+//
+// Failing to remove it is reported rather than returned: the mint has already
+// failed and that error is the one the operator needs, so this can only add to
+// it. Split out from the caller because the removal failure is otherwise
+// unreachable from a spec -- os.Remove and the atomic write both need write
+// permission on the same directory, so within one run either both work or
+// neither does, and only a direct call can present a key whose parent has
+// since been made read-only.
+func removeUnusedKey(out io.Writer, keyPath string) {
+	if keyPath == "" {
+		return
+	}
+	if err := os.Remove(keyPath); err != nil && !os.IsNotExist(err) {
+		_, _ = fmt.Fprintf(out, "Warning: could not remove the unused private key at %s: %v\n",
+			keyPath, err)
+	}
+}
+
 // matters because issuance cannot be undone: the certificate has consumed a
 // serial and is recorded in the inventory.
 func prepareOutputPath(path string) (string, error) {
