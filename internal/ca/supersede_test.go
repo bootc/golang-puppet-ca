@@ -415,6 +415,47 @@ var _ = Describe("Delayed supersession", func() {
 			Expect(revoked(replacement.SerialNumber)).To(BeFalse())
 		})
 
+		// The gate compares the presented certificate's serial against the
+		// stored one. The presented side is always canonical (serialHexStr of a
+		// *big.Int); the stored side used to be whatever the caller passed, and
+		// on the CSR re-key path that is LatestSerialForSubject, which returns
+		// inventory text verbatim. An inventory written by an older version, or
+		// migrated from Puppet Server, carries zero-padded sequential serials —
+		// so the gate compared "A" against "000A", missed, and let the
+		// superseded credential renew itself. Exactly the escalation it exists
+		// to prevent, on the worse path, and silent: the sweep parses before
+		// comparing so it still revoked correctly.
+		It("refuses a certificate recorded with a zero-padded serial", func() {
+			original := issue("node-pad")
+			padded := "000" + hexSerial(original.SerialNumber)
+			writePending([]pendingEntry{
+				{Serial: padded, Subject: "node-pad", RevokeAt: time.Now().UTC().Add(time.Hour)},
+			})
+
+			_, err := myCA.AutoRenew(ctx, original)
+			Expect(err).To(MatchError(ca.ErrCertSuperseded),
+				"a zero-padded stored serial must still match the presented certificate; "+
+					"inventory serials are not canonical and this is an authorisation decision")
+		})
+
+		It("stores the serial canonically, whatever form the caller passed", func() {
+			// Renew records LatestSerialForSubject, which is inventory text. The
+			// fixture cannot make the inventory non-canonical here, so this
+			// pins the property directly: whatever goes in, what is stored is
+			// what a reader computing serialHexStr will find.
+			original := issue("node-canon")
+			csrPEM, _ := buildCSR("node-canon")
+			_, err := myCA.Renew(ctx, "node-canon", csrPEM, original)
+			Expect(err).NotTo(HaveOccurred())
+
+			entries := pending()
+			Expect(entries).To(HaveLen(1))
+			Expect(entries[0].Serial).To(Equal(hexSerial(original.SerialNumber)),
+				"the stored serial must be the canonical rendering, not the caller's form")
+			Expect(entries[0].Serial).NotTo(HavePrefix("0"),
+				"canonical means no leading zeros")
+		})
+
 		It("does not obstruct the replacement renewing normally", func() {
 			original := issue("node-p")
 			replacementPEM, err := myCA.AutoRenew(ctx, original)

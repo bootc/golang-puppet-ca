@@ -30,6 +30,8 @@ import (
 	"math/big"
 	"sort"
 	"time"
+
+	"github.com/voxpupuli/openvox-ca/internal/storage"
 )
 
 // supersededEntry records one certificate that a renewal has replaced and that
@@ -114,7 +116,19 @@ func (c *CA) refuseIfSuperseded(ctx context.Context, presentedCert *x509.Certifi
 			subject, ErrCertSuperseded)
 	}
 	for _, e := range entries {
-		if e.Serial == serial {
+		// Normalised rather than compared raw, even though recordSuperseded now
+		// canonicalises on write. Belt and braces on purpose: this is an
+		// authorisation decision, the two sides are produced by different code,
+		// and a list written by an earlier build of this branch — or by any
+		// future caller that appends without going through recordSuperseded —
+		// would otherwise silently fail to match. An entry whose serial will not
+		// parse cannot be the presented certificate's, since that one came from
+		// a *big.Int; skip it and let the sweep discard it.
+		stored, err := storage.NormaliseSerial(e.Serial)
+		if err != nil {
+			continue
+		}
+		if stored == serial {
 			slog.Warn("Renewal: refusing to renew a superseded certificate",
 				"subject", subject, "serial", serial, "revoke_at", e.RevokeAt.Format(time.RFC3339))
 			return fmt.Errorf("rejecting renewal for %s: %w", subject, ErrCertSuperseded)
@@ -179,13 +193,28 @@ func (c *CA) supersedeReplaced(ctx context.Context, subject, oldSerial string) e
 // subject → crl → c.mu and the SQL connection-nesting depth at two; see
 // docs/development/locking.md.
 func (c *CA) recordSuperseded(ctx context.Context, subject, serial string, after time.Duration) error {
-	if _, ok := new(big.Int).SetString(serial, 16); !ok {
+	parsed, ok := new(big.Int).SetString(serial, 16)
+	if !ok {
 		// Refused here rather than written and discarded by the sweep: the
 		// caller is about to log a warning naming this serial, which is a far
 		// better place for an operator to see it than a sweep hours later.
 		c.supersedeFailures.Add(1)
 		return fmt.Errorf("malformed serial %q", serial)
 	}
+	// Stored canonical, not as handed in. The two callers disagree about form:
+	// AutoRenew passes serialHexStr of the presented certificate, already
+	// canonical, while Renew passes LatestSerialForSubject, which returns
+	// inventory text *verbatim* — and an inventory written by an older version,
+	// or migrated from Puppet Server, carries zero-padded sequential serials
+	// (see storage.NormaliseSerial and the comment above SubjectForSerial).
+	//
+	// refuseIfSuperseded compares this against serialHexStr of a presented
+	// certificate. Storing "000A" where the gate computes "A" would make that
+	// comparison miss, and the gate is the only thing stopping a superseded
+	// credential renewing itself into a fresh full-lifetime successor. The
+	// parse above already establishes the value; re-rendering it costs nothing
+	// and makes the stored form the same one every reader computes.
+	serial = serialHexStr(parsed)
 	revokeAt := time.Now().UTC().Add(after)
 	err := c.Storage.WithLock(ctx, lockNameCRL, func() error {
 		entries, _, err := c.readSuperseded(ctx)
