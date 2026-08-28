@@ -124,6 +124,9 @@ section otherwise makes optional. A deployment that genuinely needs concurrent
 writers wants a structured backend, where the entry and its integrity head are
 written in one step: SQL in one transaction, redis in one atomic script, etcd
 in one transaction.
+[#275](https://github.com/voxpupuli/openvox-ca/issues/275) would enforce the
+rule rather than document it — a cadir-wide lock so a second instance cannot
+start — and if it lands this warning goes away rather than needing a rewrite.
 
 ---
 

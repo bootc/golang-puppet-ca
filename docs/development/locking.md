@@ -672,8 +672,11 @@ state when the document was last updated and is not guaranteed exhaustive.
   still takes no cluster lock around the append — `SameHostLocker` excludes per
   lock *name*, and two processes issuing for different subjects hold different
   `subject:<name>` locks — but that is outside #204's scope and is not a
-  tracked gap: two processes writing one filesystem store is an unsupported
-  configuration. See [storage backends](../storage-backends.md).
+  tracked defect: two processes writing one filesystem store is an unsupported
+  configuration. Enforcing it is
+  [#275](https://github.com/voxpupuli/openvox-ca/issues/275), a cadir-wide lock
+  that would stop a second instance starting at all. See
+  [storage backends](../storage-backends.md).
   The offline `generate` still reports both capabilities in its pre-flight, via
   `SupportsDistributedLocking`/`SupportsAtomicInventory`, and still tells the
   operator to stop the server: neither is made true by the same-host tier, and
