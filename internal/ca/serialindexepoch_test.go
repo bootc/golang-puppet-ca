@@ -54,7 +54,7 @@ var _ = Describe("serial index epoch guard", func() {
 		c.mu.Lock()
 		defer c.mu.Unlock()
 
-		delta := c.reconcileSerialIndexLocked(map[string]string{}, c.serialIndexEpoch)
+		delta := c.reconcileSerialIndexLocked(map[string]string{}, c.serialIndexEpoch, c.serialIndexRemovalEpoch)
 
 		Expect(delta.Removed).To(Equal(1))
 		Expect(c.serialIndex).NotTo(HaveKey("AA"))
@@ -72,7 +72,7 @@ var _ = Describe("serial index epoch guard", func() {
 		readEpoch := c.serialIndexEpoch
 		c.indexSerialLocked("BB", "signed-mid-pass.example.com")
 
-		delta := c.reconcileSerialIndexLocked(map[string]string{}, readEpoch)
+		delta := c.reconcileSerialIndexLocked(map[string]string{}, readEpoch, c.serialIndexRemovalEpoch)
 
 		Expect(delta.Removed).To(BeZero(), "a pass that raced an issuance must not prune")
 		Expect(c.serialIndex).To(HaveKey("BB"), "the serial this process just issued")
@@ -88,8 +88,7 @@ var _ = Describe("serial index epoch guard", func() {
 		readEpoch := c.serialIndexEpoch
 		c.indexSerialLocked("BB", "signed-mid-pass.example.com")
 
-		delta := c.reconcileSerialIndexLocked(
-			map[string]string{"CC": "peer-signed.example.com"}, readEpoch)
+		delta := c.reconcileSerialIndexLocked(map[string]string{"CC": "peer-signed.example.com"}, readEpoch, c.serialIndexRemovalEpoch)
 
 		Expect(delta.Added).To(Equal(1))
 		Expect(c.serialIndex).To(HaveKey("CC"))
@@ -110,13 +109,12 @@ var _ = Describe("serial index epoch guard", func() {
 		readEpoch := c.serialIndexEpoch
 
 		// The newer pass: its read found a serial this process did not hold.
-		first := c.reconcileSerialIndexLocked(
-			map[string]string{"CC": "peer-signed.example.com"}, readEpoch)
+		first := c.reconcileSerialIndexLocked(map[string]string{"CC": "peer-signed.example.com"}, readEpoch, c.serialIndexRemovalEpoch)
 		Expect(first.Added).To(Equal(1))
 
 		// The older pass, whose read predates that serial existing, finishing
 		// second and still holding the epoch it sampled before either ran.
-		second := c.reconcileSerialIndexLocked(map[string]string{"AA": "already-known.example.com"}, readEpoch)
+		second := c.reconcileSerialIndexLocked(map[string]string{"AA": "already-known.example.com"}, readEpoch, c.serialIndexRemovalEpoch)
 
 		Expect(second.Removed).To(BeZero(),
 			"the addition must have moved the epoch, standing the stale pass's removals down")
@@ -134,13 +132,43 @@ var _ = Describe("serial index epoch guard", func() {
 		c.mu.Lock()
 		defer c.mu.Unlock()
 
-		delta := c.reconcileSerialIndexLocked(
-			map[string]string{"AA": "renamed.example.com"}, c.serialIndexEpoch)
+		delta := c.reconcileSerialIndexLocked(map[string]string{"AA": "renamed.example.com"}, c.serialIndexEpoch, c.serialIndexRemovalEpoch)
 
 		Expect(c.serialIndex["AA"]).To(Equal("renamed.example.com"),
 			"storage is authoritative where the two disagree")
 		Expect(delta.Added).To(BeZero(), "the serial was already known; this is a rewrite, not an addition")
 		Expect(delta.Removed).To(BeZero(), "and the inventory still holds it, so nothing is pruned")
+	})
+
+	// The addition half's own guard, and the mirror of the removal one above.
+	// CleanupExpiredCerts can prune a serial in the window between this pass
+	// reading the inventory and taking the write lock; `stored` then describes a
+	// state that has stopped being true, and re-adding from it resurrects a
+	// serial the CA has finished with — the responder starts speaking about a
+	// certificate that was deliberately swept.
+	//
+	// Additions cannot re-check their own predicate the way the OCSP cache write
+	// can: "is this serial still in storage" is another storage read, which is
+	// the round trip this job exists to keep off the lock. So this half is
+	// gated on a counter, and the removal half — which can be reasoned about
+	// from state already in hand — is gated on the other one.
+	It("does not re-add a serial pruned after the read", func() {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+
+		// The pass read the inventory while AA was still in it.
+		stored := map[string]string{"AA": "already-known.example.com"}
+		readEpoch, readRemovalEpoch := c.serialIndexEpoch, c.serialIndexRemovalEpoch
+
+		// Cleanup then prunes AA: gone from storage, gone from the index.
+		c.unindexSerialLocked("AA")
+
+		delta := c.reconcileSerialIndexLocked(stored, readEpoch, readRemovalEpoch)
+
+		Expect(c.serialIndex).NotTo(HaveKey("AA"),
+			"a serial pruned after the read must not come back through the write-back")
+		Expect(delta.Added).To(BeZero(),
+			"and the pass must not report having added it")
 	})
 
 	// A pruned serial's pre-signed response must go with its index entry, or a
@@ -152,7 +180,7 @@ var _ = Describe("serial index epoch guard", func() {
 		defer c.mu.Unlock()
 		c.ocspCache["AA"] = ocspCacheEntry{der: []byte("pre-signed good")}
 
-		c.reconcileSerialIndexLocked(map[string]string{}, c.serialIndexEpoch)
+		c.reconcileSerialIndexLocked(map[string]string{}, c.serialIndexEpoch, c.serialIndexRemovalEpoch)
 
 		Expect(c.ocspCache).NotTo(HaveKey("AA"))
 	})

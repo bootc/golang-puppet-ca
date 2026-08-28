@@ -146,10 +146,6 @@ var _ = Describe("SQLiteInventoryRenderByteIdentical", func() {
 	})
 })
 
-// SQLiteInventoryChainTamperDetection asserts the hash chain detects every
-// kind of out-of-band edit to the inventory table: modification, insertion, and
-// deletion of a row. Each mutates rows directly via the backend's db handle,
-// bypassing AppendEntry so the stored head is not advanced.
 // InventoryEntries verifies from the rows it has just fetched rather than
 // recomputing from a second read, so its integrity guarantee has to be asserted
 // separately from ReadInventory's — a fold that drifted from
@@ -229,6 +225,10 @@ var _ = Describe("SQLiteInventoryEntriesIntegrity", func() {
 	})
 })
 
+// SQLiteInventoryChainTamperDetection asserts the hash chain detects every
+// kind of out-of-band edit to the inventory table: modification, insertion, and
+// deletion of a row. Each mutates rows directly via the backend's db handle,
+// bypassing AppendEntry so the stored head is not advanced.
 var _ = Describe("SQLiteInventoryChainTamperDetection", func() {
 	ctx := context.Background()
 

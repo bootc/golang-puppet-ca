@@ -162,16 +162,24 @@ func (c *CA) unindexSerialLocked(serial string) {
 // cache with it, because a pre-signed answer derived from an index entry must
 // not outlive it.
 //
-// Shared with the sync's removal half, which must do exactly this and must NOT
-// bump the epoch — that counter means "this process issued or pruned
-// something", and a pass reconciling with storage has done neither. Keeping the
-// pair of deletes in one place is the same argument installCachedCRLLocked
-// makes about CRL installs: the divergence between the two callers is the epoch
-// and nothing else, and a third thing to forget later should only have to be
-// added here. c.mu must be held by the caller.
+// Shared with the sync's removal half, and the two counters part company here.
+// serialIndexRemovalEpoch is bumped for every removal, whoever made it, because
+// its question is "has anything left the index since you read storage" and a
+// sync removal answers yes as much as a prune does. serialIndexEpoch is bumped
+// only by unindexSerialLocked, because its question is "has this process issued
+// or pruned", and a pass reconciling with storage has done neither.
+//
+// Keeping the pair of deletes in one place is the same argument
+// installCachedCRLLocked makes about CRL installs: a third thing to forget
+// later should only have to be added here. c.mu must be held by the caller.
 func (c *CA) dropSerialLocked(serial string) {
 	delete(c.serialIndex, serial)
 	delete(c.ocspCache, serial)
+	// Every removal counts, whoever made it. A reconcile whose storage read
+	// predates this one must not re-add what just left, and this is the one
+	// place all removals pass through — which is why the counter lives here
+	// rather than at the two call sites.
+	c.serialIndexRemovalEpoch++
 }
 
 // OCSPResponse builds a DER-encoded OCSPResponse for the given DER-encoded

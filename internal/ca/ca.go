@@ -179,6 +179,20 @@ type CA struct {
 	// otherwise.
 	serialIndexEpoch uint64
 
+	// serialIndexRemovalEpoch counts serials leaving serialIndex, by any route:
+	// a local prune via unindexSerialLocked, or a sync pass applying a removal
+	// storage has already made. It gates the *addition* half of a reconcile,
+	// where serialIndexEpoch gates the removal half.
+	//
+	// Two counters rather than one because the two halves fail in opposite
+	// directions. A pass that races an issuance must still add — that is the
+	// common case and the whole point of the job. A pass that races a *removal*
+	// must not add, because the serials it read are no longer all live and it
+	// cannot tell which. One counter cannot express both: gating additions on
+	// serialIndexEpoch would make every issuance defer the additions it exists
+	// to deliver. Protected by mu.
+	serialIndexRemovalEpoch uint64
+
 	// serialIndexSyncFailures counts failures to refresh the OCSP serial index
 	// from the inventory (see SyncSerialIndex): an unreadable inventory, or on a
 	// blob backend one whose HMAC no longer verifies. While it rises, this

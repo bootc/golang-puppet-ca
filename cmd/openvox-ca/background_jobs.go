@@ -122,8 +122,8 @@ func backgroundJobs(cfg *serverConfig, myCA *ca.CA) []backgroundJob {
 	// was closed, SameHostLocker coordinates several processes writing to a
 	// filesystem or SQLite store on one host, so second writers there are
 	// supported and expected. What no second writer does today is mint a
-	// certificate. As of main 19c0b7857209, nothing under cmd/ outside the
-	// server calls AppendInventory, issueLeaf, GenerateWithOptions or
+	// certificate. As of main 65a00adb51f9, nothing under cmd/ outside the
+	// server calls AppendInventory, issueLeafLocked, CA.Generate or
 	// SignWithTTL, so no inventory row can appear that a running server did not
 	// write itself, and its index cannot fall behind. Running the job on those
 	// two backends would read the whole inventory every interval, for ever, on

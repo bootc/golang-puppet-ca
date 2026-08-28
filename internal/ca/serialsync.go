@@ -78,7 +78,7 @@ func (d SerialIndexDelta) Changed() bool { return d.Added > 0 || d.Removed > 0 }
 // process just issued would make its own OCSP answers wrong, which is not.
 func (c *CA) SyncSerialIndex(ctx context.Context) (SerialIndexDelta, error) {
 	c.mu.RLock()
-	epoch := c.serialIndexEpoch
+	epoch, removalEpoch := c.serialIndexEpoch, c.serialIndexRemovalEpoch
 	c.mu.RUnlock()
 
 	// Read outside c.mu: a storage round-trip must not block the auth path.
@@ -91,7 +91,7 @@ func (c *CA) SyncSerialIndex(ctx context.Context) (SerialIndexDelta, error) {
 	}
 
 	c.mu.Lock()
-	delta := c.reconcileSerialIndexLocked(stored, epoch)
+	delta := c.reconcileSerialIndexLocked(stored, epoch, removalEpoch)
 	c.mu.Unlock()
 
 	if delta.Changed() {
@@ -112,9 +112,15 @@ func (c *CA) SyncSerialIndex(ctx context.Context) (SerialIndexDelta, error) {
 // same decision is a proposition a spec can simply state.
 //
 // c.mu must be held by the caller.
-func (c *CA) reconcileSerialIndexLocked(stored map[string]string, readEpoch uint64) SerialIndexDelta {
-	// Decided before the additions below, which move the epoch themselves.
+func (c *CA) reconcileSerialIndexLocked(stored map[string]string, readEpoch, readRemovalEpoch uint64) SerialIndexDelta {
+	// Both decided before the loops below, which move the counters themselves.
 	raced := c.serialIndexEpoch != readEpoch
+	// A serial left the index after this pass read the inventory, so `stored`
+	// describes a state that no longer holds and this pass cannot tell which of
+	// its entries are the stale ones. Adding none of them is one interval late;
+	// adding the pruned one back is a serial this CA has finished with,
+	// reappearing as one the responder will speak about.
+	sawRemoval := c.serialIndexRemovalEpoch != readRemovalEpoch
 
 	// Read before writing, and write only on a difference. The overwhelmingly
 	// common pass changes nothing at all, and this runs under the exclusive
@@ -125,6 +131,9 @@ func (c *CA) reconcileSerialIndexLocked(stored map[string]string, readEpoch uint
 	// and rehash it.
 	var delta SerialIndexDelta
 	for serial, subject := range stored {
+		if sawRemoval {
+			break
+		}
 		known, ok := c.serialIndex[serial]
 		if !ok {
 			delta.Added++
