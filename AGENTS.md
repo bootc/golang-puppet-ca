@@ -273,24 +273,25 @@ worked example, and `cmd/openvox-ca-ctl/importcert_test.go` pins them.
 summary, `checkHTTP`'s error body and `sign --all`'s list are all quoted for
 that reason, and each has a spec that fails if the quoting is removed.
 
-Three kinds of unquoted output are deliberately left alone, for three
-*different* reasons — they are not one carve-out:
+Two kinds of unquoted output are deliberately left alone, for two *different*
+reasons:
 
-- **`list`'s status table** (`printTable`) is the only column-aligned output in
-  the CLI; quoting would break the alignment that is the point of a table.
 - **The `sign` / `clean` / `revoke` single-value confirmations** echo the
   operator's own `--certname` / `--serial` input, so there is no untrusted
-  value to escape. They have no alignment to lose either; they are simply not
-  in scope.
+  value to escape. Not "escaping declined" — out of scope.
 - **`generate`'s certificate output** (`fmt.Print(result.Certificate)`) is the
   PEM itself on stdout, while its human-readable line goes to stderr. That
   split is a contract — `openvox-ca-ctl generate … > cert.pem` must yield a
   usable file — so quoting would corrupt every consumer that redirects. This
   convention covers operator-facing *messages*; that is data.
 
-Only the first two rest on the judgement that an operator's terminal is not a
-log pipeline. Revisit that if those values ever reach something that parses
-them.
+`list`'s status table used to be a third exception, on the grounds that
+quoting would wreck its column alignment. **That reason was false** —
+`printTable` derives its width from the strings it is given, so quoting before
+the row is built leaves the columns correct — and the table is now quoted like
+everything else the server chose. `cmd/openvox-ca-ctl/list_test.go` pins both
+the escaping and the alignment, so the exemption cannot return on a rationale
+that does not hold.
 
 ## Compatibility contracts (do not rename)
 

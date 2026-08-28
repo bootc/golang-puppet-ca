@@ -61,13 +61,13 @@ query-filters:
   #     source directory names, so that call site formats with %q rather than
   #     %s, as do openvox-ca-ctl's import summary, its checkHTTP error body
   #     and its sign --all list -- every value the server chooses. Each is
-  #     pinned by a spec in cmd/openvox-ca-ctl. Deliberately left unquoted, for
-  #     three different reasons rather than one: the status table (printTable),
-  #     the only column-aligned output in the CLI; the sign/clean/revoke
-  #     single-value confirmations, which echo the operator's own
-  #     --certname/--serial and so have no untrusted value to escape; and
-  #     generate's PEM on stdout, where quoting would break the redirect
-  #     contract that makes `... > cert.pem` work. AGENTS.md carries the full
-  #     distinction; lint catches none of it.
+  #     pinned by a spec in cmd/openvox-ca-ctl -- as is list's table, which an
+  #     earlier version of this file exempted on a column-alignment rationale
+  #     that turned out to be false. Deliberately left unquoted, for two
+  #     different reasons: the sign/clean/revoke single-value confirmations,
+  #     which echo the operator's own --certname/--serial and so have no
+  #     untrusted value to escape; and generate's PEM on stdout, where quoting
+  #     would break the redirect contract that makes `... > cert.pem` work.
+  #     AGENTS.md carries the full distinction; lint catches none of it.
   - exclude:
       id: go/log-injection

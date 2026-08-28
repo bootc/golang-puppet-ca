@@ -19,10 +19,8 @@ package main
 
 import (
 	"fmt"
-	"io"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"strconv"
 	"strings"
 
@@ -58,27 +56,11 @@ var _ = Describe("sign --all output escaping", func() {
 
 	runCapturingStdout := func() string {
 		GinkgoHelper()
-		r, w, err := os.Pipe()
-		Expect(err).NotTo(HaveOccurred())
-		DeferCleanup(func() { _, _ = r.Close(), w.Close() })
-
-		origStdout := os.Stdout
-		defer func() { os.Stdout = origStdout }()
-		os.Stdout = w
-
-		cmd := newRootCmd()
-		cmd.SetOut(io.Discard)
-		cmd.SetErr(io.Discard)
-		cmd.SetArgs([]string{"sign", "--config", cfg, "--server-url", srv.URL, "--all"})
-		execErr := cmd.Execute()
-
-		os.Stdout = origStdout
-		Expect(w.Close()).To(Succeed())
-		out, readErr := io.ReadAll(r)
-		Expect(readErr).NotTo(HaveOccurred())
-		Expect(r.Close()).To(Succeed())
+		out, execErr := captureStdout([]string{
+			"sign", "--config", cfg, "--server-url", srv.URL, "--all",
+		})
 		Expect(execErr).NotTo(HaveOccurred(), "sign --all")
-		return string(out)
+		return out
 	}
 
 	It("quotes each server-returned name so one cannot forge a line", func() {

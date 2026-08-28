@@ -19,7 +19,6 @@ package main
 
 import (
 	"fmt"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -78,34 +77,15 @@ var _ = Describe("import-cert output escaping", func() {
 	// pipe in around Execute is enough to read back what an operator sees.
 	runCapturingStdout := func() string {
 		GinkgoHelper()
-		r, w, err := os.Pipe()
-		Expect(err).NotTo(HaveOccurred())
-		DeferCleanup(func() { _, _ = r.Close(), w.Close() })
-
-		origStdout := os.Stdout
-		defer func() { os.Stdout = origStdout }()
-		os.Stdout = w
-
-		cmd := newRootCmd()
-		cmd.SetOut(io.Discard)
-		cmd.SetErr(io.Discard)
-		cmd.SetArgs([]string{
+		out, execErr := captureStdout([]string{
 			"import-cert", "--config", cfg, "--server-url", srv.URL,
 			"--certname", "node1", "--cert-file", certFile,
 		})
-		execErr := cmd.Execute()
-
-		os.Stdout = origStdout
-		Expect(w.Close()).To(Succeed())
-		out, readErr := io.ReadAll(r)
-		Expect(readErr).NotTo(HaveOccurred())
-		Expect(r.Close()).To(Succeed())
 		lastErr = execErr
-		return string(out)
+		return out
 	}
 
-	// runExpectingSuccess is the common case; the error-path specs below read
-	// lastErr instead.
+	// runOK is the common case; the error-path specs read lastErr instead.
 	runOK := func() string {
 		GinkgoHelper()
 		out := runCapturingStdout()
@@ -113,15 +93,28 @@ var _ = Describe("import-cert output escaping", func() {
 		return out
 	}
 
-	DescribeTable("renders a server-chosen subject quoted, so it cannot forge a line",
-		func(body string) {
-			respBody = body
+	// Every field here comes out of one json.Unmarshal of one untrusted body,
+	// so each is exercised in turn. Quoting the subject alone was the defect a
+	// review found: the reasoning is "the server chose this", and that covers
+	// the serial and the timestamps exactly as much as the name.
+	DescribeTable("renders every server-chosen field quoted, so none can forge a line",
+		func(field string, imported bool) {
+			fields := map[string]string{
+				"subject": "node1", "serial": "0A",
+				"not_before": "a", "not_after": "b",
+			}
+			fields[field] = forged
+			respBody = fmt.Sprintf(
+				`{"subject":%s,"serial":%s,"not_before":%s,"not_after":%s,"imported":%t}`,
+				strconv.Quote(fields["subject"]), strconv.Quote(fields["serial"]),
+				strconv.Quote(fields["not_before"]), strconv.Quote(fields["not_after"]),
+				imported)
 			out := runOK()
 
 			// The consequence a terminator would buy, asserted first so a
 			// revert to %s fails for the reason this spec is named for.
 			Expect(strings.Count(out, "\n")).To(Equal(1),
-				"import-cert prints one summary line; a second means the subject's "+
+				"import-cert prints one summary line; a second means the field's "+
 					"newline reached the terminal unescaped:\n%s", out)
 			Expect(out).NotTo(ContainSubstring("\r"),
 				"a bare carriage return rewrites the line on an operator's terminal:\n%s", out)
@@ -129,14 +122,14 @@ var _ = Describe("import-cert output escaping", func() {
 			// Non-vacuity, last: the assertions above hold trivially for a run
 			// that printed nothing at all.
 			Expect(out).To(ContainSubstring(strconv.Quote(forged)),
-				"the server-supplied subject must reach the summary, quoted")
+				"the server-supplied %s must reach the summary, quoted", field)
 		},
-		Entry("on the imported branch", fmt.Sprintf(
-			`{"subject":%s,"serial":"0A","not_before":"a","not_after":"b","imported":true}`,
-			strconv.Quote(forged))),
-		Entry("on the already-tracked branch", fmt.Sprintf(
-			`{"subject":%s,"serial":"0A","not_before":"a","not_after":"b","imported":false}`,
-			strconv.Quote(forged))),
+		Entry("subject, imported branch", "subject", true),
+		Entry("subject, already-tracked branch", "subject", false),
+		Entry("serial, imported branch", "serial", true),
+		Entry("serial, already-tracked branch", "serial", false),
+		Entry("not_before", "not_before", true),
+		Entry("not_after", "not_after", true),
 	)
 	// The error paths. import-cert's only previous spec asserted the happy
 	// path; each of these pins a distinct failure and the message it produces,
