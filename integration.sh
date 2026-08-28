@@ -316,6 +316,43 @@ set -eu -o pipefail
 # but a malformed union can still parse. Assert the group count and that no two
 # groups share a name.
 
+# ---------------------------------------------------------------------------
+# WHAT BELONGS IN BRANCHES: FEATURE AND FIX PRs, NOT DEPENDENCY BUMPS
+#
+# Renovate PRs stay OUT. Chris ruled on #271, #272 and #273 on 2026-08-28, and
+# the ruling is about KIND rather than those three, so it stands after they
+# merge and applies to whatever Renovate opens next.
+#
+# The reason, because the outcome alone does not survive re-derivation: this
+# build exists to rehearse how the FEATURE branches interact — where they
+# collide, what they break in each other, which obligations nobody's diff
+# raises. A dependency bump is independent of that by construction. It merges on
+# its own, and putting it here spends the build's conflict budget on work that
+# does not collide.
+#
+# EXPECT THIS TO LOOK LIKE DRIFT, AND DO NOT "FIX" IT. Comparing BRANCHES against
+# `gh pr list` will always show some non-draft PRs absent, and the number grows
+# on its own between builds. On 2026-08-28 a coordinator read that gap as ten
+# absent PRs and reported the build was missing a third of the open work; it was
+# three, all Renovate. Two different numbers, two different meanings — "the
+# build is missing a third of the work, so its green result means much less than
+# it appears" versus "the list is current on everything substantive". Only the
+# second was true.
+#
+# So the check is not "does BRANCHES match the open PR list". It is: subtract
+# the two sets and look at the KIND of what is left. Anything that is not a
+# dependency bump is a real omission and probably a held branch (see the
+# hold-the-build rule above); a Renovate branch is this rule working.
+#
+#   eval "$(sed -n '/^BRANCHES=(/,/^)/p' integration.sh)"
+#   comm -23 <(gh pr list --state open --json isDraft,headRefName \
+#                --jq '.[] | select(.isDraft|not) | .headRefName' | sort) \
+#            <(printf '%s\n' "${BRANCHES[@]}" | sed 's|^origin/||' | sort)
+#
+# eval rather than a hand-copied list: the two cannot disagree that way. And
+# note local/integration-setup will show on the other side of the comm — it is
+# this branch, and it has no PR by design.
+
 BRANCHES=(
   # Always keep
   local/integration-setup
