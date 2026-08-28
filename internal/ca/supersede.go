@@ -193,13 +193,22 @@ func (c *CA) supersedeReplaced(ctx context.Context, subject, oldSerial string) e
 // subject → crl → c.mu and the SQL connection-nesting depth at two; see
 // docs/development/locking.md.
 func (c *CA) recordSuperseded(ctx context.Context, subject, serial string, after time.Duration) error {
-	parsed, ok := new(big.Int).SetString(serial, 16)
-	if !ok {
+	// storage.NormaliseSerial rather than a local SetString, so both sides of
+	// the comparison refuseIfSuperseded makes are produced by the *same*
+	// function. One definition of canonical is the entire point: the bug this
+	// replaced was the write side and the read side disagreeing about form.
+	//
+	// It is also stricter than SetString in two useful ways — it trims
+	// surrounding whitespace, and it rejects a negative value, which SetString
+	// would happily parse from a leading "-" and which could never be a real
+	// serial.
+	canonical, nerr := storage.NormaliseSerial(serial)
+	if nerr != nil {
 		// Refused here rather than written and discarded by the sweep: the
 		// caller is about to log a warning naming this serial, which is a far
 		// better place for an operator to see it than a sweep hours later.
 		c.supersedeFailures.Add(1)
-		return fmt.Errorf("malformed serial %q", serial)
+		return fmt.Errorf("malformed serial %q: %w", serial, nerr)
 	}
 	// Stored canonical, not as handed in. The two callers disagree about form:
 	// AutoRenew passes serialHexStr of the presented certificate, already
@@ -214,7 +223,7 @@ func (c *CA) recordSuperseded(ctx context.Context, subject, serial string, after
 	// credential renewing itself into a fresh full-lifetime successor. The
 	// parse above already establishes the value; re-rendering it costs nothing
 	// and makes the stored form the same one every reader computes.
-	serial = serialHexStr(parsed)
+	serial = canonical
 	revokeAt := time.Now().UTC().Add(after)
 	err := c.Storage.WithLock(ctx, lockNameCRL, func() error {
 		entries, _, err := c.readSuperseded(ctx)

@@ -438,24 +438,6 @@ var _ = Describe("Delayed supersession", func() {
 					"inventory serials are not canonical and this is an authorisation decision")
 		})
 
-		It("stores the serial canonically, whatever form the caller passed", func() {
-			// Renew records LatestSerialForSubject, which is inventory text. The
-			// fixture cannot make the inventory non-canonical here, so this
-			// pins the property directly: whatever goes in, what is stored is
-			// what a reader computing serialHexStr will find.
-			original := issue("node-canon")
-			csrPEM, _ := buildCSR("node-canon")
-			_, err := myCA.Renew(ctx, "node-canon", csrPEM, original)
-			Expect(err).NotTo(HaveOccurred())
-
-			entries := pending()
-			Expect(entries).To(HaveLen(1))
-			Expect(entries[0].Serial).To(Equal(hexSerial(original.SerialNumber)),
-				"the stored serial must be the canonical rendering, not the caller's form")
-			Expect(entries[0].Serial).NotTo(HavePrefix("0"),
-				"canonical means no leading zeros")
-		})
-
 		It("does not obstruct the replacement renewing normally", func() {
 			original := issue("node-p")
 			replacementPEM, err := myCA.AutoRenew(ctx, original)

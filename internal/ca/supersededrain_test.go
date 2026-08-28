@@ -42,6 +42,64 @@ import (
 // the defect review round 2 found here, where deferred entries were named in
 // the log line and then dropped from the write-back. A scenario spec caught
 // that one after the fact; this one states the invariant it violated.
+// recordSuperseded is what makes the stored form canonical. Its two callers
+// disagree: AutoRenew passes serialHexStr of the presented certificate, already
+// canonical, while Renew passes LatestSerialForSubject, which returns inventory
+// text verbatim — and a migrated or older inventory carries zero-padded
+// serials. Only a white-box call can feed it a genuinely non-canonical value:
+// a spec driving Renew against a fresh store cannot, because that store's
+// inventory is already canonical, which is precisely how a spec written that
+// way passes whether or not the canonicalisation exists.
+var _ = Describe("recordSuperseded", func() {
+	var (
+		ctx   context.Context
+		store *storage.StorageService
+		myCA  *CA
+	)
+
+	BeforeEach(func() {
+		ctx = context.Background()
+		store = storage.New(GinkgoT().TempDir())
+		myCA = New(store, AutosignConfig{Mode: "off"}, "puppet.test")
+		myCA.CAKeyConfig = KeyConfig{Algo: KeyAlgoECDSA, Size: 256}
+		myCA.LeafKeyConfig = KeyConfig{Algo: KeyAlgoECDSA, Size: 256}
+		Expect(myCA.Init(ctx)).To(Succeed())
+	})
+
+	stored := func() []supersededEntry {
+		GinkgoHelper()
+		entries, corrupt, err := myCA.readSuperseded(ctx)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(corrupt).To(BeFalse())
+		return entries
+	}
+
+	DescribeTable("stores the canonical rendering, whatever form it is given",
+		func(given, want string) {
+			Expect(myCA.recordSuperseded(ctx, "node.test", given, time.Hour)).To(Succeed())
+			entries := stored()
+			Expect(entries).To(HaveLen(1))
+			Expect(entries[0].Serial).To(Equal(want),
+				"refuseIfSuperseded compares this against serialHexStr of a presented "+
+					"certificate; a non-canonical stored form makes that comparison miss, and "+
+					"that comparison is the only thing stopping a superseded credential "+
+					"renewing itself")
+		},
+		Entry("zero-padded, as a migrated inventory carries", "000ABC", "ABC"),
+		Entry("lowercase", "abc", "ABC"),
+		Entry("lowercase and padded", "000abc", "ABC"),
+		Entry("already canonical", "ABC", "ABC"),
+		Entry("surrounding whitespace", " ABC ", "ABC"),
+	)
+
+	It("refuses a serial that is not hexadecimal at all", func() {
+		before := myCA.SupersedeFailures()
+		Expect(myCA.recordSuperseded(ctx, "node.test", "not-hex", time.Hour)).NotTo(Succeed())
+		Expect(stored()).To(BeEmpty())
+		Expect(myCA.SupersedeFailures()).To(Equal(before + 1))
+	})
+})
+
 var _ = Describe("drainDueLocked", func() {
 	var (
 		ctx    context.Context
