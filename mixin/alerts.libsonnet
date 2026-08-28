@@ -285,6 +285,23 @@
             // silently resolve between attempts. The 'unless' arm catches a
             // target that has never succeeded at all.
             //
+            // What that design cannot see, stated here because understanding
+            // why it is right is exactly what stops you noticing: a target
+            // that fails and then recovers on retry, every cycle, never fires
+            // this rule. The CA retries a failed cycle after two minutes, so
+            // last_success overtakes last_error well inside k8sExportFailingFor
+            // and the state never holds for 'for'. That silence is deliberate
+            // and was ruled on: a failure a retry resolves is transient, and
+            // flapping should not page. The uncovered case is the target that
+            // fails on its first attempt every single cycle -- it is being
+            // exported, just never first time. Catching it needs a different
+            // rule, counting advances of last_error over a window rather than
+            // comparing it to last_success; do not reach for a longer 'for'
+            // here, which makes this rule fire less, not more. Meanwhile
+            // puppetca_k8s_export_applies_total{result="error"} counts every
+            // failed attempt whether or not a retry rescued it, and
+            // docs/metrics.md carries the query.
+            //
             // Both arms have last_error on the left, so this rule can only fire
             // for a target the exporter has actually written a series for. That
             // is a contract on the exporter, not an accident: ExportAll must
