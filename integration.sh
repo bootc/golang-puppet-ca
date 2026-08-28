@@ -170,12 +170,27 @@ set -eu -o pipefail
 # pointing the same way: a branch that predates another carries the OLD claim
 # unchanged, in a region the newer branch never touches, so there is no conflict.
 #
-#   #264 x #189  docs/development/locking.md says `Generate` "takes no
-#                distributed lock at all and is the `#195` gap above", and counts
-#                20 WithLock sites + 2 in caImport.go = 22. After #189 Generate
-#                DOES take the per-subject lock (internal/ca/generate.go:229) and
-#                there are 23 sites. internal/ca/lockorder_test.go:88 repeats the
-#                count in a comment. Neither is an assertion: green either way.
+#   #264 x #189  DISCHARGED 2026-08-28 at #264 head 99018ae05246, verified
+#                here, not taken on report. Was: locking.md called `Generate`
+#                unlocked and hard-coded 20 + 2 = 22 WithLock sites, where #189
+#                makes it locked (internal/ca/generate.go:229) and 23.
+#                #264's owner took the whole thing rather than leaving it to
+#                merge order: the sentence is gone, the counts are replaced by
+#                the counting RULE, and the `#195` back-pointer is dropped.
+#                The four surviving `#195` mentions are byte-identical on main
+#                in files #264 never touches, and #189 retires all four itself
+#                (api.md, locking.md x2, signing.go: main=4, #189=0). So it is
+#                clean in BOTH merge orders, which a one-sided fix would not be.
+#
+#                Keep the shape, not the item. It found a fourth consequence
+#                neither session had: post-#189 the observer's BeforeEach calls
+#                Generate, which then supplies `subject:<name>` -> `crl` — the
+#                very edge the table asserts — so a membership check is answered
+#                by setup and four specs stayed green with Clean's entire
+#                CRL-locked revoke deleted. Fixed by counting edges before and
+#                after rather than testing membership. A doc claim going stale
+#                and a spec quietly losing its power are the SAME merge, and
+#                only the first announces itself.
 #
 #   #267 x main  docs/metrics.md says `openvox-ca-ctl revoke --serial` "is the
 #                only way to retire a superseded certificate". #267's sweep is a
