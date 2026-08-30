@@ -69,13 +69,27 @@ func (d SerialIndexDelta) Changed() bool { return d.Added > 0 || d.Removed > 0 }
 // full inventory scan per made-up serial.
 //
 // c.mu is not held across the storage read. reconcileSerialIndexLocked takes it
-// afterwards, so an issuance can land between the two; the epoch counter is how
-// this pass tells. Additions from the read always apply — a serial in the
-// inventory was issued by someone — but the removal half is skipped when the
-// count moved, because this pass cannot distinguish "pruned elsewhere" from
-// "signed here, after I read". Removals are rare and one interval late is
-// harmless (a pruned certificate is an expired one); dropping a serial this
-// process just issued would make its own OCSP answers wrong, which is not.
+// afterwards, so anything can land between the two, and two counters are how
+// this pass tells what did. Each gates one half, because the halves fail in
+// opposite directions:
+//
+//   - an issuance landing in the window means the read is missing a serial, so
+//     the removal half must stand down — it cannot distinguish "pruned
+//     elsewhere" from "signed here, after I read", and dropping a serial this
+//     process just issued would make its own answers wrong;
+//   - a removal landing in the window means the read is holding a serial that
+//     has gone, so the addition half must stand down — it cannot tell which of
+//     the serials it read are the stale ones, and re-adding a pruned one puts
+//     a certificate this CA has finished with back in front of the responder.
+//
+// Either way the deferred half runs on the next pass, an interval later. That
+// is the whole cost, and it is only paid when a pass actually overlaps a
+// mutation.
+//
+// Neither half can re-check its own predicate instead. "Is this serial still in
+// storage" is another storage read — the round trip this job exists to keep off
+// the lock — which is why this is a counter and not the re-validation the
+// analogous OCSP-cache guard uses.
 func (c *CA) SyncSerialIndex(ctx context.Context) (SerialIndexDelta, error) {
 	c.mu.RLock()
 	epoch, removalEpoch := c.serialIndexEpoch, c.serialIndexRemovalEpoch
@@ -101,8 +115,10 @@ func (c *CA) SyncSerialIndex(ctx context.Context) (SerialIndexDelta, error) {
 	return delta, nil
 }
 
-// reconcileSerialIndexLocked applies an inventory read to the index, where
-// readEpoch is the mutation count sampled before that read was taken.
+// reconcileSerialIndexLocked applies an inventory read to the index.
+// readEpoch and readRemovalEpoch are the two mutation counts sampled before
+// that read was taken: the first gates removals, the second gates additions.
+// See SyncSerialIndex for why the halves need separate counters.
 //
 // Split from SyncSerialIndex so the epoch guard can be asserted rather than
 // raced: the interleaving it protects against lasts microseconds and is
