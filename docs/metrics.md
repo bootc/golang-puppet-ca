@@ -118,9 +118,14 @@ query, and `puppetca_crl_sync_failures_total` for why it is stuck.
 > the likeliest source of a rising count: grep for `Renew:` /
 > `AutoRenew: failed to retire replaced certificate` alongside the `Clean:`
 > warnings. Both *renewal* warnings name the serial, and the certificate they
-> left valid is the one case revoking by subject cannot reach — the replacement
-> is what makes it a renewal, so `revoke --certname` would retire that instead.
-> Retire it with `openvox-ca-ctl revoke --serial <hex>`; see
+> left valid is one revoking by subject cannot reach: the replacement is what
+> makes it a renewal, so `revoke --certname` would retire that instead. That is
+> specific to a failure on the *immediate* path — nothing recorded the
+> predecessor, so nothing but its serial addresses it. Where
+> [`superseded_cert_revoke_after_sec`](configuration.md#delayed-supersession)
+> grants a window, which is the default, a predecessor is on the pending list
+> and revoking the subject does retire it. Retire an unrecorded one with
+> `openvox-ca-ctl revoke --serial <hex>`; see
 > [revocation by serial](api.md#revocation-by-serial). The `Clean:` warnings are
 > qualified differently: they name the serial only once the revocation reached
 > the CRL, and the certificate they leave behind is still reachable by subject
