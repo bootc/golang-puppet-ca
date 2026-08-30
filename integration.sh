@@ -131,17 +131,41 @@ set -eu -o pipefail
 #                This one DOES fail: SQLReservedLockKeys asserts an exact Equal,
 #                so a missing entry turns the suite red and names itself.
 #
-#   #261 x #264  the second to land adds `bootstrap` -> `hmac-key` to
-#                allowedLockNesting. This one does NOT fail on current fixtures.
-#                Nothing goes red, and the result is a silent divergence between
-#                the documented lock graph and the code — a green build would
-#                certify it.
+#   #261 x #264  WITHDRAWN 2026-08-30 — there is NO such obligation, and acting
+#                on it would have been a defect. It said the second to land must
+#                add `bootstrap` -> `hmac-key` to allowedLockNesting. Verified
+#                against both heads while merging #264:
 #
-# The second is the one that matters, and it is the shape this build is worst at
-# seeing: integration-verify-merge.sh compares TEXT and this is a semantic
-# omission, so nothing here catches it. After merging any two of #259, #261 and
-# #264, read allowedLockNesting against the lock graph rather than trusting a
-# green suite.
+#                  * The only holder of that pair is MigrateService, and it is
+#                    in internal/storage (migrate.go:90 defines migrateLockName
+#                    as "bootstrap", independently of internal/ca's identical
+#                    constant — the two are coupled only by the literal).
+#                  * CA.Init does NOT hold it. It calls InitHMAC *before* taking
+#                    bootstrap, and init.go says so outright: "This stays
+#                    *outside* the bootstrap lock taken below, and that is the
+#                    point rather than an oversight."
+#                  * allowedLockNesting is in package ca, so no WithLock-level
+#                    observer there can ever see a pair taken in the storage
+#                    package. lockNameHMACKey is unexported and unreferenced
+#                    from internal/ca.
+#
+#                #264's own rule 12 excludes exactly this, using `bootstrap` ->
+#                `sql-schema-migrate` as the precedent: "Do not add either pair
+#                to satisfy this rule — adding them would make the table claim
+#                coverage it does not have." The nesting is real and belongs in
+#                the Lock ordering PROSE, which it now has on both #261 and
+#                #264; it does not belong in the table.
+#
+# WHY THIS ONE SURVIVED SO LONG, because the shape recurs. Every check anyone
+# ran was "is the entry present?" — and the entry was genuinely absent, so the
+# obligation looked confirmed every time. Nobody asked the prior question of
+# whether the pair was in scope, which is answered by reading what takes the
+# locks rather than by grepping the table. Three sessions and two coordinators
+# carried it forward on the strength of the absence alone.
+#
+# A silent obligation is a claim about the CODE, so verify it against the code
+# before honouring it. "Nothing goes red" is equally consistent with an omission
+# that matters and with a rule that does not apply here.
 #
 # #259 x #261 OWE A SECOND CHECK, in docs/development/locking.md, and this one
 # has a positive test rather than an absence. Each branch retires a different
