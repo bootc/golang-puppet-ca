@@ -329,10 +329,14 @@ written as two.
   its slow path can re-enter `bootstrap` and deadlock startup
   ([#201](https://github.com/voxpupuli/openvox-ca/issues/201)); see known gaps.
 - `bootstrap` → `hmac-key` is the first nesting in which a name owned by
-  `StorageService` sits inside one owned by the CA layer. It is not the only
-  nesting of two different `WithLock` names — `subject:<name>` → `crl` above is
-  one — but it is the only one the order at the top of this section does not
-  cover, which is why it is written out here. `MigrateService` holds
+  `StorageService` sits inside one owned by the CA layer, and the only one taken
+  entirely within `internal/storage`. It is not the only nesting of two
+  different `WithLock` names — `subject:<name>` → `crl` above is one, and so is
+  `bootstrap` → `crl` on the import path — and it is deliberately **absent from
+  `allowedLockNesting`** rather than missing from it: that table keys pairs by
+  lock *name* and not by (store, name), so a path holding `bootstrap` over two
+  different stores is outside its scope by construction. This prose is where the
+  pair is recorded, and the table must not gain it. `MigrateService` holds
   `bootstrap` on the destination across `RebuildInventoryHMAC`, which reaches
   `EnsureHMACKey`; if the copied `hmac_key` is the wrong length, that takes
   `hmac-key` inside it. An *absent* key does not: `RebuildInventoryHMAC`
