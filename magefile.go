@@ -3443,7 +3443,8 @@ func (Test) BackendsRedis() error {
 // wired into CI so neither the bash suite nor the Go suite is left unrun.
 //
 // Requires podman-compose (or docker compose) and network access to pull
-// docker.io/redis:7-alpine.
+// docker.io/redis:7-alpine. The suite runs under -race, so it also needs cgo
+// and a C compiler, as test:unit does.
 func (Test) BackendsRedisGo() error {
 	const addr = "127.0.0.1:56379"
 

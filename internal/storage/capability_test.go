@@ -280,10 +280,6 @@ var _ = Describe("Backend capability reporting", func() {
 				Expect(svc(build()).SupportsAtomicInventory()).To(BeFalse())
 			},
 			Entry("filesystem", func() Backend { return NewFilesystemBackend(GinkgoT().TempDir()) }),
-			// Redis stays here until #212 decomposes its inventory the way #154
-			// did etcd's; that branch moves this entry to the table below rather
-			// than pre-empting it here.
-			Entry("redis", func() Backend { return &RedisBackend{} }),
 		)
 
 		DescribeTable("is true for every backend with a structured inventory",
@@ -291,10 +287,12 @@ var _ = Describe("Backend capability reporting", func() {
 				Expect(svc(build()).SupportsAtomicInventory()).To(BeTrue())
 			},
 			// etcd joined these when #154 gave EtcdBackend AppendEntry and
-			// PruneEntries. The capability is a type assertion for
+			// PruneEntries, and redis when #139 did the same for
+			// RedisBackend. The capability is a type assertion for
 			// InventoryStore, so it follows the implementation rather than the
 			// backend's name.
 			Entry("etcd", func() Backend { return &EtcdBackend{} }),
+			Entry("redis", func() Backend { return &RedisBackend{} }),
 		)
 
 		It("is true for a SQL backend", func() {

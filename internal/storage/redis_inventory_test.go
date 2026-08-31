@@ -1448,6 +1448,26 @@ var _ = Describe("RedisInventoryAppendLineBudget", func() {
 		Expect(hashFields(cli, invKey(redisInvEntriesSub))).To(HaveLen(len(sampleInventoryLines)),
 			"a refused batch must write nothing")
 	})
+
+	It("accepts a direct AppendLine of exactly one script's budget", func() {
+		// The reject case above is one past the limit, which a `>=` typo in the
+		// guard would still reject. Pinning the accept case at exactly the
+		// budget is what makes the boundary itself a regression: with `>=` this
+		// spec fails, and with `>` it passes.
+		ctx := context.Background()
+		_, b, cli, stop := newRedisInventoryService()
+		defer stop()
+
+		var buf strings.Builder
+		for i := range redisImportBatch {
+			fmt.Fprintf(&buf, "%06d 2024-01-01T00:00:00UTC 2029-01-01T00:00:00UTC /bulk%d\n", 10000+i, i)
+		}
+		Expect(b.AppendLine(ctx, KeyInventory, []byte(buf.String()), BlobPrivate)).To(Succeed(),
+			"a batch of exactly redisImportBatch must be accepted")
+		Expect(hashFields(cli, invKey(redisInvEntriesSub))).
+			To(HaveLen(len(sampleInventoryLines)+redisImportBatch),
+				"every line in an accepted batch must be stored")
+	})
 })
 
 var _ = Describe("RedisMigrateFromFilesystem", func() {

@@ -155,13 +155,10 @@ target. Both match their rows here — raced and unraced respectively.
 | `mage test:backendsEtcd` | yes | **yes** | — |
 | `mage test:backendsPostgres` | yes | **yes** | — |
 | `mage test:backendsMySQL` | yes | **yes** | — |
-| `mage test:backendsRedisGo` | yes | no | not done yet; [PR #212](https://github.com/voxpupuli/openvox-ca/pull/212) adds it |
+| `mage test:backendsRedisGo` | yes | **yes** | — |
 | `mage test:backendsOpenBao` | yes | no | exercises `internal/signer/openbao`, not storage locking |
 | `mage test:magefile` | yes | no | exercises the magefile's own build logic; no concurrency to watch |
 | `mage test:backendsRedis` | **no** | n/a | bash TAP suite; there is no `go test` to add the flag to |
-
-The residue is tracked as
-[#205](https://github.com/voxpupuli/openvox-ca/issues/205).
 
 The raced ones are raced for the reason `test:unit` is: what they assert about
 concurrency is a coarse outcome — a row count after two backends contend on

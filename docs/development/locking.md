@@ -820,11 +820,8 @@ deadlocking the suite to its timeout, which is how an inversion otherwise
 presents: every backend serialises same-process callers on a mutex that ignores
 the context deadline. These run under the race detector on every unit
 run: `mage test:unit` passes `-race` over every unit package, `internal/ca`
-included. Of the backend suites, `backendsEtcd`, `backendsPostgres` and
-`backendsMySQL` run under it too; `backendsRedisGo` does not, and
-[PR #212](https://github.com/voxpupuli/openvox-ca/pull/212) adds it. The
-residue is tracked as
-[#205](https://github.com/voxpupuli/openvox-ca/issues/205).
+included. Of the backend suites, `backendsEtcd`, `backendsPostgres`,
+`backendsMySQL` and `backendsRedisGo` run under it too.
 
 That is only the suites this document cares about. For the exhaustive list of
 every `go test` the repository invokes and whether each is raced — including the
