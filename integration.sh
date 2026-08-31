@@ -175,7 +175,10 @@ BRANCHES=(
   # rather than a stale local copy.
   origin/feature/redis-inventory          # PR #212
   origin/feature/crl-chain-distribution   # PR #168
+  # #265 and #283 both edit docs/development/locking.md and collide there, so
+  # they sit together: the conflict is theirs and surfaces once.
   origin/fix/ocsp-signing-lock-scope      # PR #265
+  origin/fix/init-bootstrap-reentrancy    # PR #283 — issue #201
 
   # The packaging pair. Neither is stacked on the other — both sit on main — but
   # they collide on README.md, magefile.go and magefile_test.go, so keep them
