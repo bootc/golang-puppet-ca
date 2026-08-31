@@ -33,8 +33,8 @@ import (
 // timeout, so without this a black-holed API-server connection could block the
 // single exporter goroutine (and thus re-export of every target) for as long as
 // the OS transport takes to give up. A per-apply deadline surfaces a stuck call
-// as a counted, logged error and lets the loop proceed to the next wake-up; the
-// next CRL update or a restart re-reconciles.
+// as a counted, logged error and lets the loop proceed to the next wake-up: the
+// retry the caller runs after a failed cycle, the next CRL update, or a restart.
 const applyTimeout = 30 * time.Second
 
 // MaterialSource provides the current CA certificate and CRL in PEM form. It is
@@ -60,7 +60,31 @@ type Exporter struct {
 // that do not set their own; it may be empty if every target sets a namespace.
 // m may be nil to disable instrumentation.
 func New(client kubernetes.Interface, cfg Config, src MaterialSource, defaultNS string, m *Metrics) *Exporter {
-	return &Exporter{client: client, cfg: cfg, src: src, defaultNS: defaultNS, metrics: m}
+	e := &Exporter{client: client, cfg: cfg, src: src, defaultNS: defaultNS, metrics: m}
+	// Publish the apply counters at zero now, so "configured but never
+	// attempted" is a series rather than an absence. See initTargets.
+	m.initTargets(cfg.Targets, defaultNS)
+	return e
+}
+
+// InitTargetMetrics publishes every configured target's apply counters at zero
+// without constructing an Exporter, for the case where the export cannot start
+// at all: NewInCluster fails, the caller logs it, and no cycle ever runs.
+//
+// That case is why this is exported rather than left inside New: it is the one
+// door New cannot cover, and the CA stays up and healthy while the exported
+// objects quietly stop being updated. See PuppetCAKubernetesExportNotRunning in
+// mixin/alerts.libsonnet.
+//
+// Call it only when the export is known not to be starting. Targets without
+// their own namespace are labelled with an empty one, since the pod namespace
+// may be exactly what could not be resolved. That placeholder is harmless here
+// only because nothing will ever record an apply for them. On a path where the
+// exporter might still start, it would strand a second series at zero under the
+// wrong label and make PuppetCAKubernetesExportNotRunning fire for a healthy
+// target for ever.
+func InitTargetMetrics(cfg Config, m *Metrics) {
+	m.initTargets(cfg.Targets, "")
 }
 
 // NewInCluster builds an Exporter using in-cluster ServiceAccount credentials,
@@ -99,16 +123,28 @@ func (c *Config) needsDefaultNamespace() bool {
 // reads each material at most once. A failure applying one target is logged and
 // collected but does not prevent the others from being applied; the joined error
 // (or nil) is returned.
+//
+// A material that cannot be read fails only the targets that asked for it, and
+// the per-target loop always runs. The invariant this function must hold: every
+// configured target records a result on every cycle, whatever failed upstream.
+// Returning before the loop leaves the export alerts nothing to match on and a
+// stale CA certificate or CRL that nothing can report -- see
+// PuppetCAKubernetesExportNotRunning in mixin/alerts.libsonnet for why.
 func (e *Exporter) ExportAll(ctx context.Context) error {
-	certPEM, crlPEM, err := e.fetchMaterials(ctx)
-	if err != nil {
-		return err
-	}
+	mats := e.fetchMaterials(ctx)
 
 	var errs []error
 	for i := range e.cfg.Targets {
 		t := &e.cfg.Targets[i]
-		err := e.applyTarget(ctx, t, certPEM, crlPEM)
+		// A material this target requested could not be read: fail the target
+		// with that error rather than calling the API server with material we
+		// know is missing. applyTarget would refuse it anyway, but reporting
+		// "refusing to export an empty CRL" would name the symptom instead of
+		// the read failure that caused it.
+		err := mats.forTarget(t)
+		if err == nil {
+			err = e.applyTarget(ctx, t, mats.certPEM, mats.crlPEM)
+		}
 		e.metrics.recordApply(t, e.namespaceFor(t), err)
 		if err != nil {
 			slog.Warn("Kubernetes export failed for target",
@@ -122,36 +158,67 @@ func (e *Exporter) ExportAll(ctx context.Context) error {
 	return errors.Join(errs...)
 }
 
+// materials holds one cycle's cert and CRL PEM alongside the error from reading
+// each. Read errors are carried per material rather than returned, so a cert
+// that cannot be read does not fail a CRL-only target — and, more importantly,
+// does not skip the per-target loop that writes the export metrics.
+type materials struct {
+	certPEM []byte
+	certErr error
+	crlPEM  []byte
+	crlErr  error
+}
+
+// forTarget returns the read error that should fail t, or nil if every material
+// t asked for was read. A target that requested both materials reports the cert
+// failure first; the joined per-target error names the target either way.
+func (m *materials) forTarget(t *Target) error {
+	if t.Cert && m.certErr != nil {
+		return m.certErr
+	}
+	if t.CRL && m.crlErr != nil {
+		return m.crlErr
+	}
+	return nil
+}
+
 // fetchMaterials reads the cert and CRL PEM, fetching each only if some target
-// requires it.
-func (e *Exporter) fetchMaterials(ctx context.Context) (certPEM, crlPEM []byte, err error) {
+// requires it. It never fails the cycle: a read error is recorded against the
+// material it belongs to and attributed to targets by materials.forTarget.
+func (e *Exporter) fetchMaterials(ctx context.Context) materials {
 	var wantCert, wantCRL bool
 	for i := range e.cfg.Targets {
 		wantCert = wantCert || e.cfg.Targets[i].Cert
 		wantCRL = wantCRL || e.cfg.Targets[i].CRL
 	}
+
+	var m materials
 	if wantCert {
-		certPEM, err = e.src.GetCACert(ctx)
-		if err != nil {
-			return nil, nil, fmt.Errorf("reading CA certificate for export: %w", err)
+		if m.certPEM, m.certErr = e.src.GetCACert(ctx); m.certErr != nil {
+			m.certErr = fmt.Errorf("reading CA certificate for export: %w", m.certErr)
 		}
 	}
 	if wantCRL {
-		crlPEM, err = e.src.GetCRL(ctx)
-		if err != nil {
-			return nil, nil, fmt.Errorf("reading CRL for export: %w", err)
+		if m.crlPEM, m.crlErr = e.src.GetCRL(ctx); m.crlErr != nil {
+			m.crlErr = fmt.Errorf("reading CRL for export: %w", m.crlErr)
 		}
 	}
-	return certPEM, crlPEM, nil
+	return m
 }
 
 // namespaceFor returns the namespace a target should be applied to: its own, or
 // the resolved default.
 func (e *Exporter) namespaceFor(t *Target) string {
+	return namespaceForTarget(t, e.defaultNS)
+}
+
+// namespaceForTarget is namespaceFor without an Exporter, so the metric labels
+// can be computed before one is constructed (see InitTargetMetrics).
+func namespaceForTarget(t *Target, defaultNS string) string {
 	if t.Metadata.Namespace != "" {
 		return t.Metadata.Namespace
 	}
-	return e.defaultNS
+	return defaultNS
 }
 
 // applyTarget server-side applies a single target. Force is set so the exporter

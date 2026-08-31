@@ -64,6 +64,41 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 	return m
 }
 
+// initTargets publishes the applies_total children for every configured target,
+// at zero, before any export runs. A nil receiver (metrics disabled) is a no-op.
+//
+// Prometheus does not export a child that has never been touched, so a target
+// nothing has ever recorded against is an absent series -- and no PromQL
+// comparison matches an absence. Publishing these at zero is what lets
+// PuppetCAKubernetesExportNotRunning tell a configured target that has never
+// been attempted from one that is not configured at all; see that rule in
+// mixin/alerts.libsonnet for the argument in full.
+//
+// Only applies_total is published this way. The last_success/last_error gauges
+// are left absent until something actually happens: a timestamp of zero is not
+// a neutral placeholder but a claim that the last success was in 1970, which
+// every `time() - last_success` query would believe. Publishing them would not
+// cost alert coverage -- the tempting misreading is that it would, and a
+// never-succeeded target does still fire the `last_error > last_success` arm
+// against a zero. It would only make the `unless` arm dead code and mislead
+// every dashboard. See docs/metrics.md.
+//
+// The namespace label is computed exactly as recordApply computes it, so a
+// published child and the child a later apply records against are the same
+// series and no orphan can arise -- including for a target with no namespace of
+// its own and no default resolved, where both agree on the empty string.
+func (m *Metrics) initTargets(targets []Target, defaultNS string) {
+	if m == nil {
+		return
+	}
+	for i := range targets {
+		t := &targets[i]
+		ns := namespaceForTarget(t, defaultNS)
+		m.applies.WithLabelValues(t.Kind, ns, t.Metadata.Name, "success")
+		m.applies.WithLabelValues(t.Kind, ns, t.Metadata.Name, "error")
+	}
+}
+
 // recordApply counts one apply attempt for a target in the given (resolved)
 // namespace. A nil receiver (metrics disabled) is a no-op.
 func (m *Metrics) recordApply(t *Target, namespace string, err error) {

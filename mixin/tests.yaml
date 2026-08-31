@@ -1,12 +1,21 @@
-# promtool rule tests for the CRL-propagation alerts.
+# promtool rule tests for the CRL-propagation and Kubernetes-export alerts.
 #
 # Run with `mage test:mixin` from the repository root, which renders the mixin
 # to the path below and then runs both promtool checks over it.
 #
-# These cover PuppetCACRLStale, whose expression is the only one in the mixin
-# built from set operators (`or`, `unless`, `and on(...)`). Its two arms exist
-# for different failure shapes and the qualifier on the second exists to keep it
-# quiet during a third, none of which is obvious from reading the PromQL.
+# These cover the rules whose firing behaviour is not obvious from reading the
+# PromQL:
+#
+#   * PuppetCACRLStale, the only expression in the mixin built from set
+#     operators (`or`, `unless`, `and on(...)`). Its two arms exist for
+#     different failure shapes and the qualifier on the second exists to keep it
+#     quiet during a third.
+#   * PuppetCAKubernetesExportFailing and PuppetCAKubernetesExportNotRunning,
+#     which between them have to cover a target that fails and a target that is
+#     never attempted. The first cannot see the second — every arm of it needs a
+#     last_error series to match on — so the cases below pin which rule owns
+#     which shape, that neither double-pages for the other's, and that a CA not
+#     using the feature at all stays silent under both.
 #
 # The firing behaviour is the contract here; the annotation prose is not, so
 # repeating it below is a maintenance cost rather than an assertion worth
@@ -128,3 +137,187 @@ tests:
       - eval_time: 8m
         alertname: PuppetCACRLStale
         exp_alerts: []
+
+  # --- Kubernetes export ---
+
+  # The shape a failed material read now produces. One unreadable CRL fails
+  # every target that asked for it, and each of them stamps last_error with no
+  # last_success ever recorded, so the 'unless' arm fires once per target.
+  #
+  # This is the case the exporter used to make impossible: ExportAll returned
+  # before the per-target loop when the read failed, so none of these series
+  # were written and the rule below had nothing to match. The exporter now
+  # records every target on every cycle precisely so this test describes
+  # reality.
+  - interval: 1m
+    name: a failed material read alerts on every target that wanted it
+    input_series:
+      - series: 'puppetca_k8s_export_last_error_timestamp_seconds{job="openvox-ca",instance="ca-1:9140",kind="Secret",namespace="ns1",name="trust"}'
+        values: "1000+0x30"
+      - series: 'puppetca_k8s_export_last_error_timestamp_seconds{job="openvox-ca",instance="ca-1:9140",kind="ConfigMap",namespace="ns2",name="bundle"}'
+        values: "1000+0x30"
+      - series: 'puppetca_k8s_export_applies_total{job="openvox-ca",instance="ca-1:9140",kind="Secret",namespace="ns1",name="trust",result="error"}'
+        values: "1+1x30"
+      - series: 'puppetca_k8s_export_applies_total{job="openvox-ca",instance="ca-1:9140",kind="ConfigMap",namespace="ns2",name="bundle",result="error"}'
+        values: "1+1x30"
+    alert_rule_test:
+      # k8sExportFailingFor (15m) debounces a failure corrected moments later.
+      - eval_time: 10m
+        alertname: PuppetCAKubernetesExportFailing
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: PuppetCAKubernetesExportFailing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: openvox-ca
+              instance: ca-1:9140
+              kind: ConfigMap
+              namespace: ns2
+              name: bundle
+            exp_annotations:
+              summary: "A Kubernetes export target is failing to apply."
+              description: "The most recent apply of ConfigMap/bundle in namespace ns2 from ca-1:9140 failed; the exported object may hold a stale CA certificate or CRL until the next successful export. Check the CA logs, RBAC, and API server connectivity."
+          - exp_labels:
+              severity: warning
+              job: openvox-ca
+              instance: ca-1:9140
+              kind: Secret
+              namespace: ns1
+              name: trust
+            exp_annotations:
+              summary: "A Kubernetes export target is failing to apply."
+              description: "The most recent apply of Secret/trust in namespace ns1 from ca-1:9140 failed; the exported object may hold a stale CA certificate or CRL until the next successful export. Check the CA logs, RBAC, and API server connectivity."
+      # Attempts are being recorded, so this is Failing's business, not
+      # NotRunning's. A target that fails every time must not double-page.
+      - eval_time: 40m
+        alertname: PuppetCAKubernetesExportNotRunning
+        exp_alerts: []
+
+  # A CA with no export series at all. Both rules need a series to match on, so
+  # neither can fire here — and after the exporter changes that shape means
+  # exactly one thing: the feature is not configured on this CA. A configured
+  # target always has an applies_total series, published at zero before the
+  # first cycle and even when the export fails to start at all, which is what
+  # NotRunning above matches.
+  #
+  # So this asserts silence is correct, not that a gap is tolerated. It is also
+  # the guard against closing that gap the wrong way: an `absent()` arm or an
+  # `or vector(0)` on either rule would make every CA that does not use the
+  # Kubernetes export page for a feature it has not switched on. Both rules are
+  # evaluated, because a fix to one that forgot the other would otherwise pass.
+  - interval: 1m
+    name: a CA not using the export feature is silent
+    input_series:
+      - series: 'puppetca_collector_scrape_success{job="openvox-ca",instance="ca-1:9140"}'
+        values: "1+0x60"
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: PuppetCAKubernetesExportFailing
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: PuppetCAKubernetesExportNotRunning
+        exp_alerts: []
+
+  # The backstop. The CA creates the apply counters at zero for every configured
+  # target before the first cycle, so a target that is configured but never
+  # attempted is a series sitting at zero — something PromQL can match — rather
+  # than an absence, which it cannot.
+  - interval: 1m
+    name: a configured target that is never attempted
+    input_series:
+      - series: 'puppetca_k8s_export_applies_total{job="openvox-ca",instance="ca-1:9140",kind="Secret",namespace="ns1",name="trust",result="success"}'
+        values: "0+0x60"
+      - series: 'puppetca_k8s_export_applies_total{job="openvox-ca",instance="ca-1:9140",kind="Secret",namespace="ns1",name="trust",result="error"}'
+        values: "0+0x60"
+    alert_rule_test:
+      # k8sExportNotRunningFor (30m) rides out a slow start.
+      - eval_time: 20m
+        alertname: PuppetCAKubernetesExportNotRunning
+        exp_alerts: []
+      - eval_time: 40m
+        alertname: PuppetCAKubernetesExportNotRunning
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: openvox-ca
+              instance: ca-1:9140
+              kind: Secret
+              namespace: ns1
+              name: trust
+            exp_annotations:
+              summary: "A Kubernetes export target has never been attempted."
+              description: "The Puppet CA on ca-1:9140 has Secret/trust in namespace ns1 configured for export but has not attempted a single apply in 30m. The exported object holds whatever it held before, and PuppetCAKubernetesExportFailing cannot report on a target with no apply results. Check the CA logs for the Kubernetes export job starting, and for errors initialising the in-cluster client."
+      # Nothing has failed, only nothing has happened, so Failing stays quiet.
+      - eval_time: 40m
+        alertname: PuppetCAKubernetesExportFailing
+        exp_alerts: []
+
+  # A target that succeeded and then failed: the '>' arm, and the proof that a
+  # later success clears it. The two-minute retry the exporter runs after a failed
+  # cycle is what produces the second half of this timeline on a quiet CA, where
+  # the next CRL update could be weeks away.
+  - interval: 1m
+    name: a failure that a retry later clears
+    input_series:
+      # Fails at t=0, then a retry succeeds at t=25m with a newer timestamp.
+      - series: 'puppetca_k8s_export_last_error_timestamp_seconds{job="openvox-ca",instance="ca-1:9140",kind="Secret",namespace="ns1",name="trust"}'
+        values: "1000+0x60"
+      - series: 'puppetca_k8s_export_last_success_timestamp_seconds{job="openvox-ca",instance="ca-1:9140",kind="Secret",namespace="ns1",name="trust"}'
+        values: "900+0x24 2000+0x36"
+      - series: 'puppetca_k8s_export_applies_total{job="openvox-ca",instance="ca-1:9140",kind="Secret",namespace="ns1",name="trust",result="error"}'
+        values: "1+0x60"
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: PuppetCAKubernetesExportFailing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: openvox-ca
+              instance: ca-1:9140
+              kind: Secret
+              namespace: ns1
+              name: trust
+            exp_annotations:
+              summary: "A Kubernetes export target is failing to apply."
+              description: "The most recent apply of Secret/trust in namespace ns1 from ca-1:9140 failed; the exported object may hold a stale CA certificate or CRL until the next successful export. Check the CA logs, RBAC, and API server connectivity."
+      # The retry succeeded; last_success now leads and the alert resolves.
+      - eval_time: 30m
+        alertname: PuppetCAKubernetesExportFailing
+        exp_alerts: []
+
+  # Deployment-added labels must not be aggregated away. Under the shipped
+  # ServiceMonitor (honorLabels: false) Prometheus renames the exporter's
+  # `namespace` to `exported_namespace`, so two targets that differ only by
+  # export namespace -- the documented way to publish one trust bundle into
+  # several -- carry identical job/instance/kind/name. A `by` allowlist naming
+  # `namespace` would group them together and let the attempted one hide the
+  # never-attempted one; `without (result)` keeps them apart.
+  - interval: 1m
+    name: a sibling target does not mask a never-attempted one
+    input_series:
+      # ns1 is being exported normally.
+      - series: 'puppetca_k8s_export_applies_total{job="openvox-ca",instance="ca-1:9140",namespace="pki",exported_namespace="ns1",kind="Secret",name="trust",result="success"}'
+        values: "5+0x60"
+      - series: 'puppetca_k8s_export_applies_total{job="openvox-ca",instance="ca-1:9140",namespace="pki",exported_namespace="ns1",kind="Secret",name="trust",result="error"}'
+        values: "0+0x60"
+      # ns2 is configured and has never been attempted.
+      - series: 'puppetca_k8s_export_applies_total{job="openvox-ca",instance="ca-1:9140",namespace="pki",exported_namespace="ns2",kind="Secret",name="trust",result="success"}'
+        values: "0+0x60"
+      - series: 'puppetca_k8s_export_applies_total{job="openvox-ca",instance="ca-1:9140",namespace="pki",exported_namespace="ns2",kind="Secret",name="trust",result="error"}'
+        values: "0+0x60"
+    alert_rule_test:
+      - eval_time: 40m
+        alertname: PuppetCAKubernetesExportNotRunning
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: openvox-ca
+              instance: ca-1:9140
+              namespace: pki
+              exported_namespace: ns2
+              kind: Secret
+              name: trust
+            exp_annotations:
+              summary: "A Kubernetes export target has never been attempted."
+              description: "The Puppet CA on ca-1:9140 has Secret/trust in namespace pki configured for export but has not attempted a single apply in 30m. The exported object holds whatever it held before, and PuppetCAKubernetesExportFailing cannot report on a target with no apply results. Check the CA logs for the Kubernetes export job starting, and for errors initialising the in-cluster client."

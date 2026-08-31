@@ -278,11 +278,39 @@
           {
             alert: 'PuppetCAKubernetesExportFailing',
             // The most recent apply attempt for a target failed. Exports are
-            // event-driven (startup and CRL updates) and can be days apart on
-            // a quiet CA, so this compares last-error/last-success timestamps
-            // — a state that persists until a retry succeeds — rather than a
-            // rate window, which would silently resolve between attempts. The
-            // 'unless' arm catches a target that has never succeeded at all.
+            // event-driven (startup, CRL updates, and a retry after a failed
+            // cycle) and can be days apart on a quiet CA, so this compares
+            // last-error/last-success timestamps — a state that persists until
+            // a retry succeeds — rather than a rate window, which would
+            // silently resolve between attempts. The 'unless' arm catches a
+            // target that has never succeeded at all.
+            //
+            // What that design cannot see, stated here because understanding
+            // why it is right is exactly what stops you noticing: a target
+            // that fails and then recovers on retry, every cycle, never fires
+            // this rule. The CA retries a failed cycle after two minutes, so
+            // last_success overtakes last_error well inside k8sExportFailingFor
+            // and the state never holds for 'for'. That silence is deliberate
+            // and was ruled on: a failure a retry resolves is transient, and
+            // flapping should not page. The uncovered case is the target that
+            // fails on its first attempt every single cycle -- it is being
+            // exported, just never first time. Catching it needs a different
+            // rule, counting advances of last_error over a window rather than
+            // comparing it to last_success; do not reach for a longer 'for'
+            // here, which makes this rule fire less, not more. Meanwhile
+            // puppetca_k8s_export_applies_total{result="error"} counts every
+            // failed attempt whether or not a retry rescued it, and
+            // docs/metrics.md carries the query.
+            //
+            // Both arms have last_error on the left, so this rule can only fire
+            // for a target the exporter has actually written a series for. That
+            // is a contract on the exporter, not an accident: ExportAll must
+            // record a metric for every target on every cycle, whatever failed
+            // upstream. It once returned before the per-target loop when a
+            // material read failed, which wrote no series at all and made this
+            // alert unable to report the very outage it exists for.
+            // PuppetCAKubernetesExportNotRunning below is the backstop for that
+            // whole class, and mixin/tests.yaml exercises both.
             expr: |||
               puppetca_k8s_export_last_error_timestamp_seconds{%(selector)s}
                 > puppetca_k8s_export_last_success_timestamp_seconds{%(selector)s}
@@ -297,6 +325,81 @@
             annotations: {
               summary: 'A Kubernetes export target is failing to apply.',
               description: 'The most recent apply of {{ $labels.kind }}/{{ $labels.name }} in namespace {{ $labels.namespace }} from {{ $labels.instance }} failed; the exported object may hold a stale CA certificate or CRL until the next successful export. Check the CA logs, RBAC, and API server connectivity.',
+            },
+          },
+          {
+            alert: 'PuppetCAKubernetesExportNotRunning',
+            // A configured target that has never been attempted at all. This
+            // is where the two export rules' division of labour is argued;
+            // ExportAll and InitTargetMetrics in internal/k8sexport state the
+            // invariant they enforce and point here. The separate decision to
+            // leave the last_success/last_error gauges unpublished is argued
+            // where it is made, at initTargets in internal/k8sexport/metrics.go
+            // and, for operators, in docs/metrics.md.
+            //
+            // Every arm of PuppetCAKubernetesExportFailing has last_error on
+            // its left, so that rule can only speak about a target the CA has
+            // recorded a result for. It is structurally silent when the CA
+            // records nothing — and no PromQL comparison matches an absence, so
+            // no reshaping of that expression can fix it from this side. The
+            // answer has to come from the CA: publish a series for a target
+            // that has done nothing, and "nothing has happened" becomes a value
+            // that can be tested.
+            //
+            // So the CA publishes puppetca_k8s_export_applies_total at zero for
+            // every configured target before the first cycle runs, and also on
+            // the path where the export gives up before starting — an
+            // in-cluster client it cannot build, a pod namespace it cannot
+            // resolve. That path is the one worth the trouble: the CA stays up,
+            // readiness stays green, the exported objects quietly stop being
+            // updated, and a single log line is otherwise the only trace.
+            //
+            // `without (result)` rather than a `by` allowlist. Both collapse
+            // the success/error pair, but an allowlist also discards every
+            // label it does not name -- and under the chart's own defaults the
+            // label it would keep is not the one it looks like. The shipped
+            // ServiceMonitor sets honorLabels: false, so Prometheus resolves
+            // the collision on `namespace` in the target's favour and renames
+            // the exporter's to `exported_namespace`. A `by (… namespace …)`
+            // clause would then group on the CA pod's namespace, identical for
+            // every target, and drop the export namespace entirely -- so two
+            // targets differing only by namespace, which is the documented way
+            // to publish one trust bundle into several, would share a group and
+            // an attempted sibling would mask a never-attempted one. `without`
+            // keeps whatever labels the deployment actually attached, and
+            // leaves this rule carrying the same label set as
+            // PuppetCAKubernetesExportFailing so the pair routes and silences
+            // alike.
+            //
+            // Collapsing 'result' means a target that is attempted and always
+            // fails is not caught here
+            // (that is Failing's job, and the two cannot both fire: a zero sum
+            // means no result was ever recorded, so there is no last_error for
+            // Failing to match). Only a target attempted zero times matches.
+            // The counter resets to zero on restart and the startup export runs
+            // immediately, so k8sExportNotRunningFor only has to outlast a slow
+            // start.
+            //
+            // It does not cover a crashlooping CA, and must not be read as
+            // doing so. A pod that keeps restarting fails scrapes; Prometheus
+            // writes staleness markers, the instance stops being returned, and
+            // this rule's 'for' clock resets rather than accumulating. That is
+            // PuppetCAExporterDown's job (downFor, 5m), and it is the better
+            // alert for it. What this rule covers is the opposite shape: a CA
+            // that stays up, scrapes cleanly, and reports readiness while its
+            // export job does nothing.
+            expr: |||
+              sum without (result) (
+                puppetca_k8s_export_applies_total{%(selector)s}
+              ) == 0
+            ||| % {
+              selector: $._config.puppetCASelector,
+            },
+            'for': $._config.k8sExportNotRunningFor,
+            labels: { severity: 'warning' } + $._config.alertLabels,
+            annotations: {
+              summary: 'A Kubernetes export target has never been attempted.',
+              description: 'The Puppet CA on {{ $labels.instance }} has {{ $labels.kind }}/{{ $labels.name }} in namespace {{ $labels.namespace }} configured for export but has not attempted a single apply in %(k8sExportNotRunningFor)s. The exported object holds whatever it held before, and PuppetCAKubernetesExportFailing cannot report on a target with no apply results. Check the CA logs for the Kubernetes export job starting, and for errors initialising the in-cluster client.' % { k8sExportNotRunningFor: $._config.k8sExportNotRunningFor },
             },
           },
         ],

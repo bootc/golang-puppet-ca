@@ -66,7 +66,26 @@
     // newer than last-success). Exports are event-driven and can be days apart
     // on a quiet CA, so the alert is stateful and stays firing until a retry
     // succeeds; 'for' only debounces a failure that is corrected moments later.
+    //
+    // Keep it comfortably above the CA's export retry interval, which is a
+    // compile-time constant of two minutes and not configurable. Lowering this
+    // below that pages on every blip the retry would have cleared by itself;
+    // raising it leaves a persistently failing target unreported for longer.
+    //
+    // This knob cannot reach the case where a target fails its first attempt
+    // and succeeds on retry every cycle: last_success overtakes last_error
+    // within the retry interval, so at any value above two minutes that target
+    // is invisible here whatever you set. Watch applies_total{result="error"}
+    // instead — docs/metrics.md carries the query.
     k8sExportFailingFor: '15m',
+
+    // A configured target the exporter has never attempted at all — the gap
+    // that the alert above, which needs an apply result to match on, cannot
+    // see. The apply counters reset on restart and the startup export runs
+    // straight away, so this only has to outlast a slow start (a large target
+    // list, a slow API server); 30m leaves plenty of room without letting a
+    // wedged export job sit unreported for hours.
+    k8sExportNotRunningFor: '30m',
 
     // 'for' durations applied to the expiry alerts to debounce flapping at the
     // threshold boundary.

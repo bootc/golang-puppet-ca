@@ -204,8 +204,9 @@ with no issued certificate), `signed`, or `revoked`.
 
 Only present when [Kubernetes export](kubernetes-export.md) targets are
 configured. Export failures are logged but never stop the CA, so these series
-are the way to alert on a target that persistently fails. One series per
-configured target (cardinality is bounded by the configuration).
+are the way to alert on a target that persistently fails. Two `applies_total`
+series per configured target, plus up to one of each timestamp gauge;
+cardinality is bounded by the configuration.
 
 | Metric | Labels | Description |
 | --- | --- | --- |
@@ -213,13 +214,34 @@ configured target (cardinality is bounded by the configuration).
 | `puppetca_k8s_export_last_success_timestamp_seconds` | `kind`, `namespace`, `name` | Time of the last successful apply for each target. |
 | `puppetca_k8s_export_last_error_timestamp_seconds` | `kind`, `namespace`, `name` | Time of the last failed apply for each target. |
 
-> Exports are event-driven (startup and CRL updates) and can be days apart on a
-> quiet CA, so alert by comparing `last_error` against `last_success` (the
-> mixin's `PuppetCAKubernetesExportFailing` does this) rather than with rate
-> windows or staleness thresholds, which misbehave between sparse attempts. A
-> cycle that fails before any target is applied — the cert/CRL cannot be read
-> from storage — touches none of these series, but storage failures already
-> trip `PuppetCAScrapeFailing` via `puppetca_collector_scrape_success`.
+> Exports are event-driven (startup, CRL updates, and a retry a couple of
+> minutes after a failed cycle) and can be days apart on a quiet CA, so alert by
+> comparing `last_error` against `last_success` (the mixin's
+> `PuppetCAKubernetesExportFailing` does this) rather than with rate windows or
+> staleness thresholds, which misbehave between sparse attempts.
+
+Every configured target gets a result recorded on every cycle, including one
+where the CA certificate or CRL could not be read from storage: such a read
+fails the targets that asked for that material and leaves the rest alone. This
+matters for alerting, because `PuppetCAKubernetesExportFailing` has
+`last_error` on the left of both its arms and so can only speak about targets
+that have a series at all.
+
+The two `applies_total` children of each target are published at zero before
+the first cycle runs — and also when the export fails to start at all, so a
+Kubernetes client that cannot be built is reported rather than merely logged.
+Without that, a configured-but-never-attempted target would be an absent
+series, indistinguishable from a target that is not configured, and no
+threshold can match an absence. The mixin's
+`PuppetCAKubernetesExportNotRunning` alerts on that zero.
+
+The timestamp gauges are deliberately *not* published this way. A `last_success`
+of zero is not a neutral placeholder: it asserts that the last successful export
+happened in 1970, which poisons any `time() - last_success` staleness query or
+dashboard panel written against a gauge whose help text promises the time of the
+last successful apply. (Alert coverage would survive it — a never-succeeded
+target still trips the `last_error > last_success` arm against a zero — but the
+`unless` arm would become dead code and every derived query would lie.)
 
 ## Example queries
 
@@ -242,6 +264,17 @@ puppetca_k8s_export_last_error_timestamp_seconds
 or
 puppetca_k8s_export_last_error_timestamp_seconds
   unless puppetca_k8s_export_last_success_timestamp_seconds
+
+# Kubernetes export targets configured but never attempted
+sum without (result) (
+  puppetca_k8s_export_applies_total
+) == 0
+
+# Export targets that keep needing a retry to succeed. No shipped alert covers
+# this: the CA retries a failed cycle after two minutes, well inside the
+# fifteen-minute debounce on PuppetCAKubernetesExportFailing, so a target that
+# fails first and succeeds second every cycle never pages.
+increase(puppetca_k8s_export_applies_total{result="error"}[6h]) > 0
 
 # Replicas enforcing a CRL behind the stored one (see below)
 puppetca_crl_number - puppetca_crl_cached_number > 0

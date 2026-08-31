@@ -150,8 +150,24 @@ resources to the minimum above.
   (e.g. openvox-ca is not running in a cluster, or the namespace cannot be
   resolved), the error is logged and the CA continues serving normally.
 - A failure applying one target is logged and does not prevent the other targets
-  from being applied. Transient failures are retried on the next CRL update, or
-  on the next restart.
+  from being applied.
+- A cert or CRL that cannot be read from storage fails only the targets that
+  asked for that material: a CRL-only target is still applied when the CA
+  certificate read fails, and vice versa. Every target still gets a result
+  recorded either way, which is what the alerting below depends on.
+- A cycle in which any target failed is retried two minutes later, and keeps
+  being retried until one succeeds completely. Without that, the next attempt
+  would wait for the next CRL update, which on a low-churn CA can be weeks —
+  long enough for a momentary storage blip to leave every target holding a stale
+  CA certificate or CRL. The interval is fixed and not configurable.
+- Because two minutes sits inside the mixin's fifteen-minute alert debounce, a
+  failure that clears on the first retry or two never pages; one that takes
+  longer than the debounce to clear still does. The deliberate gap is a target
+  that fails its first attempt but succeeds on retry *every* cycle — it never
+  pages, because `last_success` always overtakes `last_error` within two
+  minutes. Watch `puppetca_k8s_export_applies_total{result="error"}`, which
+  counts every failed attempt whether or not a retry rescued it; see
+  [metrics](metrics.md) for the query.
 - Configuration is validated at startup; an invalid `kubernetes_export` block
   (bad `kind`, a `type` on a ConfigMap, neither `cert` nor `crl`, colliding
   keys, …) stops the server with a clear error.
@@ -165,6 +181,32 @@ recent outcomes. Because export failures are only logged, alerting on these
 series is the recommended way to catch a target that persistently fails; the
 [monitoring mixin](../mixin/) ships a `PuppetCAKubernetesExportFailing` alert
 that fires while a target's most recent apply attempt failed.
+
+That alert matches on the `last_error` gauge, so it can only report on a target
+the CA has recorded a result for. The mixin pairs it with
+`PuppetCAKubernetesExportNotRunning`, which fires when a configured target's
+`applies_total` has stayed at zero for thirty minutes — the export job wedged
+before attempting anything, or never started at all.
+
+"Never started" is covered because the CA publishes those counters at zero even
+when it gives up on the export: if the in-cluster client cannot be built, or the
+pod namespace cannot be resolved, the CA logs the error, carries on serving, and
+still exports the zeroed counters. That case is otherwise entirely silent —
+readiness stays green and the exported objects simply stop being updated — so
+without the zeroed series neither alert could report it. Deploy both.
+
+When the export never started, a target that relies on the pod namespace shows
+a blank namespace in that alert. That is not a glitch, and it does tell you
+something — but less than it looks. The implication runs one way only: a blank
+means the export never started, because a running exporter always resolves a
+real namespace before it publishes anything. A target wedged *after* starting
+shows its resolved namespace like any other, so a namespace you did not
+configure appearing here is the wedged case, not this one. It does *not*
+say which startup failure occurred: the placeholder is used for both, including
+the case where the client could not be built and the namespace file was never
+read. RBAC and the API server are ruled out, since nothing was attempted; to
+tell the remaining causes apart, read the `Kubernetes export disabled: failed
+to initialise client` line in the CA log, which names the actual error.
 
 ## Limitations
 

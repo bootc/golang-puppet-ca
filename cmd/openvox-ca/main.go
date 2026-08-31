@@ -747,12 +747,10 @@ func newRootCmd() *cobra.Command {
 				if exporter != nil {
 					k8sMetrics = k8sexport.NewMetrics(exporter.Registry())
 				}
-				k8sExporter, err := k8sexport.NewInCluster(cfg.KubernetesExport, store, k8sMetrics)
-				if err != nil {
-					slog.Error("Kubernetes export disabled: failed to initialise client", "error", err)
-				} else {
-					go runK8sExporter(ctx, myCA, k8sExporter)
-				}
+				startK8sExport(ctx, myCA, cfg.KubernetesExport, k8sMetrics,
+					func() (*k8sexport.Exporter, error) {
+						return k8sexport.NewInCluster(cfg.KubernetesExport, store, k8sMetrics)
+					})
 			}
 
 			shutdownDone := make(chan struct{})
