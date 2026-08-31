@@ -422,7 +422,8 @@ for a `reason` field of `route requires admin access` — rendered
 `reason="route requires admin access"` on stderr, and
 `"reason":"route requires admin access"` when `logfile` is set, since that
 selects the JSON handler. The message is `Request denied by authorisation
-middleware` and the CN is in `client_cn`.
+middleware` and the client is in `client.cn`, beside the `client.domain` that
+vouched for the name.
 
 First, be clear what restoring it costs. Admin is a single boolean
 (`isAdmin`), not a per-route grant, so both of the options that preserve
@@ -436,12 +437,26 @@ to fix a status poll can also sign and revoke certificates.
 If the caller only needs to observe state, `GET /certificate/{subject}` and the
 CRL are both public and need no grant at all.
 
-Two ways to restore authenticated access, in order of preference:
+**First check which trust domain the caller was attributed to**, because it
+decides whether either remedy below can work at all. Both are scoped to
+certificates **this CA issued**. If the caller holds a certificate from a
+[`client_ca`](configuration.md#trusting-client-certificates-from-another-ca)
+issuer — the usual shape when the servers and operators administering this CA
+sit under a sibling intermediate — then neither `--puppet-server` nor
+`pp_cli_auth` reaches them: their admin grant is that entry's `admin_cns` and
+`allow_pp_cli_auth`. The denial log line carries a `client.domain` field naming the
+domain the certificate was attributed to, beside `client.cn` and `reason`.
+
+For a caller this CA issued, two ways to restore authenticated access, in order
+of preference:
 
 1. **Add the caller's CN to the admin allow list** — `--puppet-server`, or
    `--puppet-server-file` for one CN per line. Authentication is preserved and
-   the grant is explicit. Both are read once at startup, so the CA must be
-   restarted before the change takes effect. Grants full admin, as above.
+   the grant is explicit. `--puppet-server` is frozen at startup, so changing it
+   needs a restart; `--puppet-server-file` is re-read on `SIGHUP` — see
+   [reloading configuration](configuration.md#reloading-configuration) — which
+   is the reason to prefer the file where the set will change. Grants full
+   admin, as above.
 2. **Give the caller a certificate carrying `pp_cli_auth`**, which is how
    OpenVox Server's own CLI authenticates. It is the *more* invasive of the
    two, not the less: authorisation-arc OIDs are stripped from submitted CSRs (see
@@ -472,10 +487,14 @@ holds, so on a replica that has not yet synced a revoked certificate gets past
 the middleware and is refused here instead — `403 access denied` either way.
 That is deliberate, and it is why revoking cannot be outrun by renewing.
 
-The issuer requirement is not reachable yet: the middleware trusts exactly this
-CA's certificate, so a foreign one never reaches the handler. It starts earning
-its place once a second issuer can be trusted for client authentication, and
-answers `403 certificate not eligible for renewal` when it does.
+The issuer requirement is reachable once a `client_ca` entry is configured: the
+middleware then trusts a second issuer for authentication, while renewal stays
+scoped to this CA's own namespace. A foreign certificate authenticates, may be
+an administrator of its own domain, and is still answered `403 certificate not
+eligible for renewal` — renewal reissues under our authority using the presented
+certificate's subject, which is only safe for names we assigned. With no
+`client_ca` configured there is one trust domain and the requirement is
+unreachable, exactly as before.
 
 The third is a defence-in-depth invariant on the internal API rather than
 something a request can trip: the HTTP handler derives the subject from the
