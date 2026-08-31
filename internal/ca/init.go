@@ -98,6 +98,11 @@ func (c *CA) Init(ctx context.Context) error {
 		return fmt.Errorf("CA misconfigured: ExternalSigner and KeyProvider are mutually exclusive")
 	}
 
+	// Size the CA-key signing bound before anything can sign. Init itself
+	// signs on the bootstrap path, so this has to precede that rather than
+	// merely precede serving.
+	c.initSigningBound()
+
 	if err := c.Storage.EnsureDirs(ctx); err != nil {
 		return err
 	}

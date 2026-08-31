@@ -71,7 +71,16 @@ func (c *CA) signCRLLocked(ctx context.Context, prev *storedCRL, revoked []x509.
 		NextUpdate:                now.Add(c.CRLValidityDuration()),
 	}
 
+	// Take a CA-key signing slot for the signature below. This queues rather
+	// than sheds: a CRL that could not be re-signed is a revocation that did
+	// not land, which is a correctness failure and not a load-shedding
+	// opportunity. See signbound.go for why waiting here is bounded.
+	if err := c.acquireSigningSlot(ctx); err != nil {
+		c.crlUpdateFailures.Add(1)
+		return fmt.Errorf("waiting for a CA signing slot to re-sign the CRL: %w", err)
+	}
 	crlBytes, err := x509.CreateRevocationList(rand.Reader, template, c.CACert, c.CAKey)
+	c.releaseSigningSlot()
 	if err != nil {
 		c.crlUpdateFailures.Add(1)
 		return fmt.Errorf("failed to sign CRL: %w", err)

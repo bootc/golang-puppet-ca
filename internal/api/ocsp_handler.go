@@ -73,7 +73,24 @@ func (s *Server) handleOCSP(w http.ResponseWriter, r *http.Request) {
 	answer, err := s.CA.AnswerOCSP(r.Context(), reqDER)
 	if err != nil {
 		w.Header().Set("Content-Type", "application/ocsp-response")
-		if errors.Is(err, ca.ErrInternal) {
+		if errors.Is(err, ca.ErrSigningBusy) {
+			// The CA-key signing bound was full: this responder is at the
+			// concurrency its operator configured for the deployment's signer.
+			// RFC 6960 §2.3 `tryLater` is precisely this case — the request was
+			// well formed and nothing is broken, there was simply no capacity —
+			// and it tells a verifier to come back rather than to treat the
+			// certificate as unverifiable.
+			//
+			// Logged at Warn, not Error: a shed is the bound working. It is
+			// worth an operator's attention because it may mean the limit is
+			// below what the deployment needs, but it is not a fault. The
+			// counter behind puppetca_ca_signing_shed_total is the thing to
+			// alert on; this line is for working out which caller provoked it.
+			slog.Warn("OCSP response shed: CA signing concurrency limit reached",
+				"client_ip", clientIP(r))
+			w.WriteHeader(http.StatusServiceUnavailable)
+			w.Write(xocsp.TryLaterErrorResponse)
+		} else if errors.Is(err, ca.ErrInternal) {
 			slog.Error("OCSP internal error", "error", err)
 			w.WriteHeader(http.StatusInternalServerError)
 			w.Write(xocsp.InternalErrorErrorResponse)
