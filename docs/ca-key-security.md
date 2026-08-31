@@ -55,6 +55,43 @@ The same isolation is why the shipped systemd unit sets `LimitCORE=0` and
 withholds `$NOTIFY_SOCKET` from the signer — see
 [running under systemd](systemd.md).
 
+### The signer is a shared, unbounded resource
+
+Every signature the CA makes crosses the socketpair to this one process:
+certificate issuance, CRL re-signing, **and OCSP responses**. Two properties of
+that path are worth knowing together, because neither is obvious from the other.
+
+**OCSP signing does not serialise, and `/ocsp` is unauthenticated.** Issuance
+holds the CA's process-wide lock across its signing call, so it proceeds at
+roughly one round trip at a time. The OCSP responder does not
+([#197](https://github.com/voxpupuli/openvox-ca/issues/197)) — that was the
+point of the change — so concurrent OCSP requests become concurrent signer
+round trips. The endpoint is public by design (verifiers query it before they
+hold a client certificate), the only rate limiter in the server applies to CSR
+submission, and a response that misses the cache signs. An RFC 8954 nonced
+request misses on every request.
+
+**`RemoteSigner.Sign` carries no deadline.** Unlike the OpenBao Transit path,
+whose every call is bounded by the login timeout, the isolated signer's RPC has
+no timeout of its own. A signer that stops answering therefore blocks its caller
+until the request is abandoned from elsewhere.
+
+Together these mean OCSP load and issuance load contend for one signer with no
+aggregate bound, and the deployment that has *fewer* bounds than the OpenBao one
+is the default. This is tracked as
+[#274](https://github.com/voxpupuli/openvox-ca/issues/274), which is where a
+configurable cap would land if one is added. Until then:
+
+- If `/ocsp` is reachable by untrusted clients, front it with a cache or a
+  proxy-level rate limit. That is the only bound available today.
+- Watch OCSP request rates alongside issuance latency. There is no CA-side
+  metric for in-flight signatures yet (also #274), so a rise in issuance latency
+  with no rise in issuance *rate* is the signal that OCSP is crowding it out.
+
+The equivalent note for the OpenBao Transit backend is in
+[the OpenBao Transit guide](openbao-transit.md) under "Performance and outage
+behaviour".
+
 ## CA key encryption at rest
 
 By default, the CA private key is stored as unencrypted PEM at `<cadir>/private/ca_key.pem`.

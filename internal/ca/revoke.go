@@ -429,7 +429,7 @@ func (c *CA) IsRevokedSerial(ctx context.Context, serial *big.Int) (bool, error)
 // freshly read from storage.
 //
 // Two callers deliberately keep their own loop, because a bool cannot carry
-// what they need from the matched entry: ocsp.go's isRevokedSerial wants the
+// what they need from the matched entry: ocsp.go's decideOCSPStatus wants the
 // RevocationTime for the OCSP response, and revokeSerialLocked wants it to
 // project into the certificate index. Change the predicate here and check
 // those two.

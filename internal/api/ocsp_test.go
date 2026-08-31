@@ -20,10 +20,13 @@ package api_test
 import (
 	"bytes"
 	"context"
+	"crypto"
 	"crypto/rand"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/pem"
+	"errors"
+	"io"
 	"math"
 	"net/http"
 	"net/http/httptest"
@@ -55,6 +58,17 @@ func setupOCSPServer(dir string) (*ca.CA, http.Handler) {
 	Expect(myCA.Init(context.Background())).To(Succeed())
 	srv := api.New(myCA)
 	return myCA, srv.Routes()
+}
+
+// brokenSigner stands in for a signer backend that has stopped answering — an
+// unreachable OpenBao, or an isolated signer process that has gone away. It
+// keeps the public key so nothing upstream of the signature notices.
+type brokenSigner struct{ inner crypto.Signer }
+
+func (b *brokenSigner) Public() crypto.PublicKey { return b.inner.Public() }
+
+func (b *brokenSigner) Sign(io.Reader, []byte, crypto.SignerOpts) ([]byte, error) {
+	return nil, errors.New("signer backend unavailable")
 }
 
 // signCert is a helper that submits a CSR and signs it, returning the leaf cert.
@@ -244,6 +258,34 @@ var _ = Describe("OCSP HTTP Handler", func() {
 	})
 
 	// --- Cache-Control ---
+
+	// The 500-vs-400 distinction is the externally observable half of the
+	// signing-failure reclassification, and the half a verifier acts on: RFC 6960
+	// internalError may be retried, malformedRequest says the request was at
+	// fault and should not be. A signer outage is neither the client's doing nor
+	// something it can fix by rephrasing.
+	//
+	// Pinned at the HTTP layer as well as in internal/ca because a regression
+	// here is silent on our side — responses keep being produced, nothing errors
+	// in CI, and the only symptom is verifiers declining to retry an outage,
+	// which shows up in their logs rather than ours.
+	It("answers a signer failure with 500 internalError, not 400 malformedRequest", func() {
+		cert := signCert(myCA, "signer-failure-node")
+		reqDER := ocspReqDER(cert, myCA.CACert)
+
+		// Break the signer only after the certificate exists, so the failure
+		// under test is the OCSP response signature and nothing earlier.
+		myCA.CAKey = &brokenSigner{inner: myCA.CAKey}
+
+		req := httptest.NewRequest(http.MethodPost, "/ocsp", bytes.NewReader(reqDER))
+		rr := httptest.NewRecorder()
+		mux.ServeHTTP(rr, req)
+
+		Expect(rr.Code).To(Equal(http.StatusInternalServerError),
+			"a signer outage is a server fault, not a malformed request")
+		Expect(rr.Body.Bytes()).To(Equal(xocsp.InternalErrorErrorResponse))
+		Expect(rr.Body.Bytes()).NotTo(Equal(xocsp.MalformedRequestErrorResponse))
+	})
 
 	It("GET response carries Cache-Control: max-age=..., public", func() {
 		cert := signCert(myCA, "cc-ocsp-node")

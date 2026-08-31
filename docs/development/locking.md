@@ -274,19 +274,45 @@ That costs nothing in ordering: a rejection and a `Generate` for the same name
 serialise on `subject:<name>`, which both take, in every process rather than
 merely within one. `c.mu` was never what stood between them.
 
-`c.mu` is also held across the signing call itself. Every issuance path (`Sign`,
-`SignWithTTL`, `SaveRequest`'s autosign, `Renew`, `AutoRenew`,
-`ImportCertificate`, `Generate`) calls `issueLeafLocked` with `c.mu` held, and
-`x509.CreateCertificate` runs inside it — so with an external key provider
-(`ca_key_provider: openbao`, or the isolated signer) `c.mu`, not the per-subject
-cluster lock, is the process-wide issuance serialiser, and it spans a
-network/IPC round trip. Issuance therefore proceeds at roughly one signing
-round trip at a time within a process, and a stalled signer backend pins the
-mutex and stalls all issuance — see the "Performance and outage behaviour"
-section of [the OpenBao Transit guide](../openbao-transit.md). This is the one
-deliberate exception to rule 3 (keep expensive work outside the lock): the
-signature is inside the lock because the cache update it guards must be atomic
-with the issuance.
+`c.mu` is held across the signing call itself **on the issuance paths**. Every
+one of them (`Sign`, `SignWithTTL`, `SaveRequest`'s autosign, `Renew`,
+`AutoRenew`, `ImportCertificate`, `Generate`) calls `issueLeafLocked` with
+`c.mu` held, and `x509.CreateCertificate` runs inside it — so with an external
+key provider (`ca_key_provider: openbao`, or the isolated signer) `c.mu`, not
+the per-subject cluster lock, is the process-wide issuance serialiser, and it
+spans a network/IPC round trip. Issuance therefore proceeds at roughly one
+signing round trip at a time within a process, and a stalled signer backend
+pins the mutex and stalls all issuance — see the "Performance and outage
+behaviour" section of [the OpenBao Transit guide](../openbao-transit.md). This
+is the one deliberate exception to rule 3 (keep expensive work outside the
+lock): the signature is inside the lock because the cache update it guards must
+be atomic with the issuance.
+
+**The OCSP responder is not in that set, and the difference is worth stating
+because it used to be.** `AnswerOCSP` reads what it needs under `c.mu.RLock` —
+whether the serial is in `serialIndex`, the `cachedCRL` pointer, `CACert` and
+`CAKey` — releases, and signs holding no CA lock at all; it re-takes the write
+lock only to store the finished response, and only when there is one to store —
+a nonced or `unknown` answer is never cached, so those take no write lock at
+all. It can do this and issuance cannot because the two guard different
+things. An issuance *mutates* storage, so its
+cache update has to be atomic with the write. A response is *derived* from
+state the responder only reads, so the equivalent obligation is weaker: not
+"nothing may change while I sign", but "do not cache an answer that stopped
+being true while I signed". `AnswerOCSP` discharges that by re-deciding the
+status under the write lock and dropping the cache write if it moved — see
+[#197](#known-gaps). A revocation landing mid-signature therefore costs a
+re-sign on the next request, and the response it overtook is emitted with
+`MaxAge` zero so no shared cache stores it.
+
+What that does *not* undo is the `NextUpdate` already inside the signed
+response: it says four hours, and it cannot be changed without re-signing. A
+verifier that keeps the response for its stated validity may therefore hold a
+`good` that was true when signed and is not now. That residue is not new — the
+pre-#197 arrangement produced the identical artefact whenever a revocation sat
+waiting on `c.mu` behind a response being signed — and the window is the
+signature rather than the whole request. It is the reason the CRL, not OCSP
+response lifetime, is what a revocation is ultimately enforced by.
 
 `c.mu` is non-reentrant. The same `...Locked` suffix convention applies: e.g.
 `revokeLocked` requires the cluster `crl` lock **and** `c.mu`; each `...Locked`
@@ -396,8 +422,28 @@ Read-only operations must stay cheap and must keep working while another
 replica holds a lock. The pattern:
 
 - **Authentication revocation checks** (`IsRevokedSerial`) and **OCSP**
-  (`OCSPResponse` fast path) answer from `cachedCRL`/`ocspCache`/`serialIndex`
-  under `c.mu.RLock`.
+  (`AnswerOCSP`) answer from `cachedCRL`/`ocspCache`/`serialIndex` under
+  `c.mu.RLock`. A *cacheable* miss — no nonce, and a definite status — is not
+  wholly a read path: it ends by taking the write lock to re-check and store.
+  It still takes its snapshot under the same `RLock` and signs outside it, so
+  what it holds these readers off across is **a CRL scan plus a map write**,
+  rather than a signer round trip. The scan is `decideOCSPStatus` re-deciding
+  the status before the entry is stored — the check that makes the race guard
+  sound — and it is linear in the number of revoked certificates, so it is the
+  part of that window which grows with the CRL. Naming only the map write would
+  understate it by leaving out the one term that scales. Go's `RWMutex` gives
+  that waiting writer priority, so the store does briefly stall new `RLock`
+  acquisitions.
+
+  That window is not a cost #197 added: the pre-#197 code ran the same scan
+  under the same exclusive lock, and a signature besides. What changed is that
+  the signer round trip left it, which is the whole of the improvement — but
+  the remaining window is a scan and a map write, not a map write. The
+  guarantee is about the signature, not about never blocking.
+
+  A nonced miss and an `unknown` are never cached, so they take no write lock at
+  all — which matters, because the nonced request is the motivating case: it
+  misses on every request.
 - **HTTP GETs** (certificate, CRL, status listings) read straight through
   `StorageService` getters, which take only the relevant tier-2 read lock.
 - `ReadInventory` verifies the integrity HMAC under `inventoryMu.RLock` but
@@ -442,11 +488,15 @@ path — still provides no cross-replica guarantee anyway.
    assembles a CSR at all — that round trip through the signing path was
    removed); parsing and validation in `Renew`/`SaveRequest` likewise. Only the
    storage-touching tail belongs inside. The deliberate exception is the CA
-   signature itself: `x509.CreateCertificate` runs under `c.mu` (see Tier 3),
-   because the cache update it guards must be atomic with the issuance.
+   signature *on the issuance paths*: `x509.CreateCertificate` runs under
+   `c.mu` (see Tier 3), because the cache update it guards must be atomic with
+   the issuance. The OCSP responder's signature is not an exception — it signs
+   outside the lock and re-checks before caching, which is the shape to copy
+   for anything else that signs from state it only reads.
 4. **Respect the ordering** (`subject` → `crl` → `c.mu`, and `bootstrap` →
    `crl` on the CA-import path), never acquire the same lock reentrantly, and
-   release `c.mu` before entering another `WithLock`. Use the closure-with-defer shape from `Renew`/`AutoRenew` so a
+   release `c.mu` before entering another `WithLock`. Use the
+   closure-with-defer shape from `Renew`/`AutoRenew` so a
    panic can't wedge a mutex.
 5. **Calling convention:** public CA methods take their own locks and say so
    ("The caller must NOT hold c.mu"); internal `...Locked` helpers document
@@ -597,12 +647,118 @@ path — still provides no cross-replica guarantee anyway.
 Concurrency limitations that are understood and tracked. This list reflects the
 state when the document was last updated and is not guaranteed exhaustive.
 
-- [#197](https://github.com/voxpupuli/openvox-ca/issues/197) — OCSP's slow
+- ~~[#197](https://github.com/voxpupuli/openvox-ca/issues/197) — OCSP's slow
   path signs responses while holding `c.mu` exclusively, so nonced requests
   (which always miss the cache) serialise process-wide behind the signing
-  round trip. This is the same "signature under `c.mu`" property as the
-  issuance paths (see Tier 3) surfacing on the OCSP responder; an efficiency
-  gap rather than a correctness one.
+  round trip.~~ Fixed. `AnswerOCSP` now snapshots the decision inputs under
+  `c.mu.RLock`, signs holding no CA lock, and re-takes the write lock only to
+  store the result — and only when there is a result to store, since a nonced
+  or `unknown` answer is never cached and so takes no write lock at all.
+  Concurrent responses sign in parallel, and neither they nor the `c.mu.RLock`
+  readers on the authentication path queue behind **the responder's** signer
+  round trip.
+
+  That qualifier is not decoration. **Issuance still holds `c.mu` exclusively
+  across its signature** — deliberately, see Tier 3 — so an authentication-path
+  `IsRevokedSerial` can still queue behind a signer round trip; it is just an
+  issuance's rather than a responder's. Do not assume that wait is short:
+  under `ca_key_provider: openbao` it is bounded by roughly *twice* the
+  configured login timeout, not once — `openbao.Signer.Sign` records why, the
+  403 path's `Reauth` taking a mutex that does not honour a context — and under
+  the isolated signer `RemoteSigner.Sign` issues a `net/rpc` call carrying no
+  deadline at all, so it is not bounded. An unnonced OCSP request can likewise
+  block on `c.mu.Lock()` for its optional cache write while an issuance holds
+  the lock. Anyone diagnosing a stalled authentication
+  path should still look at the signer.
+
+  **What the restructure had to add, and why anything else narrowing a lock
+  around a cache needs the same.** Signing outside `c.mu` opens a window the
+  serialised version did not have: a revocation can land between the status
+  snapshot and the cache write. Storing unconditionally would put a pre-signed
+  `good` back *after* `installCachedCRLLocked` evicted it, where it would be
+  served for `OCSPValidity` — reintroducing, by a different door, exactly the
+  staleness the #183 entry below closed. `AnswerOCSP` therefore re-decides the
+  status under the write lock (`decideOCSPStatus`, the same function the response
+  was built from) and skips the cache write if the answer moved, emitting the
+  response with `MaxAge` zero so nothing downstream stores it either. Evicting
+  locally while still handing a shared proxy a four-hour licence would only be
+  half a guard — the same argument `AnswerOCSP` already makes about `unknown`.
+  The response already signed is still returned, since an OCSP response is a
+  statement about its `ThisUpdate`/`NextUpdate` window and the pre-fix code
+  returned an equally stale one whenever a revocation was waiting behind the
+  lock.
+
+  The predicate is re-run rather than a generation counter compared. Both work;
+  re-running settles the question a later reader of the cache actually has, and
+  survives a third eviction path being added. `serialIndexEpoch` is the counter
+  shape, and the #183 entry below says why the index sync has to use it —
+  that path cannot re-check its own predicate, and this one can.
+
+- [#274](https://github.com/voxpupuli/openvox-ca/issues/274) — unbounded
+  concurrent signing on `/ocsp`, opened by the #197 fix above. Recorded here
+  because closing one gap opened another, and a known-gaps list that only
+  records what was closed is misleading.
+
+  Before #197, `c.mu` capped CA-key use at **one signature in flight
+  process-wide**: every `CAKey.Sign` call site — `issueLeafLocked`,
+  `signCRLLocked` and the OCSP responder — held it. Signing outside the lock
+  removes that bound for OCSP, and nothing replaces it. `/ocsp` is
+  unauthenticated by design (`tierPublic` in
+  [auth.go](../../internal/api/auth.go)), the package's only rate limiter is
+  CSR-only, and a cache *miss* signs — so an unauthenticated caller can drive
+  as many concurrent CA-key signatures as it can open connections.
+
+  **This relocates a denial of service rather than creating one.** The same
+  flood previously stalled openvox-ca itself by queueing on the mutex, which is
+  the bug #197 exists to fix. What is new is where it lands: against
+  `ca_key_provider: openbao` or an isolated signer, N in-flight requests are N
+  concurrent operations on the CA key with no aggregate cap, and that signer is
+  shared with issuance and CRL re-signing. A mutex queue drains; a saturated
+  signing backend serving other consumers does not, and it takes issuance down
+  with it. `openbao.Signer.Sign` bounds each call — by roughly twice the login
+  timeout, as the #197 entry above sets out — but nothing bounds how many run at
+  once, and under the isolated signer `RemoteSigner.Sign` carries no per-call
+  deadline either.
+
+  The missing half is a cap on concurrent signing — a semaphore around the
+  signature sized to the signer's capacity — which is deliberately not attempted
+  in the #197 change: the right size is a property of the deployment's signer,
+  so it is configuration and a design decision rather than a lock-scope fix. A
+  rate limit in front of `/ocsp` would address the same exposure from the other
+  end; extending the existing CSR limiter to that route was raised in review and
+  declined for the same reason, since throttling a public revocation-status
+  endpoint changes what verifiers see and is a decision in its own right.
+
+  What #197 *did* take is the cheap half that needs no size: `AnswerOCSP` checks
+  `ctx.Err()` immediately before signing, so a request whose client has already
+  disconnected — or whose server deadline has expired — does not spend a signer
+  round trip on an answer nobody can receive. That sheds load; it does not bound
+  it, and it is not offered as a substitute.
+
+  **No metric covers either of these.** The raced cache write logs, and nothing
+  counts it; concurrent signing has no gauge at all. An operator cannot tell
+  "this never happens" from "this happens throughout every CRL update", and the
+  same is true of a caller saturating the signer. Raised in review and left out
+  of #197 as scope — this repository ships a Prometheus mixin and adding series
+  to it is its own change — but it belongs with whatever closes the gap above,
+  because a bound nobody can observe being approached is only half an answer.
+
+  Two smaller consequences of the same restructure, both deliberate:
+
+  - **Concurrent misses for one serial no longer coalesce.** The pre-#197 code
+    re-checked the cache after taking the write lock, so N goroutines racing on
+    one uncached serial cost one signature and N-1 cache hits. They now cost N
+    signatures. #197 sanctions this outright ("tolerating the benign race where
+    two goroutines both sign the same serial and one result wins"), and the
+    attacker case was never bounded by it since varying the serial is free. The
+    case worth knowing is legitimate: the first burst after a restart, or after
+    an eviction of a serial many verifiers poll, stampedes rather than
+    coalescing. A `singleflight` around the signature would close it, at the
+    cost of promoting `golang.org/x/sync` to a direct dependency.
+  - **A signing failure is now a routine degradation path**, not a rarity, so it
+    is reported as RFC 6960 `internalError` rather than `malformedRequest` —
+    the latter tells a verifier not to retry and logs an outage as a client
+    error.
 - [#201](https://github.com/voxpupuli/openvox-ca/issues/201) — `CA.Init`'s slow
   path can re-enter the `bootstrap` lock (via `finishLoadExisting` →
   `seedSupportingState`) and deadlock startup, because `WithLock` is not
@@ -785,6 +941,31 @@ refused and that the lock frees itself when that process is **SIGKILLed** — no
 orderly release, so the kernel dropping the descriptor is the only thing that
 can explain it. That is the property the whole flock-over-lockfile choice rests
 on, and it is asserted rather than assumed.
+
+The opposite property — that a lock is *not* held — is automated in
+[ocsplockscope_test.go](../../internal/ca/ocsplockscope_test.go), which is what
+rule 3 points at when it calls the OCSP responder "the shape to copy". It parks
+a wrapped `crypto.Signer` inside `Sign` so a signature can be held open, and
+splits into two pairs.
+
+Two specs pin the **scope**: an unrelated `c.mu.RLock` reader
+(`IsRevokedSerial`) must complete while a signature is parked, and two
+responses must sign concurrently rather than queueing — asserted as a parked
+peak of two. Both assert the other work finished *while* the signature was
+still in flight, since an end-state assertion is equally satisfied by a late
+unblock. Both were run against the pre-#197 arrangement and fail there.
+
+Two more pin the **guard**, and they cannot fail against pre-#197 code because
+there the racing operation simply waits for the lock, making the interleave
+unreachable. One lands a revocation mid-signature; the other an index-sync
+prune, which reaches `decideOCSPStatus`'s `!known` early return rather than the
+CRL scan, and so resurrects an entry `dropSerialLocked` removed rather than one
+a CRL install evicted. Each requires an operation needing the *write* lock to
+complete while the signature is parked, which is what makes the claim "no CA
+lock" rather than "no read lock". Their mutations are the guard itself, and
+there are two: dropping the re-validation before the cache write, and
+decoupling `MaxAge` from whether the response was actually cached. Each fails
+both guard specs on its own assertion and leaves the two scope specs green.
 
 That a given path takes its lock *at all* is automated for five of them, all in
 the same shape: park the operation on a held `subject:<name>` and require it to

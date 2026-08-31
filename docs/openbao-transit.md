@@ -503,6 +503,25 @@ failure and throughput profile; plan for it:
   at a time rather than in parallel. For most fleets this is fine; if you
   issue at very high rates, keep OpenBao close (network-wise) and sized for the
   request rate.
+- **OCSP signs against the same backend, and it does not serialise.** The
+  serialisation above is a property of *issuance*, not of every signature. The
+  OCSP responder signs outside the CA's process-wide lock
+  ([#197](https://github.com/voxpupuli/openvox-ca/issues/197)), so concurrent
+  OCSP requests produce concurrent Transit `sign` calls against the same
+  backend that issuance uses. Two consequences worth planning for:
+
+  - `/ocsp` is **unauthenticated**, and the only rate limiter in the server
+    applies to CSR submission, so the request rate is not something the CA
+    bounds for you. A response that misses the cache signs, and an RFC 8954
+    nonced request misses on every request.
+  - OCSP load and issuance load land on one OpenBao, so a burst of the first
+    can consume capacity the second needs. Size and place OpenBao for the sum,
+    and if `/ocsp` is exposed to untrusted clients consider fronting it with a
+    cache or a proxy-level rate limit.
+
+  This is tracked as
+  [#274](https://github.com/voxpupuli/openvox-ca/issues/274), which is where a
+  configurable bound would land if one is added.
 - **A stalled backend cannot pin the CA indefinitely.** Each signing round
   trip is bounded by `openbao` login/renew timeout (`LoginTimeout`, default
   10s), so a hung Transit backend fails that request and releases the lock
@@ -534,7 +553,12 @@ local-key custody, where the CA can sign with no external dependency at all.
   the source.
 - **What to monitor.** Because OpenBao availability is now on the CA's
   critical path, alert on OpenBao reachability/health from the CA hosts and on
-  certificate-issuance error rates, and watch for repeated
+  certificate-issuance error rates. Watch OCSP request rates too, if `/ocsp` is
+  reachable by untrusted clients: those signatures hit the same backend and are
+  not serialised, so they can crowd out issuance without issuance itself
+  looking abnormal until it starts failing. There is no CA-side metric for this
+  yet (see [#274](https://github.com/voxpupuli/openvox-ca/issues/274)), so the
+  signal to watch today is on the OpenBao side. Also watch for repeated
   "re-authentication failed" warnings in the `openvox-ca` logs — a steady
   stream of those means the source credential can no longer authenticate and
   needs operator attention before the current token lease runs out.
