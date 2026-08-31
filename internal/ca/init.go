@@ -147,7 +147,7 @@ func (c *CA) Init(ctx context.Context) error {
 	// distributed lock. Once a CA exists, all replicas can read it.
 	loadErr := c.loadCA(ctx)
 	if loadErr == nil {
-		return c.finishLoadExisting(ctx)
+		return c.finishLoadExisting(ctx, c.seedSupportingState)
 	}
 
 	// When using an external signer (key isolation mode), the frontend must
@@ -166,7 +166,9 @@ func (c *CA) Init(ctx context.Context) error {
 	return c.Storage.WithLock(ctx, lockNameBootstrap, func() error {
 		if err := c.loadCA(ctx); err == nil {
 			slog.Info("Loaded CA bootstrapped by another replica", "cert", c.Storage.CACertPath())
-			return c.finishLoadExisting(ctx)
+			// ...Locked: we are inside the bootstrap critical section, and
+			// WithLock is not reentrant. See finishLoadExisting's comment.
+			return c.finishLoadExisting(ctx, c.seedSupportingStateLocked)
 		}
 		hasCert, errCert := c.Storage.HasCACert(ctx)
 		if errCert != nil {
@@ -237,9 +239,24 @@ func (c *CA) Init(ctx context.Context) error {
 // cache). c.mu must be held by the caller. When the CRL is absent from the
 // backend but the cert+key loaded successfully — the common case when an
 // existing CA cert/key is mounted via an overlay against a fresh remote
-// backend — seed the CRL, inventory, and serial counter under the bootstrap
-// lock so startup can complete.
-func (c *CA) finishLoadExisting(ctx context.Context) error {
+// backend — the CRL, inventory and serial counter are seeded so startup can
+// complete.
+//
+// That seeding is the only part of this function that takes a distributed
+// lock, and only the caller knows whether the bootstrap lock is already held,
+// so the caller passes the variant to use. Init's fast path holds nothing and
+// passes seedSupportingState, which acquires bootstrap; Init's slow path is
+// already inside the bootstrap critical section and passes
+// seedSupportingStateLocked, which does the same work without acquiring it
+// again. finishLoadExisting itself acquires nothing either way.
+//
+// Making that the caller's choice is not a stylistic preference. WithLock is
+// not reentrant at any tier — every implementation takes a plain per-name
+// sync.Mutex before it touches the network or the filesystem, and a plain
+// sync.Mutex ignores the context — so a second acquisition on this goroutine
+// does not fail at LockTimeout, it hangs startup outright. The slow path used
+// to call the acquiring variant from inside the lock, which is #201.
+func (c *CA) finishLoadExisting(ctx context.Context, seed func(context.Context) error) error {
 	slog.Info("Loaded existing CA", "cert", c.Storage.CACertPath())
 	if err := c.buildSerialIndex(ctx); err != nil {
 		slog.Warn("Failed to build OCSP serial index", "error", err)
@@ -257,7 +274,7 @@ func (c *CA) finishLoadExisting(ctx context.Context) error {
 	if c.ExternalSigner != nil {
 		return fmt.Errorf("failed to load CRL into memory: %w", err)
 	}
-	if err := c.seedSupportingState(ctx); err != nil {
+	if err := seed(ctx); err != nil {
 		return fmt.Errorf("seeding CA supporting state: %w", err)
 	}
 	if err := c.loadCRLCache(ctx); err != nil {
@@ -271,61 +288,70 @@ func (c *CA) finishLoadExisting(ctx context.Context) error {
 
 // seedSupportingState writes the public key, CRL, inventory, and serial counter
 // that bootstrapCA would normally create, for the case where the cert+key
-// already exist (e.g. mounted via an overlay against an empty backend). Runs
-// under the bootstrap lock so concurrent replicas don't race to seed.
-//
-// The public key is also a backfill: a bootstrap that failed on that blob
-// leaves a cert and key that load cleanly forever after, so this is the only
-// path that would ever write it again.
+// already exist (e.g. mounted via an overlay against an empty backend). It
+// takes the bootstrap lock so concurrent replicas don't race to seed, so the
+// caller must NOT already hold that lock — one that does wants
+// seedSupportingStateLocked below, because WithLock is not reentrant.
 func (c *CA) seedSupportingState(ctx context.Context) error {
 	ctx, cancel := context.WithTimeout(ctx, LockTimeout)
 	defer cancel()
 	return c.Storage.WithLock(ctx, lockNameBootstrap, func() error {
-		// The public key first, and before the CRL short-circuit below, because
-		// this is the one blob nothing else ever rewrites: bootstrapCA writes it
-		// before the CRL, so a bootstrap that failed on it leaves a CA whose key
-		// and certificate load cleanly forever after while ca_pub.pem stays
-		// missing. Taken from the certificate rather than the key because it is
-		// the public component every consumer already trusts, and because it is
-		// available whether the key is local or at a provider. Idempotent, so a
-		// replica that lost the race simply rewrites identical bytes.
-		if err := savePubKeyPEM(ctx, c.Storage, c.CACert.PublicKey); err != nil {
-			return fmt.Errorf("writing CA public key: %w", err)
-		}
-
-		// Another replica may have seeded between our initial check and the
-		// lock acquisition.
-		if _, err := c.Storage.GetCRL(ctx); err == nil {
-			return nil
-		} else if !errors.Is(err, fs.ErrNotExist) {
-			return fmt.Errorf("re-checking CRL: %w", err)
-		}
-		crl, err := newEmptyCRL(c.CACert, c.CAKey, c.CRLValidityDuration())
-		if err != nil {
-			return fmt.Errorf("creating initial CRL: %w", err)
-		}
-		crlPEM := pem.EncodeToMemory(&pem.Block{Type: "X509 CRL", Bytes: crl.Raw})
-		// Bootstrap-only write: runs before any CRL consumer exists, so it
-		// deliberately skips the crlNotify signal (see signCRLLocked).
-		if err := c.Storage.UpdateCRL(ctx, crlPEM); err != nil {
-			return fmt.Errorf("writing initial CRL: %w", err)
-		}
-		if err := c.Storage.TouchInventory(ctx); err != nil {
-			return fmt.Errorf("creating inventory: %w", err)
-		}
-		hasSerial, err := c.Storage.HasSerial(ctx)
-		if err != nil {
-			return fmt.Errorf("checking serial: %w", err)
-		}
-		if !hasSerial {
-			if err := c.Storage.WriteSerial(ctx, "0001"); err != nil {
-				return fmt.Errorf("writing serial: %w", err)
-			}
-		}
-		slog.Info("Seeded CA supporting state for existing cert+key",
-			"cert", c.Storage.CACertPath())
-		return nil
+		return c.seedSupportingStateLocked(ctx)
 	})
+}
+
+// seedSupportingStateLocked does the seeding itself. The caller must hold the
+// bootstrap lock, and c.mu along with it — Init is the only caller of either
+// variant, and it holds c.mu across the whole of itself.
+//
+// The public key is also a backfill: a bootstrap that failed on that blob
+// leaves a cert and key that load cleanly forever after, so this is the only
+// path that would ever write it again.
+func (c *CA) seedSupportingStateLocked(ctx context.Context) error {
+	// The public key first, and before the CRL short-circuit below, because
+	// this is the one blob nothing else ever rewrites: bootstrapCA writes it
+	// before the CRL, so a bootstrap that failed on it leaves a CA whose key
+	// and certificate load cleanly forever after while ca_pub.pem stays
+	// missing. Taken from the certificate rather than the key because it is
+	// the public component every consumer already trusts, and because it is
+	// available whether the key is local or at a provider. Idempotent, so a
+	// replica that lost the race simply rewrites identical bytes.
+	if err := savePubKeyPEM(ctx, c.Storage, c.CACert.PublicKey); err != nil {
+		return fmt.Errorf("writing CA public key: %w", err)
+	}
+
+	// Another replica may have seeded between our initial check and the
+	// lock acquisition.
+	if _, err := c.Storage.GetCRL(ctx); err == nil {
+		return nil
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("re-checking CRL: %w", err)
+	}
+	crl, err := newEmptyCRL(c.CACert, c.CAKey, c.CRLValidityDuration())
+	if err != nil {
+		return fmt.Errorf("creating initial CRL: %w", err)
+	}
+	crlPEM := pem.EncodeToMemory(&pem.Block{Type: "X509 CRL", Bytes: crl.Raw})
+	// Bootstrap-only write: runs before any CRL consumer exists, so it
+	// deliberately skips the crlNotify signal (see signCRLLocked).
+	if err := c.Storage.UpdateCRL(ctx, crlPEM); err != nil {
+		return fmt.Errorf("writing initial CRL: %w", err)
+	}
+	if err := c.Storage.TouchInventory(ctx); err != nil {
+		return fmt.Errorf("creating inventory: %w", err)
+	}
+	hasSerial, err := c.Storage.HasSerial(ctx)
+	if err != nil {
+		return fmt.Errorf("checking serial: %w", err)
+	}
+	if !hasSerial {
+		if err := c.Storage.WriteSerial(ctx, "0001"); err != nil {
+			return fmt.Errorf("writing serial: %w", err)
+		}
+	}
+	slog.Info("Seeded CA supporting state for existing cert+key",
+		"cert", c.Storage.CACertPath())
+	return nil
 }
 
 // loadCA reads and validates the CA key and certificate from disk.
