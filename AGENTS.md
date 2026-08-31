@@ -236,6 +236,63 @@ the inventory, in-memory caches) must follow
   drives a minority of them, so a green suite is not confirmation you had
   nothing to add.
 
+## Logging: `log/slog` only
+
+**Non-test code logs through `log/slog`.** This is a hard convention — do not
+introduce `logrus`, `zap`, `zerolog`, `hclog`, `go-logr` or any other logging
+library, and do not implement your own `slog.Handler`.
+
+The reason is a security property, not taste. `slog`'s `TextHandler` and
+`JSONHandler` escape control characters in every position — message, attribute
+key, attribute value, group name, group-prefixed key and slice element — so a
+newline in a certname cannot terminate a record and forge a second log entry.
+That is why CodeQL's `go/log-injection` rule is excluded in
+[.github/codeql/codeql-config.yml](.github/codeql/codeql-config.yml): the query
+models sinks rather than handlers, and would otherwise report every untrusted
+value reaching a log call, for ever. The exclusion is sound only while this
+convention holds.
+
+Two guards back it up, and neither is complete on its own:
+
+- `.golangci.yml`'s `only-slog-logs` depguard rule denies the known unescaped
+  logging libraries. It is a **denylist** — an unlisted library, or an
+  `slog.Handler` written in this tree, passes lint. That gap is why this
+  section exists.
+- `cmd/openvox-ca/main_test.go` ("control characters in logged data cannot
+  forge a second entry") pins the escaping behaviour itself, so a stdlib
+  regression fails CI.
+
+Output that is operator-facing but not `slog` — such as
+`internal/storage/migrate.go`'s `Logf`, which the CLI writes straight to stderr
+— gets no escaping from anything. Format values that have not passed
+`ca.ValidateSubject` with `%q` there — including values decoded from a server
+response, which nothing re-validates. `import-cert`'s summary lines are the
+worked example, and `cmd/openvox-ca-ctl/importcert_test.go` pins them.
+
+**The rule of thumb: if the server chose the value, quote it.** `import-cert`'s
+summary, `checkHTTP`'s error body and `sign --all`'s list are all quoted for
+that reason, and each has a spec that fails if the quoting is removed.
+
+Two kinds of unquoted output are deliberately left alone, for two *different*
+reasons:
+
+- **The `sign` / `clean` / `revoke` single-value confirmations** echo the
+  operator's own `--certname` / `--serial` input, so there is no untrusted
+  value to escape. Not "escaping declined" — out of scope.
+- **`generate`'s certificate output** (`fmt.Print(result.Certificate)`) is the
+  PEM itself on stdout, while its human-readable line goes to stderr. That
+  split is a contract — `openvox-ca-ctl generate … > cert.pem` must yield a
+  usable file — so quoting would corrupt every consumer that redirects. This
+  convention covers operator-facing *messages*; that is data.
+
+`list`'s status table used to be a third exception, on the grounds that
+quoting would wreck its column alignment. **That reason was false** —
+`printTable` derives its width from the strings it is given, so quoting before
+the row is built leaves the columns correct — and the table is now quoted like
+everything else the server chose. `cmd/openvox-ca-ctl/list_test.go` pins both
+the escaping and the alignment, so the exemption cannot return on a rationale
+that does not hold.
+
 ## Compatibility contracts (do not rename)
 
 openvox-ca is a drop-in for the OpenVox/Puppet Server CA. The following

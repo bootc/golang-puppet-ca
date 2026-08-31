@@ -22,6 +22,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -170,6 +172,62 @@ var _ = Describe("MigrateLogfReceivesEachCopiedBlob", func() {
 		})
 		Expect(err).NotTo(HaveOccurred(), "Migrate")
 		Expect(lines).To(Equal(len(want)), "Logf call count")
+	})
+})
+
+// SECURITY: pins the %q in migrate.go's logf call.
+//
+// Logf is operator-facing output with no escaping anywhere behind it: the CLI
+// implements it as fmt.Fprintf(os.Stderr, format+"\n", a...). The keys it
+// renders are built from source directory entry names, which nothing
+// validates -- migrating a foreign or legacy CA directory is exactly the case
+// where a filename can carry a terminator. %q is what stands between that and
+// a forged progress line, and it is one of the two sanitisers CodeQL's
+// go/log-injection query recognises.
+//
+// The sibling spec above counts Logf calls and discards their arguments, so it
+// would not notice %q reverting to %s. This asserts the rendering, which is
+// the part an attacker cares about.
+var _ = Describe("MigrateLogfEscapesTerminatorsInKeys", func() {
+	It("renders the key with %q so a terminator cannot forge a second line", func() {
+		ctx := context.Background()
+		src := NewFilesystemBackend(GinkgoT().TempDir())
+		seedCA(src)
+
+		// Both terminators, and a tail shaped to look like a real progress
+		// line if either reached the output raw.
+		forged := "evil\r\ncopied \"everything\" (0 bytes)"
+		key := CSRKey(forged)
+		Expect(src.Put(ctx, key, []byte("csr"), BlobPublic)).
+			NotTo(HaveOccurred(), "seeding a CSR whose name carries terminators")
+
+		dst := NewFilesystemBackend(GinkgoT().TempDir())
+
+		var calls int
+		var out strings.Builder
+		_, err := Migrate(ctx, src, dst, MigrateOptions{
+			// Deliberately the CLI's own shim: appends the newline itself and
+			// escapes nothing, so what lands here is what an operator sees.
+			Logf: func(format string, a ...any) {
+				calls++
+				fmt.Fprintf(&out, format+"\n", a...)
+			},
+		})
+		Expect(err).NotTo(HaveOccurred(), "Migrate")
+
+		// The consequence an injected terminator would buy: one call, one line.
+		Expect(strings.Count(out.String(), "\n")).To(Equal(calls),
+			"each Logf call must render as exactly one line; more lines than calls "+
+				"means a key's newline reached the output unescaped:\n%s", out.String())
+		Expect(out.String()).NotTo(ContainSubstring("\r"),
+			"a bare carriage return starts a fresh line on an operator's terminal:\n%s",
+			out.String())
+
+		// Non-vacuity, last: the assertions above all hold trivially for a run
+		// that copied nothing, so this pins that the seeded key really did
+		// reach Logf, in its quoted form.
+		Expect(out.String()).To(ContainSubstring(strconv.Quote(key)),
+			"the seeded key must reach Logf, quoted")
 	})
 })
 

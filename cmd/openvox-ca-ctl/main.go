@@ -34,6 +34,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -204,11 +205,22 @@ func (c *Client) post(path string, body []byte) (int, []byte, error) {
 
 // ---------- helpers ----------
 
+// checkHTTP turns a non-2xx response into an error naming the request.
+//
+// %q on the body, for the same reason as the import summary below: it is
+// chosen entirely by the server, and cobra prints a returned error straight to
+// stderr (the subcommands set SilenceUsage but not SilenceErrors), so it
+// reaches an operator's terminal unescaped. TrimSpace removes only leading and
+// trailing whitespace, so an embedded CR or LF would survive it and could
+// fabricate a reassuring second line after a failed operation -- against a
+// hostile or MITM'd server, which the CLI's own --insecure warning admits is a
+// case worth considering. This is the sink with the least provenance of any in
+// the CLI, so it is quoted rather than enumerated as an exception.
 func checkHTTP(code int, body []byte, method, path string) error {
 	if code >= 200 && code < 300 {
 		return nil
 	}
-	return fmt.Errorf("HTTP %d on %s %s: %s", code, method, path, strings.TrimSpace(string(body)))
+	return fmt.Errorf("HTTP %d on %s %s: %q", code, method, path, strings.TrimSpace(string(body)))
 }
 
 func printTable(rows [][2]string) {
@@ -262,9 +274,15 @@ func newListCmd() *cobra.Command {
 				fmt.Println("(no certificates)")
 				return nil
 			}
+			// Quoted here rather than in printTable: the name is whatever the
+			// server returned, and quoting before the row means printTable's
+			// width calculation counts the quotes, so the columns still line
+			// up. An earlier version of this change claimed the table could
+			// not be quoted without wrecking the alignment; reading printTable
+			// shows that is false, and the claim is gone with it.
 			rows := make([][2]string, len(statuses))
 			for i, s := range statuses {
-				rows[i] = [2]string{s.Name, s.State}
+				rows[i] = [2]string{strconv.Quote(s.Name), s.State}
 			}
 			printTable(rows)
 			return nil
@@ -304,7 +322,18 @@ func newSignCmd() *cobra.Command {
 				if len(result.Signed) == 0 {
 					fmt.Println("Signed: (none)")
 				} else {
-					fmt.Printf("Signed: %s\n", strings.Join(result.Signed, ", "))
+					// Each name quoted, for the same reason as the import
+					// summary: this list is decoded from the server's response
+					// body, so it is the one confirmation line here whose
+					// contents the server chooses rather than the operator.
+					// Quoting per element rather than the joined string keeps
+					// the separator meaningful -- "a", "b" rather than "a, b",
+					// which would read as a single name containing a comma.
+					quoted := make([]string, len(result.Signed))
+					for i, name := range result.Signed {
+						quoted[i] = strconv.Quote(name)
+					}
+					fmt.Printf("Signed: %s\n", strings.Join(quoted, ", "))
 				}
 				return nil
 			}
@@ -503,6 +532,12 @@ func newGenerateCmd() *cobra.Command {
 				return fmt.Errorf("failed to save private key to %s: %w", keyPath, err)
 			}
 			fmt.Fprintf(os.Stderr, "Private key saved to %s\n", keyPath)
+			// NOT quoted, deliberately, and not an oversight: this is the PEM
+			// itself on stdout, while the human-readable line above goes to
+			// stderr. That split is a contract -- `openvox-ca-ctl generate ...
+			// > cert.pem` has to yield a usable file -- so %q here would
+			// corrupt every consumer that redirects. The escaping convention
+			// in AGENTS.md covers operator-facing *messages*; this is data.
 			fmt.Print(result.Certificate)
 			return nil
 		},
@@ -556,11 +591,21 @@ func newImportCertCmd() *cobra.Command {
 			if err := json.Unmarshal(body, &result); err != nil {
 				return fmt.Errorf("could not parse response: %w", err)
 			}
+			// %q on every field, not just the subject: all four come out of
+			// the same json.Unmarshal of the same response body, and this CLI
+			// does not trust that body. The server serving this route does
+			// validate -- PUT /certificate/{subject} reaches handlePutCert,
+			// which gates on ca.ValidateSubject, and ImportCertificate
+			// validates again -- but that is the honest server's behaviour,
+			// not a property of the bytes arriving here. A compromised or
+			// MITM'd server (see the --insecure warning) chooses all of them
+			// freely, and a serial or a timestamp carries a terminator just as
+			// well as a name does.
 			if result.Imported {
-				fmt.Printf("Imported %s (serial %s, valid %s to %s)\n",
+				fmt.Printf("Imported %q (serial %q, valid %q to %q)\n",
 					result.Subject, result.Serial, result.NotBefore, result.NotAfter)
 			} else {
-				fmt.Printf("%s already tracked (serial %s), no changes made\n",
+				fmt.Printf("%q already tracked (serial %q), no changes made\n",
 					result.Subject, result.Serial)
 			}
 			return nil

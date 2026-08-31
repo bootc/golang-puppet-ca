@@ -123,11 +123,16 @@ var _ = Describe("StorageService SubjectForSerial", func() {
 		Expect(err).To(MatchError(fs.ErrNotExist))
 	})
 
-	// The output alphabet is the property two CodeQL log-injection dismissals on
-	// PR #213 rest on: the value CA.RevokeSerial logs is this function's output,
-	// so if it can only ever be [0-9A-F] it cannot carry a newline, a quote or a
-	// separator into a log line. Asserted rather than argued, so the dismissal
-	// is checkable by anyone who doubts it.
+	// The output alphabet is a property the go/log-injection exclusion in
+	// .github/codeql/codeql-config.yml rests on: the value CA.RevokeSerial logs
+	// is this function's output, so if it can only ever be [0-9A-F] it cannot
+	// carry a newline, a quote or a separator into a log line. Asserted rather
+	// than argued, so the claim is checkable by anyone who doubts it.
+	//
+	// This originally underwrote two per-alert dismissals on PR #213. Those are
+	// history now -- the rule is excluded centrally rather than dismissed alert
+	// by alert -- but the property is what makes the exclusion honest for this
+	// value, so it is still worth pinning.
 	DescribeTable("emits only uppercase hexadecimal, whatever it is given",
 		func(in string) {
 			out, err := storage.NormaliseSerial(in)
@@ -150,8 +155,8 @@ var _ = Describe("StorageService SubjectForSerial", func() {
 		// canonicalised rather than rejected. They matter more than the ASCII
 		// entries above: U+2028 and U+2029 are line breaks to a JSON- or
 		// JS-based log viewer, which is the reading of "log injection" the
-		// CodeQL dismissal has to answer. What these pin is that the separator
-		// is stripped rather than carried into the output.
+		// exclusion has to answer. What these pin is that the separator is
+		// stripped rather than carried into the output.
 		Entry("U+2028 line separator", "\u20280A\u2028"),
 		Entry("U+2029 paragraph separator", "\u20290A\u2029"),
 		Entry("U+0085 next line", "\u00850A\u0085"),
