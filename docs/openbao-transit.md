@@ -528,6 +528,18 @@ failure and throughput profile; plan for it:
   rather than wedging all issuance forever. Raising that timeout for a slow or
   distant OpenBao correspondingly raises the worst-case time the lock can be
   held.
+- **Set `ca_signing_concurrency` explicitly.** The bound on concurrent CA-key
+  signatures defaults to `max(4, GOMAXPROCS)`, derived from *this host's* CPU
+  count — a number with no relationship to what your Transit key can sustain,
+  especially where other consumers share it. Set it to that key's capacity. The
+  bound is per process, so N replicas permit N × the limit against one shared
+  key; size it against your replica count too. See
+  [bounding CA-key signing](configuration.md#bounding-ca-key-signing).
+
+  This matters most on `/ocsp`, which is unauthenticated and signs on a cache
+  miss: it is the one path where a caller you did not authorise decides how many
+  Transit requests you make. Requests over the limit are refused with RFC 6960
+  `tryLater` and counted in `puppetca_ca_signing_shed_total`.
 
 In short, `ca_key_provider: openbao` makes OpenBao's availability and HA a
 hard dependency of CA availability. This is the intended trade-off — the key

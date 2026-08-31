@@ -55,11 +55,12 @@ The same isolation is why the shipped systemd unit sets `LimitCORE=0` and
 withholds `$NOTIFY_SOCKET` from the signer — see
 [running under systemd](systemd.md).
 
-### The signer is a shared, unbounded resource
+### The signer is a shared resource, and how it is bounded
 
 Every signature the CA makes crosses the socketpair to this one process:
-certificate issuance, CRL re-signing, **and OCSP responses**. Two properties of
-that path are worth knowing together, because neither is obvious from the other.
+certificate issuance, CRL re-signing, **and OCSP responses**. Isolation decides
+*where* the key lives; on its own it does nothing to limit how much work
+reaches it.
 
 **OCSP signing does not serialise, and `/ocsp` is unauthenticated.** Issuance
 holds the CA's process-wide lock across its signing call, so it proceeds at
@@ -71,22 +72,34 @@ hold a client certificate), the only rate limiter in the server applies to CSR
 submission, and a response that misses the cache signs. An RFC 8954 nonced
 request misses on every request.
 
-**`RemoteSigner.Sign` carries no deadline.** Unlike the OpenBao Transit path,
-whose every call is bounded by the login timeout, the isolated signer's RPC has
-no timeout of its own. A signer that stops answering therefore blocks its caller
-until the request is abandoned from elsewhere.
+**`ca_signing_concurrency` is the aggregate cap**
+([#274](https://github.com/voxpupuli/openvox-ca/issues/274)). It bounds all
+three paths together, because they share one key, and it defaults to
+`max(4, GOMAXPROCS)` — sized for exactly this topology, since signing is
+CPU-bound inside the signer child and beyond the CPU count extra concurrency
+buys latency and memory rather than throughput. Issuance and CRL re-signing
+queue for a slot; the OCSP responder is refused with RFC 6960 `tryLater`, which
+costs no key work because a non-success OCSP response carries no signature. See
+[bounding CA-key signing](configuration.md#bounding-ca-key-signing).
 
-Together these mean OCSP load and issuance load contend for one signer with no
-aggregate bound, and the deployment that has *fewer* bounds than the OpenBao one
-is the default. This is tracked as
-[#274](https://github.com/voxpupuli/openvox-ca/issues/274), which is where a
-configurable cap would land if one is added. Until then:
+**`RemoteSigner.Sign` carries no deadline of its own.** Unlike the OpenBao
+Transit path, whose every call is bounded by the login timeout, the isolated
+signer's RPC has none. A signer that stops answering blocks its caller until
+the request is abandoned from elsewhere. So the cap bounds *how many callers
+may be waiting*, not how long any one of them waits — it keeps a wedged signer
+from accumulating callers without limit, which is a different guarantee from
+bounding the wait itself.
 
-- If `/ocsp` is reachable by untrusted clients, front it with a cache or a
-  proxy-level rate limit. That is the only bound available today.
-- Watch OCSP request rates alongside issuance latency. There is no CA-side
-  metric for in-flight signatures yet (also #274), so a rise in issuance latency
-  with no rise in issuance *rate* is the signal that OCSP is crowding it out.
+Fronting `/ocsp` with a cache or a proxy-level rate limit remains worthwhile
+where it is reachable by untrusted clients: the cap stops CA-key work growing
+without limit, but it does not stop the connections, handshakes and goroutines
+that carry the requests.
+
+Watch `puppetca_ca_signing_shed_total` and `puppetca_ca_signing_in_flight`
+against `puppetca_ca_signing_limit` — sustained shedding while the signer has
+capacity to spare means the limit is too low. A rise in issuance latency with
+no rise in issuance *rate* is still the signal that OCSP is crowding issuance
+out. See [metrics.md](metrics.md).
 
 The equivalent note for the OpenBao Transit backend is in
 [the OpenBao Transit guide](openbao-transit.md) under "Performance and outage
