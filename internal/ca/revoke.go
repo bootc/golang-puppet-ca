@@ -88,18 +88,18 @@ import (
 // safe to retry either way: revokeSerialLocked short-circuits a serial already
 // listed, so revocation is idempotent.
 //
-// One issuance path it does not wait on this lock for: Generate takes no
-// distributed lock at all, so a server-side key generation on another replica
-// is not serialised against a revocation here. Within one process the two do
-// still serialise, but only on c.mu — which Generate holds across evict, save
-// and sign, and which this takes inside the CRL lock — so the ordering holds on
-// a single node and is lost as soon as there is a second one.
+// Every issuance path waits on this lock, Generate included: GenerateWithOptions
+// takes subject:<name> across its whole evict-and-issue sequence, so a
+// server-side key generation on another replica is serialised against a
+// revocation here rather than racing it. That closed issue #195, which this
+// comment used to describe as the standing exception.
 //
 // Lock ordering: subject-lock (distributed) → CRL-lock (distributed) → c.mu,
 // matching Clean, and no path takes those two in the other order. Callers must
-// therefore not already hold the subject lock: those that do — Clean, and the
-// post-issue revokes in Renew and AutoRenew — reach revokeLocked or
-// revokeSerialLocked directly rather than coming through here.
+// therefore not already hold the subject lock: those that do — Clean, the
+// post-issue revokes in Renew and AutoRenew, and GenerateWithOptions' revoke of
+// the certificate it replaces — reach revokeLocked or revokeSerialLocked
+// directly rather than coming through here.
 func (c *CA) Revoke(ctx context.Context, subject string) error {
 	if err := ValidateSubject(subject); err != nil {
 		return err

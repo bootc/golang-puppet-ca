@@ -81,14 +81,22 @@ for the same import-direction reason: `lockNameHMACKey` (`"hmac-key"`) in
 [etcd_inventory.go](../../internal/storage/etcd_inventory.go). They are no
 less protocol for it.
 
+One name in `internal/storage` is not a lock in that sense at all:
+`lockProbeName` in [storage.go](../../internal/storage/storage.go) defines
+`capability-probe`, which `SupportsDistributedLocking` acquires and releases
+purely to find out whether the backend coordinates across processes. It sits
+outside every namespace above so it can never contend with an operation in
+flight — see its row below.
+
 | Lock name | Serialises | Taken by |
 | --- | --- | --- |
 | `bootstrap` | First-run CA generation; seeding supporting state (CRL/inventory/serial) for a mounted cert+key; whole-store migration | `CA.Init`, `CA.seedSupportingState`, `storage.MigrateService` (which reuses the name deliberately so a migration and a bootstrapping server exclude each other) |
-| `crl` | Every CRL read-modify-write (read entries → re-sign → write), **and** the pending-supersession list's read-modify-write, which has to be mutual with the revocations it schedules | `Revoke`, `RevokeSerial`, `ReissueCRL`, `RefreshCRLIfDue`, `CleanupExpiredCerts`, `ReconcileSuperseded`, the revoke step inside `Clean`, and the retire step inside `Renew`, `AutoRenew` — "retire" because only those two can defer it to the list; `Clean` always revokes inline |
-| `subject:<name>` | The whole lifecycle of one subject: evict/save CSR/sign/delete CSR/import/clean/revoke | `SaveRequest`, `Sign`, `SignWithTTL`, `DeleteRequest`, `Renew`, `AutoRenew`, `Clean`, `ImportCertificate`, `Revoke` — but currently **not** `Generate` (see known gaps below) |
+| `crl` | Every CRL read-modify-write (read entries → re-sign → write), **and** the pending-supersession list's read-modify-write, which has to be mutual with the revocations it schedules | `Revoke`, `RevokeSerial`, `ReissueCRL`, `RefreshCRLIfDue`, `CleanupExpiredCerts`, `ReconcileSuperseded`, the revoke step inside `Clean` and `GenerateWithOptions`, and the retire step inside `Renew`, `AutoRenew` — "retire" because only those two can defer it to the list; `Clean` and `GenerateWithOptions` always revoke inline |
+| `subject:<name>` | The whole lifecycle of one subject: evict/save CSR/sign/delete CSR/renew/import/clean/revoke/generate | `SaveRequest`, `Sign`, `SignWithTTL`, `DeleteRequest`, `Renew`, `AutoRenew`, `Clean`, `ImportCertificate`, `Revoke`, `Generate`/`GenerateWithOptions` |
 | `hmac-key` | Generating and persisting the inventory HMAC key when none is usable — a cold start, or a stored blob of the wrong length | `StorageService.EnsureHMACKey`, reached from `CA.Init` → `InitHMAC` and from `MigrateService` → `RebuildInventoryHMAC`. Deliberately **not** `bootstrap`: the migration already holds that name across the rebuild, and `WithLock` is not reentrant |
 | `sql-schema-migrate` | One schema-migration run, so two replicas starting at once do not migrate concurrently (SQL backends only) | `SQLBackend.EnsureReady` |
 | `inventory-decompose` | One-time legacy inventory blob conversion (etcd backend only) on the first start after upgrading | `EtcdBackend.decomposeLegacyInventory`, from `EnsureReady` |
+| `capability-probe` | Nothing. Acquired and released immediately by `StorageService.SupportsDistributedLocking` to find out whether this backend coordinates locks across processes at all | The offline `openvox-ca generate` pre-flight. The name sits deliberately outside every namespace above so a probe can never contend with an operation in flight |
 
 How each backend provides the distributed lock (a summary — the full per-backend
 mechanism, key layouts and transaction/retry detail lives in
@@ -259,9 +267,9 @@ with what the same process just wrote. Read paths take `c.mu.RLock` only.
 
 `DeleteRequest` is the one mutation that takes no `c.mu` at all: a pending CSR
 backs none of these caches, so there is nothing to keep in step with the write.
-That is worth knowing beyond cache coherence — it is why a rejection does not
-serialise against `Generate` even within a single process, where `c.mu` is what
-the two would otherwise have in common.
+That costs nothing in ordering: a rejection and a `Generate` for the same name
+serialise on `subject:<name>`, which both take, in every process rather than
+merely within one. `c.mu` was never what stood between them.
 
 `c.mu` is also held across the signing call itself. Every issuance path (`Sign`,
 `SignWithTTL`, `SaveRequest`'s autosign, `Renew`, `AutoRenew`,
@@ -314,14 +322,15 @@ written as two.
   depth (and therefore the SQL pool floor below) is unchanged, and the sweep
   needs one acquisition to cover both the list rewrite and the revocations it
   drives. See [supersede.go](../../internal/ca/supersede.go).
-- `Revoke`, `Clean`, `Renew`, and `AutoRenew` are the paths that take all
-  three. For the three issuance paths it is the subject lock around the whole
-  operation, then the `crl` lock + `c.mu` for the revocation step; note they
-  release and re-acquire `c.mu` between the signing and revocation steps —
-  `c.mu` is not held across a `WithLock` acquisition. `Revoke` has the same
-  nesting for a different reason: the `crl` lock + `c.mu` cover the revocation
-  that is the whole operation, and the subject lock is there only to serialise
-  it against an issuance already under way for that subject.
+- `Revoke`, `Clean`, `Renew`, `AutoRenew` and `GenerateWithOptions` (the last
+  on its `ReplaceExisting` path only) are the paths that take all three. For
+  the four issuance paths it is the subject lock around the whole operation,
+  then the `crl` lock + `c.mu` for the revocation step; note they release and
+  re-acquire `c.mu` between the signing and revocation steps — `c.mu` is not
+  held across a `WithLock` acquisition. `Revoke` has the same nesting for a
+  different reason: the `crl` lock + `c.mu` cover the revocation that is the
+  whole operation, and the subject lock is there only to serialise it against
+  an issuance already under way for that subject.
 - No code path acquires `subject:<name>` while holding `crl`, and none acquires
   either while holding `c.mu`. Keep it that way; the comments in
   [signing.go](../../internal/ca/signing.go) and
@@ -426,8 +435,9 @@ path — still provides no cross-replica guarantee anyway.
    / [PR #186](https://github.com/voxpupuli/openvox-ca/pull/186) exist because
    a renewal once did such a re-check outside the lock.
 3. **Keep expensive, shared-state-free work outside the lock.** Key
-   generation and CSR assembly in `Generate` run before any lock is taken;
-   parsing and validation in `Renew`/`SaveRequest` likewise. Only the
+   generation in `Generate` runs before any lock is taken (it no longer
+   assembles a CSR at all — that round trip through the signing path was
+   removed); parsing and validation in `Renew`/`SaveRequest` likewise. Only the
    storage-touching tail belongs inside. The deliberate exception is the CA
    signature itself: `x509.CreateCertificate` runs under `c.mu` (see Tier 3),
    because the cache update it guards must be atomic with the issuance.
@@ -583,29 +593,6 @@ path — still provides no cross-replica guarantee anyway.
 Concurrency limitations that are understood and tracked. This list reflects the
 state when the document was last updated and is not guaranteed exhaustive.
 
-- [#195](https://github.com/voxpupuli/openvox-ca/issues/195) — `CA.Generate`
-  (the `POST /generate/{subject}` endpoint) is the one issuance path that
-  takes only `c.mu`, not the `subject:<name>` cluster lock. On an HA backend,
-  a `Generate` on one replica can race a `Sign`/`SaveRequest`/`Generate` for
-  the same subject on another and double-issue.
-
-  Four passages elsewhere assert that exception, and closing this gap
-  falsifies all four. They cite the issue only in passing, so search for the
-  claim — `Generate` — rather than for `#195`, which finds fewer:
-
-  - the `POST /generate/{subject}` paragraph under
-    [CSR management](../api.md#csr-management) — delete it;
-  - the `Generate` paragraph in `CA.DeleteRequest`'s godoc
-    ([signing.go](../../internal/ca/signing.go)) — delete it;
-  - the final sentence of the retired [#196](#known-gaps) entry below — drop
-    that sentence, keep the entry;
-  - the Tier 3 paragraph on `DeleteRequest` taking no `c.mu` — **rewrite, do
-    not delete**. Its first two sentences stay true whatever happens to this
-    gap; only the trailing clause about not serialising against `Generate`
-    dies with it.
-
-  The Tier 1 table's "but currently **not** `Generate`" goes as well, but that
-  cell is being edited anyway when `Generate` joins the takers.
 - [#197](https://github.com/voxpupuli/openvox-ca/issues/197) — OCSP's slow
   path signs responses while holding `c.mu` exclusively, so nonced requests
   (which always miss the cache) serialise process-wide behind the signing
@@ -676,6 +663,10 @@ state when the document was last updated and is not guaranteed exhaustive.
   ([#138](https://github.com/voxpupuli/openvox-ca/issues/138)). Whatever lock
   the fix takes, the single-node backends will get it cross-process for free
   now that `WithLock` reaches a same-host tier.
+  The offline `generate` still reports both capabilities in its pre-flight, via
+  `SupportsDistributedLocking`/`SupportsAtomicInventory`, and still tells the
+  operator to stop the server: neither is made true by the same-host tier, and
+  the inventory append above is why.
 - [#171](https://github.com/voxpupuli/openvox-ca/issues/171) — `cachedCRL` is
   per-replica, so authentication and renewal keep accepting a certificate
   revoked elsewhere until this process re-signs the CRL.
@@ -732,16 +723,17 @@ state when the document was last updated and is not guaranteed exhaustive.
   rejection orders against an in-flight sign instead of racing it. The HTTP
   layer also stopped reporting a failed deletion as `404`, which had told the
   operator the request was gone at the moment it was still queued; it answers
-  `503` now. The one issuance a rejection still cannot wait for is `Generate`,
-  which saves and signs a CSR under `c.mu` alone — see the `Generate` gap
-  above.
+  `503` now.
 - ~~[#173](https://github.com/voxpupuli/openvox-ca/issues/173) — renewal
   re-checked revocation before acquiring the subject lock.~~ Fixed: both
   renewal paths now call `refuseIfRevoked` again as the first statement inside
   the subject lock, and `Revoke` takes `subject:<name>` → `crl` so nothing can
-  revoke in the gap between that answer and the issuance it guards. The one
-  issuance path a revocation still cannot wait for is `Generate`, which takes
-  no distributed lock — see the `Generate` gap above.
+  revoke in the gap between that answer and the issuance it guards. `Generate`
+  takes `subject:<name>` as well, so a revocation orders against it like any
+  other issuance. It remains the one issuance path with no `refuseIfRevoked`
+  gate, and deliberately so: it issues *for* a subject rather than renewing a
+  certificate someone presented, so a revoked certificate for that name is
+  evicted and replaced rather than refused.
 - On blob backends (filesystem/redis), an inventory append and its HMAC
   update are two writes, not one atomic unit; the failure window is documented
   at the write site in `AppendInventory` and the structured (SQL, etcd)
@@ -895,3 +887,25 @@ would:
   rather than by store, so driving it would record a self-nesting that is not
   one. Out of scope here rather than misrepresented; rule 9's operator-visible
   half is pinned by the spec above.
+
+`GenerateWithOptions` is a fifth holder of both locks, on its `ReplaceExisting`
+path. Neither mechanism above reaches it: it is not in the per-caller fixture,
+and the edge observer does not drive it either — that spec's setup calls
+`Generate`, which takes `subject:<name>` alone and so records no pair. It is a
+worked instance of the "any caller the specs do not drive" bullet above, and its
+`subject:<name>` → `crl` pair is already sanctioned by `allowedLockNesting`, so
+nothing there fails; the pair is simply never observed. Two things are pinned
+for it separately, in
+[generate_test.go](../../internal/ca/generate_test.go):
+
+- **The subject → CRL ordering**, asserted directly rather than raced, for the
+  same reason `renewrace_test.go` parks rather than races: nothing forces the
+  hazardous interleaving reliably.
+- **The cross-replica outcome** — two `CA` values over one `StorageService`-shared
+  backend that implements `Locker`, racing the same subject, exactly one
+  certificate. This is the outcome the per-subject lock exists for, as opposed
+  to the per-backend mechanism the integration suites cover. Note what the
+  fixture has to do to be a test at all: the two callers rendezvous at the
+  existence check, because an unsynchronised race is decided by whichever
+  goroutine writes first and detects a missing lock only by luck. Its doc
+  comment records the measurements.
