@@ -637,6 +637,18 @@ func (c *CA) Clean(ctx context.Context, subject string) error {
 			// Revoke first so the CRL is updated before the file is removed.
 			// Acquire the CRL lock directly here (inside the subject lock) and
 			// call revokeLocked to avoid double-locking via the public Revoke().
+			// Deliberately not withCRLLockCounted. Most failures inside this
+			// closure are already counted -- revokeLocked and signCRLLocked both
+			// do it -- so what
+			// wrapping would add is the arm where the lock could not be taken at
+			// all, and a contended lock during a best-effort revoke is not a
+			// revocation that did not happen. Note revokeLocked has its own
+			// uncounted arm besides, and hasCert above is what makes it
+			// interesting: the certificate is in storage, so reaching
+			// revokeLocked's fs.ErrNotExist means the *inventory* has no entry
+			// for it. That divergence is classed as never-issued rather than as
+			// a failed revocation. docs/metrics.md names this path as uncounted
+			// on the lock arm.
 			if err := c.Storage.WithLock(ctx, lockNameCRL, func() error {
 				c.mu.Lock()
 				defer c.mu.Unlock()

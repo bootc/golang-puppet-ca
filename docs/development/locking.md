@@ -94,7 +94,7 @@ flight — see its row below.
 | Lock name | Serialises | Taken by |
 | --- | --- | --- |
 | `bootstrap` | First-run CA generation; seeding supporting state (CRL/inventory/serial) for a mounted cert+key; whole-store migration | `CA.Init`, `CA.seedSupportingState`, `storage.MigrateService` (which reuses the name deliberately so a migration and a bootstrapping server exclude each other) |
-| `crl` | Every CRL read-modify-write (read entries → re-sign → write), **and** the pending-supersession list's read-modify-write, which has to be mutual with the revocations it schedules | `Revoke`, `RevokeSerial`, `ReissueCRL`, `RefreshCRLIfDue`, `CleanupExpiredCerts`, `ReconcileSuperseded`, the revoke step inside `Clean` and `GenerateWithOptions`, and the retire step inside `Renew`, `AutoRenew` — "retire" because only those two can defer it to the list; `Clean` and `GenerateWithOptions` always revoke inline |
+| `crl` | Every CRL read-modify-write (read entries → re-sign → write), **and** the pending-supersession list's read-modify-write, which has to be mutual with the revocations it schedules | `Revoke`, `RevokeSerial`, `ReissueCRL`, `RefreshCRLIfDue`, `CleanupExpiredCerts`, `RefreshCRLChainFile` (the `crl_chain_file` job, on every replica on a timer), `ImportCA`, `ReconcileSuperseded`, the revoke step inside `Clean` and `GenerateWithOptions`, and the retire step inside `Renew`, `AutoRenew` — "retire" because only those two can defer it to the list; `Clean` and `GenerateWithOptions` always revoke inline |
 | `subject:<name>` | The whole lifecycle of one subject: evict/save CSR/sign/delete CSR/renew/import/clean/revoke/generate | `SaveRequest`, `Sign`, `SignWithTTL`, `DeleteRequest`, `Renew`, `AutoRenew`, `Clean`, `ImportCertificate`, `Revoke`, `Generate`/`GenerateWithOptions` |
 | `hmac-key` | Generating and persisting the inventory HMAC key when none is usable — a cold start, or a stored blob of the wrong length | `StorageService.EnsureHMACKey`, reached from `CA.Init` → `InitHMAC` and from `MigrateService` → `RebuildInventoryHMAC`. Deliberately **not** `bootstrap`: the migration already holds that name across the rebuild, and `WithLock` is not reentrant |
 | `sql-schema-migrate` | One schema-migration run, so two replicas starting at once do not migrate concurrently (SQL backends only) | `SQLBackend.EnsureReady` |
@@ -318,8 +318,13 @@ response lifetime, is what a revocation is ultimately enforced by.
 `revokeLocked` requires the cluster `crl` lock **and** `c.mu`; each `...Locked`
 function's comment states exactly which locks its caller must hold.
 
-`RevokeSerial` takes the same two as `Revoke` and in the same order, and its
-checks run inside them for the reason rule 3 exists: the subject a serial belongs
+`RevokeSerial` takes the `crl` lock and then `c.mu`, in that order. It does
+**not** take a subject lock, which `Revoke` acquires outside both: a revocation
+by serial has no subject to lock, the serial being the identifier precisely
+because the name now resolves to a different certificate. It does take the `crl`
+lock through `withCRLLockCounted`, as `Revoke` does, so a lock it cannot take
+moves `crl_update_failures`. Its checks run inside the locks for the reason
+rule 3 exists: the subject a serial belongs
 to, and whether that subject's stored certificate still carries it, are what
 justify the CRL write, so resolving either outside the lock would let the answer
 go stale before the mutation. That puts an inventory read — on blob backends an
