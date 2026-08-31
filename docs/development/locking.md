@@ -748,9 +748,12 @@ state when the document was last updated and is not guaranteed exhaustive.
   What that does **not** reach: the bound is per process, so N replicas permit
   N × the limit against one shared signer; it caps CA-key work and not the
   connections, handshakes and goroutines carrying the requests; and
-  `RemoteSigner.Sign` still carries no per-call deadline, so the cap bounds how
-  many callers may be waiting rather than how long any one waits. The
-  coalescing sub-bullet at the end of this entry is also still open.
+  `RemoteSigner.Sign`'s new two-minute deadline bounds *the caller's wait, not
+  the signer's work* — the RPC layer has no cancellation, so an abandoned call
+  leaves the child still signing. That deadline is what lets a slot come back
+  from a wedged signer, which is what makes the cap a limit rather than an
+  outage; it does not reduce the load on the signer itself. The coalescing
+  sub-bullet at the end of this entry is also still open.
 
   **The rest of this entry is retained as the reasoning, and is now history in
   two places**: "The missing half is a cap on concurrent signing … deliberately

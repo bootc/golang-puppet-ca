@@ -29,6 +29,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -186,6 +187,45 @@ func connFromFD(fd int) (net.Conn, error) {
 type RemoteSigner struct {
 	client *rpc.Client
 	pub    crypto.PublicKey
+
+	// timeout bounds a single Sign round trip. Zero selects
+	// defaultRemoteSignTimeout, which is what every production construction
+	// gets; it is set explicitly only by tests.
+	timeout time.Duration
+}
+
+// defaultRemoteSignTimeout bounds how long the frontend waits for the isolated
+// signer to answer one Sign call.
+//
+// Deliberately far above any legitimate signature and purely a backstop against
+// a signer that has stopped answering: before this, Sign was a bare
+// rpc.Client.Call, which waits for a reply or a broken connection, and neither
+// arrives when the child is wedged rather than dead. That made the default
+// deployment the *less* bounded of the two -- openbao.Signer.Sign bounds each
+// call at roughly twice its login timeout -- and it is why a concurrency bound
+// alone is not enough: capping how many callers may wait does nothing if each
+// waits forever.
+//
+// The number has to clear the slowest thing the signer child can legitimately
+// be doing, which is not a local signature. Under ca_key_provider: openbao the
+// child's own Sign is a network round trip bounded at about 2x LoginTimeout
+// (10s by default, so ~20s). Two minutes leaves room for an operator who has
+// raised that substantially, while still turning an indefinite hang into an
+// error. An operator raising LoginTimeout past a minute should know this
+// ceiling exists.
+const defaultRemoteSignTimeout = 2 * time.Minute
+
+// ErrSignTimeout is returned when the isolated signer did not answer within the
+// per-call deadline. The signer may still be working: net/rpc has no
+// cancellation, so this abandons the wait, not the call.
+var ErrSignTimeout = errors.New("timed out waiting for the isolated signer")
+
+// signTimeout returns the deadline for one Sign call.
+func (r *RemoteSigner) signTimeout() time.Duration {
+	if r.timeout > 0 {
+		return r.timeout
+	}
+	return defaultRemoteSignTimeout
 }
 
 // DialConn connects to the signer process and performs the mutual PSK
@@ -240,15 +280,44 @@ func (r *RemoteSigner) Public() crypto.PublicKey {
 	return r.pub
 }
 
-// Sign proxies the signing operation to the isolated signer process.
+// Sign proxies the signing operation to the isolated signer process, waiting
+// at most signTimeout() for a reply.
 // The rand parameter is ignored; randomness is provided by the signer process.
 func (r *RemoteSigner) Sign(_ io.Reader, digest []byte, opts crypto.SignerOpts) ([]byte, error) {
 	req := &SignRequest{Digest: digest, HashFunc: opts.HashFunc()}
-	var resp SignResponse
-	if err := r.client.Call("Signer.Sign", req, &resp); err != nil {
-		return nil, fmt.Errorf("remote sign: %w", err)
+	resp := &SignResponse{}
+
+	// An asynchronous call rather than a blocking one, so the wait can be
+	// bounded. crypto.Signer takes no context, so there is nothing to thread a
+	// deadline through; this is the timer-and-select shape readPSK uses, and
+	// for the same reason.
+	//
+	// The Done channel MUST be buffered: net/rpc discards a reply rather than
+	// block when it cannot deliver it, so an unbuffered channel would drop the
+	// answer to any call this stopped waiting for. With capacity 1 the reply is
+	// always delivered and the client's pending-call entry always cleaned up,
+	// even when nobody is listening any more.
+	call := r.client.Go("Signer.Sign", req, resp, make(chan *rpc.Call, 1))
+
+	timer := time.NewTimer(r.signTimeout())
+	defer timer.Stop()
+
+	select {
+	case done := <-call.Done:
+		if done.Error != nil {
+			return nil, fmt.Errorf("remote sign: %w", done.Error)
+		}
+		return resp.Signature, nil
+	case <-timer.C:
+		// net/rpc cannot cancel an in-flight call, so this bounds *this
+		// caller's* wait and not the signer's work: the child may still be
+		// signing, and its reply will be delivered to the buffered channel
+		// above and dropped. That is the honest limit of this deadline. It
+		// stops callers accumulating against a wedged signer, which is what
+		// makes the concurrency bound's slots recoverable; it does not reduce
+		// the load on the signer itself.
+		return nil, fmt.Errorf("remote sign: %w", ErrSignTimeout)
 	}
-	return resp.Signature, nil
 }
 
 // Close shuts down the RPC connection to the signer.

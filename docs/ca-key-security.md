@@ -82,13 +82,18 @@ queue for a slot; the OCSP responder is refused with RFC 6960 `tryLater`, which
 costs no key work because a non-success OCSP response carries no signature. See
 [bounding CA-key signing](configuration.md#bounding-ca-key-signing).
 
-**`RemoteSigner.Sign` carries no deadline of its own.** Unlike the OpenBao
-Transit path, whose every call is bounded by the login timeout, the isolated
-signer's RPC has none. A signer that stops answering blocks its caller until
-the request is abandoned from elsewhere. So the cap bounds *how many callers
-may be waiting*, not how long any one of them waits — it keeps a wedged signer
-from accumulating callers without limit, which is a different guarantee from
-bounding the wait itself.
+**`RemoteSigner.Sign` waits at most two minutes.** The OpenBao Transit path
+bounds every call by its login timeout; the isolated signer's RPC used to bound
+nothing at all, so a signer child that stopped answering blocked its caller
+indefinitely. It now gives up and returns an error, which is what lets a
+signing slot come back.
+
+That deadline is a backstop, not a tuning, and it bounds *this caller's wait
+rather than the signer's work*: the RPC layer has no cancellation, so an
+abandoned call leaves the child still signing and its reply is discarded. If
+you have raised OpenBao's login timeout substantially, note that the signer
+child's own call is bounded at roughly twice it — well inside two minutes at
+the 10s default, but worth knowing the ceiling exists.
 
 Fronting `/ocsp` with a cache or a proxy-level rate limit remains worthwhile
 where it is reachable by untrusted clients: the cap stops CA-key work growing
