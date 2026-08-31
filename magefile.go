@@ -3353,6 +3353,26 @@ func (Test) Bench() error {
 	return err
 }
 
+// FailureLogHelpers runs the regression suite for the compose harnesses'
+// failure-log dump (test/failure-log.sh): the helper that decides what a
+// container-suite failure leaves behind for whoever has to read it.
+//
+// It drives the helper against a stub compose command serving a fixture shaped
+// like the restart loop of issue #281 -- a CA replica whose reason for dying
+// appears only in its first start attempt, in a log far longer than the tail
+// depth. A dump that reverted to a tail would print plenty and still not reach
+// the reason, which is indistinguishable from a working one by inspection but
+// fails here.
+//
+// Runs on the host in under a second and needs no container runtime, so it is
+// a separate target rather than a step inside Puppet or BackendsRedis -- both
+// of which it covers, since both harnesses share the helper. CI runs it in the
+// unit job, ahead of either.
+func (Test) FailureLogHelpers() error {
+	fmt.Println("Running failure-log helper tests...")
+	return sh.RunV("bash", "test/failure-log-test.sh")
+}
+
 // Puppet builds the Puppet stack images (puppet-master, puppet-client) and runs
 // the full Puppet integration test suite: CA TLS, catalog application,
 // PuppetDB reporting, exported resources, and CRL revocation enforcement.
