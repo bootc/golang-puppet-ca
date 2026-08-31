@@ -140,6 +140,42 @@ type serverConfig struct {
 	// which leaves the replaced certificate valid until it naturally expires.
 	RevokeOnAutoRenew bool `yaml:"revoke_on_auto_renew"`
 
+	// SupersededCertRevokeAfterSec is how long a certificate a renewal has
+	// replaced stays valid before it is revoked, instead of being revoked
+	// inside the renewal call. Three states, per the CSRRateLimit convention:
+	//
+	//	 0  revoke immediately, inside the renewal — an explicit operator choice,
+	//	    and the behaviour of every release before this setting existed
+	//	>0  that duration
+	//	-1  unset: the built-in default (24h)
+	//
+	// The default grants an overlap window in which both the replaced and the
+	// replacement certificate verify, so relying parties can pick up the new
+	// one without a gap — which is what makes a certificate other parties are
+	// actively verifying safe to renew at all.
+	//
+	// It is also a deliberate weakening, and since it is the default it is one
+	// every deployment inherits on upgrade: for the length of the window the
+	// replaced certificate — and, on the CSR-based re-key path, the replaced
+	// private key — is still a credential this CA accepts. Set 0 to restore the
+	// previous behaviour. What keeps the window bounded rather than open-ended
+	// is ca.CA.refuseIfSuperseded, which stops a certificate inside its window
+	// renewing itself into a fresh full-lifetime successor.
+	//
+	// 24h is the same window the serving-certificate work settled on for the
+	// same question asked about a different subject. That work is not in this
+	// repository, so this deliberately does not name its setting: a comment
+	// pointing at a config key nobody can grep for is worse than no pointer.
+	//
+	// It governs both renewal paths. RevokeOnAutoRenew still decides whether
+	// the auto-renewal path retires its predecessor at all.
+	SupersededCertRevokeAfterSec int `yaml:"superseded_cert_revoke_after_sec"`
+	// SupersededCertSweepIntervalSec is how often the sweep that performs those
+	// delayed revocations runs; 0 = built-in default (15m). The interval is
+	// added to the effective delay in the worst case, so keep it well below
+	// superseded_cert_revoke_after_sec.
+	SupersededCertSweepIntervalSec int `yaml:"superseded_cert_sweep_interval_sec"`
+
 	// KubernetesExport optionally publishes the CA certificate and/or CRL into
 	// one or more Kubernetes Secrets and ConfigMaps. Disabled when no targets are
 	// configured. File-only: the nested target list, labels, and annotations are
@@ -174,6 +210,9 @@ func loadServerConfig(configFile string) (*serverConfig, error) {
 		CSRRateLimit:      -1,   // unset sentinel; 0 disables, -1 falls back to defaultCSRRateLimit
 		PromoteCNToSAN:    true, // RFC 2818: add CN as SAN when CSR has no SANs
 		RevokeOnAutoRenew: true, // only the newest serial per subject should be valid
+		// unset sentinel; 0 revokes inside the renewal, -1 falls back to
+		// defaultSupersededCertRevokeAfter
+		SupersededCertRevokeAfterSec: -1,
 	}
 
 	if configFile != "" {
@@ -273,6 +312,23 @@ const (
 	// defaultExpiredCertCleanupInterval is how often the cleanup job runs when no
 	// interval is configured. Daily is ample: expiry is a slow, day-scale event.
 	defaultExpiredCertCleanupInterval = 24 * time.Hour
+	// defaultSupersededCertRevokeAfter is how long a certificate a renewal has
+	// replaced stays valid before revocation when the operator has not chosen
+	// otherwise. 24 hours comfortably exceeds the interval on which a fleet picks
+	// up a replacement, while staying short enough that a replaced credential is
+	// not a standing one — the same reasoning, and the same answer, the
+	// serving-certificate work reached for its own subject.
+	defaultSupersededCertRevokeAfter = 24 * time.Hour
+	// defaultSupersededCertSweepInterval is how often the delayed-supersession
+	// sweep runs when no interval is configured. The interval is the sweep's
+	// own overshoot past a recorded revoke_at, so it wants to be small relative
+	// to the delays operators will configure — those are pickup windows, which
+	// are hour-scale at the shortest. Fifteen minutes keeps the overshoot
+	// immaterial at that scale while keeping the idle cost — one absent-key read
+	// per replica per quarter hour, taking no cluster lock, because
+	// ReconcileSuperseded rules the work out before acquiring one — negligible
+	// on a CA that has recorded nothing.
+	defaultSupersededCertSweepInterval = 15 * time.Minute
 )
 
 // expiredCertRetention resolves the grace period the cleanup job applies after a
@@ -294,6 +350,31 @@ func (c *serverConfig) expiredCertCleanupInterval() time.Duration {
 		return time.Duration(c.ExpiredCertCleanupIntervalSec) * time.Second
 	}
 	return defaultExpiredCertCleanupInterval
+}
+
+// supersededCertRevokeAfter resolves how long a certificate a renewal has
+// replaced stays valid before it is revoked.
+//
+// Zero is an operator's explicit "revoke immediately", not an absent value, so
+// it is honoured rather than replaced by the default — which is the whole point
+// of the -1 unset sentinel and the reason this cannot use the `> 0` shape its
+// interval neighbours use. Any other negative value is treated as unset too:
+// nothing else is representable in the YAML int, and reading a typo as the
+// default is the same answer an absent key gets.
+func (c *serverConfig) supersededCertRevokeAfter() time.Duration {
+	if c.SupersededCertRevokeAfterSec >= 0 {
+		return time.Duration(c.SupersededCertRevokeAfterSec) * time.Second
+	}
+	return defaultSupersededCertRevokeAfter
+}
+
+// supersededCertSweepInterval resolves how often the delayed-supersession sweep
+// runs, falling back to defaultSupersededCertSweepInterval when unset.
+func (c *serverConfig) supersededCertSweepInterval() time.Duration {
+	if c.SupersededCertSweepIntervalSec > 0 {
+		return time.Duration(c.SupersededCertSweepIntervalSec) * time.Second
+	}
+	return defaultSupersededCertSweepInterval
 }
 
 // applyServerEnv overlays PUPPET_CA_* environment variables onto cfg.
@@ -478,6 +559,29 @@ func applyServerEnv(cfg *serverConfig) {
 	if v := os.Getenv("PUPPET_CA_REVOKE_ON_AUTO_RENEW"); v != "" {
 		if b, err := strconv.ParseBool(v); err == nil {
 			cfg.RevokeOnAutoRenew = b
+		}
+	}
+	// n >= 0, unlike every interval setting around it. Those treat 0 as "unset,
+	// use the built-in default", so refusing it costs nothing. Here 0 is the
+	// feature's off switch and a distinct, meaningful value: with a positive
+	// superseded_cert_revoke_after_sec in the config file, a `n > 0` guard would
+	// silently drop an env override of 0 and leave the window open. That is the
+	// one direction this must not fail in — the env channel is how a container
+	// or Helm deployment overrides a baked-in config.yaml, and it would be able
+	// to widen the weakening but never close it.
+	if v := os.Getenv("PUPPET_CA_SUPERSEDED_CERT_REVOKE_AFTER_SEC"); v != "" {
+		// Any integer, including negatives. supersededCertRevokeAfter already
+		// reads a negative as unset, so -1 — the value this setting documents
+		// as "unset" — has to reach it rather than being filtered out here. A
+		// bound of n >= 0 would silently drop exactly the documented way to say
+		// "go back to the default" when a config file has set a window.
+		if n, err := strconv.Atoi(v); err == nil {
+			cfg.SupersededCertRevokeAfterSec = n
+		}
+	}
+	if v := os.Getenv("PUPPET_CA_SUPERSEDED_CERT_SWEEP_INTERVAL_SEC"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cfg.SupersededCertSweepIntervalSec = n
 		}
 	}
 	if v := os.Getenv("PUPPET_CA_KEY_PASSPHRASE_FILE"); v != "" {
@@ -706,3 +810,36 @@ func loadPuppetServerFile(path string) ([]string, error) {
 
 // resolveConfigFile delegates to the shared config.ResolveConfigFile.
 var resolveConfigFile = config.ResolveConfigFile
+
+// supersededWindowWarning reports whether the configured sweep interval makes
+// the overlap window meaningfully longer than the operator asked for, and the
+// log line to emit when it does.
+//
+// The interval is added to every window in the worst case: a certificate
+// becomes due between two passes and is revoked on the later one. An operator
+// following the docs' advice to set the window no longer than a fleet's pickup
+// takes can easily land below the 15-minute default interval and get an
+// effective window several times what they asked for — on a setting the docs
+// call a deliberate weakening.
+//
+// It warns rather than refuses, because the configuration is coherent, just not
+// what it looks like. Split out of the serve command so it can be asserted:
+// inside a cobra RunE it was a branch nothing could reach.
+func supersededWindowWarning(c *serverConfig) (string, []any, bool) {
+	revokeAfter := c.supersededCertRevokeAfter()
+	if revokeAfter <= 0 {
+		return "", nil, false
+	}
+	sweep := c.supersededCertSweepInterval()
+	if sweep < revokeAfter {
+		return "", nil, false
+	}
+	return "superseded_cert_sweep_interval_sec is not shorter than " +
+			"superseded_cert_revoke_after_sec, so the sweep interval sets the effective " +
+			"overlap window rather than the delay does",
+		[]any{
+			"revoke_after", revokeAfter,
+			"sweep_interval", sweep,
+			"worst_case_window", revokeAfter + sweep,
+		}, true
+}

@@ -54,6 +54,8 @@ fi
 # -- Configuration --------------------------------------------------------─
 # Host-side URLs (CA on 8141, master on 8140, as mapped in test/compose-puppet.yml).
 CA_HOST_URL="https://localhost:8141"
+# The Prometheus exporter, plain HTTP on its own listener (see compose-puppet.yml).
+CA_METRICS_URL="http://localhost:9141/metrics"
 MASTER_URL="https://puppet-master:8140"   # used from inside master container
 
 WORK_DIR=$(mktemp -d /tmp/puppet-stack-integ.XXXXXX)
@@ -668,19 +670,49 @@ _pubkey_after=$(exec_client openssl x509 -in "$_client_cert_path" -noout -pubkey
     || fail "renewed cert keeps the same public key (no CSR, no re-key)" \
         "$([[ -z "$_pubkey_after" ]] && echo "post-renewal public key could not be extracted" || echo "public key changed across renewal")"
 
-# revoke_on_auto_renew defaults to true: the pre-renewal serial must now be
-# in the CRL, so only the newest serial for this subject stays valid.
+# Delayed supersession: superseded_cert_revoke_after_sec defaults to 24h, so the
+# pre-renewal serial is deliberately NOT on the CRL yet. It is recorded instead,
+# and a sweep revokes it once the window elapses. Both halves are asserted --
+# absence from the CRL alone would also hold if the supersession had been
+# silently dropped, which is the failure this feature must never have.
+#
+# Before this default existed the renewal revoked its predecessor inline and
+# this block asserted the opposite. Set superseded_cert_revoke_after_sec: 0 to
+# get that behaviour back.
 _old_serial_hex=${_serial_before#serial=}
 _crl_after_renew=$(curl -sfk "${_CA[@]}" \
     "${CA_HOST_URL}/puppet-ca/v1/certificate_revocation_list/ca" 2>/dev/null \
     | openssl crl -text -noout 2>/dev/null) || true
 # Guard on a non-empty serial first: _serial_before is captured with `|| true`,
 # so if the pre-renewal serial could not be extracted, _old_serial_hex is empty
-# and `grep -qF ""` would match any CRL unconditionally — passing the assertion
-# without ever testing revocation. Refuse to pass on an empty serial.
-[[ -n "$_old_serial_hex" ]] && grep -qF "$_old_serial_hex" <<< "$_crl_after_renew" \
-    && pass "pre-renewal serial is revoked by default after auto-renewal" \
-    || fail "pre-renewal serial is revoked by default after auto-renewal" "serial '$_old_serial_hex' not found in CRL"
+# and `grep -qF ""` would match any CRL unconditionally. Here that would make the
+# *absence* assertion fail rather than pass, but the guard is kept explicit so
+# the two assertions below cannot be read as depending on which way it errs.
+if [[ -z "$_old_serial_hex" ]]; then
+    fail "pre-renewal serial stays valid inside its overlap window" "pre-renewal serial could not be extracted"
+elif grep -qF "$_old_serial_hex" <<< "$_crl_after_renew"; then
+    fail "pre-renewal serial stays valid inside its overlap window" \
+        "serial '$_old_serial_hex' is already on the CRL; the 24h window should still be open"
+else
+    pass "pre-renewal serial stays valid inside its overlap window"
+fi
+
+# ...and it must be on the pending list, not merely un-revoked. The gauge is the
+# backend-agnostic way to see that: this script also runs against the Redis and
+# Redis stack (test/backends/redis-stack.sh runs this same script), where there
+# is no superseded.json to read.
+_pending=$(curl -sf "$CA_METRICS_URL" 2>/dev/null \
+    | awk '$1 == "puppetca_supersede_pending" { print $2 }') || true
+[[ -n "$_pending" ]] \
+    && pass "exporter publishes puppetca_supersede_pending" \
+    || fail "exporter publishes puppetca_supersede_pending" "gauge absent from ${CA_METRICS_URL}"
+# awk prints the Prometheus float verbatim ("1" or "1.0"); compare numerically
+# so either form counts, and refuse an empty value rather than letting the
+# arithmetic treat it as zero.
+[[ -n "$_pending" ]] && awk -v v="$_pending" 'BEGIN { exit !(v >= 1) }' \
+    && pass "the superseded certificate is recorded for delayed revocation" \
+    || fail "the superseded certificate is recorded for delayed revocation" \
+        "puppetca_supersede_pending is '${_pending:-<absent>}'; the renewal left nothing on the pending list"
 
 # The renewed cert must still work for a normal agent run (still trusted,
 # same private key on disk as before the renewal). Match Group 3's depth:

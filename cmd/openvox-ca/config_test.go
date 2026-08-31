@@ -354,6 +354,128 @@ var _ = Describe("expired-cert cleanup resolvers", func() {
 			"expiredCertCleanupInterval() = %v; want %v", cfg.expiredCertCleanupInterval(), 900*time.Second)
 	})
 
+	// The warning exists because an operator who follows the docs' advice — set
+	// the window no longer than the pickup takes — can land below the 15-minute
+	// default sweep interval and silently get an effective window several times
+	// what they asked for. Inside the serve command it was a branch nothing
+	// could reach.
+	DescribeTable("warns when the sweep interval swamps the overlap window",
+		func(revokeAfterSec, sweepSec int, wantWarn bool) {
+			cfg := &serverConfig{
+				SupersededCertRevokeAfterSec:   revokeAfterSec,
+				SupersededCertSweepIntervalSec: sweepSec,
+			}
+			msg, args, warn := supersededWindowWarning(cfg)
+			Expect(warn).To(Equal(wantWarn))
+			if !wantWarn {
+				Expect(msg).To(BeEmpty())
+				return
+			}
+			Expect(msg).To(ContainSubstring("superseded_cert_sweep_interval_sec"))
+			// The worst case is what the operator actually gets, so it has to be
+			// in the line rather than left for them to work out.
+			Expect(args).To(ContainElement("worst_case_window"))
+			Expect(args).To(ContainElement(
+				time.Duration(revokeAfterSec)*time.Second + time.Duration(sweepSec)*time.Second))
+		},
+		Entry("interval longer than the window", 60, 900, true),
+		Entry("interval equal to the window", 900, 900, true),
+		Entry("interval shorter than the window", 86400, 900, false),
+		// 0 is an explicit "revoke inside the renewal": there is no window for
+		// an interval to swamp, so warning would be noise on the one setting
+		// that turns the feature off.
+		Entry("window closed", 0, 900, false),
+		// Unset resolves to the 24h default, comfortably above the 15m default
+		// interval — the shipped configuration must not warn.
+		Entry("both unset (the shipped default)", -1, 0, false),
+	)
+
+	It("resolves the delayed-supersession settings", func() {
+		clearServerEnv()
+		cfg, err := loadServerConfig("")
+		Expect(err).NotTo(HaveOccurred(), "unexpected error")
+		Expect(cfg.supersededCertRevokeAfter()).To(Equal(defaultSupersededCertRevokeAfter),
+			"an unset window must resolve to the built-in default, not to zero")
+		Expect(cfg.supersededCertRevokeAfter()).To(Equal(24*time.Hour),
+			"and that default is 24h, matching tls_self_provision_revoke_after_sec")
+		Expect(cfg.supersededCertSweepInterval()).To(Equal(defaultSupersededCertSweepInterval),
+			"supersededCertSweepInterval() = %v; want default %v",
+			cfg.supersededCertSweepInterval(), defaultSupersededCertSweepInterval)
+		// time.NewTicker panics on a non-positive duration and the sweep runs on
+		// every deployment, so the default has to be positive on its own terms
+		// and not merely equal to a constant that could itself become zero.
+		Expect(cfg.supersededCertSweepInterval()).To(BeNumerically(">", 0))
+
+		clearServerEnv()
+		setEnv("PUPPET_CA_SUPERSEDED_CERT_REVOKE_AFTER_SEC", "3600")
+		setEnv("PUPPET_CA_SUPERSEDED_CERT_SWEEP_INTERVAL_SEC", "60")
+		cfg, err = loadServerConfig("")
+		Expect(err).NotTo(HaveOccurred(), "unexpected error")
+		Expect(cfg.supersededCertRevokeAfter()).To(Equal(time.Hour))
+		Expect(cfg.supersededCertSweepInterval()).To(Equal(time.Minute))
+
+		// Zero is an operator's explicit "revoke immediately", not an absent
+		// value. This is the one setting here where the `> 0` shape its
+		// neighbours use would be wrong: it would swallow the off switch and
+		// hand back a 24-hour window to someone who asked for none.
+		clearServerEnv()
+		cfg, err = loadServerConfig("")
+		Expect(err).NotTo(HaveOccurred(), "unexpected error")
+		cfg.SupersededCertRevokeAfterSec = 0
+		Expect(cfg.supersededCertRevokeAfter()).To(BeZero(),
+			"an explicit 0 must mean revoke-inside-the-renewal, not fall back to the default")
+
+		// Any other negative reads as unset, like an absent key.
+		cfg.SupersededCertRevokeAfterSec = -5
+		Expect(cfg.supersededCertRevokeAfter()).To(Equal(defaultSupersededCertRevokeAfter))
+		cfg.SupersededCertSweepIntervalSec = -1
+		Expect(cfg.supersededCertSweepInterval()).To(Equal(defaultSupersededCertSweepInterval))
+	})
+
+	// The env channel is how a container or Helm deployment overrides a baked-in
+	// config.yaml, and this is the one setting where 0 is a meaningful value
+	// rather than "unset". The `n > 0` guard its neighbours use would silently
+	// drop this override and leave the overlap window open — so the env route
+	// could widen the weakening but never close it.
+	It("lets the environment turn the overlap window off, not just on", func() {
+		clearServerEnv()
+		dir := GinkgoT().TempDir()
+		path := filepath.Join(dir, "config.yaml")
+		Expect(os.WriteFile(path, []byte("superseded_cert_revoke_after_sec: 3600\n"), 0o600)).To(Succeed())
+
+		cfg, err := loadServerConfig(path)
+		Expect(err).NotTo(HaveOccurred(), "unexpected error")
+		Expect(cfg.supersededCertRevokeAfter()).To(Equal(time.Hour), "precondition: the file sets a window")
+
+		setEnv("PUPPET_CA_SUPERSEDED_CERT_REVOKE_AFTER_SEC", "0")
+		cfg, err = loadServerConfig(path)
+		Expect(err).NotTo(HaveOccurred(), "unexpected error")
+		Expect(cfg.supersededCertRevokeAfter()).To(BeZero(),
+			"an env value of 0 must override a positive file value and close the window")
+
+		// And it must close it against the *default* too, not only against a
+		// file value — that is now the case an operator restoring the previous
+		// behaviour on upgrade actually hits.
+		clearServerEnv()
+		setEnv("PUPPET_CA_SUPERSEDED_CERT_REVOKE_AFTER_SEC", "0")
+		cfg, err = loadServerConfig("")
+		Expect(err).NotTo(HaveOccurred(), "unexpected error")
+		Expect(cfg.supersededCertRevokeAfter()).To(BeZero(),
+			"an env value of 0 must also override the built-in 24h default")
+
+		// -1 is the documented way to say "unset". A bound of n >= 0 in
+		// applyServerEnv would silently drop it, so an operator whose config
+		// file sets a window could not use the env channel to go back to the
+		// default — only to some other explicit number.
+		clearServerEnv()
+		Expect(os.WriteFile(path, []byte("superseded_cert_revoke_after_sec: 3600\n"), 0o600)).To(Succeed())
+		setEnv("PUPPET_CA_SUPERSEDED_CERT_REVOKE_AFTER_SEC", "-1")
+		cfg, err = loadServerConfig(path)
+		Expect(err).NotTo(HaveOccurred(), "unexpected error")
+		Expect(cfg.supersededCertRevokeAfter()).To(Equal(defaultSupersededCertRevokeAfter),
+			"an env value of -1 must reach the resolver and mean the built-in default")
+	})
+
 	It("falls back to defaults for non-positive values", func() {
 		clearServerEnv()
 		setEnv("PUPPET_CA_EXPIRED_CERT_RETENTION_SEC", "0")
@@ -726,6 +848,16 @@ var _ = Describe("applyServerEnv each variable", func() {
 		// typo in the env key would then leave it false and fail this entry.
 		Entry("REVOKE_ON_AUTO_RENEW", "PUPPET_CA_REVOKE_ON_AUTO_RENEW", "true",
 			func(c *serverConfig) bool { return c.RevokeOnAutoRenew }, "RevokeOnAutoRenew"),
+		// Distinct values, because these two are adjacent ints with adjacent
+		// names: swapping the destinations would turn a 12-hour overlap window
+		// into a 12-hour sweep interval on a 90-second delay, and both would
+		// still "work".
+		Entry("SUPERSEDED_CERT_REVOKE_AFTER_SEC", "PUPPET_CA_SUPERSEDED_CERT_REVOKE_AFTER_SEC", "43200",
+			func(c *serverConfig) bool { return c.SupersededCertRevokeAfterSec == 43200 },
+			"SupersededCertRevokeAfterSec"),
+		Entry("SUPERSEDED_CERT_SWEEP_INTERVAL_SEC", "PUPPET_CA_SUPERSEDED_CERT_SWEEP_INTERVAL_SEC", "90",
+			func(c *serverConfig) bool { return c.SupersededCertSweepIntervalSec == 90 },
+			"SupersededCertSweepIntervalSec"),
 		// CA key provider selection and OpenBao settings. Each entry uses a
 		// distinct value and asserts the specific destination field, so a
 		// wrong target (e.g. role-id <-> secret-id, or tls_cert <-> tls_key —

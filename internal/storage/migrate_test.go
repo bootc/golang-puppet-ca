@@ -43,6 +43,7 @@ func seedCA(b Backend) map[string][]byte {
 		KeyInventory:     []byte("0xABC /CN=a\n"),
 		KeyInventoryHMAC: []byte("hmac-bytes"),
 		KeyHMACKey:       []byte("hmac-key-bytes"),
+		KeySuperseded:    []byte(`[{"serial":"0ABC","subject":"web01","revoke_at":"2026-01-01T00:00:00Z"}]`),
 		CSRKey("web01"):  []byte("csr-web01"),
 		CSRKey("web02"):  []byte("csr-web02"),
 		CertKey("web01"): []byte("cert-web01"),
@@ -63,10 +64,18 @@ var _ = Describe("MigrateCopiesEverything", func() {
 
 		report, err := Migrate(ctx, src, dst, MigrateOptions{})
 		Expect(err).NotTo(HaveOccurred(), "Migrate")
-		Expect(report.Singletons).To(Equal(8), "want 8 singletons, 2 CSRs, 1 cert")
-		Expect(report.CSRs).To(Equal(2), "want 8 singletons, 2 CSRs, 1 cert")
-		Expect(report.Certs).To(Equal(1), "want 8 singletons, 2 CSRs, 1 cert")
+		Expect(report.Singletons).To(Equal(9), "want 9 singletons, 2 CSRs, 1 cert")
+		Expect(report.CSRs).To(Equal(2), "want 9 singletons, 2 CSRs, 1 cert")
+		Expect(report.Certs).To(Equal(1), "want 9 singletons, 2 CSRs, 1 cert")
 		Expect(report.Total()).To(Equal(len(want)))
+
+		// Called out because dropping this one is silent and permanent: the
+		// pending-supersession list is the only record that a certificate a
+		// renewal replaced is still due for revocation. A migration that left
+		// it behind would strand every entry — each of them a live credential —
+		// with nothing at the destination able to rediscover them.
+		Expect(dst.Get(ctx, KeySuperseded)).To(Equal(want[KeySuperseded]),
+			"the pending-supersession list must survive a store migration")
 
 		for k, v := range want {
 			got, err := dst.Get(ctx, k)
@@ -101,6 +110,7 @@ var _ = Describe("MigratePreservesVisibility", func() {
 			{KeyCAKey, FilePermPrivate},
 			{KeyInventory, FilePermPrivate},
 			{KeyHMACKey, FilePermPrivate},
+			{KeySuperseded, FilePermPrivate},
 		}
 		for _, c := range cases {
 			p := dst.Path(c.key)

@@ -20,6 +20,7 @@ interface. Every backend serves the following logical keys:
 | `inventory` | Append-only log of issued/revoked certificates | sign / revoke / seed |
 | `inventory_hmac` | Inventory integrity head (blob HMAC, or hash chain on the structured backends: SQL, etcd) | sign / revoke |
 | `hmac_key` | Integrity key for `inventory_hmac` | first run |
+| `superseded` | JSON list of certificates a renewal has replaced and that are awaiting delayed revocation: `{serial, subject, revoke_at}` per entry. Absent until the first supersession, which needs `superseded_cert_revoke_after_sec` set. Read-modify-written whole, under the cluster `crl` lock so an append and the sweep's rewrite exclude each other | renew / auto-renew / revoke / supersession sweep |
 | `csr/<subject>` | Pending certificate signing request (PEM), per subject | CSR submission |
 | `cert/<subject>` | Issued certificate (PEM), per subject | sign |
 
@@ -42,6 +43,7 @@ itself, which nothing else would write again.
 ├── serial                          (KeySerial)
 ├── inventory.txt                   (KeyInventory)
 ├── .inventory.hmac                 (KeyInventoryHMAC)
+├── superseded.json                 (KeySuperseded)     0600
 ├── private/
 │   ├── ca_key.pem                  (KeyCAKey)          0600
 │   ├── .inventory_hmac_key         (KeyHMACKey)        0600
@@ -75,6 +77,7 @@ With the default prefix `/puppet-ca`:
 | `inventory` | `/puppet-ca/inventory/data` (presence marker only; see below) |
 | `inventory_hmac` | `/puppet-ca/inventory/hmac` |
 | `hmac_key` | `/puppet-ca/private/hmac_key` |
+| `superseded` | `/puppet-ca/superseded` |
 | `csr/<subject>` | `/puppet-ca/requests/<subject>` |
 | `cert/<subject>` | `/puppet-ca/signed/<subject>` |
 
@@ -135,6 +138,7 @@ separator):
 | `inventory` | `puppet-ca:inventory:data` |
 | `inventory_hmac` | `puppet-ca:inventory:hmac` |
 | `hmac_key` | `puppet-ca:private:hmac_key` |
+| `superseded` | `puppet-ca:superseded` |
 | `csr/<subject>` | `puppet-ca:requests:<subject>` |
 | `cert/<subject>` | `puppet-ca:signed:<subject>` |
 

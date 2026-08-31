@@ -75,6 +75,8 @@ type Collector struct {
 
 	ocspIndexSyncFailures *prometheus.Desc
 	ocspIndexSerials      *prometheus.Desc
+	supersedeFailures     *prometheus.Desc
+	supersedePending      *prometheus.Desc
 
 	caInfo      *prometheus.Desc
 	caNotBefore *prometheus.Desc
@@ -142,6 +144,34 @@ func NewCollector(c *ca.CA) *Collector {
 				"sharing a backend should converge on the same value within one sync interval; a "+
 				"replica persistently below the others is reporting valid certificates as unknown.",
 			nil, nil),
+		supersedeFailures: prometheus.NewDesc(
+			prometheus.BuildFQName(namespace, "supersede", "failures_total"),
+			"Total failures to schedule or carry out the revocation of a certificate a renewal "+
+				"replaced: a supersession the renewal path could not record, a pending-revocation "+
+				"list that could not be read or parsed, a sweep pass that could not take the CRL "+
+				"lock or write the list back, and each pass that left an entry unrevoked or "+
+				"discarded one whose serial it could never revoke. One pass counts "+
+				"once however many entries it failed on. Only where "+
+				"superseded_cert_revoke_after_sec is 0 is nothing recorded — the revocation then "+
+				"happens inside the renewal, and a failure there lands in "+
+				"puppetca_crl_update_failures_total instead — so this stays flat there, with one "+
+				"exception: the sweep, every renewal and every subject revocation read the pending "+
+				"list whatever the setting says, and a store that cannot serve that key raises "+
+				"this even with the window closed. A rising value means a certificate a renewal "+
+				"replaced may still be a valid credential.",
+			nil, nil),
+		supersedePending: prometheus.NewDesc(
+			prometheus.BuildFQName(namespace, "supersede", "pending"),
+			"Certificates a renewal has replaced that are still inside their overlap window and "+
+				"not yet revoked. Each one is a credential this CA still accepts even though "+
+				"something newer has taken its place, so this is the live measure of the exposure "+
+				"superseded_cert_revoke_after_sec buys. It returns to zero as the sweep drains "+
+				"the list; a value that does not fall means the sweep is not completing — check "+
+				"puppetca_supersede_failures_total, which a pass that failed or ran out of budget "+
+				"both raise, and the log for 'ran out of budget; deferring the rest'. Absent, "+
+				"rather than zero, when the list could not be read: zero is what a drained list "+
+				"reports, so it must not also be what an unreadable one reports.",
+			nil, nil),
 		crlCachedNumber: prometheus.NewDesc(
 			prometheus.BuildFQName(namespace, "crl", "cached_number"),
 			"CRL sequence number of the copy this replica is answering revocation checks from. "+
@@ -208,6 +238,8 @@ func (c *Collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.caReady
 	ch <- c.crlUpdateFailures
 	ch <- c.crlSyncFailures
+	ch <- c.supersedeFailures
+	ch <- c.supersedePending
 	ch <- c.crlCachedNumber
 	ch <- c.ocspIndexSyncFailures
 	ch <- c.ocspIndexSerials
@@ -253,6 +285,8 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 		float64(c.ca.SerialIndexSyncFailures()))
 	ch <- prometheus.MustNewConstMetric(c.ocspIndexSerials, prometheus.GaugeValue,
 		float64(c.ca.SerialIndexSize()))
+	ch <- prometheus.MustNewConstMetric(c.supersedeFailures, prometheus.CounterValue,
+		float64(c.ca.SupersedeFailures()))
 	if cached, ok := c.ca.CachedCRLNumber(); ok {
 		num, _ := new(big.Float).SetInt(cached).Float64()
 		ch <- prometheus.MustNewConstMetric(c.crlCachedNumber, prometheus.GaugeValue, num)
@@ -279,6 +313,11 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 		ch <- prometheus.MustNewConstMetric(c.crlThisUpdate, prometheus.GaugeValue, timestamp(snap.crlThisUpdate))
 		ch <- prometheus.MustNewConstMetric(c.crlNextUpdate, prometheus.GaugeValue, timestamp(snap.crlNextUpdate))
 		ch <- prometheus.MustNewConstMetric(c.crlRevoked, prometheus.GaugeValue, float64(snap.crlRevokedCount))
+	}
+
+	if snap.haveSupersedePending {
+		ch <- prometheus.MustNewConstMetric(c.supersedePending, prometheus.GaugeValue,
+			float64(snap.supersedePending))
 	}
 
 	stateCounts := map[string]int{stateRequested: 0, stateSigned: 0, stateRevoked: 0}
@@ -325,6 +364,9 @@ type snapshot struct {
 	crlNextUpdate   time.Time
 	crlRevokedCount int
 
+	haveSupersedePending bool
+	supersedePending     int
+
 	leaves []leafCert
 }
 
@@ -370,6 +412,23 @@ func (c *Collector) gather(ctx context.Context) (snapshot, error) {
 		} else {
 			slog.Warn("Prometheus exporter: failed to parse CRL", "error", perr)
 		}
+	}
+
+	// Certificates awaiting delayed revocation. Absent on any CA that has never
+	// recorded one, which reads as a genuine zero.
+	//
+	// A read *failure* omits the series rather than reporting zero, the same
+	// way haveCRL omits the CRL series above. Zero is the value this gauge takes
+	// when the exposure it measures is gone, so publishing it on a list nobody
+	// could read would say "drained" about the one state where the list may be
+	// full and the sweep stuck — and would do it while looking healthy. An
+	// omitted series goes stale and is visible as such. The failure itself is
+	// counted by the sweep, which meets the same error once per pass.
+	if pending, perr := c.ca.PendingSupersessions(ctx); perr != nil {
+		slog.Warn("Prometheus exporter: failed to read pending supersessions", "error", perr)
+	} else {
+		snap.supersedePending = pending
+		snap.haveSupersedePending = true
 	}
 
 	// Signed certificates: enumerate the live (non-deleted) signed set. A cleaned

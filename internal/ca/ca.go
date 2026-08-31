@@ -24,6 +24,7 @@ import (
 	"crypto/x509/pkix"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/voxpupuli/openvox-ca/internal/storage"
 )
@@ -146,8 +147,39 @@ type CA struct {
 	// does not do this — both the old and new certs (same key) stay valid
 	// until the old one naturally expires. Set to false to match that
 	// behaviour exactly. This does not affect the CSR-based Renew path
-	// (a genuine re-key), which always revokes the certificate it replaces.
+	// (a genuine re-key), which always retires the certificate it replaces.
+	//
+	// It is a whether, not a when: SupersedeAfter decides how long the
+	// replaced certificate stays valid before the revocation lands.
 	RevokeOnAutoRenew bool
+
+	// SupersedeAfter delays the revocation of a certificate a renewal has
+	// replaced by this long, instead of revoking it in the renewal call. The
+	// replaced serial is recorded on a durable, cross-subject list and a
+	// periodic sweep (ReconcileSuperseded) revokes it once the delay elapses.
+	//
+	// Zero is the behaviour that predates the list: the replaced certificate is
+	// revoked immediately, inside the renewal, and nothing is recorded. It is
+	// this type's zero value, so a CA constructed without setting it — the
+	// offline commands and openvox-ca-ctl — retires immediately, which is the
+	// right default for a deliberate operator action at a terminal.
+	//
+	// It is *not* what the server does. `openvox-ca serve` sets this from
+	// superseded_cert_revoke_after_sec, which defaults to 24h, so an ordinary
+	// deployment grants a window. The two differ deliberately: a fleet renewing
+	// on a timer needs the overlap, and an operator revoking by hand does not.
+	//
+	// A positive value is a deliberate weakening of that: for the length of the
+	// window the replaced certificate — and, on the CSR-based re-key path, the
+	// replaced *private key* — remains a credential this CA accepts. It buys
+	// the overlap a fleet needs to pick up a replacement without a gap, which is
+	// what makes a renewal safe to perform on a certificate other parties are
+	// actively verifying. Set it no longer than that pickup takes.
+	//
+	// It applies to both renewal paths: the CSR-based Renew and, subject to
+	// RevokeOnAutoRenew, AutoRenew. RevokeOnAutoRenew still decides whether
+	// AutoRenew retires its predecessor at all; this decides when.
+	SupersedeAfter time.Duration
 
 	// ExternalSigner, when non-nil, is used instead of loading the CA private
 	// key from disk. This enables key isolation: the private key lives in a
@@ -231,6 +263,19 @@ type CA struct {
 	// fleet, so a certificate revoked there may still be admitted here. Exposed
 	// via the metrics exporter (puppetca_crl_sync_failures_total) for alerting.
 	crlSyncFailures atomic.Uint64
+
+	// supersedeFailures counts failures to schedule or carry out a delayed
+	// revocation: a supersession the renewal path could not record, a
+	// pending-revocation list that could not be read or parsed, a sweep pass
+	// that could not take the CRL lock or write the list back, and each pass
+	// that left an entry unrevoked or discarded one whose serial it could never
+	// revoke. A pass counts once however many entries it failed on. Distinct from crlUpdateFailures, which counts failures to
+	// amend the CRL — an entry can be lost here without the CRL ever being
+	// touched. While it rises, a certificate that a renewal replaced may still
+	// be a valid credential, and on a lost entry nothing else records that it
+	// should not be. Exposed via the metrics exporter
+	// (puppetca_supersede_failures_total) for alerting.
+	supersedeFailures atomic.Uint64
 
 	// crlNotify carries a coalesced signal each time the CRL is re-signed (see
 	// signCRLLocked). It is buffered to depth 1 and written non-blockingly, so a

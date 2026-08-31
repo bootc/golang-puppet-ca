@@ -47,6 +47,7 @@ var migratableSingletons = []migratableSingleton{
 	{KeyInventory, BlobPrivate},
 	{KeyInventoryHMAC, BlobPrivate},
 	{KeyHMACKey, BlobPrivate},
+	{KeySuperseded, BlobPrivate},
 }
 
 // MigrateOptions tunes a Migrate run.

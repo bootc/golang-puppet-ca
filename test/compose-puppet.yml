@@ -39,11 +39,26 @@ services:
     volumes:
       - ../docker/puppet/ca-entrypoint.sh:/etc/puppet-ca/entrypoint.sh:ro,z
       - ca-data:/data
+    # The Prometheus exporter is off by default because it reveals certificate
+    # subjects. It is on here so the stack can assert on puppetca_supersede_pending:
+    # with superseded_cert_revoke_after_sec defaulting to 24h, a renewal's
+    # predecessor is deliberately absent from the CRL, and that gauge is the only
+    # backend-agnostic evidence the supersession was *recorded* rather than
+    # silently dropped. Checking a file would not work on the Redis stack,
+    # which runs this same script against a backend that has no cadir.
+    environment:
+      PUPPET_CA_METRICS_LISTEN: ":9140"
     expose:
       - "8140"
-    # Port 8141 on the host allows the test script to reach the CA directly.
+      - "9140"
+    # Port 8141 on the host allows the test script to reach the CA directly;
+    # 9141 reaches the exporter, which is plain HTTP on its own listener.
     ports:
       - "8141:8140"
+      # Loopback-only: the exporter reveals certificate subjects, and the CA's
+      # own documentation says to keep it off a shared interface. Nothing
+      # outside this host needs it.
+      - "127.0.0.1:9141:9140"
     healthcheck:
       # Use -k (insecure) so the healthcheck works before any other container
       # has downloaded the CA cert.  The TLS cert is valid; we just skip CN

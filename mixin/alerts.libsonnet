@@ -202,7 +202,33 @@
             labels: { severity: 'warning' } + $._config.alertLabels,
             annotations: {
               summary: 'Puppet CA is failing to update its CRL.',
-              description: 'The Puppet CA on {{ $labels.instance }} could not amend its CRL (puppetca_crl_update_failures_total is rising). Revocations may not have taken effect and superseded certificates may still be valid. Check the CA logs to tell the causes apart: "Renew:"/"AutoRenew: failed to revoke replaced certificate"/"Clean:" warnings are a real failure to maintain the CRL, and on filesystem or SQLite a "Revoke failed" warning on a request that took over a minute is instead a revocation that merely queued too long for its subject lock. Then check CRL storage.',
+              description: 'The Puppet CA on {{ $labels.instance }} could not amend its CRL (puppetca_crl_update_failures_total is rising). Revocations may not have taken effect and superseded certificates may still be valid. Check the CA logs to tell the causes apart: "Renew:"/"AutoRenew: failed to retire replaced certificate"/"Clean:" warnings are a real failure to maintain the CRL, and on filesystem or SQLite a "Revoke failed" warning on a request that took over a minute is instead a revocation that merely queued too long for its subject lock. Then check CRL storage.',
+            },
+          },
+          {
+            alert: 'PuppetCASupersedeFailing',
+            // A certificate a renewal replaced is still a valid credential,
+            // because the CA could not schedule or carry out its delayed
+            // revocation: a supersession the renewal path could not record, a
+            // pending-revocation list it could not read or parse, or a sweep
+            // pass that left an entry unrevoked or discarded one whose serial it
+            // could never revoke. Live on any CA that renews certificates,
+            // since superseded_cert_revoke_after_sec defaults to 24h; only
+            // where it is 0 does the revocation happen inside the renewal, and
+            // a failure there is a CRL failure counted by the alert above.
+            // Even then the sweep, every renewal and every subject revocation
+            // read the pending list whatever the setting says, so a store that
+            // cannot serve that key fires this with the window closed too.
+            // Counter resets on restart, so alert on increase() over a window.
+            expr: 'increase(puppetca_supersede_failures_total{%(selector)s}[%(window)s]) > 0' % {
+              selector: $._config.puppetCASelector,
+              window: $._config.supersedeWindow,
+            },
+            'for': $._config.supersedeFor,
+            labels: { severity: 'warning' } + $._config.alertLabels,
+            annotations: {
+              summary: 'Puppet CA is failing to revoke superseded certificates.',
+              description: 'The Puppet CA on {{ $labels.instance }} could not schedule or carry out the revocation of a certificate a renewal replaced (puppetca_supersede_failures_total is rising), so that certificate is still a valid credential. Check the CA logs to tell the causes apart: "Superseded-certificate revocation sweep failed" means the sweep could not read the list, take the CRL lock or write the list back, which is the likeliest cause and blocks every pending revocation at once; "failed to retire replaced certificate" means the supersession was never recorded and the serial is in the warning; "Could not revoke superseded certificate" means it was recorded but the sweep could not revoke it, and it will retry; "ran out of budget; deferring the rest" means the backlog is draining slower than it accrues, and the entries are still listed; "Discarding" means the entry is gone and will never be retried. A store that cannot serve the superseded key raises this even where the overlap window is closed (superseded_cert_revoke_after_sec: 0) — look for "cannot determine supersession status" or "Revoke: could not read pending supersessions", which also mean renewals are being refused. Retire anything the sweep will not with openvox-ca-ctl revoke --serial <hex>. puppetca_supersede_pending shows how many are still waiting.',
             },
           },
           {

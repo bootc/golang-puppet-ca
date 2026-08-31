@@ -84,7 +84,7 @@ less protocol for it.
 | Lock name | Serialises | Taken by |
 | --- | --- | --- |
 | `bootstrap` | First-run CA generation; seeding supporting state (CRL/inventory/serial) for a mounted cert+key; whole-store migration | `CA.Init`, `CA.seedSupportingState`, `storage.MigrateService` (which reuses the name deliberately so a migration and a bootstrapping server exclude each other) |
-| `crl` | Every CRL read-modify-write (read entries → re-sign → write) | `Revoke`, `RevokeSerial`, `ReissueCRL`, `RefreshCRLIfDue`, `CleanupExpiredCerts`, and the revoke step inside `Clean`, `Renew`, `AutoRenew` |
+| `crl` | Every CRL read-modify-write (read entries → re-sign → write), **and** the pending-supersession list's read-modify-write, which has to be mutual with the revocations it schedules | `Revoke`, `RevokeSerial`, `ReissueCRL`, `RefreshCRLIfDue`, `CleanupExpiredCerts`, `ReconcileSuperseded`, the revoke step inside `Clean`, and the retire step inside `Renew`, `AutoRenew` — "retire" because only those two can defer it to the list; `Clean` always revokes inline |
 | `subject:<name>` | The whole lifecycle of one subject: evict/save CSR/sign/delete CSR/import/clean/revoke | `SaveRequest`, `Sign`, `SignWithTTL`, `DeleteRequest`, `Renew`, `AutoRenew`, `Clean`, `ImportCertificate`, `Revoke` — but currently **not** `Generate` (see known gaps below) |
 | `hmac-key` | Generating and persisting the inventory HMAC key when none is usable — a cold start, or a stored blob of the wrong length | `StorageService.EnsureHMACKey`, reached from `CA.Init` → `InitHMAC` and from `MigrateService` → `RebuildInventoryHMAC`. Deliberately **not** `bootstrap`: the migration already holds that name across the rebuild, and `WithLock` is not reentrant |
 | `sql-schema-migrate` | One schema-migration run, so two replicas starting at once do not migrate concurrently (SQL backends only) | `SQLBackend.EnsureReady` |
@@ -304,6 +304,16 @@ Both are one-way. `bootstrap` and `subject:<name>` are never held together at
 all, so the two lines do not compose into a single chain — which is why they are
 written as two.
 
+- The pending-supersession list deliberately has **no lock name of its own**.
+  Its read-modify-write must exclude the sweep that rewrites it — an append
+  landing between the sweep's read and its write would be erased, leaving a
+  superseded certificate valid with nothing recording that it should not be —
+  and the per-subject lock cannot provide that, because two renewals for
+  different subjects hold different subject locks. `crl` can, and reusing it
+  costs nothing: the renewal path already took that lock to revoke, so nesting
+  depth (and therefore the SQL pool floor below) is unchanged, and the sweep
+  needs one acquisition to cover both the list rewrite and the revocations it
+  drives. See [supersede.go](../../internal/ca/supersede.go).
 - `Revoke`, `Clean`, `Renew`, and `AutoRenew` are the paths that take all
   three. For the three issuance paths it is the subject lock around the whole
   operation, then the `crl` lock + `c.mu` for the revocation step; note they

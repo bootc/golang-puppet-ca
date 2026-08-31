@@ -99,6 +99,13 @@ openvox-ca-ctl revoke --certname agent.example.com
 # retired: --certname would now revoke the live replacement and leave the
 # superseded certificate valid. Serials are hexadecimal, in any case, and are
 # what `openssl x509 -noout -serial` prints.
+#
+# With superseded_cert_revoke_after_sec set, --certname does reach a predecessor
+# still inside its overlap window, so this is for the two cases it cannot: a
+# supersession that was never recorded (puppetca_supersede_failures_total is
+# what tells you one exists), and cutting an active window short for a
+# certificate you now believe is compromised. Revoking a serial the sweep still
+# has queued is safe -- re-revoking a listed serial is a no-op.
 openvox-ca-ctl revoke --serial 472C95FAA0DAE424BD7E911E26066010
 
 # A serial that is still the certificate stored for its subject is refused,

@@ -128,6 +128,13 @@ ca_key_passphrase_file: ""      # path to passphrase file; auto-generated if omi
 puppet_datetime_format: false   # use Puppet CA style "2006-01-02T15:04:05MST" instead of RFC 3339
 # Certificate auto-renewal (empty-body POST /certificate_renewal).
 revoke_on_auto_renew: true      # false matches OpenVox Server's Clojure CA (no revocation on auto-renewal)
+# Delayed supersession. A renewal records the certificate it replaced and a sweep
+# revokes it once the overlap window elapses, so both verify in the meantime and
+# relying parties can pick up the replacement without a gap. The window is a
+# deliberate weakening and it is on by default — read "Delayed supersession"
+# below, and set 0 for the earlier behaviour of revoking inside the call.
+superseded_cert_revoke_after_sec: -1   # overlap window; 0 = revoke inside the renewal; -1/unset = 24h
+superseded_cert_sweep_interval_sec: 0  # how often the sweep runs; 0 = built-in default (15m)
 ```
 
 ## Environment variables
@@ -209,6 +216,8 @@ The CA key passphrase can also be provided via `PUPPET_CA_KEY_PASSPHRASE` (env v
 | `etcd_tls_key_file` | `PUPPET_CA_ETCD_TLS_KEY_FILE` |
 | `puppet_datetime_format` | `PUPPET_CA_PUPPET_DATETIME_FORMAT` |
 | `revoke_on_auto_renew` | `PUPPET_CA_REVOKE_ON_AUTO_RENEW` |
+| `superseded_cert_revoke_after_sec` | `PUPPET_CA_SUPERSEDED_CERT_REVOKE_AFTER_SEC` |
+| `superseded_cert_sweep_interval_sec` | `PUPPET_CA_SUPERSEDED_CERT_SWEEP_INTERVAL_SEC` |
 
 > **Note:** `--daemon` is intentionally excluded from config file and environment
 > variable support because `PUPPET_CA_DAEMON` is used internally as the daemon fork
@@ -517,6 +526,118 @@ replica reading *above* its peers is not a fault: a pass that overlaps a local
 issuance defers its removals to the next one, so a busy replica can hold pruned
 serials a little longer.
 
+## Delayed supersession
+
+A renewal replaces a certificate. What happens to the one it replaced is
+`superseded_cert_revoke_after_sec`, and the default is **24 hours**: the
+predecessor is recorded and stays valid for that long, and a sweep revokes it
+once the window elapses. Both certificates verify in the meantime.
+
+The window exists because a certificate other parties are actively verifying
+cannot be replaced without a gap unless the predecessor outlives the moment the
+replacement is published — the verifiers do not all learn about it at once. An
+agent renewing its own credential does not need it: it holds both and simply
+stops presenting the old one. The default is set for the harder case.
+
+24 hours is chosen to comfortably exceed the interval on which a fleet notices a
+renewal, while staying short enough that a replaced credential is not a standing
+one. The same window is what the CA's own serving-certificate work settled on
+for the same question asked about a different subject; that work is not in this
+release, so there is no companion setting to compare against yet.
+
+> **Upgrading.** This changes behaviour without any config change. Before this
+> setting existed, every renewal revoked its predecessor before returning; now
+> the predecessor stays valid for 24 hours by default. If you need the old
+> behaviour — because your threat model does not tolerate a replaced credential
+> outliving its replacement at all — set `superseded_cert_revoke_after_sec: 0`,
+> which is an explicit choice and not the same as leaving it unset. You will
+> also see a new `superseded.json` in the cadir, a
+> `Starting superseded-certificate revocation sweep` line in the logs at
+> startup, and `puppetca_supersede_pending` rising and falling.
+
+**The window is a deliberate weakening, and because it is the default it is one
+you inherit rather than choose.** For its whole length the replaced certificate
+is still a credential this CA accepts, and on the CSR-body (re-key) renewal path
+the replaced *private key* is too, since that path issues against a new key and
+the old one keeps working until its certificate is revoked. Everything a
+compromised predecessor could do, it can still do until the sweep catches up.
+
+Two things bound that, and they are why the default is defensible:
+
+- **A superseded certificate cannot renew itself.** The renewal paths check the
+  pending list as well as the CRL, so the credential the window keeps alive
+  cannot mint a fresh full-lifetime successor and leave the window behind. That
+  check is what makes the window bound the exposure rather than end it, and it
+  runs for every deployment because the window now does.
+- **Revoking the subject retires it.** `revoke --certname` reaches a recorded
+  predecessor in the same call, so containment is not weakened by the window.
+
+If you are replacing a certificate *because* it was compromised, still do not
+rely on the window: revoke the serial directly with
+`openvox-ca-ctl revoke --serial <hex>`, or set the window to 0 for that
+deployment.
+
+Two settings, two questions:
+
+| Setting | Question |
+| --- | --- |
+| `revoke_on_auto_renew` | *Whether* an auto-renewal retires its predecessor at all. `false` keeps it valid until it naturally expires and records nothing. |
+| `superseded_cert_revoke_after_sec` | *When*, on both renewal paths. `0` means inside the renewal call; unset means 24 hours later. |
+
+They compose as you would expect: with `revoke_on_auto_renew: false` the
+auto-renewal path records nothing, whatever the delay says, and the CSR-body
+path — which always retires what it replaces — still honours the delay.
+
+Some things worth knowing before you rely on it:
+
+- **Each entry keeps the window it was given.** The due time is fixed when the
+  supersession is recorded. Shortening the setting later changes what future
+  renewals record; it does not retroactively expire a window a fleet may be
+  mid-way through relying on, and lengthening it does not extend one.
+- **The sweep runs whatever the setting says, including zero.** It is the only
+  thing that drains the list, so gating it on the delay would strand every entry
+  recorded under an earlier configuration — including one recorded before an
+  operator set the window to 0. On a CA that has never recorded a supersession
+  each pass is a single absent-key read taking no cluster lock: the sweep rules
+  the work out before acquiring one.
+- **Each due entry costs one CRL re-sign, under the shared CRL lock.** The sweep
+  revokes entries one at a time, and every revocation is a full read, re-sign
+  and write of the CRL. A large backlog coming due at once — after a fleet-wide
+  outage, say — therefore drains at a rate set by CRL re-sign cost rather than
+  by the sweep interval, and it holds the lock that every revocation on every
+  replica needs while it does. A pass stops before its budget is spent and logs
+  what it deferred to the next one, so a backlog that is not draining is visible
+  rather than silent: a deferred pass raises `puppetca_supersede_failures_total`
+  and logs `ran out of budget; deferring the rest`, and the entries it defers
+  stay on the list. Batching those re-signs into one is a separate change.
+- **Revoking a subject retires its pending predecessor too.** `revoke --certname`
+  and `DELETE /certificate_status` retire the subject's current certificate
+  *and* anything of that subject's still inside its window, in the same call —
+  otherwise containing a compromised node would leave a second working
+  credential for it in circulation. A predecessor whose supersession was never
+  recorded is not reachable that way; see the failure counter below.
+- **A superseded certificate cannot renew itself.** It is absent from the CRL
+  for the length of its window, so the renewal paths check the pending list as
+  well; without that, the credential the window keeps alive could mint a fresh
+  full-lifetime successor and leave the window behind. If the list cannot be
+  read, renewals are refused rather than admitted — and that check runs whatever
+  the window setting says, so a store that cannot serve the
+  `superseded` key refuses renewals even on a CA that never enabled one.
+- **The sweep interval is added to the window in the worst case.** A certificate
+  due at 12:00 is revoked on the first pass after that, so keep
+  `superseded_cert_sweep_interval_sec` (15 minutes by default) well below the
+  window. The server warns at startup when it is not shorter than the window,
+  naming the worst-case effective window — with the default interval, any window
+  of 15 minutes or less trips it.
+- **Safe on every replica.** The list rewrite and the revocations it drives run
+  under the shared cluster CRL lock, so only the first replica to take it
+  revokes and the others find the list already drained. No leader election.
+- **Watch `puppetca_supersede_pending`** for how many certificates are inside
+  their window right now, and `puppetca_supersede_failures_total` for
+  supersessions that were lost or could not be carried out — see
+  [metrics](metrics.md#delayed-supersession). A pending count that does not fall
+  means the sweep is not completing.
+
 ## Autosigning
 
 The `--autosign-config` flag controls automatic CSR signing:
@@ -554,6 +675,8 @@ csr_pem=$(cat)
   ca_pub.pem          CA public key
   ca_crl.pem          Certificate Revocation List
   inventory.txt       Signed certificate log (hex serial, dates, subject per line)
+  superseded.json     Certificates awaiting delayed revocation (mode 0600; absent until
+                      the first supersession) — see "Delayed supersession" above
   signed/             Issued certificates
   requests/           Pending CSRs
   locks/              Same-host lock files (empty, mode 0600) — see below
@@ -579,6 +702,7 @@ store the same logical state elsewhere.
 | Directories | `0750` |
 | Private keys | `0600` |
 | CRL file | `0600` |
+| Pending-supersession list | `0600` |
 | Lock files under `locks/` | `0600` |
 | Public data (certs, CSRs, inventory) | `0644` |
 

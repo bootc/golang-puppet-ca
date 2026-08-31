@@ -116,11 +116,16 @@ query, and `puppetca_crl_sync_failures_total` for why it is stuck.
 > `DELETE /certificate_status` (`puppet cert clean`) and the best-effort
 > revocation of a superseded certificate on renewal, which on a busy fleet is
 > the likeliest source of a rising count: grep for `Renew:` /
-> `AutoRenew: failed to revoke replaced certificate` alongside the `Clean:`
+> `AutoRenew: failed to retire replaced certificate` alongside the `Clean:`
 > warnings. Both *renewal* warnings name the serial, and the certificate they
-> left valid is the one case revoking by subject cannot reach — the replacement
-> is what makes it a renewal, so `revoke --certname` would retire that instead.
-> Retire it with `openvox-ca-ctl revoke --serial <hex>`; see
+> left valid is one revoking by subject cannot reach: the replacement is what
+> makes it a renewal, so `revoke --certname` would retire that instead. That is
+> specific to a failure on the *immediate* path — nothing recorded the
+> predecessor, so nothing but its serial addresses it. Where
+> [`superseded_cert_revoke_after_sec`](configuration.md#delayed-supersession)
+> grants a window, which is the default, a predecessor is on the pending list
+> and revoking the subject does retire it. Retire an unrecorded one with
+> `openvox-ca-ctl revoke --serial <hex>`; see
 > [revocation by serial](api.md#revocation-by-serial). The `Clean:` warnings are
 > qualified differently: they name the serial only once the revocation reached
 > the CRL, and the certificate they leave behind is still reachable by subject
@@ -226,6 +231,67 @@ local issuance defers its removals, so pruned serials linger an interval or two.
 `puppetca_ocsp_index_sync_failures_total` has a shipped alert
 (`PuppetCAOCSPIndexSyncFailing`); the fleet-relative gauge comparison above does
 not, and has to be added by hand if you want it.
+
+### Delayed supersession
+
+Present on every CA, and live on any CA that renews certificates, since
+[`superseded_cert_revoke_after_sec`](configuration.md#delayed-supersession)
+defaults to 24 hours. Only where it is set to `0` is nothing ever recorded — a
+renewal then revokes its predecessor inside the call, and a failure there is a
+CRL failure counted above instead — so there the gauge sits at zero and the
+counter stays flat.
+
+Even there, one exception, and it is the one an operator who set `0` will
+actually hit: three code paths read the pending list whatever the setting says —
+the sweep, every renewal, and every subject revocation — and each counts a list
+it could not read. A store that cannot serve the `superseded` key therefore
+raises the counter, and fires `PuppetCASupersedeFailing`, even with the window
+closed. The log line says which path: `Superseded-certificate revocation sweep
+failed`, `cannot determine supersession status`, or `Revoke: could not read
+pending supersessions`.
+
+| Metric | Description |
+| --- | --- |
+| `puppetca_supersede_pending` | Certificates a renewal has replaced that are still inside their overlap window and not yet revoked. Read from storage, so identical on every replica. **Absent, not zero**, when the list could not be read — zero is what a drained list reports, so an unreadable one must not report it too. |
+| `puppetca_supersede_failures_total` | Counter of failures to schedule or carry out one of those revocations. Per-process, and resets to `0` on process restart. |
+
+`puppetca_supersede_pending` is the live measure of the exposure the window
+buys: each of those certificates is a credential the CA still accepts even
+though something newer has taken its place. It rises as renewals happen and
+falls as the sweep drains the list, so a value that does not fall means the
+sweep is not completing — check the failure counter.
+
+> **What the failure counter sees.** A supersession the renewal path could not
+> record (the certificate was replaced but nothing scheduled its revocation —
+> the `failed to retire replaced certificate` warning names the serial); a
+> pending list that could not be *read*, on the renewal path, in the sweep, or
+> while revoking a subject; one that could not be *parsed*, in the sweep or
+> while revoking a subject — a parse failure met on the renewal path refuses
+> that renewal but is left for the sweep to count, so one corrupt blob cannot
+> become a counter storm on a busy CA; a sweep pass that could not take the CRL
+> lock or write the list back; a predecessor a subject revocation could not
+> retire; and each pass that left an entry unrevoked, deferred one for want of
+> budget, or discarded one whose serial it could never revoke. A pass counts
+> once however many entries it failed on, so this is a count of bad passes
+> rather than of lost certificates.
+>
+> The cases differ in what you have to do about them, and the log line is what
+> tells them apart. `Could not revoke superseded certificate` retries on the
+> next pass by itself. `failed to retire replaced certificate` and `Discarding`
+> are both gone for good — nothing will rediscover them, and the certificate
+> stays valid for its full remaining life. Retire those by serial with
+> `openvox-ca-ctl revoke --serial <hex>`; see
+> [revocation by serial](api.md#revocation-by-serial). Revoking by subject does
+> reach a predecessor the CA still has *recorded* — that is what makes
+> `revoke --certname` containment during a window — but not one whose record was
+> lost, which is exactly what a rising count here means.
+>
+> A sweep that cannot read the list at all counts once per pass and omits
+> `puppetca_supersede_pending` rather than reporting zero, so the two signals
+> cannot both read clean while the list stops draining. A sweep that *can* read
+> it but runs out of budget counts too, and logs `ran out of budget; deferring
+> the rest to the next pass` — that is the shape a backlog draining slower than
+> it accrues takes, and the entries it defers stay on the list.
 
 ### Leaf certificates
 
@@ -368,3 +434,7 @@ failures, with all thresholds configurable. It does **not** alert on the
 fleet-relative `puppetca_ocsp_index_serials` comparison — that one is left to
 the operator, since it needs a `by (job)` aggregation to avoid fanning in
 across unrelated CAs and the condition it catches is not fail-open.
+
+`puppetca_crl_sync_failures_total`), delayed revocations that were lost or could
+not be carried out (`puppetca_supersede_failures_total`), and Kubernetes export
+failures, with all thresholds configurable.

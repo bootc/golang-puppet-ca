@@ -31,6 +31,16 @@ alerting rules for the openvox-ca exporter. It alerts on:
   verifier that hard-fails on `unknown` rejects against that replica and no
   other. See `ocsp_index_sync_interval_sec` in
   [configuration](../docs/configuration.md).
+- **Delayed-revocation failures** — the CA failing to schedule or carry out the
+  revocation of a certificate a renewal replaced, which leaves that certificate
+  a valid credential. Live on any CA that renews certificates, since
+  `superseded_cert_revoke_after_sec` defaults to 24 hours; only where it is set
+  to `0` does the revocation happen inside the renewal instead, and a failure
+  there is counted by the CRL-update alert above. Even then a store that cannot
+  serve the pending-supersession key fires this, because the sweep, every
+  renewal and every subject revocation read that key whatever the setting says.
+  See
+  [delayed supersession](../docs/configuration.md#delayed-supersession).
 - **Kubernetes export** targets whose applies keep failing, and targets that are
   configured but never attempted at all (only when the
   [Kubernetes export](../docs/kubernetes-export.md) feature is in use).
@@ -130,4 +140,6 @@ jsonnet -J vendor -m . mixin.jsonnet
 | `crlLagFor` | `10m` | How long a replica may keep enforcing a CRL behind the stored one before it is paged on. Raise it if you have raised `crl_sync_interval_sec`. |
 | `k8sExportNotRunningFor` | `30m` | How long a configured export target may go with no apply attempt at all before alerting. Only has to outlast a slow start: the counters reset on restart and the startup export runs immediately. |
 | `k8sExportFailingFor` | `15m` | How long a target's most recent apply may stay failed before alerting. Keep it above the CA's export retry interval, a compile-time constant of two minutes: below that, every blip the retry would have cleared by itself pages. It cannot reach a target that fails once and succeeds on retry every cycle — see [metrics](../docs/metrics.md) for the query that can. |
+| `supersedeWindow` | `1h` | Window over which delayed-revocation failures are counted (the metric is a restart-resetting counter). |
+| `supersedeFor` | `30m` | `for:` debounce for the delayed-revocation-failure alert. Longer than the CRL ones because the sweep retries on its own interval; raise it if you have raised `superseded_cert_sweep_interval_sec`. |
 | `expiryFor` / `scrapeFor` / `readyFor` / `downFor` | `1h` / `15m` / `10m` / `5m` | `for:` debounce durations. |

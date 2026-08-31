@@ -135,6 +135,7 @@ func applyCAConfig(myCA *ca.CA, cfg *serverConfig) error {
 	myCA.EncryptCAKey = cfg.EncryptCAKey
 	myCA.PromoteCNToSAN = cfg.PromoteCNToSAN
 	myCA.RevokeOnAutoRenew = cfg.RevokeOnAutoRenew
+	myCA.SupersedeAfter = cfg.supersededCertRevokeAfter()
 	myCA.KeyPassphrase = ca.KeyPassphraseConfig{
 		PassphraseFile: cfg.CAKeyPassphraseFile,
 	}
@@ -470,6 +471,12 @@ func newRootCmd() *cobra.Command {
 			if !tlsConfigured && (cfg.PuppetServer != "" || cfg.PuppetServerFile != "") {
 				slog.Warn("--puppet-server / --puppet-server-file have no effect without TLS; " +
 					"all endpoints are accessible without authentication in plain HTTP mode.")
+			}
+			// The sweep's interval is added to every overlap window in the worst
+			// case, because a certificate becomes due between two passes and is
+			// revoked on the later one. See supersededWindowWarning.
+			if msg, args, warn := supersededWindowWarning(cfg); warn {
+				slog.Warn(msg, args...)
 			}
 
 			// --- Storage, and the key provider when this role may reach the key ---

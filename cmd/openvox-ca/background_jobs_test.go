@@ -40,10 +40,25 @@ func jobNames(cfg *serverConfig) []string {
 var _ = Describe("backgroundJobs", func() {
 	// The default backend is filesystem, so the default job set deliberately
 	// does not include the OCSP index sync; the table below owns that decision.
-	It("runs CRL refresh and CRL sync by default, and cleanup only on request", func() {
-		Expect(jobNames(&serverConfig{})).To(ConsistOf(jobCRLRefresh, jobCRLSync))
+	It("runs CRL refresh, CRL sync and the superseded sweep by default, and cleanup only on request", func() {
+		Expect(jobNames(&serverConfig{})).To(ConsistOf(jobCRLRefresh, jobCRLSync, jobSupersededSweep))
 		Expect(jobNames(&serverConfig{EnableExpiredCertCleanup: true})).
-			To(ConsistOf(jobCRLRefresh, jobCRLSync, jobCertCleanup))
+			To(ConsistOf(jobCRLRefresh, jobCRLSync, jobSupersededSweep, jobCertCleanup))
+	})
+
+	// The same promise as the CRL-sync one below, for the other list a
+	// configuration change can strand. superseded_cert_revoke_after_sec decides
+	// whether a renewal *records* a delayed revocation; it must not also decide
+	// whether revocations already recorded are ever carried out. An operator who
+	// grants a window, accrues entries and then sets the delay back to zero
+	// still has those entries, each with its own recorded due time — and gating
+	// the sweep on the delay would leave every one of them a live credential,
+	// with the job that would retire them switched off by the change meant to
+	// tighten things up.
+	It("runs the superseded sweep even with no delay configured", func() {
+		Expect(jobNames(&serverConfig{SupersededCertRevokeAfterSec: 0})).
+			To(ContainElement(jobSupersededSweep),
+				"a zero delay must still drain a list an earlier configuration filled")
 	})
 
 	// The promise this whole change rests on. disable_crl_refresh governs
@@ -59,12 +74,12 @@ var _ = Describe("backgroundJobs", func() {
 		Expect(names).NotTo(ContainElement(jobCRLRefresh))
 	})
 
-	It("still runs both sync jobs when every other job is switched off", func() {
+	It("still runs both sync jobs and the superseded sweep when every other job is switched off", func() {
 		Expect(jobNames(&serverConfig{
 			StorageConfig:            config.StorageConfig{StorageBackend: "etcd"},
 			DisableCRLRefresh:        true,
 			EnableExpiredCertCleanup: false,
-		})).To(ConsistOf(jobCRLSync, jobOCSPIndexSync))
+		})).To(ConsistOf(jobCRLSync, jobOCSPIndexSync, jobSupersededSweep))
 	})
 
 	// The OCSP index goes stale when a *second* process issues certificates
