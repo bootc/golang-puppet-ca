@@ -112,3 +112,65 @@ var _ = Describe("openvox-ca-ctl and the store instance lock", func() {
 		refusal(cmd.Execute())
 	})
 })
+
+var _ = Describe("migrate and the store instance lock", func() {
+	It("refuses a store pointed at itself, instead of waiting for ever", func() {
+		// Migrating a store onto itself was never supported. Before the
+		// store-wide lock it deadlocked: the destination waited on a bootstrap
+		// lock the source already held, and `migrate` applies no timeout, so
+		// the command sat there printing nothing. Now the second acquisition is
+		// refused at once.
+		dir := GinkgoT().TempDir()
+		cfgDir := GinkgoT().TempDir()
+		seedFilesystemCA(dir)
+
+		cfgPath := filepath.Join(cfgDir, "same.yaml")
+		fsConfig(cfgPath, dir)
+
+		cmd := newMigrateCmd()
+		cmd.SetOut(GinkgoWriter)
+		cmd.SetErr(GinkgoWriter)
+		cmd.SetArgs([]string{"--source-config", cfgPath, "--dest-config", cfgPath, "--force"})
+
+		done := make(chan error, 1)
+		go func() { done <- cmd.Execute() }()
+
+		var err error
+		Eventually(done, "10s").Should(Receive(&err), "migrate must not wait on a lock it can never be granted")
+		Expect(err).To(HaveOccurred())
+		Expect(err).To(MatchError(ContainSubstring("destination backend")))
+	})
+
+	It("refuses to migrate out of a store a server is running against", func() {
+		// Reading a live store still copies an inventory the server is
+		// appending to, so the source end is not the lenient one.
+		srcDir := GinkgoT().TempDir()
+		dstDir := GinkgoT().TempDir()
+		cfgDir := GinkgoT().TempDir()
+		seedFilesystemCA(srcDir)
+		holdStoreLock(srcDir)
+
+		srcCfg := filepath.Join(cfgDir, "src.yaml")
+		dstCfg := filepath.Join(cfgDir, "dst.yaml")
+		fsConfig(srcCfg, srcDir)
+		fsConfig(dstCfg, dstDir)
+
+		cmd := newMigrateCmd()
+		cmd.SetOut(GinkgoWriter)
+		cmd.SetErr(GinkgoWriter)
+		cmd.SetArgs([]string{"--source-config", srcCfg, "--dest-config", dstCfg})
+
+		err := cmd.Execute()
+		Expect(err).To(MatchError(ContainSubstring("source backend")))
+		Expect(err).To(MatchError(ContainSubstring("already running against this store")))
+	})
+})
+
+// holdStoreLock takes a cadir's instance lock for the rest of the spec, the way
+// a running server holds it.
+func holdStoreLock(cadir string) {
+	GinkgoHelper()
+	ul, err := storage.New(cadir).AcquireInstanceLock(context.Background())
+	Expect(err).NotTo(HaveOccurred(), "the store must be free before the spec holds it")
+	DeferCleanup(func() { _ = ul.Unlock() })
+}
