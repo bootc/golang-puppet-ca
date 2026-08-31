@@ -15,16 +15,16 @@
 // with this program; if not, write to the Free Software Foundation, Inc.,
 // 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 
-// White-box, because occupying the bound is the only way to observe it.
+// White-box, because the bound's own operations are unexported and because
+// occupying a slot deliberately is the clearest way to state most of these
+// properties.
 //
-// On the state this spec runs against, AnswerOCSP still signs while holding
-// c.mu, so two concurrent OCSP requests cannot overlap inside the signature no
-// matter how many goroutines a spec throws at them — c.mu serialises them
-// first. Racing the responder against itself would therefore pass with the
-// bound deleted. Holding the slots directly is what makes the refusal
-// something a spec can state, and it is equally valid once the signature moves
-// out from under c.mu (#197 / PR #265), which is the state the bound exists
-// for.
+// Holding slots by hand states the mechanism, but not that it engages on the
+// real path. That is signboundrace_test.go's job: since #197 the OCSP
+// responder signs *outside* `c.mu`, so two requests can genuinely be inside
+// the signature at once and the bound can be shown to bound them. Read the two
+// files together — these specs would all still pass if nothing ever took a
+// slot during an actual signature.
 package ca
 
 import (

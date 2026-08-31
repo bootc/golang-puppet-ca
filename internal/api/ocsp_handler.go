@@ -122,12 +122,12 @@ func (s *Server) handleOCSP(w http.ResponseWriter, r *http.Request) {
 // ocspErrorResponse maps an AnswerOCSP failure to the HTTP status and the
 // pre-serialised RFC 6960 response body to answer it with.
 //
-// Split out from the handler because the shed branch is otherwise beyond a
-// spec's reach: on the state this builds against every signing slot is taken
-// under c.mu, so nothing can occupy one through the public API and provoke a
-// real refusal. The classification is the part worth pinning — it decides what
-// a verifier does next — so it is separated from the request handling that
-// cannot be driven into that state.
+// Split out from the handler so the classification can be stated directly. It
+// is the part worth pinning — it decides what a verifier does next — and
+// exercising it through the handler would mean holding a signature open just
+// to observe which constant comes back. (That the bound really engages under
+// concurrent signing is a separate claim, and belongs where it can be shown:
+// internal/ca/signboundrace_test.go.)
 //
 // The three cases say genuinely different things to a verifier:
 //
