@@ -226,7 +226,9 @@ var subjectClass = lockSubjectPrefix + "<name>"
 // regression, and the failure message will not know the difference.
 var allowedLockNesting = map[[2]string]string{
 	{subjectClass, lockNameCRL}: "locking.md, Lock ordering: `subject:<name>` → `crl` → `c.mu`. " +
-		"Taken by Revoke, Clean, Renew and AutoRenew; renewrace_test.go pins it per-caller.",
+		"Taken by Revoke, Clean, Renew, AutoRenew and GenerateWithOptions (on its " +
+		"ReplaceExisting path only, which no spec here drives); renewrace_test.go pins " +
+		"the first four per-caller, generate_test.go pins the fifth.",
 	{lockNameBootstrap, lockNameCRL}: "locking.md, Lock ordering: `bootstrap` → `crl`. " +
 		"ImportCACertificate holds bootstrap across importCAMaterial's CRL rewrite " +
 		"(caImport.go). One-way: nothing takes crl and then bootstrap. Listed but not " +
