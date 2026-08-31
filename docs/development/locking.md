@@ -283,11 +283,17 @@ loop.
 
 ## Lock ordering
 
-Nested acquisition always follows one global order:
+Nested acquisition follows a fixed order. The request paths share one chain, and
+there is a second, narrower nesting on the CA-import path:
 
 ```text
 subject:<name>  →  crl  →  c.mu  →  (StorageService internal mutexes)
+bootstrap       →  crl                    (ImportCACertificate only)
 ```
+
+Both are one-way. `bootstrap` and `subject:<name>` are never held together at
+all, so the two lines do not compose into a single chain — which is why they are
+written as two.
 
 - `Revoke`, `Clean`, `Renew`, and `AutoRenew` are the paths that take all
   three. For the three issuance paths it is the subject lock around the whole
@@ -311,6 +317,20 @@ subject:<name>  →  crl  →  c.mu  →  (StorageService internal mutexes)
   while serving. Init also has a *separate*, unfixed hazard on the same lock —
   its slow path can re-enter `bootstrap` and deadlock startup
   ([#201](https://github.com/voxpupuli/openvox-ca/issues/201)); see known gaps.
+- `ImportCACertificate` holds `bootstrap` across the CRL rewrite inside
+  `importCAMaterial`, so **`bootstrap` → `crl`** is a second permitted nesting
+  ([caImport.go](../../internal/ca/caImport.go)). One-way, like the first:
+  nothing takes `crl` and then `bootstrap`, and nothing may start. This matters
+  more than an import-only path sounds like it should — the documented import
+  procedure restarts replicas *after* the import, so the server is serving
+  throughout, and a future path acquiring `crl` before `bootstrap` would
+  deadlock against a live import rather than fail.
+- This section has a machine-readable counterpart: `allowedLockNesting` in
+  [lockorder_test.go](../../internal/ca/lockorder_test.go) lists the
+  simultaneously-held pairs the CA layer is permitted to take, and a spec fails
+  on any pair that is not there — an inverted one *and* a newly introduced one.
+  Adding a nesting therefore means editing both, together. See the Tests
+  section below for what that does and does not reach.
 - `MigrateService` holds two `bootstrap` locks (source backend, then
   destination). Pointing both at the same store deadlocks on **every** backend
   now, not only the distributed ones: on filesystem and SQLite the two are
@@ -373,9 +393,9 @@ path — still provides no cross-replica guarantee anyway.
    storage-touching tail belongs inside. The deliberate exception is the CA
    signature itself: `x509.CreateCertificate` runs under `c.mu` (see Tier 3),
    because the cache update it guards must be atomic with the issuance.
-4. **Respect the ordering** (`subject` → `crl` → `c.mu`), never acquire the
-   same lock reentrantly, and release `c.mu` before entering another
-   `WithLock`. Use the closure-with-defer shape from `Renew`/`AutoRenew` so a
+4. **Respect the ordering** (`subject` → `crl` → `c.mu`, and `bootstrap` →
+   `crl` on the CA-import path), never acquire the same lock reentrantly, and
+   release `c.mu` before entering another `WithLock`. Use the closure-with-defer shape from `Renew`/`AutoRenew` so a
    panic can't wedge a mutex.
 5. **Calling convention:** public CA methods take their own locks and say so
    ("The caller must NOT hold c.mu"); internal `...Locked` helpers document
@@ -484,6 +504,36 @@ path — still provides no cross-replica guarantee anyway.
     on either side of it derive different keys and do not exclude one another
     for the length of the rollout, so it needs a full restart rather than a
     rolling one.
+
+12. **A new nesting is protocol too, not only a new name.** Rule 7 covers
+    defining and documenting a lock *name*; this covers holding two of them at
+    once. Any pair of **two different** named locks that the **CA layer** can
+    hold simultaneously through `StorageService.WithLock` must appear both in
+    the **Lock ordering** section above and in `allowedLockNesting` in
+    [lockorder_test.go](../../internal/ca/lockorder_test.go), added together —
+    a pair in only one is drift. **The obligation is unconditional; the
+    automated detection is not.** A pair missing from the table fails that spec
+    only when a spec drives the caller that takes it, and the specs drive a
+    minority of the call sites (see "What the observer does not see" in the
+    Tests section). Do not read a green suite as confirmation that you had
+    nothing to add. The
+    order within a pair is the protocol: one path taking it the other way is
+    what deadlocks, and it deadlocks rather than timing out because the
+    per-name gate ignores the context.
+
+    The qualifiers are load-bearing, and each excludes a real pair the table
+    deliberately does not carry. They are exclusions, not an inventory: pairs
+    that *are* in scope go in the table whether or not a spec drives them —
+    `bootstrap` → `crl` is listed on exactly that basis. **Two different**: `MigrateService` holds
+    `bootstrap` over the source store and then over the destination, which the
+    Lock ordering section documents and the table cannot express, because pairs
+    are keyed by name and `("bootstrap", "bootstrap")` would read as a
+    self-nesting it is not. **CA layer, through `WithLock`**: `bootstrap` →
+    `sql-schema-migrate` is a live nesting reached from `MigrateService`, but
+    `EnsureReady` takes that name through `Backend.AcquireLock`, so no
+    `WithLock`-level observer can see it; it stays governed by rules 7 and 9.
+    Do not add either pair to satisfy this rule — adding them would make the
+    table claim coverage it does not have.
 
 ## Known gaps
 
@@ -667,10 +717,19 @@ below, and
 the inventory append inside an autosigning `SaveRequest`'s issuance, so it
 observes the lock being held from that append until `SaveRequest` returns, not
 across the evict/save prefix ahead of it. Dropping `SaveRequest`'s `WithLock`
-still fails it, which is what makes `SaveRequest` pinned too. `Sign`,
-`SignWithTTL` and `ImportCertificate` are the ones with no such spec: for those
-the lock-name table above is the only record, and dropping the lock fails no
-assertion. That is the shape to copy when closing one of the gaps above.
+still fails it, which is what makes `SaveRequest` pinned too.
+
+`Sign` is pinned as well, but in a second shape rather than this one:
+[lockorder_test.go](../../internal/ca/lockorder_test.go)'s rule-9 spec compares
+the count of `subject:<name>` acquisitions before and after a `Sign`, so
+dropping its `WithLock` fails on the delta rather than on a lock wait. The
+`c.mu` spec's expected-acquisition total counts it too. `SignWithTTL` and
+`ImportCertificate` are the ones now left with no spec at all: for those the
+lock-name table above is the only record, and dropping the lock fails no
+assertion. Either shape is worth copying when closing one of the gaps above —
+park-on-a-held-lock proves the operation *waits*, a before/after count proves it
+*acquires*, and the second is much cheaper when the operation is not otherwise
+concurrent.
 
 The nested lock-ordering invariant *is* now automated, in
 [renewrace_test.go](../../internal/ca/renewrace_test.go): for each caller that
@@ -681,6 +740,92 @@ deadlocking the suite to its timeout, which is how an inversion otherwise
 presents: every backend serialises same-process callers on a mutex that ignores
 the context deadline. These run under the race detector on every unit
 run: `mage test:unit` passes `-race` over every unit package, `internal/ca`
-included. What is still unraced is the build-tagged backend integration
-suites — tracked as
+included. Of the backend suites, `backendsEtcd`, `backendsPostgres` and
+`backendsMySQL` run under it too; `backendsRedisGo` does not, and
+[PR #212](https://github.com/voxpupuli/openvox-ca/pull/212) adds it. The
+residue is tracked as
 [#205](https://github.com/voxpupuli/openvox-ca/issues/205).
+
+That is only the suites this document cares about. For the exhaustive list of
+every `go test` the repository invokes and whether each is raced — including the
+two outside storage locking — see
+[testing](testing.md#which-suites-run-under--race); enumerating it in two places
+is how the two came to disagree before.
+
+That per-caller coverage is not the whole graph, and cannot be: it is a
+hand-maintained list of callers — three `Entry` lines plus the standalone
+`Revoke` spec beside them — so a further caller that nests two locks, or a
+first caller that nests two *different* names, is protected by nothing until
+somebody extends it.
+[lockorder_test.go](../../internal/ca/lockorder_test.go) covers the graph
+itself instead. It wraps the backend in an observer that records every
+`(outer, inner)` pair the CA layer actually takes through
+`StorageService.WithLock`, and asserts the observed set against
+`allowedLockNesting` — the machine-readable form of the **Lock ordering**
+section above. An inversion fails because the reversed pair is absent from that
+table; a **new** nesting fails because the new pair is absent too, which is
+deliberate. A new pair of simultaneously-held lock names is protocol in the same
+sense rule 7 makes a new lock *name* protocol — rule 7 governs names, not pairs,
+so the pair obligation is its own rule ("A new nesting is protocol too") in
+**Rules for new or changed code** above — and it should cost a line in
+`allowedLockNesting` and a line in the **Lock ordering** section above, added
+together. The failure message names the offending pair.
+
+Three things that file pins which nothing else does:
+
+- **Rule 4's "release `c.mu` before entering another `WithLock`".** `c.mu` is
+  unexported, so no spec outside `internal/ca` can probe it, and the per-caller
+  table checks only that the *CRL* lock stays grantable. The observer instead
+  tries `c.mu` at each acquisition and records a violation if it is held.
+  `CA.Init` is excluded explicitly rather than by accident — it holds `c.mu`
+  while taking `bootstrap`, which this document sanctions above — so the probe
+  is armed after `Init` returns.
+- **Completion under concurrency.** Competing issuance, renewal, revocation and
+  clean paths run at once against a bounded context and must all finish, with
+  two of them racing for one subject through different callers — the only shape
+  that can close an ordering cycle, since goroutines on disjoint subjects
+  serialise instead of deadlocking whatever order they take. Be clear which
+  assertion is the detector: the **edge table** catches an inversion
+  deterministically and in a fraction of a second, and the timeout is a *bound*
+  that keeps an interleaving which does reach a real cycle legible rather than
+  hanging the suite, because the per-name gate ignores the deadline.
+- **Rule 9's documented *non*-edge.** A migration holding `bootstrap` must not
+  exclude per-subject signing — that is precisely why operators are told to
+  stop the server rather than rely on the lock. A well-meant widening of the
+  migration lock would look like a safety improvement while converting a
+  documented "stop the server" into a silent stall bounded only by
+  `lockTimeout`.
+
+What the observer does **not** see, stated because a check that never reaches a
+class of acquisition reports a clean graph exactly as a check that reached it
+would:
+
+- **Tiers 2 and 3.** They are not named locks, so no backend wrapper can observe
+  them; the tail of the order (`… → c.mu → internal mutexes`) is covered by the
+  `c.mu` probe above rather than by the edge table.
+- **Any caller the specs do not drive.** The observer is passive — it records
+  what the operations a spec calls actually do, so it sees a minority of the
+  `WithLock` call sites in `internal/ca`, and an inversion in one it does not
+  reach would fail nothing. The driven and untouched sets are listed once, in
+  [lockorder_test.go](../../internal/ca/lockorder_test.go)'s top-of-file comment,
+  and deliberately not restated here — the same reason the `-race` roster lives
+  only in [testing](testing.md#which-suites-run-under--race): a list kept in two
+  places is a list that will disagree with itself. To check the ratio at any
+  commit, count
+  `c.Storage.WithLock` in non-test `internal/ca` plus the sites in
+  [caImport.go](../../internal/ca/caImport.go) that lock through a passed-in
+  store — deliberately a rule rather than a number, because which operations take
+  which locks is under active change and a literal here would go stale in a merge
+  that conflicts with nothing and fails no spec. What the edge table removes is
+  the hand-maintained list of *pairs*, not the list of callers: driving one more
+  operation checks every pair that operation takes.
+- **Names taken outside `WithLock`.** `sql-schema-migrate`
+  ([sql.go](../../internal/storage/sql.go)) and `inventory-decompose`
+  ([etcd_inventory.go](../../internal/storage/etcd_inventory.go)) are acquired
+  through `Backend.AcquireLock` directly, so a `WithLock`-level observer cannot
+  see them at all.
+- **`MigrateService`.** It nests the *same* name over two different stores
+  (`bootstrap` source, then destination), and pairs are keyed by lock name
+  rather than by store, so driving it would record a self-nesting that is not
+  one. Out of scope here rather than misrepresented; rule 9's operator-visible
+  half is pinned by the spec above.
