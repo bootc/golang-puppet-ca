@@ -9,11 +9,17 @@
 # restarts and image upgrades. On first run a new CA is bootstrapped under
 # /data and served over HTTPS on port 8140, using the CA's own certificate
 # as the TLS server certificate (the server refuses plain HTTP on
-# non-loopback addresses). For production, issue a dedicated TLS server
-# certificate with `openvox-ca-ctl generate` and point
-# --tls-cert/--tls-key at it: that keeps the CA's long-lived signing key
-# out of the network-facing listener and presents a certificate that
-# matches the server's DNS name.
+# non-loopback addresses).
+#
+# That last part is what makes this file a one-command start, and it is not
+# a working configuration for agents: the CA certificate's keyUsage is
+# certSign/cRLSign and it carries no subjectAltName, so the handshake
+# completes and every client that verifies it refuses the connection. The
+# server warns about this at startup. Before pointing agents at this CA,
+# issue a dedicated serving certificate with `openvox-ca-ctl generate` and
+# point --tls-cert/--tls-key at it -- which also keeps the CA's long-lived
+# signing key out of the network-facing listener. See "Serving certificate"
+# in docs/configuration.md.
 #
 # See docs/container-images.md for the available image tags, and
 # docs/configuration.md for the full configuration reference (mTLS,
@@ -48,7 +54,11 @@ services:
     healthcheck:
       # curl exists in the default image, busybox wget in the -alpine
       # variant; certificate verification is disabled because the CA's own
-      # cert does not carry localhost as a SAN.
+      # cert cannot be verified at all -- see the note at the top of this
+      # file. Starting this stack therefore logs two warnings on every run,
+      # "cannot serve TLS to a client that verifies it" and "puts a signing
+      # key on the network-facing listener": both expected here, and both
+      # the thing to fix before agents are pointed at it.
       test: ["CMD-SHELL", "curl -skf https://localhost:8140/healthz/ready || wget -q --no-check-certificate -O /dev/null https://localhost:8140/healthz/ready"]
       interval: 30s
       timeout: 5s

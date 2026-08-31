@@ -73,11 +73,19 @@ On first run this bootstraps a new CA under `/data` and serves HTTPS on port
 8140, using the CA's own certificate as the TLS server certificate. (The
 server refuses plain HTTP on a non-loopback address unless `--no-tls-required`
 is set — only do that behind a trusted TLS-terminating proxy or in test
-environments.) For a production deployment — a TLS certificate matching the
-server's DNS name, mTLS, an alternative storage backend, autosigning — pass
-the relevant flags (or mount a config file and set `--config`). See
-[configuring the server](configuration.md) for the full reference, and the
-[HTTP API reference](api.md) for the endpoints agents use.
+environments.)
+
+That last part makes the command self-contained, and nothing else: the CA
+certificate's `keyUsage` is `certSign, cRLSign` and it has no
+`subjectAltName`, so no agent will accept the connection. The server warns
+about this at startup; see [serving
+certificate](configuration.md#serving-certificate). Before any agent talks to
+this CA, issue it a serving certificate with `openvox-ca-ctl generate` and
+point `--tls-cert`/`--tls-key` at that. The same goes for the rest of a
+production deployment — mTLS, an alternative storage backend, autosigning: pass the
+relevant flags, or mount a config file and set `--config`. See [configuring the
+server](configuration.md) for the full reference, and the [HTTP API
+reference](api.md) for the endpoints agents use.
 
 ### Runtime user
 

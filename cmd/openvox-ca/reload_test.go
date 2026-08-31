@@ -25,19 +25,24 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/asn1"
 	"encoding/pem"
 	"log/slog"
 	"math/big"
+	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"github.com/voxpupuli/openvox-ca/internal/api"
+	"github.com/voxpupuli/openvox-ca/internal/ca"
 	"github.com/voxpupuli/openvox-ca/internal/sdnotify"
+	"github.com/voxpupuli/openvox-ca/internal/storage"
 )
 
 // writeTestKeypair writes a self-signed server certificate and its key into
@@ -56,16 +61,25 @@ func writeTestKeypair(dir, cn string) (certPath, keyPath string) {
 // valid — the cases a rotation is supposed to warn about.
 func writeTestKeypairValid(dir, cn string, notBefore, notAfter time.Time) (certPath, keyPath string) {
 	GinkgoHelper()
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	Expect(err).NotTo(HaveOccurred())
-
-	tmpl := &x509.Certificate{
+	return writeTestKeypairFromTemplate(dir, &x509.Certificate{
 		SerialNumber: big.NewInt(1),
 		Subject:      pkix.Name{CommonName: cn},
 		NotBefore:    notBefore,
 		NotAfter:     notAfter,
 		DNSNames:     []string{cn},
-	}
+	})
+}
+
+// writeTestKeypairFromTemplate self-signs tmpl with a fresh key and writes the
+// pair into dir under the same fixed names the other helpers use. It exists so
+// a spec can reload a certificate of a deliberately wrong shape -- a CA
+// certificate, say -- without each such spec restating how a keypair is
+// written.
+func writeTestKeypairFromTemplate(dir string, tmpl *x509.Certificate) (certPath, keyPath string) {
+	GinkgoHelper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	Expect(err).NotTo(HaveOccurred())
+
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
 	Expect(err).NotTo(HaveOccurred())
 
@@ -77,6 +91,24 @@ func writeTestKeypairValid(dir, cn string, notBefore, notAfter time.Time) (certP
 	Expect(os.WriteFile(certPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0600)).To(Succeed())
 	Expect(os.WriteFile(keyPath, pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER}), 0600)).To(Succeed())
 	return certPath, keyPath
+}
+
+// bootstrappedCATemplate is the certificate internal/ca mints for a new CA:
+// IsCA, keyUsage certSign|cRLSign, no extendedKeyUsage and no SANs. It is
+// reproduced here rather than imported because it is the *documented example*
+// that is under test -- docs/configuration.md offered these paths as the
+// tls_cert/tls_key pair, and the point of the specs below is that this shape
+// of certificate cannot serve TLS.
+func bootstrappedCATemplate(cn string) *x509.Certificate {
+	return &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "Puppet CA: " + cn},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+	}
 }
 
 // servedCN returns the common name of the certificate the reloader currently
@@ -245,6 +277,271 @@ var _ = Describe("TLS certificate reloading", func() {
 
 		Expect(reloader.reload()).To(HaveOccurred())
 		Expect(servedCN(reloader)).To(Equal("first.example.com"))
+	})
+})
+
+var _ = Describe("servingCertProblems", func() {
+	// The reference case. docs/configuration.md offered the CA's own
+	// ca_crt.pem/ca_key.pem as the tls_cert/tls_key example; a CA started that
+	// way logs "TLS enabled", completes the handshake, and is rejected by
+	// every client that verifies it. `openssl s_client -verify_hostname`
+	// against such a server reports both "unsuitable certificate purpose" and
+	// "hostname mismatch" — the two faults asserted here. Being a CA
+	// certificate is not one of them: reload() warns about that separately,
+	// as custody advice, because such a certificate can still serve TLS.
+	It("names every fault in the CA certificate the config reference used to point tls_cert at", func() {
+		Expect(servingCertProblems(bootstrappedCATemplate("ca.example.com"))).To(ConsistOf(
+			ContainSubstring("no subjectAltName"),
+			ContainSubstring("neither digitalSignature nor keyEncipherment"),
+		))
+	})
+
+	It("stays silent about basicConstraints, which does not stop a client verifying a leaf", func() {
+		// Empirically: a self-signed certificate with CA:TRUE, a SAN,
+		// serverAuth and digitalSignature -- what `openssl req -x509`
+		// produces by default -- verifies and serves. OpenSSL applies its CA
+		// checks to a certificate in the issuer position, not the end-entity
+		// one. Claiming such a certificate "cannot serve TLS" would be the
+		// false positive this table exists to prevent; reload() warns about
+		// a CA certificate separately, as custody advice.
+		leaf := servingLeafTemplate()
+		leaf.IsCA = true
+		Expect(servingCertProblems(leaf)).To(BeEmpty())
+	})
+
+	It("agrees with what internal/ca actually mints, so the fixture cannot drift", func() {
+		// bootstrappedCATemplate is hand-written. This anchors it to the real
+		// bootstrap: if internal/ca ever gives the CA certificate a SAN or a
+		// serving keyUsage, this fails while the fixture-based specs above
+		// would carry on passing against a shape the product no longer makes.
+		dir := GinkgoT().TempDir()
+		bootstrapCAInDir(dir, "ca.example.com")
+		caCert, err := ca.New(storage.New(dir), ca.AutosignConfig{Mode: "off"}, "ca.example.com").
+			Storage.GetCACert(context.Background())
+		Expect(err).NotTo(HaveOccurred())
+		block, _ := pem.Decode(caCert)
+		Expect(block).NotTo(BeNil())
+		real, err := x509.ParseCertificate(block.Bytes)
+		Expect(err).NotTo(HaveOccurred())
+
+		Expect(real.IsCA).To(BeTrue(), "reload() warns about this separately")
+
+		// Asserted against the matchers directly, not only against
+		// servingCertProblems(fixture): comparing the function with itself
+		// would be satisfied by any shared value, two empty slices included.
+		Expect(servingCertProblems(real)).To(ConsistOf(
+			ContainSubstring("no subjectAltName"),
+			ContainSubstring("neither digitalSignature nor keyEncipherment"),
+		))
+		Expect(servingCertProblems(real)).
+			To(Equal(servingCertProblems(bootstrappedCATemplate("ca.example.com"))))
+
+		// servingCertProblems never reads the subject, but the wiring spec
+		// matches on it and docs/configuration.md publishes it.
+		Expect(real.Subject.CommonName).
+			To(Equal(bootstrappedCATemplate("ca.example.com").Subject.CommonName))
+	})
+
+	It("says nothing about a leaf this CA actually issues", func() {
+		// The mirror of the anchor above, for the fixture that carries far
+		// more specs. If internal/ca ever narrows the extendedKeyUsage or the
+		// keyUsage it issues, every "says nothing" entry would keep passing
+		// against servingLeafTemplate while the CA's own serving certificates
+		// started tripping the warning — the false positive those specs exist
+		// to prevent. Mutation testing cannot reach it: the drifting party is
+		// internal/ca, not the code under review.
+		dir := GinkgoT().TempDir()
+		myCA := ca.New(storage.New(dir), ca.AutosignConfig{Mode: "off"}, "ca.example.com")
+		myCA.CAKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
+		myCA.LeafKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
+		Expect(myCA.Init(context.Background())).To(Succeed())
+
+		result, err := myCA.Generate(context.Background(), "node.example.com", []string{"node.example.com"})
+		Expect(err).NotTo(HaveOccurred())
+		block, _ := pem.Decode(result.CertificatePEM)
+		Expect(block).NotTo(BeNil())
+		leaf, err := x509.ParseCertificate(block.Bytes)
+		Expect(err).NotTo(HaveOccurred())
+
+		Expect(leaf.IsCA).To(BeFalse(), "and so draws no custody warning either")
+		Expect(servingCertProblems(leaf)).To(BeEmpty())
+	})
+
+	DescribeTable("reports one fault at a time",
+		func(mutate func(*x509.Certificate), want string) {
+			leaf := servingLeafTemplate()
+			mutate(leaf)
+			Expect(servingCertProblems(leaf)).To(ConsistOf(ContainSubstring(want)))
+		},
+		Entry("no subjectAltName of either kind", func(c *x509.Certificate) {
+			c.DNSNames, c.IPAddresses = nil, nil
+		}, "no subjectAltName"),
+		Entry("a keyUsage with neither signing nor encipherment bit", func(c *x509.Certificate) {
+			c.KeyUsage = x509.KeyUsageCertSign | x509.KeyUsageCRLSign
+		}, "neither digitalSignature nor keyEncipherment"),
+		Entry("an extendedKeyUsage that excludes serverAuth", func(c *x509.Certificate) {
+			c.ExtKeyUsage = []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}
+		}, "does not include serverAuth"),
+		Entry("an extendedKeyUsage Go has no constant for", func(c *x509.Certificate) {
+			c.ExtKeyUsage = nil
+			c.UnknownExtKeyUsage = []asn1.ObjectIdentifier{{1, 3, 6, 1, 4, 1, 99999, 1}}
+		}, "does not include serverAuth"),
+	)
+
+	DescribeTable("says nothing about a certificate a client can accept",
+		func(mutate func(*x509.Certificate)) {
+			// Each of these is a shape that must NOT warn: warning about a
+			// working configuration trains operators to ignore the line, and
+			// the one case it exists for would go with it.
+			leaf := servingLeafTemplate()
+			mutate(leaf)
+			Expect(servingCertProblems(leaf)).To(BeEmpty())
+		},
+		Entry("as generated by `openvox-ca-ctl generate`", func(*x509.Certificate) {}),
+		Entry("with no extendedKeyUsage extension at all, which is unconstrained", func(c *x509.Certificate) {
+			c.ExtKeyUsage = nil
+		}),
+		Entry("with no keyUsage extension at all, which is likewise unconstrained", func(c *x509.Certificate) {
+			c.KeyUsage = 0
+		}),
+		Entry("with anyExtendedKeyUsage rather than serverAuth", func(c *x509.Certificate) {
+			c.ExtKeyUsage = []x509.ExtKeyUsage{x509.ExtKeyUsageAny}
+		}),
+		Entry("named by IP address rather than DNS name", func(c *x509.Certificate) {
+			c.DNSNames = nil
+			c.IPAddresses = []net.IP{net.ParseIP("192.0.2.10")}
+		}),
+		Entry("with keyEncipherment but not digitalSignature", func(c *x509.Certificate) {
+			c.KeyUsage = x509.KeyUsageKeyEncipherment
+		}),
+		Entry("with digitalSignature but not keyEncipherment, the usual ECDSA shape", func(c *x509.Certificate) {
+			c.KeyUsage = x509.KeyUsageDigitalSignature
+		}),
+		Entry("with serverAuth somewhere other than first", func(c *x509.Certificate) {
+			c.ExtKeyUsage = []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageServerAuth}
+		}),
+	)
+})
+
+// logLineContaining returns the single log record in logged that contains
+// want, failing if none or more than one does. Specs assert against one record
+// rather than the whole buffer because both serving-certificate warnings carry
+// the same `cert` and `subject` attributes, and a buffer-wide match would hold
+// even with an attribute dropped from the record under test.
+func logLineContaining(logged, want string) string {
+	GinkgoHelper()
+	var found []string
+	for _, line := range strings.Split(strings.TrimSpace(logged), "\n") {
+		if strings.Contains(line, want) {
+			found = append(found, line)
+		}
+	}
+	Expect(found).To(HaveLen(1), "expected exactly one log record containing %q, got:\n%s", want, logged)
+	return found[0]
+}
+
+// servingLeafTemplate is a certificate shaped like the one `openvox-ca-ctl
+// generate` issues: end-entity, serverAuth + clientAuth, digitalSignature +
+// keyEncipherment, one DNS SAN. Specs mutate one field of it at a time, so
+// each asserts on the fault it introduced and nothing else.
+func servingLeafTemplate() *x509.Certificate {
+	return &x509.Certificate{
+		SerialNumber:          big.NewInt(2),
+		Subject:               pkix.Name{CommonName: "ca.example.com"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
+		BasicConstraintsValid: true,
+		DNSNames:              []string{"ca.example.com"},
+	}
+}
+
+var _ = Describe("Loading a certificate that cannot serve TLS", func() {
+	It("warns, naming the certificate and how to replace it", func() {
+		var buf bytes.Buffer
+		orig := slog.Default()
+		slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+		defer slog.SetDefault(orig)
+
+		dir := GinkgoT().TempDir()
+		certPath, keyPath := writeTestKeypairFromTemplate(dir, bootstrappedCATemplate("ca.example.com"))
+		reloader, err := newCertReloader(certPath, keyPath)
+		Expect(err).NotTo(HaveOccurred())
+
+		// Installed regardless: refusing it here would take the CA down on an
+		// upgrade, and a CA that is reachable over a certificate agents
+		// distrust is still serving the CRL and the public endpoints.
+		Expect(servedCN(reloader)).To(Equal("Puppet CA: ca.example.com"))
+
+		// Asserted against the one line rather than the whole buffer: both
+		// warnings carry `cert` and `subject`, so a buffer-wide match would
+		// still pass with either attribute dropped from this one.
+		// The attribute KEYS are asserted, not just their values:
+		// docs/configuration.md publishes this record whole, and an operator's
+		// realistic use of it is to grep their logs for it. Renaming `problems`
+		// would leave every value-matching assertion green and the doc wrong.
+		cannotServe := logLineContaining(buf.String(), "cannot serve TLS to a client that verifies it")
+		Expect(cannotServe).To(ContainSubstring(
+			"msg=\"The TLS certificate just loaded cannot serve TLS to a client that verifies it; " +
+				"issue a serving certificate with `openvox-ca-ctl generate` and point tls_cert/tls_key at that\""))
+		Expect(cannotServe).To(ContainSubstring("cert="+certPath), "the operator needs to know which path is wrong")
+		Expect(cannotServe).To(ContainSubstring(`subject="Puppet CA: ca.example.com"`), "and which certificate it loaded")
+		Expect(cannotServe).To(ContainSubstring("problems="))
+
+		// Spans the "; " join, so logging only the first fault fails here.
+		// An operator told one fault of two fixes it and still has no
+		// working server. docs/configuration.md publishes this exact line.
+		Expect(cannotServe).To(ContainSubstring(
+			`problems="it has no subjectAltName, and clients match the hostname against SANs only; ` +
+				`its keyUsage allows neither digitalSignature nor keyEncipherment"`))
+
+		// The custody advice is a separate line: it is true of certificates
+		// that serve TLS perfectly well, so it must not be folded into the
+		// "cannot serve TLS" verdict.
+		custody := logLineContaining(buf.String(), "is a CA certificate; serving from it puts a signing key on the network-facing listener")
+		Expect(custody).To(ContainSubstring(
+			"msg=\"The TLS certificate just loaded is a CA certificate; serving from it puts a signing key " +
+				"on the network-facing listener. Issue an end-entity certificate with `openvox-ca-ctl generate` " +
+				"and point tls_cert/tls_key at that\""))
+		Expect(custody).To(ContainSubstring("cert=" + certPath))
+		Expect(custody).To(ContainSubstring(`subject="Puppet CA: ca.example.com"`))
+	})
+
+	It("warns only about custody for a CA certificate that can otherwise serve", func() {
+		var buf bytes.Buffer
+		orig := slog.Default()
+		slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+		defer slog.SetDefault(orig)
+
+		tmpl := servingLeafTemplate()
+		tmpl.IsCA = true
+		certPath, keyPath := writeTestKeypairFromTemplate(GinkgoT().TempDir(), tmpl)
+		_, err := newCertReloader(certPath, keyPath)
+		Expect(err).NotTo(HaveOccurred())
+
+		logged := buf.String()
+		Expect(logged).To(ContainSubstring("puts a signing key on the network-facing listener"))
+		Expect(logged).NotTo(ContainSubstring("cannot serve TLS"),
+			"this certificate does serve TLS; saying otherwise is the false positive that trains operators to ignore the line")
+	})
+
+	It("warns again when a reload swaps a working certificate for one that cannot serve", func() {
+		dir := GinkgoT().TempDir()
+		certPath, keyPath := writeTestKeypair(dir, "working.example.com")
+		reloader, err := newCertReloader(certPath, keyPath)
+		Expect(err).NotTo(HaveOccurred())
+
+		var buf bytes.Buffer
+		orig := slog.Default()
+		slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+		defer slog.SetDefault(orig)
+
+		writeTestKeypairFromTemplate(dir, bootstrappedCATemplate("ca.example.com"))
+		Expect(reloader.reload()).To(Succeed())
+		Expect(buf.String()).To(ContainSubstring("cannot serve TLS to a client that verifies it"),
+			"a rotation onto an unusable certificate is exactly as silent as a bad one at startup")
+		Expect(buf.String()).To(ContainSubstring("puts a signing key on the network-facing listener"))
 	})
 })
 
