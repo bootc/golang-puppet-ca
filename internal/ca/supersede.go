@@ -339,8 +339,13 @@ func (c *CA) ReconcileSuperseded(ctx context.Context) (int, error) {
 		// they are swept like any others, and the write-back below persists the
 		// survivors — which is the same overwrite the corrupt bytes need.
 
-		// Oldest first, so a pass that runs out of deadline part-way has
-		// retired the certificates that have been superseded longest.
+		// Oldest first. This used to be what made stopping part-way safe, when
+		// a pass could run out of deadline mid-drain; since #176 batched the
+		// re-sign a pass attempts every due entry or none of them, so what it
+		// buys now is a deterministic order for the entries the batch appends
+		// to the CRL — the same list, swept on two replicas, produces the same
+		// sequence of revocation entries rather than one that depends on the
+		// order the store happened to return.
 		sort.Slice(due, func(i, j int) bool { return due[i].RevokeAt.Before(due[j].RevokeAt) })
 
 		outcome := func() drainOutcome {
@@ -491,6 +496,16 @@ func (c *CA) retireSupersededForSubjectLocked(ctx context.Context, subject strin
 // four is a credential left valid with nothing tracking it — which is exactly
 // the defect review round 2 found here, where deferred entries were counted in
 // the log line and then dropped from the write-back.
+//
+// deferred has been empty since #176 batched the re-sign, and is kept rather
+// than removed. It existed because N entries cost N re-signs, so a large
+// backlog could not fit in one lock hold; one re-sign for all of them removes
+// the budget problem that produced it. What it still buys is the shape of the
+// contract: a future implementation that has to stop part-way — a chunked batch
+// for a backlog too large for one CRL, say — reports it here without reshaping
+// the caller, and the write-back that carries it forward is already written and
+// already specified. Nothing sets it today, and the specs assert that it stays
+// empty.
 type drainOutcome struct {
 	revoked   int
 	failed    []supersededEntry
@@ -498,108 +513,221 @@ type drainOutcome struct {
 	discarded int
 }
 
-// drainDueLocked revokes the due entries, oldest first, and reports what
-// happened to each. The cluster CRL lock and c.mu must both be held.
+// drainDueLocked revokes the due entries in one batched CRL re-sign, and
+// reports what happened to each. The cluster CRL lock and c.mu must both be
+// held.
 //
-// # This is the seam for #176
+// # The batch, and what it is worth
 //
-// #176 batches the CRL re-sign, and this function is the only thing it has to
-// replace. The contract it must keep is drainOutcome's: every entry it is given
-// comes back in exactly one disposition. Everything around it — the due/pending
-// split, the failure counting, the write-back that carries failed and deferred
-// entries back to the list — reads only that struct and does not care how the
-// revocations happened.
+// This partitions first and batches second: every entry whose serial is
+// canonical hexadecimal goes into a single appendCRLEntriesLocked call, which
+// costs one CRL read, one signature and one write however many entries there
+// are. It used to call revokeSerialLocked once per entry, each a whole
+// read-modify-write of a document carrying the fleet's entire revocation
+// history, with the CRL lock — the one every revocation and every OCSP lookup
+// on every replica waits for — held across all of them, and under
+// ca_key_provider: openbao a remote Transit round trip per signature. That was
+// tolerable while N was normally one. Since delayed supersession ships with a
+// 24h default (#174) the pending list spans subjects: every node renewal and
+// every managed certificate feeds one sweep, so N is structurally larger in
+// steady state on every CA that renews anything, and the per-entry cost stopped
+// being an occasional stall and became the normal cost of a pass. That is #176.
 //
-// Two things a batched implementation gets to simplify, both of which exist
-// here only because each revocation is its own CRL read-modify-write:
+// # The partition is a safety property, not an optimisation
 //
-//   - `deferred` becomes dead. It exists because N entries cost N re-signs, so
-//     a large backlog cannot fit in one lock hold. One re-sign for all of them
-//     removes the budget problem, and with it the reserve check and the
-//     oldest-first sort that makes stopping early safe. Leave the field in
-//     place, always empty, rather than reshaping the caller.
-//   - `failed` becomes all-or-nothing. A batched re-sign either lands or does
-//     not, so the per-entry retry list collapses to "every entry it tried".
-//     That is a simplification, not a regression: the entries still stay
-//     listed and are still retried on the next pass.
+// A malformed serial must never reach the batch. One entry that cannot be
+// parsed would fail the single re-sign and take every valid entry in the pass
+// down with it — where the per-entry loop merely lost that one. Worse, it would
+// keep doing so on every subsequent pass, because a failed batch carries all of
+// its entries forward: one unparseable serial would permanently stall every
+// pending revocation on the CA. So the loop below validates and canonicalises
+// every serial up front and discards what can never be revoked, and only what
+// survives is handed to the batch.
 //
-// What a batched implementation must NOT drop is the malformed-serial split.
-// `discarded` entries must never reach the batch — a serial that is not
-// parseable hex can never be revoked, and including one would fail the whole
-// re-sign and take every valid entry down with it. Partition first, then batch.
+// Canonicalisation is storage.NormaliseSerial, the same validator
+// recordSuperseded writes the list through, rather than a bare big.Int parse.
+// Inventory serials are not canonical — a store migrated from Puppet carries
+// zero-padded ones — so "000ABC" and "ABC" are one certificate, and comparing
+// them raw is how a duplicate slips into a batch that appends its entries in
+// one go. NormaliseSerial is also stricter than the parse it replaces, in the
+// two directions that make the pending list and the CRL agree: it accepts a
+// serial with surrounding whitespace, which recordSuperseded already stores
+// canonically and which the old check discarded outright, and it rejects a
+// negative one, which the old check handed on as revocable although no
+// certificate can carry it.
+//
+// # Failure granularity
+//
+// A batched re-sign either lands or it does not, so failed is all-or-nothing:
+// every entry the batch tried comes back in it, stays on the list, and is
+// retried on the next pass. That is what the shared failure always was — a CRL
+// this replica cannot read, sign or write fails the whole pass however the
+// entries are grouped — and the one genuinely per-entry failure, the malformed
+// serial, is discarded above and never reaches it. The carry-forward spec
+// ("keeps an entry whose revocation failed for a reason that may pass") is the
+// single-entry case of that and still holds.
+//
+// crlUpdateFailures follows the batch: readStoredCRL and signCRLLocked each
+// count their own failure, so a failed pass moves that counter once rather than
+// once per due entry. mixin/alerts.libsonnet says so.
 func (c *CA) drainDueLocked(ctx context.Context, due []supersededEntry) drainOutcome {
 	var out drainOutcome
-	for i, e := range due {
-		// Each revokeSerialLocked below is a whole CRL read, re-sign and
-		// write — over IPC to the isolated signer where one is
-		// configured — so a pass with a large backlog costs one of those
-		// per entry, all under the CRL lock every revocation on every
-		// replica is waiting for. Batching them into a single re-sign is
-		// issue #176, deliberately not this change.
-		//
-		// Until it lands, stop while there is budget left rather than
-		// running until the deadline cuts the pass off mid-loop. The
-		// reserve is what pays for the caller's write-back, and the
-		// caller's oldest-first sort is what makes stopping safe: the
-		// entries left are the ones superseded most recently, and the
-		// next tick takes them. Never silently — a backlog that is not
-		// draining has to be visible, or "the sweep is keeping up" and
-		// "the sweep is falling behind by one interval every interval"
-		// look identical.
-		//
-		// i > 0 guarantees a pass always attempts at least one entry.
-		// ReconcileSuperseded sets the deadline at its own entry, before
-		// the fast-path read and before the wait for a CRL lock that
-		// every revocation on every replica contends for — so on a busy
-		// cluster the reserve can already be gone by the time the drain
-		// starts. Without this the pass would revoke nothing, every
-		// time, forever. Entry 0 may then fail on the spent deadline
-		// instead, which carries it forward and counts, rather than
-		// looking like a clean pass that did nothing.
-		if deadline, ok := ctx.Deadline(); ok && i > 0 && time.Until(deadline) < LockTimeout/2 {
-			// due[i:] is returned, not merely stepped over: the list is
-			// the only record that these certificates are owed a
-			// revocation, so a caller that wrote back without them would
-			// erase exactly what this claimed to defer — and the pending
-			// gauge would fall as though they had been retired. That is
-			// the drainOutcome contract, and it is the defect review
-			// round 2 found.
-			//
-			// due[i:] aliases due rather than copying it, which is safe
-			// because the caller does not mutate due after sorting and
-			// writeSuperseded only marshals what it is given.
-			out.deferred = due[i:]
-			slog.Warn("Superseded-certificate sweep ran out of budget; deferring the rest "+
-				"to the next pass", "revoked", out.revoked, "deferred", len(out.deferred))
-			break
-		}
-		if _, ok := new(big.Int).SetString(e.Serial, 16); !ok {
+
+	// Partition first, then batch. See the godoc: an unparseable serial inside
+	// the batch fails every valid entry beside it, on this pass and on every
+	// pass after it.
+	type dueSerial struct {
+		entry supersededEntry
+		// canon is the key the CRL, the OCSP cache and the certificate index
+		// all agree on, and the form logged.
+		canon  string
+		number *big.Int
+	}
+	batch := make([]dueSerial, 0, len(due))
+	for _, e := range due {
+		canon, err := storage.NormaliseSerial(e.Serial)
+		if err != nil {
 			// Retrying is right for a transient failure and wrong for a
-			// permanent one. A serial that is not parseable hex can
-			// never be revoked, so carrying it forward would retry it
-			// on every pass forever, latching both this counter's alert
-			// and the CRL one with nothing an operator could do to clear
-			// them. Discarded, loudly — and never handed to
-			// revokeSerialLocked, so it does not count as a CRL failure
-			// as well.
+			// permanent one. A serial that is not a hexadecimal number can
+			// never be revoked, so carrying it forward would retry it on every
+			// pass forever, latching both this counter's alert and the CRL one
+			// with nothing an operator could do to clear them. Discarded,
+			// loudly — and never handed to the batch, so it does not fail the
+			// entries around it and does not count as a CRL failure as well.
 			slog.Error("Discarding superseded-certificate entry with a malformed serial; "+
-				"it can never be revoked", "serial", e.Serial, "subject", e.Subject)
+				"it can never be revoked", "serial", e.Serial, "subject", e.Subject, "error", err)
 			out.discarded++
 			continue
 		}
-		if err := c.revokeSerialLocked(ctx, e.Serial); err != nil {
-			// Per entry, not all-or-nothing: one failure must not stall
-			// the revocations behind it, which would leave each of those
-			// certificates a valid credential indefinitely.
-			slog.Warn("Could not revoke superseded certificate; will retry",
-				"subject", e.Subject, "serial", e.Serial, "error", err)
-			out.failed = append(out.failed, e)
+		number, ok := new(big.Int).SetString(canon, 16)
+		if !ok {
+			// Unreachable: canon is NormaliseSerial's own rendering of a
+			// non-negative big.Int in uppercase hex. Handled as a discard
+			// rather than asserted, because the alternative to the branch is a
+			// nil SerialNumber reaching x509.CreateRevocationList, which fails
+			// the whole batch for a reason no log line explains.
+			slog.Error("Discarding superseded-certificate entry whose canonical serial will "+
+				"not parse; it can never be revoked", "serial", e.Serial, "canonical", canon,
+				"subject", e.Subject)
+			out.discarded++
 			continue
 		}
-		out.revoked++
-		slog.Info("Revoked superseded certificate", "subject", e.Subject, "serial", e.Serial)
+		batch = append(batch, dueSerial{entry: e, canon: canon, number: number})
+	}
+	if len(batch) == 0 {
+		return out
+	}
+
+	serials := make([]*big.Int, 0, len(batch))
+	for _, d := range batch {
+		serials = append(serials, d.number)
+	}
+	revokedAt, err := c.appendCRLEntriesLocked(ctx, serials)
+	if err != nil {
+		// All-or-nothing by construction: one re-sign covers the whole batch,
+		// so none of these is on the CRL. They stay listed and the next pass
+		// retries them, which is what the per-entry loop did for each failure
+		// it saw.
+		slog.Warn("Could not revoke superseded certificates; will retry",
+			"entries", len(batch), "error", err)
+		out.failed = make([]supersededEntry, 0, len(batch))
+		for _, d := range batch {
+			out.failed = append(out.failed, d.entry)
+		}
+		return out
+	}
+
+	out.revoked = len(batch)
+	for _, d := range batch {
+		// Project the revocation into the certificate index, per serial and
+		// after the batch, exactly as revokeSerialLocked did per call. Not
+		// folded into the batch because it is not the same kind of write: the
+		// index column is one indexed row update on the backends that have an
+		// index and a no-op on the rest, never a re-sign of a whole document,
+		// and it is a display cache of the CRL rather than the record itself —
+		// so a failure is logged and the startup index repair reconverges it.
+		//
+		// revokedAt carries a time for entries the batch found already listed
+		// as well as for the ones it appended, which is deliberate: a retried
+		// revocation is exactly the case where the CRL write landed and the
+		// index update did not.
+		c.markCertRevokedIndex(ctx, d.canon, revokedAt[d.canon])
+		slog.Info("Revoked superseded certificate", "subject", d.entry.Subject, "serial", d.canon)
 	}
 	return out
+}
+
+// appendCRLEntriesLocked adds every serial in add to the CRL in a single
+// read-modify-write: one read, one signature and one write however long add is.
+// It is a no-op — no re-sign — when every serial is already listed. The cluster
+// CRL lock and c.mu must both be held by the caller.
+//
+// This is the addition-side mirror of dropCRLEntriesLocked, which is what
+// CleanupExpiredCerts already does on the removal side: collect the serials,
+// then amend the CRL once. It lives here, beside its only caller, for the same
+// reason that one lives beside its own.
+//
+// It returns the revocation time now recorded for each serial in add, keyed by
+// serialHexStr. Serials it appended carry this call's timestamp; serials the
+// CRL already listed carry the one it already held, so a caller projecting the
+// revocation elsewhere records when it happened rather than when it was
+// noticed.
+//
+// Deduplication is by canonical serial, against the stored CRL and within add
+// itself. Both matter. A serial listed twice grows the CRL without bound, which
+// is what revokeSerialLocked's duplicate check exists to prevent one entry at a
+// time; and a batch can carry the same certificate twice where a loop could
+// not, because the loop's second pass re-read a CRL its first had already
+// amended. Callers pass parsed *big.Int values, so the keying is on the number
+// rather than on the text a serial arrived as.
+//
+// Nothing invalidates the OCSP cache here, and nothing needs to: signCRLLocked
+// installs the new list through installCachedCRLLocked, which drops the cached
+// response for every serial the new CRL revokes and the old one did not. That
+// is the whole batch, in one pass, and it is the same mechanism that already
+// covers a revocation performed on another replica.
+func (c *CA) appendCRLEntriesLocked(ctx context.Context, add []*big.Int) (map[string]time.Time, error) {
+	stored, err := c.readStoredCRL(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	listed := make(map[string]time.Time, len(stored.own.RevokedCertificateEntries))
+	for _, entry := range stored.own.RevokedCertificateEntries {
+		listed[serialHexStr(entry.SerialNumber)] = entry.RevocationTime
+	}
+
+	now := time.Now()
+	revokedAt := make(map[string]time.Time, len(add))
+	revoked := stored.own.RevokedCertificateEntries
+	appended := 0
+	for _, n := range add {
+		key := serialHexStr(n)
+		if at, already := listed[key]; already {
+			revokedAt[key] = at
+			continue
+		}
+		listed[key] = now
+		revokedAt[key] = now
+		revoked = append(revoked, x509.RevocationListEntry{
+			SerialNumber:   n,
+			RevocationTime: now,
+		})
+		appended++
+	}
+	if appended == 0 {
+		// Every serial was already on the CRL, so there is nothing to sign.
+		// This is the idempotent re-run — another replica finished the work, or
+		// an earlier pass wrote the CRL and then failed to prune the list — and
+		// it must not cost a signature, which on a Transit-backed key is a
+		// remote round trip and on every backend a CRL write the fleet re-reads.
+		return revokedAt, nil
+	}
+
+	if err := c.signCRLLocked(ctx, stored, revoked); err != nil {
+		return nil, err
+	}
+	return revokedAt, nil
 }
 
 // PendingSupersessions returns the number of certificates currently recorded
