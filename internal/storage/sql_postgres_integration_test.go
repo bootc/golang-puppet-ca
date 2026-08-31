@@ -263,3 +263,58 @@ var _ = Describe("Postgres schema migrations", func() {
 		migrationDDLFaultInjection(newPostgresBackend())
 	})
 })
+
+var _ = Describe("Postgres AcquireLockAliasingSubjects", func() {
+	It("does not let two subject locks that shared one FNV-1a key exclude each other", func() {
+		dsn := postgresDSNFromEnv()
+		a := newPostgresBackend()
+		b, err := NewSQLBackend(SQLConfig{Dialect: SQLPostgres, DSN: dsn})
+		Expect(err).NotTo(HaveOccurred())
+		defer b.Close()
+
+		// Short deadline on purpose: before #203 the second acquisition
+		// blocked on the first until the context expired, so a regression
+		// fails here in seconds rather than hanging the suite.
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		// Two backends deliberately: a single backend's process-local mutex
+		// serialises same-name callers before the server is consulted, and
+		// these are different names anyway, so only two connections can show
+		// whether the *server* thinks they are the same lock.
+		ulA, err := a.AcquireLock(ctx, aliasingSubjectA)
+		Expect(err).NotTo(HaveOccurred(), "A AcquireLock")
+		defer func() { Expect(ulA.Unlock()).To(Succeed(), "A Unlock") }()
+
+		// A cancel of its own, so the regression path can join the goroutine
+		// rather than leave it running. Fail unwinds this spec immediately, and
+		// a goroutine still inside AcquireLock would then race b's connection
+		// pool and lock map against this node's cleanup and the next spec's
+		// setup — noise on precisely the branch that exists to fail cleanly.
+		attemptCtx, cancelAttempt := context.WithCancel(ctx)
+		defer cancelAttempt()
+
+		done := make(chan error, 1)
+		go func() {
+			ul, err := b.AcquireLock(attemptCtx, aliasingSubjectB)
+			if err == nil {
+				err = ul.Unlock()
+			}
+			done <- err
+		}()
+
+		select {
+		case err := <-done:
+			Expect(err).NotTo(HaveOccurred(), "B AcquireLock on the aliasing subject")
+		case <-time.After(5 * time.Second):
+			// Cancel unblocks the acquisition; the bounded wait confirms it
+			// actually left before Fail unwinds the spec.
+			cancelAttempt()
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+			}
+			Fail("B blocked on A: the two subject locks still share one advisory-lock key")
+		}
+	})
+})

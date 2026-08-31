@@ -84,6 +84,7 @@ less protocol for it.
 | `bootstrap` | First-run CA generation; seeding supporting state (CRL/inventory/serial) for a mounted cert+key; whole-store migration | `CA.Init`, `CA.seedSupportingState`, `storage.MigrateService` (which reuses the name deliberately so a migration and a bootstrapping server exclude each other) |
 | `crl` | Every CRL read-modify-write (read entries → re-sign → write) | `Revoke`, `RevokeSerial`, `ReissueCRL`, `RefreshCRLIfDue`, `CleanupExpiredCerts`, and the revoke step inside `Clean`, `Renew`, `AutoRenew` |
 | `subject:<name>` | The whole lifecycle of one subject: evict/save CSR/sign/delete CSR/import/clean/revoke | `SaveRequest`, `Sign`, `SignWithTTL`, `DeleteRequest`, `Renew`, `AutoRenew`, `Clean`, `ImportCertificate`, `Revoke` — but currently **not** `Generate` (see known gaps below) |
+| `sql-schema-migrate` | One schema-migration run, so two replicas starting at once do not migrate concurrently (SQL backends only) | `SQLBackend.EnsureReady` |
 | `inventory-decompose` | One-time legacy inventory blob conversion (etcd backend only) on the first start after upgrading | `EtcdBackend.decomposeLegacyInventory`, from `EnsureReady` |
 
 How each backend provides the distributed lock (a summary — the full per-backend
@@ -406,11 +407,20 @@ path — still provides no cross-replica guarantee anyway.
    all stable across releases, and document them in the table above. All
    callers using a name contend on one lock, so
    never derive a name from unvalidated input (subject names pass
-   `ValidateSubject` first). `ValidateSubject` is necessary but not sufficient
-   on the SQL backends: there the lock identity is a 64-bit FNV-1a hash of the
-   name (`advisoryLockKey`), so distinct names can alias and a crafted subject
-   could collide with `crl`/`bootstrap`
-   ([#203](https://github.com/voxpupuli/openvox-ca/issues/203)).
+   `ValidateSubject` first). **A new singleton name that can reach a SQL
+   backend must also be reserved** in `reservedLockOrdinals` in
+   [sql.go](../../internal/storage/sql.go), which is how those backends keep
+   singleton locks out of the hashed key space — see rule 11. "Can reach a SQL
+   backend" is the test, not "is a singleton": `inventory-decompose` is a
+   singleton that only the etcd backend takes, so reserving it would claim a
+   key nothing uses.
+
+   For a name declared in `internal/storage` this is **enforced**, not just
+   asked for: `SQLLockNameConstantsAreRegistered` walks the package source for
+   lock-name constants and fails unless each is reserved or listed as
+   deliberately exempt. A name declared in `internal/ca` is not reachable by
+   that check — `internal/storage` cannot import `internal/ca` — so for those
+   this rule is the only thing standing.
 8. **SQL pool sizing:** on PostgreSQL/MySQL every *held* distributed lock pins
    one pooled connection. A single in-flight `Revoke`/`Clean`/`Renew`/`AutoRenew`
    needs at least three connections at once — one for the `subject:<name>` lock,
@@ -441,6 +451,39 @@ path — still provides no cross-replica guarantee anyway.
     the directory layout may change without a compatibility story. Hashing is
     also what keeps a name from addressing a path — nothing about a new lock
     name needs to be filesystem-safe.
+11. **A lock name is also a hashed key on the SQL backends, so the key space is
+    partitioned.** `pg_advisory_lock` takes a `bigint`, so a name has to be
+    reduced to 64 bits and distinct names can in principle share one. That is
+    tolerable between two subject locks — they cost each other contention — and
+    was not tolerable between a subject lock and `crl` or `bootstrap`, where it
+    is a repeatable denial of revocation
+    ([#203](https://github.com/voxpupuli/openvox-ca/issues/203)). So
+    `advisoryLockKey` splits the key space on bit 63 instead of hashing every
+    name alike: a name in `reservedLockOrdinals` gets a namespaced base plus its
+    hand-assigned ordinal, with bit 63 clear, and every other name gets the
+    leading 64 bits of SHA-256 over the domain-separated name, with bit 63 set.
+    Nothing a caller supplies crosses that line, so the aliasing is
+    structurally impossible and `ValidateSubject` is no longer load-bearing
+    for it. `mysqlLockName` partitions the same way,
+    on a class tag in the `GET_LOCK` name (`openvox-ca:0:<name>` reserved,
+    `openvox-ca:1:<128-bit hex>` derived); it has 64 characters to spend rather
+    than 64 bits, so its derived form puts collisions between two derived names
+    out of reach too.
+
+    The base is namespaced rather than starting the ordinals at 1 because
+    `pg_advisory_lock` keys are scoped to the *database*, not to the
+    application: every client of that database shares one key space, and 1 and
+    2 are exactly what a co-tenant's migration tool would pick. The old FNV-1a
+    keys had that property by accident, being pseudorandom; the partition has
+    to ask for it.
+
+    The ordinals and the derivation are protocol, exactly as rule 10 says of
+    the lock filename: replicas exclude one another only by deriving the same
+    key. Never renumber or reuse an ordinal. Changing the derivation is a
+    breaking change for a *running* cluster — during a rolling upgrade, nodes
+    on either side of it derive different keys and do not exclude one another
+    for the length of the rollout, so it needs a full restart rather than a
+    rolling one.
 
 ## Known gaps
 
@@ -486,10 +529,20 @@ state when the document was last updated and is not guaranteed exhaustive.
   `bootstrap` lock) is an unlocked read-modify-write, so two replicas
   cold-starting against a fresh shared backend can generate divergent keys and
   one then fails inventory-HMAC verification.
-- [#203](https://github.com/voxpupuli/openvox-ca/issues/203) — on the SQL
+- ~~[#203](https://github.com/voxpupuli/openvox-ca/issues/203) — on the SQL
   backends the distributed-lock identity is a 64-bit FNV-1a hash of the name,
   so distinct names can alias; a crafted subject that passes `ValidateSubject`
-  could collide with the `crl`/`bootstrap` key and deny revocation.
+  could collide with the `crl`/`bootstrap` key and deny revocation.~~ Fixed:
+  the key space is now partitioned so a hashed name and a reserved singleton
+  can never share a key (rule 11). What that does *not* remove is aliasing
+  *within* the hashed half — two subject locks still share a `pg_advisory_lock`
+  key with probability 2^-63, which the `bigint` key makes a floor rather than
+  a choice (the partition spends one of the 64 bits on the class tag). The
+  cost of landing on it is contention between two subjects, not a stalled
+  CRL, and finding such a pair deliberately is now a search against
+  SHA-256 rather than against FNV-1a, whose invertible per-byte step made a
+  chosen target reachable by meet-in-the-middle. MySQL has no such floor: its
+  `GET_LOCK` name carries a 128-bit digest.
 - ~~[#187](https://github.com/voxpupuli/openvox-ca/issues/187) — filesystem and
   SQLite backends have no same-host, cross-**process** locking.~~ Fixed: both
   now implement `SameHostLocker`, so every name taken through `WithLock`

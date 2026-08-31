@@ -419,6 +419,25 @@ backend creates and upgrades its own tables automatically on startup, so
 multiple replicas can start against the same database safely. `cadir` is still
 required for per-subject keys and ancillary local state.
 
+> **Upgrading a PostgreSQL or MySQL deployment across this release.** The
+> advisory-lock key derivation changed, so a server running either side of the
+> change does not exclude one running the other side — for as long as both are
+> up, nothing serialises CRL rewrites or bootstrap across the two generations.
+> **Stop the old process before starting the new one** for this one upgrade:
+> with the Helm chart set `strategy: {type: Recreate}` (an external-backend
+> deployment otherwise derives `RollingUpdate`), or scale to zero and back. If
+> you set the strategy, clear it again afterwards — a pin left in place keeps
+> costing you a Recreate outage on every later upgrade.
+>
+> **One replica is not enough to be safe.** The derived `RollingUpdate` sets
+> `maxUnavailable: 0`, so the new pod must become Ready before the old one is
+> terminated, and the two overlap even at `replicaCount: 1`. What does exempt
+> you is already being on `Recreate` (which `persistence.enabled: true`
+> derives), or running a single process you stop and restart yourself. SQLite
+> and the filesystem backend are unaffected either way: their same-host lock
+> derives from `sha256(name).lock` and is unchanged. Background: rule 11 of
+> [locking](development/locking.md).
+
 SQL backends additionally maintain a certificate index (as does
 [etcd](#etcd-backend)): `GET /certificate_statuses` (`puppetserver ca list`)
 is answered from indexed columns instead of reading and parsing every stored
@@ -534,6 +553,14 @@ form (`user:pass@tcp(host:3306)/dbname`).
 **Operational notes.** The CA private key lives in the database by default;
 enable `encrypt_ca_key` or pin it to a local file with `ca_key_file`.
 `openvox-ca-ctl setup` / `import` work on the local filesystem only.
+
+Do not point two independent `openvox-ca` deployments at one MySQL server, even
+with separate databases. `GET_LOCK` names are scoped to the server instance
+rather than to a schema, so both deployments take the same lock names and
+serialise against each other. (Multiple replicas of *one* deployment sharing a
+database is the supported arrangement and is exactly what those locks are for.)
+PostgreSQL advisory locks are database-scoped, so the equivalent there is not to
+share a *database* with another application that uses `pg_advisory_lock`.
 
 ### SQL environment variables
 
