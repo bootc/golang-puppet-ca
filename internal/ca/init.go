@@ -124,9 +124,11 @@ func (c *CA) Init(ctx context.Context) error {
 	// point rather than an oversight: InitHMAC runs on every start, and the
 	// fast path a few lines down deliberately loads an already-bootstrapped CA
 	// without taking a distributed lock. Moving it inside would make every
-	// replica's every start contend for `bootstrap`, and would enlarge #201's
-	// re-entrancy hazard rather than avoid it. Once the key exists EnsureHMACKey
-	// takes no lock either, so a warm start still costs no lock at all.
+	// replica's every start contend for `bootstrap`, and would enlarge the
+	// bootstrap critical section that #201's re-entrancy was found inside. That
+	// gap is fixed below; the contention argument stands on its own. Once the
+	// key exists EnsureHMACKey takes no lock either, so a warm start still costs
+	// no lock at all.
 	hmacCtx, cancelHMAC := context.WithTimeout(ctx, LockTimeout)
 	errHMAC := c.Storage.InitHMAC(hmacCtx)
 	cancelHMAC()
