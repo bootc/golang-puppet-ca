@@ -172,35 +172,34 @@ BRANCHES=(
   local/integration-setup
 
   # Open non-draft PRs. origin/ refs so each build integrates what is on the PR
-  # rather than a stale local copy.
-  origin/feature/redis-inventory          # PR #212
-  origin/feature/crl-chain-distribution   # PR #168
-  # #265 and #283 both edit docs/development/locking.md and collide there, so
-  # they sit together: the conflict is theirs and surfaces once.
-  origin/fix/ocsp-signing-lock-scope      # PR #265
+  # rather than a stale local copy, and so a head moving needs no edit here.
   origin/fix/init-bootstrap-reentrancy    # PR #283 — issue #201
+  origin/feat/one-instance-unless-distributed-locking  # PR #284
+  origin/fix/ocsp-signing-concurrency-bound  # PR #285
+  origin/fix/281-first-start-attempt-logs # PR #288
+  origin/perf/batch-supersession-crl-resign  # PR #289 — issue #176
 
-  # The packaging pair. Neither is stacked on the other — both sit on main — but
-  # they collide on README.md, magefile.go and magefile_test.go, so keep them
-  # adjacent and the collision surfaces in one place rather than twice.
+  # The packaging pair, last because #282 is the furthest behind and still
+  # moving. They are the ONLY pair that conflicts with each other — on
+  # magefile.go — so they sit adjacent and it surfaces once. #266 is approved
+  # and held behind #282, so they land together anyway.
   origin/feature/release-packaging        # PR #266
   origin/feature/package-payload          # PR #282
-
-  # Descendant of #168, so it stays after it. Last because it is stacked, not
-  # because it is least important.
-  origin/feature/client-trust-domains     # PR #166 — STACKED on #168
 )
 
 # LEFT THE LIST, all merged, so their code arrives via origin/main now:
 # 2026-08-30  #221 #259 #262 #263 #264
-# 2026-08-31  #224 #260 #261 #267 #189
+# 2026-08-31  #224 #260 #261 #267 #189, then #166 #168 #212 #265
 #
 # #165 and #167 are CLOSED and not returning. They sat here commented out as
-# drafts awaiting a rebase, which is no longer what they are, so the lines are
-# gone rather than left as a bench nobody is on.
+# drafts awaiting a rebase, which is no longer what they are.
 #
-# #265 is no longer stacked: it read "STACKED on #221" while #221 was open, and
-# is now rebased onto main. #166 -> #168 is still real and still ordered.
+# MEMBERSHIP is the only thing that needs editing here. Heads move constantly
+# and cost nothing, because the entries are refs rather than shas — so "wait
+# until PR X settles before refreshing" is answering the wrong question: X
+# settling changes no membership. Refresh when the SET changes, which is what
+# leaves a build merging branches already in main, or silently omitting open
+# ones. The second is the dangerous half: see the hold-the-build rule above.
 
 
 # Branches excluded for a REASON, as opposed to merely not listed. Commenting a
