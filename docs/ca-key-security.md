@@ -206,8 +206,39 @@ deletion) per authenticated client. When a single client exceeds **5 destructive
 operations per minute**, a warning is emitted to the structured log:
 
 ```text
-level=WARN msg="High rate of destructive operations detected" client=admin.example.com operation=revoke
+level=WARN msg="High rate of destructive operations detected" client.cn=admin.example.com client.domain="this CA" operation=revoke
 ```
+
+A client is identified by its common name *and* the trust domain that vouched for
+it. With [`client_ca`](configuration.md#trusting-client-certificates-from-another-ca)
+configured, an `ops-admin` issued by a partner CA is therefore counted separately
+from an `ops-admin` this CA issued: they are different principals, so neither can
+spend the other's allowance or raise an alert against it.
+
+> **Upgrading: the `client` log field has changed shape.** It used to be a flat
+> string holding the common name — `client=admin.example.com`. It is now a group,
+> rendering as the two fields shown above, `client.cn` and `client.domain`
+> (`client` becomes an object under the JSON handler). Every log line in the API
+> that names a client changed with it, not only this one, and three lines that
+> previously used a bare `cn` key now use the same group.
+>
+> **This breaks queries keyed on the old field.** A SIEM rule, log-based alert,
+> Loki selector or `grep` matching `client=<value>` will stop matching after the
+> upgrade — and it fails quietly, because the line is still emitted and still
+> carries the name. Update such queries to `client.cn` before upgrading. The
+> message text is unchanged, so alerts keyed on the message alone are unaffected.
+>
+> The reason for the change is that a common name is not an identity once more
+> than one issuer is trusted: two CAs may each have an `ops-admin`, and a record
+> naming only the name cannot say which of them acted.
+>
+> **`client.domain` takes one of three shapes.** `this CA` for a certificate we
+> issued; `client_ca "<name>"` — quoted — for one attributed to a configured
+> entry; and **`unattributed`** where the request never passed through the
+> authorisation middleware, so nothing vouched for the name. The last is not an
+> error and is the normal value on a deployment with no mTLS configured, but on
+> one that does have it, an `unattributed` record is a request that reached a
+> handler without being attributed, and is worth looking at.
 
 This is a detective control, not a preventive one. It does not block the operation, but alerts
 operators to potentially anomalous administrative activity. Operators should:
@@ -225,8 +256,12 @@ operators to potentially anomalous administrative activity. Operators should:
   handed out, that one when it is used destructively
 - Investigate any alerts promptly. A burst of revocations may indicate a
   compromised admin certificate or an operational error
-- Consider whether the `--puppet-server` allow list should be tightened if
-  unexpected clients appear in these warnings
+- Consider whether the allow list that granted the client should be tightened
+  if unexpected clients appear in these warnings. Read `client.domain` first: it
+  names which one. `this CA` means `--puppet-server` or `--puppet-server-file`;
+  `client_ca "<name>"` means that entry's own `admin_cns`, or its
+  `allow_pp_cli_auth` if the certificate carries the extension — tightening the
+  wrong one changes nothing and leaves the grant in place
 
 The threshold (5 ops/minute) is a sensible default for environments where
 bulk revocation is uncommon. Future versions may make this configurable.

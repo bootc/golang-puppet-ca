@@ -37,6 +37,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -639,6 +640,71 @@ var _ = Describe("API Workflow", func() {
 			Expect(rr.Body.String()).NotTo(ContainSubstring("backend unavailable"))
 			// And the CSR the operator was not told about is still there.
 			Expect(faultStore.HasCSR(ctx, subject)).To(BeTrue())
+		})
+		It("names the client as a principal on the delete-fault record, not as a bare CN", func() {
+			// docs/api.md points the operator at this log line as the
+			// authoritative record of an ambiguous delete, and the handler's own
+			// comment says so. It was the last site in the package still calling
+			// clientCN(r) for a log field, two lines below a sibling already
+			// using clientOf(r) -- so the one record the documentation promises
+			// carried an unsanitised name and no vouching domain.
+			subject := "delete-fault-log"
+			csrPEM, err := testutil.GenerateCSR(subject)
+			Expect(err).NotTo(HaveOccurred())
+
+			faultDir, err := os.MkdirTemp("", "openvox-ca-api-delete-fault-log")
+			Expect(err).NotTo(HaveOccurred())
+			defer os.RemoveAll(faultDir)
+
+			backend := &deleteFaultBackend{
+				Backend: storage.NewFilesystemBackend(faultDir),
+				key:     storage.CSRKey(subject),
+				err:     errors.New("backend unavailable"),
+			}
+			faultStore := storage.NewWithBackend(backend, filepath.Join(faultDir, "private"))
+			faultCA := ca.New(faultStore, ca.AutosignConfig{Mode: "off"}, "puppet.test")
+
+			ctx := context.Background()
+			Expect(faultStore.EnsureDirs(ctx)).To(Succeed())
+			Expect(faultStore.SaveCAKey(ctx, cachedKeyPEM)).To(Succeed())
+			Expect(faultStore.SaveCACert(ctx, cachedCrtPEM)).To(Succeed())
+			Expect(faultStore.UpdateCRL(ctx, cachedCrlPEM)).To(Succeed())
+			Expect(faultStore.WriteSerial(ctx, "0001")).To(Succeed())
+			Expect(faultStore.TouchInventory(ctx)).To(Succeed())
+			Expect(faultCA.Init(ctx)).To(Succeed())
+			faultMux := api.New(faultCA).Routes()
+
+			faultMux.ServeHTTP(httptest.NewRecorder(),
+				httptest.NewRequest("PUT", "/certificate_request/"+subject, bytes.NewReader(csrPEM)))
+
+			hostile := &x509.Certificate{
+				Subject: pkix.Name{CommonName: "ops\nlevel=ERROR msg=\"forged\""},
+			}
+
+			var buf bytes.Buffer
+			orig := slog.Default()
+			slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelError})))
+			defer slog.SetDefault(orig)
+
+			req := httptest.NewRequest("DELETE", "/certificate_request/"+subject, nil)
+			req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{hostile}}
+			rr := httptest.NewRecorder()
+			faultMux.ServeHTTP(rr, req)
+			Expect(rr.Code).To(Equal(http.StatusServiceUnavailable))
+
+			// Anchored on the record itself: a buffer-wide assertion would pass
+			// on the Debug line above, which already used the principal.
+			var record string
+			for _, line := range strings.Split(buf.String(), "\n") {
+				if strings.Contains(line, "DeleteRequest failed") {
+					record = line
+				}
+			}
+			Expect(record).NotTo(BeEmpty())
+			Expect(record).To(MatchRegexp(`client\.cn=[^\n]*client\.domain=`),
+				"the record must carry the principal, not a bare name")
+			Expect(record).NotTo(ContainSubstring(`msg="forged"`),
+				"and the name must not be able to close the record and open another")
 		})
 
 		It("should return 400 for an invalid subject", func() {
@@ -1490,8 +1556,18 @@ var _ = Describe("API Workflow", func() {
 				foreignCert, err = x509.ParseCertificate(leafDER)
 				Expect(err).NotTo(HaveOccurred())
 
+				// Domain zero's anchor is the *foreign* issuer, so the
+				// middleware attributes the certificate to our own domain and
+				// tierOwnClient admits it — while the CA still knows it did not
+				// issue it. That divergence is what makes the handler's
+				// ErrForeignCertificate branch reachable at all.
 				splitServer := api.New(myCA)
-				splitServer.AuthConfig = &api.AuthConfig{CACert: foreignCA}
+				// A CA that trusts an issuer other than itself: domain zero is
+				// the foreign certificate, so a client this CA issued does not
+				// verify and the renewal refusal below is reachable.
+				splitServer.AuthConfig = &api.AuthConfig{
+					Domains: []api.TrustDomain{api.OwnTrustDomain(foreignCA, nil, true)},
+				}
 				splitMux = splitServer.Routes()
 
 				// The eligibility refusals are logged, and the migration guide
@@ -1570,6 +1646,112 @@ var _ = Describe("API Workflow", func() {
 
 				Expect(rr.Code).To(Equal(http.StatusForbidden))
 				Expect(rr.Body.String()).To(ContainSubstring("not eligible for renewal"))
+			})
+		})
+
+		// The renewal handler's own log lines. It keys them on "subject" rather
+		// than "client" -- the name being renewed, not the principal asking --
+		// so they do not go through the principal's LogValue, and nine of them
+		// carried the common name verbatim while clientCN's doc comment implied
+		// the class was closed.
+		//
+		// Not safe by construction either: ImportCertificate accepts any
+		// certificate this CA's key signed and matches the path subject against
+		// the CN *or a DNS SAN*, so a CN of arbitrary bytes can be registered
+		// under a validated name. slog's handlers quote control characters, so
+		// this is defence in depth rather than a live forgery -- but the branch
+		// advertises that a CN cannot reach a record unsanitised, and an
+		// invariant with nine exceptions is not one.
+		//
+		// Both halves of the handler, because they are separate code paths with
+		// separate log sites: the empty-body auto-renewal and the CSR renewal.
+		Context("logging a hostile common name", func() {
+			const hostile = "evil\nlevel=ERROR msg=\"forged\""
+
+			// A leaf carrying the hostile CN, self-signed so this CA did not
+			// issue it: renewal then refuses it and the rejection lines are
+			// reached. The middleware is bypassed here (api.New leaves
+			// AuthConfig nil), so what the certificate chains to does not
+			// matter -- clientCN reads the CN straight off the presented cert,
+			// which is the whole point of sanitising it.
+			hostileLeaf := func() (*x509.Certificate, *rsa.PrivateKey) {
+				GinkgoHelper()
+				key, err := rsa.GenerateKey(rand.Reader, 2048)
+				Expect(err).NotTo(HaveOccurred())
+				tmpl := &x509.Certificate{
+					SerialNumber: big.NewInt(20260823),
+					Subject:      pkix.Name{CommonName: hostile},
+					NotBefore:    time.Now().Add(-time.Hour),
+					NotAfter:     time.Now().Add(time.Hour),
+					KeyUsage:     x509.KeyUsageDigitalSignature,
+					ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+				}
+				der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+				Expect(err).NotTo(HaveOccurred())
+				leaf, err := x509.ParseCertificate(der)
+				Expect(err).NotTo(HaveOccurred())
+				return leaf, key
+			}
+
+			// recordFor isolates one log line. A buffer-wide assertion would pass
+			// with the line under test left raw, because every other line in the
+			// handler already carries a neutralised name.
+			recordFor := func(buf *bytes.Buffer, msg string) string {
+				GinkgoHelper()
+				for _, line := range strings.Split(buf.String(), "\n") {
+					if strings.Contains(line, msg) {
+						return line
+					}
+				}
+				Fail("no log record matching " + msg)
+				return ""
+			}
+
+			capture := func(fn func()) *bytes.Buffer {
+				GinkgoHelper()
+				var buf bytes.Buffer
+				orig := slog.Default()
+				slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+				defer slog.SetDefault(orig)
+				fn()
+				return &buf
+			}
+
+			It("neutralises it on the auto-renewal path", func() {
+				leaf, _ := hostileLeaf()
+
+				buf := capture(func() {
+					req := httptest.NewRequest("POST", "/certificate_renewal", bytes.NewReader(nil))
+					req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{leaf}}
+					mux.ServeHTTP(httptest.NewRecorder(), req)
+				})
+
+				record := recordFor(buf, "Auto-renewal rejected")
+				Expect(record).NotTo(ContainSubstring("msg=\"forged\""),
+					"the name must not be able to close the record and open another")
+				Expect(record).To(ContainSubstring("\uFFFD"),
+					"sanitiseForLog replaces the control character rather than dropping the field")
+			})
+
+			It("neutralises it on the CSR renewal path", func() {
+				leaf, key := hostileLeaf()
+
+				// The CSR has to carry the same name, or the handler refuses at
+				// the comparison before any of these lines is reached.
+				csrDER, err := x509.CreateCertificateRequest(rand.Reader,
+					&x509.CertificateRequest{Subject: pkix.Name{CommonName: hostile}}, key)
+				Expect(err).NotTo(HaveOccurred())
+				csrPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: csrDER})
+
+				buf := capture(func() {
+					req := httptest.NewRequest("POST", "/certificate_renewal", bytes.NewReader(csrPEM))
+					req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{leaf}}
+					mux.ServeHTTP(httptest.NewRecorder(), req)
+				})
+
+				record := recordFor(buf, "Renewal rejected")
+				Expect(record).NotTo(ContainSubstring("msg=\"forged\""))
+				Expect(record).To(ContainSubstring("\uFFFD"))
 			})
 		})
 

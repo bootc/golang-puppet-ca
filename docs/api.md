@@ -231,7 +231,9 @@ The revocation condition is reached in ordinary operation: the CA re-reads the C
 
 The supersession condition can only *refuse* where an overlap window is configured — nothing is ever recorded without one — and it is what keeps that window a grace period for relying parties rather than a reprieve for the credential. A superseded certificate is deliberately absent from the CRL, so the revocation check above cannot see it — and a renewal mints a fresh full-lifetime certificate. Without this condition the replaced credential could renew itself out of the window entirely, which on the re-key path means the *previous private key* doing it. A match, and an unparseable list, both answer `403 access denied`, like the revocation condition. A list that cannot be *read* fails closed too, but answers `500 internal server error`: the CA cannot determine the certificate's status, which is not an authorisation decision, and the same is true of the revocation check when its storage read fails. Note that this check runs on every renewal whatever `superseded_cert_revoke_after_sec` says — a store that cannot serve the pending-supersession key refuses renewals on a CA that never enabled a window, and raises `puppetca_supersede_failures_total`.
 
-The other two are not reachable today. The authorisation middleware trusts exactly this CA's certificate, so a foreign certificate is refused before the handler runs; that changes once a second issuer can be trusted for client authentication, which is when the issuer check starts earning its place and answers `403 certificate not eligible for renewal`. The subject condition cannot be reached from HTTP at all, because the handler derives the subject from the presented certificate; it guards future callers of the internal API.
+The issuer condition is reachable as soon as a `client_ca` entry is configured — see [trusting client certificates from another CA](configuration.md#trusting-client-certificates-from-another-ca). Renewal is scoped to domain zero, this CA's own: a foreign certificate authenticates and may hold admin authority in its own domain, but it has no standing to renew, because renewal reissues under our authority using the presented certificate's own subject, which is only safe for names we assigned. It is answered `403 certificate not eligible for renewal`. With no `client_ca` configured there is one trust domain and the condition stays unreachable, as it always was.
+
+The subject condition cannot be reached from HTTP at all, because the handler derives the subject from the presented certificate; it guards future callers of the internal API.
 
 ## Bulk signing
 
@@ -349,9 +351,9 @@ When mTLS is enabled (both `--tls-cert` and `--tls-key` set), each endpoint requ
 | Tier | Required client cert | Endpoints |
 | --- | --- | --- |
 | **Public** | None | `GET /healthz/*`, `GET /certificate/{subject}`, `GET /certificate_revocation_list/ca`, `PUT /certificate_request/{subject}`, `GET /expirations`, `POST /ocsp`, `GET /ocsp/{request}` |
-| **Any client** | Any CA-signed cert with `clientAuth` EKU | `POST /certificate_renewal` — restricted to certificates this CA issued (see [renewal eligibility](#renewal-eligibility)); renewal reissues under our authority using that certificate's own subject, which is only safe for names we assigned. The empty-body path also carries that certificate's SANs and Puppet OID extensions forward unchanged; the CSR path takes Puppet OID extensions from the CSR and strips authorization-arc OIDs (see [Certificate renewal](#certificate-renewal)) |
-| **Self or admin** | Cert CN matches path subject, OR cert is admin | `GET /certificate_request/{subject}` |
-| **Admin** | Cert is admin (see below) | `GET /certificate_status/{subject}` (public with `--allow-public-status`), `PUT /certificate_status/{subject}`, `DELETE /certificate_status/{subject}`, `PUT /certificate_status_by_serial/{serial}`, `DELETE /certificate_request/{subject}`, `GET /certificate_statuses/*`, `POST /sign`, `POST /sign/all`, `POST /generate/{subject}`, `PUT /clean`, `PUT /certificate_revocation_list/ca`, `PUT /certificate/{subject}` |
+| **Own client** | A cert **this CA** issued, with `clientAuth` EKU | `POST /certificate_renewal` — restricted to certificates this CA issued (see [renewal eligibility](#renewal-eligibility)); renewal reissues under our authority using that certificate's own subject, which is only safe for names we assigned. The empty-body path also carries that certificate's SANs and Puppet OID extensions forward unchanged; the CSR path takes Puppet OID extensions from the CSR and strips authorization-arc OIDs (see [Certificate renewal](#certificate-renewal)) |
+| **Self or admin** | Cert CN matches path subject **and was issued by this CA**, OR cert is admin | `GET /certificate_request/{subject}` |
+| **Admin** | Cert is admin (see below) | `GET /certificate_status/{subject}` (public with `--allow-public-status`), `PUT /certificate_status/{subject}`, `DELETE /certificate_status/{subject}`, `DELETE /certificate_request/{subject}`, `GET /certificate_statuses/*`, `POST /sign`, `POST /sign/all`, `POST /generate/{subject}`, `PUT /clean`, `PUT /certificate_revocation_list/ca`, `PUT /certificate/{subject}`, `PUT /certificate_status_by_serial/{serial}` |
 
 Above the public tier, a presented certificate must also be **currently valid,
 not revoked, and carry the `clientAuth` extended key usage**: an expired
@@ -359,6 +361,15 @@ certificate, one listed in the CRL, or one issued for `serverAuth` only is
 refused at every tier above public — including `POST /certificate_renewal`, so
 revoking an agent's certificate cuts off its access to every *authenticated*
 endpoint, not merely its next renewal.
+
+That is unconditional for certificates **this CA issued**. For a client from a
+configured [`client_ca`](configuration.md#trusting-client-certificates-from-another-ca) domain, the
+revocation half is governed by `client_revocation_policy`: the default
+`require` refuses a client whose issuer has no currently valid CRL, `check`
+consults whatever CRLs are loaded and admits the client when there are none, and
+`skip` does not check at all. Under `skip` — and under `check` for an issuer
+publishing no CRL — a foreign certificate its own issuer has revoked **is**
+admitted above the public tier, including where its CN grants it admin.
 
 The public tier is unaffected, because it examines no client certificate at
 all. A revoked agent can still fetch the CA certificate and the CRL, read
@@ -476,6 +487,8 @@ A client certificate is considered an admin credential if **either** condition i
 2. **`pp_cli_auth` extension:** the certificate carries the Puppet authorization extension OID `1.3.6.1.4.1.34380.1.3.39` with the UTF8String value `"true"`. OpenVox Server embeds this extension in its own certificate by default, so the `puppetserver ca` CLI can authenticate without being listed by CN.
 
 The `pp_cli_auth` check is enabled by default. Disable it with `--no-pp-cli-auth` (or `no_pp_cli_auth: true` in the config file) if you prefer strict CN-only authorization.
+
+Both conditions are scoped to the **issuer** that signed the certificate. A CN means something only within the namespace of the CA that signed it, so `--puppet-server` and `pp_cli_auth` grant admin to certificates **this CA issued**. Certificates from another issuer are granted admin by **that entry's** `admin_cns` and `allow_pp_cli_auth` — *entry*, not certificate: where an entry's `file` bundles more than one anchor the grant spans all of them, which the server warns about at startup, so give each issuer its own entry — see [trusting client certificates from another CA](configuration.md#trusting-client-certificates-from-another-ca). With no `client_ca` configured there is one issuer and this distinction has no effect.
 
 The CN allow list is not fixed for the life of the process: `SIGHUP` (or `systemctl reload`) rebuilds it from the current contents of `--puppet-server-file`, merged with the `--puppet-server` value the process started with, so CN-based admin access can be granted or withdrawn without a restart. The swap is atomic with respect to in-flight requests, and the CNs added or removed are named in the log. See [reloading configuration](configuration.md#reloading-configuration).
 
