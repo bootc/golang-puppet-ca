@@ -441,6 +441,19 @@ func (c *CA) AnswerOCSP(ctx context.Context, reqDER []byte) (OCSPAnswer, error) 
 	if !hasNonce && template.Status != ocsp.Unknown {
 		c.mu.Lock()
 		_, stillKnown := c.serialIndex[serialHex]
+		// statusErr is kept in the condition below rather than handled: it can
+		// only be non-nil when the serial is known and cachedCRL is nil, and
+		// nothing sets cachedCRL to nil — installCachedCRLLocked in crl.go is
+		// its only writer and always installs a parsed CRL. So it cannot fire
+		// today, and it earns its place by costing one comparison while
+		// declining the cache write if some future path ever does install nil.
+		//
+		// There is deliberately no log branch of its own. An earlier round added
+		// one, on the grounds that a swallowed error at this line misleads an
+		// incident review; a later round pointed out the branch is unreachable
+		// and so untestable. Both are right, and a comment stating why it cannot
+		// happen is worth more than a branch no spec can reach or a test-only
+		// seam cut into a cache-write guard.
 		stillStatus, stillRevokedAt, statusErr := decideOCSPStatus(c.cachedCRL, req.SerialNumber, stillKnown)
 		if statusErr == nil && stillStatus == template.Status && stillRevokedAt.Equal(template.RevokedAt) {
 			c.ocspCache[serialHex] = ocspCacheEntry{
@@ -448,16 +461,6 @@ func (c *CA) AnswerOCSP(ctx context.Context, reqDER []byte) (OCSPAnswer, error) 
 				expiresAt: now.Add(OCSPValidity),
 			}
 			cached = true
-		} else if statusErr != nil {
-			// Distinguished from the raced case below, because they are not the
-			// same event and the log is what an incident review reads. A failed
-			// re-decision returns ocsp.Unknown as its status, so folding it into
-			// the other branch would report a CRL that vanished as though it
-			// were an ordinary prune — the one input that audience would be
-			// silently misled about.
-			slog.Warn("not caching an OCSP response: could not re-decide its status",
-				"serial", serialHex, "signed_status", template.Status,
-				"error", statusErr)
 		} else {
 			// Info, not Debug: the default verbosity is Info, and this is the
 			// record an incident review wants when reconstructing why a client
