@@ -107,8 +107,13 @@ func (c *CA) Revoke(ctx context.Context, subject string) error {
 
 	ctx, cancel := context.WithTimeout(ctx, LockTimeout)
 	defer cancel()
+	// Both properties, from two branches that changed this call independently:
+	// the subject lock outside the CRL lock, so a revoke cannot interleave with
+	// a sign or a clean for the same name; and the CRL acquisition counted, so
+	// a revocation an operator asked for that never took the lock moves
+	// crl_update_failures rather than failing silently.
 	return c.Storage.WithLock(ctx, subjectLockName(subject), func() error {
-		return c.Storage.WithLock(ctx, lockNameCRL, func() error {
+		return c.withCRLLockCounted(ctx, func() error {
 			c.mu.Lock()
 			defer c.mu.Unlock()
 			return c.revokeLocked(ctx, subject)
@@ -210,8 +215,21 @@ var ErrSerialStateUnknown = errors.New("cannot determine whether the serial is t
 // name. It does NOT admit a serial this CA never issued: ErrSerialUnknown is
 // refused with or without it, for the reason given on that sentinel.
 //
-// Locking matches Revoke: the cluster-wide "crl" lock, then c.mu, so concurrent
-// revocations on different replicas cannot clobber one another's CRL write.
+// Locking is the cluster-wide "crl" lock, then c.mu, so concurrent revocations
+// on different replicas cannot clobber one another's CRL write. Revoke takes a
+// per-subject lock outside that, which a revocation by serial has no subject to
+// take: the serial is the identifier here precisely because the name resolves
+// to a different certificate.
+//
+// The CRL lock goes through withCRLLockCounted, like every other revocation an
+// operator asked for. The three sites in signing.go that take it directly say
+// "deliberately not withCRLLockCounted" and justify it on exactly that
+// distinction -- they are best-effort revocations inside an operation that has
+// already succeeded, so a contended lock there is not a revocation that did not
+// happen. This one is: it is the openvox-ca-ctl revoke --serial path, and the
+// only way to retire a superseded certificate, which docs/api.md sends the
+// operator here to do. A lock it could not take must move crl_update_failures
+// rather than reaching a log line and nothing else.
 func (c *CA) RevokeSerial(ctx context.Context, serial string, force bool) error {
 	normalised, err := storage.NormaliseSerial(serial)
 	if err != nil {
@@ -220,7 +238,7 @@ func (c *CA) RevokeSerial(ctx context.Context, serial string, force bool) error 
 
 	ctx, cancel := context.WithTimeout(ctx, LockTimeout)
 	defer cancel()
-	return c.Storage.WithLock(ctx, lockNameCRL, func() error {
+	return c.withCRLLockCounted(ctx, func() error {
 		c.mu.Lock()
 		defer c.mu.Unlock()
 		return c.revokeSerialCheckedLocked(ctx, normalised, force)
