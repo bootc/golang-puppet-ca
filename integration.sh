@@ -15,14 +15,18 @@ set -eu -o pipefail
 # ---------------------------------------------------------------------------
 # CARRIED FIXES — integration-fixes.patch, applied after the merge loop
 #
-#   capability_test.go  #189 x #212. The file exists ONLY on #189, whose
-#                       "SupportsAtomicInventory is false for every backend that
-#                       appends to the inventory blob" table lists redis. #212
-#                       gives RedisBackend a decomposed inventory, so that
-#                       becomes true and the entry fails. The fix moves redis to
-#                       the "is true" table. Neither branch can make it: #212
-#                       does not have the file. Retires when #212 merges and
-#                       #189 does the move on its own branch.
+#   capability_test.go  #212. Main's "SupportsAtomicInventory is false for every
+#                       backend that appends to the inventory blob" table lists
+#                       redis, which is correct on main. #212 gives RedisBackend
+#                       a decomposed inventory, so the capability — a type
+#                       assertion for InventoryStore — becomes true and that
+#                       entry fails. The fix moves the redis Entry to the "is
+#                       true" table.
+#
+#                       #212 cannot make the edit itself: it predates the file,
+#                       which arrived on main with #189 on 2026-08-31. (Until
+#                       then this was a #189 x #212 pair and the file existed
+#                       only on #189's branch.) Retires when #212 merges.
 #
 # A carried fix is a spec correct on its own branch and wrong only once another
 # is merged beside it. Rules this one set produced:
@@ -49,29 +53,18 @@ set -eu -o pipefail
 # ---------------------------------------------------------------------------
 # MERGE OBLIGATIONS THAT NO CONFLICT WILL ANNOUNCE
 #
-# Both concern #261, the last of the lock trio still open — #259 and #264 are in
-# main as of 2026-08-30.
+# None outstanding. The lock trio is fully merged — #259 and #264 on 2026-08-30,
+# #261 on 2026-08-31 — and main was checked afterwards: `~~[#202]` and
+# `~~[#203]` are both present in docs/development/locking.md, and
+# reservedLockOrdinals carries exactly one `"hmac-key"` entry. Nothing here is
+# waiting on a second branch to land.
 #
-#   reservedLockOrdinals   main carries `"hmac-key": 4` (from #259) and so does
-#                          #261 — one entry each. What must not happen is #261's
-#                          merge producing two. Fails loudly if it does:
-#                          SQLReservedLockKeys asserts an exact Equal.
-#
-#   #202/#203 retirements  in docs/development/locking.md, and now ASYMMETRIC.
-#                          #259 retired #203 and has merged; #261 retires #202
-#                          and carries BOTH markers. So #261's own tree is right
-#                          and the whole risk sits in the merge: a resolution
-#                          taking main's side of that hunk drops #202's
-#                          retirement and looks clean doing it. Check both are
-#                          PRESENT — "zero conflict markers" is satisfied by
-#                          either wrong answer:
-#
-#                            grep -cF -- '~~[#202]' docs/development/locking.md
-#                            grep -cF -- '~~[#203]' docs/development/locking.md
-#
-#                          -F matters: both needles contain [ ], which an
-#                          unescaped grep reads as a character class matching
-#                          neither, so the check would pass silently.
+# Keep the SHAPE, because it will recur. Both were invisible to git: a pair of
+# branches each correct alone and wrong merged, with no textual conflict to
+# announce it. The retirement one was checkable as "both markers PRESENT", which
+# is the form to reach for — "zero conflict markers" is satisfied by either
+# wrong resolution, and `grep -F` matters when a needle contains `[ ]`, since an
+# unescaped grep reads it as a character class matching nothing.
 #
 # DO NOT RE-ADD `bootstrap` -> `hmac-key` to allowedLockNesting. It was carried
 # as a live obligation for days and is not one: that pair is taken only by
@@ -88,7 +81,8 @@ set -eu -o pipefail
 # ---------------------------------------------------------------------------
 # WHAT A GREEN BUILD IS NOT EVIDENCE FOR
 #
-# #266: do NOT push a `v*` tag until issue #250 lands. release.yml,
+# #266: do NOT push a `v*` tag until issue #250 is closed — #282 is the PR for
+# it and is in BRANCHES below, so watch that rather than the issue. release.yml,
 # container-images.yml and helm-chart.yml each trigger on `v*` independently
 # with no `needs:` between them, so a premature tag publishes images — including
 # the mutable `latest` — and the chart, regardless of release.yml failing. This
@@ -172,34 +166,29 @@ BRANCHES=(
   local/integration-setup
 
   # Open non-draft PRs. origin/ refs so each build integrates what is on the PR
-  # rather than a stale local copy. One pair is stacked and must follow its base;
-  # everything else is order-independent, so the order below is chosen rather
-  # than forced — see the notes after the list.
+  # rather than a stale local copy.
   origin/feature/redis-inventory          # PR #212
   origin/feature/crl-chain-distribution   # PR #168
-  origin/feature/offline-generate         # PR #189
   origin/fix/ocsp-signing-lock-scope      # PR #265
-  origin/fix/codeql-log-injection         # PR #224
-  origin/fix/hmac-key-init-race           # PR #261
-  origin/fix/migration-diagnostics        # PR #260
-  origin/feature/release-packaging        # PR #266
 
-  # Late on purpose: the busiest branch open, touching signing.go, storage.go,
-  # revoke.go, config.go and ca.go. Merging it into the fullest tree surfaces
-  # all of its collisions at once rather than a few at a time, and its 14-file
-  # conflict set is the largest here by a wide margin. Its own author flagged it.
-  origin/feature/delayed-supersession     # PR #267
+  # The packaging pair. Neither is stacked on the other — both sit on main — but
+  # they collide on README.md, magefile.go and magefile_test.go, so keep them
+  # adjacent and the collision surfaces in one place rather than twice.
+  origin/feature/release-packaging        # PR #266
+  origin/feature/package-payload          # PR #282
 
   # Descendant of #168, so it stays after it. Last because it is stacked, not
   # because it is least important.
   origin/feature/client-trust-domains     # PR #166 — STACKED on #168
 )
 
-# LEFT THE LIST 2026-08-30. Merged, so their code arrives via origin/main now:
-# #221, #259, #262, #263, #264. Closed and not returning: #165 and #167 — they
-# sat here commented out as drafts awaiting a rebase, which is no longer what
-# they are, so the lines are gone rather than left as a bench nobody is on. If
-# that work comes back it comes back as new PRs.
+# LEFT THE LIST, all merged, so their code arrives via origin/main now:
+# 2026-08-30  #221 #259 #262 #263 #264
+# 2026-08-31  #224 #260 #261 #267 #189
+#
+# #165 and #167 are CLOSED and not returning. They sat here commented out as
+# drafts awaiting a rebase, which is no longer what they are, so the lines are
+# gone rather than left as a bench nobody is on.
 #
 # #265 is no longer stacked: it read "STACKED on #221" while #221 was open, and
 # is now rebased onto main. #166 -> #168 is still real and still ordered.
