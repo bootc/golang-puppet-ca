@@ -837,6 +837,15 @@ var _ = Describe("The shipped systemd unit", func() {
 	It("declares a start timeout long enough to bootstrap a CA key", func() {
 		start, err := time.ParseDuration(unit["TimeoutStartSec"])
 		Expect(err).NotTo(HaveOccurred())
-		Expect(start).To(BeNumerically(">=", time.Minute))
+
+		// Two of internal/ca's lock budgets, not one. Init spends the first on
+		// the inventory-HMAC step (EnsureHMACKey's `hmac-key` lock on a cold
+		// start, plus verification) and the second on `bootstrap`; they are
+		// separate context.WithTimeout calls in sequence, not one shared
+		// budget. A contended cold start against a shared backend is also
+		// exactly when a CA key has to be generated, so both terms land
+		// together and the floor has to clear the pair.
+		Expect(start).To(BeNumerically(">", 2*ca.LockTimeout),
+			"TimeoutStartSec must outlast both of Init's sequential lock budgets with room for key generation")
 	})
 })

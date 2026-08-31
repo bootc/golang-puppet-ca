@@ -74,8 +74,10 @@ on them, so they are **stable across releases**. Names taken through
 [migrate.go](../../internal/storage/migrate.go) redefines `"bootstrap"`
 independently (the `internal/storage` package cannot import `internal/ca`), so
 the two are coupled only by the string literal and must be renamed together.
-Backend-internal locks live beside the backend that takes them, for the same
-import-direction reason: `etcdDecomposeLockName` (`"inventory-decompose"`) in
+Storage-layer and backend-internal locks live beside the code that takes them,
+for the same import-direction reason: `lockNameHMACKey` (`"hmac-key"`) in
+[storage.go](../../internal/storage/storage.go) and `etcdDecomposeLockName`
+(`"inventory-decompose"`) in
 [etcd_inventory.go](../../internal/storage/etcd_inventory.go). They are no
 less protocol for it.
 
@@ -84,6 +86,7 @@ less protocol for it.
 | `bootstrap` | First-run CA generation; seeding supporting state (CRL/inventory/serial) for a mounted cert+key; whole-store migration | `CA.Init`, `CA.seedSupportingState`, `storage.MigrateService` (which reuses the name deliberately so a migration and a bootstrapping server exclude each other) |
 | `crl` | Every CRL read-modify-write (read entries → re-sign → write) | `Revoke`, `RevokeSerial`, `ReissueCRL`, `RefreshCRLIfDue`, `CleanupExpiredCerts`, and the revoke step inside `Clean`, `Renew`, `AutoRenew` |
 | `subject:<name>` | The whole lifecycle of one subject: evict/save CSR/sign/delete CSR/import/clean/revoke | `SaveRequest`, `Sign`, `SignWithTTL`, `DeleteRequest`, `Renew`, `AutoRenew`, `Clean`, `ImportCertificate`, `Revoke` — but currently **not** `Generate` (see known gaps below) |
+| `hmac-key` | Generating and persisting the inventory HMAC key when none is usable — a cold start, or a stored blob of the wrong length | `StorageService.EnsureHMACKey`, reached from `CA.Init` → `InitHMAC` and from `MigrateService` → `RebuildInventoryHMAC`. Deliberately **not** `bootstrap`: the migration already holds that name across the rebuild, and `WithLock` is not reentrant |
 | `sql-schema-migrate` | One schema-migration run, so two replicas starting at once do not migrate concurrently (SQL backends only) | `SQLBackend.EnsureReady` |
 | `inventory-decompose` | One-time legacy inventory blob conversion (etcd backend only) on the first start after upgrading | `EtcdBackend.decomposeLegacyInventory`, from `EnsureReady` |
 
@@ -223,11 +226,17 @@ has no read-only fast path:
 | `fileMu` | `ca_cert`, `ca_pubkey`, `ca_key`, `csr/<subject>`, `cert/<subject>`, per-subject private keys | One mutex spans all subjects; simple and sufficient at current scale |
 | `serialMu` | `serial` | Plain read/write pairs |
 
-One shared-state key is deliberately absent from this table: `hmac_key`. Its
-initialisation (`EnsureHMACKey`, reached via `InitHMAC` *before* any lock is
-taken) is an unlocked read-modify-write, guarded by neither a mutex nor a
-cluster lock today — a genuine gap, tracked as
-[#202](https://github.com/voxpupuli/openvox-ca/issues/202) (see known gaps).
+One shared-state key is absent from this table for a reason worth stating:
+`hmac_key` is guarded a tier *up*, not here. Its initialisation
+(`EnsureHMACKey`) is a read-modify-write, and the replicas that can fork the key
+are in different processes, so a process-local mutex would never have been the
+answer — the generating path takes the Tier 1 `hmac-key` lock and reads the key
+again after winning it. The read-only path — a key already present *and* of the
+expected length, which is every start after the first — takes no lock at all; a
+present-but-wrong-length blob regenerates, and so locks. That was
+[#202](https://github.com/voxpupuli/openvox-ca/issues/202); how far the
+guarantee reaches is `WithLock`'s tiers and nothing more, so see the known gaps
+below for the one configuration where two processes can still fork it.
 
 These are **internal to `StorageService`** — callers never touch them, and no
 `StorageService` method calls another locked method while holding one (they are
@@ -310,13 +319,32 @@ written as two.
   nesting site.
 - Two *different* subject locks are never held at once (bulk operations like
   `SignMultiple` loop, taking one at a time).
-- `CA.Init` inverts the order (it holds `c.mu` while acquiring `bootstrap`).
-  The inversion itself is safe only because `Init` runs to completion before
+- `CA.Init` inverts the order (it holds `c.mu` while acquiring **two**
+  distributed locks in turn: `hmac-key`, via `InitHMAC` → `EnsureHMACKey` on a
+  cold start, and then `bootstrap`). They are sequential, never nested. The
+  inversion itself is safe only because `Init` runs to completion before
   the server starts serving, so nothing else can be holding a distributed lock
   while waiting on `c.mu`; do not copy this pattern into anything that runs
   while serving. Init also has a *separate*, unfixed hazard on the same lock —
   its slow path can re-enter `bootstrap` and deadlock startup
   ([#201](https://github.com/voxpupuli/openvox-ca/issues/201)); see known gaps.
+- `bootstrap` → `hmac-key` is the first nesting in which a name owned by
+  `StorageService` sits inside one owned by the CA layer, and the only one taken
+  entirely within `internal/storage`. It is not the only nesting of two
+  different `WithLock` names — `subject:<name>` → `crl` above is one, and so is
+  `bootstrap` → `crl` on the import path — and it is deliberately **absent from
+  `allowedLockNesting`** rather than missing from it: that table keys pairs by
+  lock *name* and not by (store, name), so a path holding `bootstrap` over two
+  different stores is outside its scope by construction. This prose is where the
+  pair is recorded, and the table must not gain it. `MigrateService` holds
+  `bootstrap` on the destination across `RebuildInventoryHMAC`, which reaches
+  `EnsureHMACKey`; if the copied `hmac_key` is the wrong length, that takes
+  `hmac-key` inside it. An *absent* key does not: `RebuildInventoryHMAC`
+  short-circuits on an `Exists` check before it calls `EnsureHMACKey`, so
+  corruption is the only route to this nesting.
+  This order is one-way and must stay so — nothing may acquire `bootstrap` from
+  inside an `hmac-key` critical section, and `WithLock` is not reentrant at any
+  tier, so the two names must also never be made equal.
 - `ImportCACertificate` holds `bootstrap` across the CRL rewrite inside
   `importCAMaterial`, so **`bootstrap` → `crl`** is a second permitted nesting
   ([caImport.go](../../internal/ca/caImport.go)). One-way, like the first:
@@ -418,11 +446,16 @@ path — still provides no cross-replica guarantee anyway.
    in [storage.go](../../internal/storage/storage.go) spells this out, and
    the blob-backend gap is tracked as
    [#204](https://github.com/voxpupuli/openvox-ca/issues/204)).
-7. **New lock names are protocol.** Define CA-layer names as constants in
+7. **New lock names are protocol.** There are three homes, one per layer that
+   takes a lock. Define CA-layer names as constants in
    [init.go](../../internal/ca/init.go) (keeping `migrateLockName` in
    [migrate.go](../../internal/storage/migrate.go) in sync — it redefines
-   `"bootstrap"` independently) and backend-internal names as constants in the
-   owning backend package (e.g. `etcdDecomposeLockName` in
+   `"bootstrap"` independently); storage-layer names, taken through
+   `StorageService.WithLock` by `StorageService` itself, as constants beside
+   the code that takes them (e.g. `lockNameHMACKey` in
+   [storage.go](../../internal/storage/storage.go)); and backend-internal
+   names, taken directly via `Backend.AcquireLock`, as constants in the owning
+   backend package (e.g. `etcdDecomposeLockName` in
    [etcd_inventory.go](../../internal/storage/etcd_inventory.go)); keep them
    all stable across releases, and document them in the table above. All
    callers using a name contend on one lock, so
@@ -574,11 +607,34 @@ state when the document was last updated and is not guaranteed exhaustive.
   `seedSupportingState`) and deadlock startup, because `WithLock` is not
   reentrant and its process-local gate ignores the context. Reachable when a
   replica loads a CA bootstrapped elsewhere but then finds the CRL absent.
-- [#202](https://github.com/voxpupuli/openvox-ca/issues/202) — `hmac_key`
+- ~~[#202](https://github.com/voxpupuli/openvox-ca/issues/202) — `hmac_key`
   initialisation (`EnsureHMACKey`, called by `InitHMAC` *before* the
   `bootstrap` lock) is an unlocked read-modify-write, so two replicas
   cold-starting against a fresh shared backend can generate divergent keys and
-  one then fails inventory-HMAC verification.
+  one then fails inventory-HMAC verification.~~ Fixed: `EnsureHMACKey` now runs
+  its generating path under the `hmac-key` lock and re-reads the key after
+  winning it, so the replica that loses adopts the winner's key rather than
+  writing over it. The re-read is the load-bearing half — a lock alone would
+  only have ordered two overwrites. `InitHMAC` still runs *before* the
+  `bootstrap` lock, deliberately: `InitHMAC` runs on every start, and the fast
+  path immediately below it loads an already-bootstrapped CA *without* a
+  distributed lock. Moving it inside `bootstrap` would make every replica's
+  every start contend for that lock and would enlarge
+  [#201](https://github.com/voxpupuli/openvox-ca/issues/201)'s re-entrancy
+  hazard rather than avoid it. A separate reason, and a separate claim, is why
+  the new name is not *called* `bootstrap`: `MigrateService` reaches
+  `EnsureHMACKey` from inside that lock and `WithLock` is not reentrant, so a
+  shared name would turn a migration that met a corrupt key into a hang —
+  #201's failure mode arrived at from the storage side. What is left open is
+  the reach of the lock itself, which is exactly `WithLock`'s: cross-replica on
+  etcd, Redis and the server SQL dialects; cross-process on filesystem and
+  SQLite; process-local for an in-memory SQLite database or a platform without
+  `flock(2)`. Read that last tier as single-*process*, not single-node: an
+  in-memory database is private to its process, but two `openvox-ca` processes
+  over one `cadir` on a platform with no `flock(2)` (Windows, AIX, Solaris,
+  js/wasm) can still fork the key. That is the residue. Across hosts the
+  question does not arise, since shared storage is unsupported for those
+  backends for the reason `flock(2)` gives above.
 - ~~[#203](https://github.com/voxpupuli/openvox-ca/issues/203) — on the SQL
   backends the distributed-lock identity is a 64-bit FNV-1a hash of the name,
   so distinct names can alias; a crafted subject that passes `ValidateSubject`

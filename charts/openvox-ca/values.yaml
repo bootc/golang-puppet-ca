@@ -430,6 +430,23 @@ readinessProbe:
     path: /healthz/ready
     port: https
 
+# failureThreshold x periodSeconds is the whole budget CA.Init gets: the probe
+# path is only served once Init returns, so the kubelet sees connection-refused
+# until then and kills the pod when the budget runs out. Init's worst case is
+# two internal/ca LockTimeout waits in sequence — `hmac-key` on a cold start,
+# then `bootstrap` — plus CA key generation.
+#
+# 30 x 2s = 60s does not cover that worst case. That is deliberate and settled:
+# the maintainer ruled on 2026-08-23 that the worst case is not realistic in
+# practice, so the number stays and this comment records the relationship. Do
+# not "fix" it in passing — raise it as a question if you have new grounds.
+#
+# Raise failureThreshold yourself if you run several replicas against a fresh
+# shared store, where both locks can actually be contended. The steady-state
+# start takes neither. For comparison, packaging/systemd/openvox-ca.service
+# gives Init 300s through TimeoutStartSec, and cmd/openvox-ca/launcher_test.go
+# holds that to 2 x LockTimeout; the chart is deliberately not held to the same
+# floor.
 startupProbe:
   enabled: true
   failureThreshold: 30

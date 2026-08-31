@@ -31,6 +31,8 @@ import (
 	"log/slog"
 	"math/big"
 	"time"
+
+	"github.com/voxpupuli/openvox-ca/internal/storage"
 )
 
 // Named lock identifiers used with StorageService.WithLock. These names
@@ -55,6 +57,13 @@ const (
 // distributed lock before giving up. Long enough to ride out a brief
 // leader election, short enough that a stuck lease on a crashed replica
 // does not hang startup past the lease TTL on the etcd backend.
+//
+// At Init it covers more than an acquisition: it is the budget for the whole
+// inventory-HMAC step — the `hmac-key` lock EnsureHMACKey may wait on, plus the
+// verification scan that follows it. Other budgets are derived from this
+// constant (the shipped unit's WatchdogSec below, the chart's startupProbe,
+// CleanupExpiredCerts' LockTimeout/2), so that second job is named here and not
+// only at the call site.
 //
 // Read "distributed" strictly: it bounds the cross-node half of an acquisition
 // and not a wait on another goroutine in this process, which no deadline ends.
@@ -92,9 +101,45 @@ func (c *CA) Init(ctx context.Context) error {
 		return err
 	}
 
-	// Initialize inventory HMAC integrity checking.
-	if err := c.Storage.InitHMAC(ctx); err != nil {
-		return fmt.Errorf("inventory integrity check failed: %w", err)
+	// Initialise inventory HMAC integrity checking. On a cold start against a
+	// fresh shared backend, EnsureHMACKey generates the key under its own
+	// cluster lock so two replicas cannot fork it, which means this call can
+	// now wait on a peer. Bound that wait exactly as the bootstrap lock below
+	// is bounded, so a stuck lease cannot hang startup indefinitely. The
+	// timeout lives here and not inside EnsureHMACKey because the other caller
+	// of that path, storage.MigrateService, deliberately applies none — a
+	// migration waits for its store rather than abandoning it. Startup is the
+	// caller that must not wait forever.
+	//
+	// The budget covers all of InitHMAC, verification included, not only the
+	// lock: VerifyInventoryHMAC reads the whole inventory and folds a MAC over
+	// it, and that scan had no deadline before. It is a generous ceiling rather
+	// than a tight one — every backend already caps a single call far below it
+	// (etcd and SQL at ~10s) and the fold is in memory — so what the budget
+	// newly catches is a backend that has stopped answering, which used to hang
+	// startup with no bound at all.
+	//
+	// This stays *outside* the bootstrap lock taken below, and that is the
+	// point rather than an oversight: InitHMAC runs on every start, and the
+	// fast path a few lines down deliberately loads an already-bootstrapped CA
+	// without taking a distributed lock. Moving it inside would make every
+	// replica's every start contend for `bootstrap`, and would enlarge #201's
+	// re-entrancy hazard rather than avoid it. Once the key exists EnsureHMACKey
+	// takes no lock either, so a warm start still costs no lock at all.
+	hmacCtx, cancelHMAC := context.WithTimeout(ctx, LockTimeout)
+	errHMAC := c.Storage.InitHMAC(hmacCtx)
+	cancelHMAC()
+	if errHMAC != nil {
+		// "integrity check failed" is this project's tampering wording, and it
+		// is what an operator escalates on. Reserve it for an actual failed
+		// verification: InitHMAC can now also fail on lock contention or a
+		// backend outage, and reporting a stuck lease on a peer as a suspected
+		// compromise sends the on-call after the wrong thing. sql_inventory.go
+		// names its columns explicitly for this same reason.
+		if errors.Is(errHMAC, storage.ErrInventoryTampered) {
+			return fmt.Errorf("inventory integrity check failed: %w", errHMAC)
+		}
+		return fmt.Errorf("initialising inventory integrity: %w", errHMAC)
 	}
 
 	// Fast path: load an already-bootstrapped CA without taking a

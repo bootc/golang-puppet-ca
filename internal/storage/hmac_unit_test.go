@@ -18,9 +18,13 @@
 package storage
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io/fs"
+	"log/slog"
+	"strings"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -128,6 +132,123 @@ var _ = Describe("EnsureHMACKey", func() {
 			}
 			Expect(be.putCalls).To(Equal(0), "Put called %d times; want 0 (existing valid key must not be overwritten)", be.putCalls)
 		})
+	})
+})
+
+// sequencedHMACBackend answers successive Get(KeyHMACKey) calls from a script,
+// so a test can model "absent when we looked, present once we held the lock" —
+// the state EnsureHMACKey's re-read exists for. hmacStubBackend cannot: it
+// returns the same scripted value on every call, so a fix with the re-read and
+// one without behave identically against it.
+type sequencedHMACBackend struct {
+	hmacStubBackend
+	gets []struct {
+		value []byte
+		err   error
+	}
+	getCalls int
+}
+
+func (b *sequencedHMACBackend) Get(ctx context.Context, key string) ([]byte, error) {
+	if key != KeyHMACKey {
+		return b.hmacStubBackend.Get(ctx, key)
+	}
+	i := b.getCalls
+	b.getCalls++
+	if i >= len(b.gets) {
+		Fail(fmt.Sprintf("Get(%s) called %d times; the script has only %d entries", KeyHMACKey, b.getCalls, len(b.gets)))
+	}
+	return b.gets[i].value, b.gets[i].err
+}
+
+var _ = Describe("EnsureHMACKey when the stored key is corrupt", func() {
+	// Regenerating a wrong-length key invalidates every existing inventory
+	// MAC, so VerifyInventoryHMAC reports ErrInventoryTampered — "possible
+	// tampering" — a moment later, for something the CA itself just did. This
+	// warning is the only thing standing between an operator and a phantom
+	// compromise, which is the same misattribution internal/ca/inithmac_test.go
+	// spends two specs policing in the error wording.
+	//
+	// The nil case is not hypothetical padding: it is what pins loadHMACKey's
+	// normalisation of a nil blob read with no error. Without that, an empty
+	// blob reads as first boot, the warning never fires, and the operator gets
+	// the tamper alarm with nothing to explain it.
+	DescribeTable("warns once, naming the length it found",
+		func(stored []byte, wantLength string) {
+			be := &hmacStubBackend{getValue: stored}
+			svc := NewWithBackend(be, "")
+
+			var buf bytes.Buffer
+			orig := slog.Default()
+			slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+			defer slog.SetDefault(orig)
+
+			key, err := svc.EnsureHMACKey(context.Background())
+			Expect(err).NotTo(HaveOccurred(), "EnsureHMACKey: %v", err)
+			Expect(key).To(HaveLen(hmacKeyLen), "the corrupt key was not replaced")
+			Expect(be.putCalls).To(Equal(1), "Put called %d times; want 1", be.putCalls)
+
+			// Once, not twice: loadHMACKey runs on both the unlocked look and
+			// the re-read under the lock, and only the second is a decision.
+			Expect(strings.Count(buf.String(), "wrong length")).To(Equal(1),
+				"want exactly one wrong-length warning, got: %s", buf.String())
+			Expect(buf.String()).To(ContainSubstring(wantLength),
+				"the warning does not name the length found: %s", buf.String())
+		},
+		Entry("a truncated blob", []byte("too-short"), "length=9"),
+		Entry("a blob the backend returns as nil with no error", nil, "length=0"),
+	)
+
+	// The negative case, and the reason it is worth having: the warning is
+	// tamper-adjacent, and a length check that misfired on the valid-key path
+	// — an off-by-one on hmacKeyLen, say — would satisfy every other assertion
+	// in this file (the key is returned verbatim, nothing is written) while
+	// emitting "possible tampering" wording on every restart of a healthy CA.
+	// Nothing else pins the silence.
+	It("says nothing when the stored key is the expected length", func() {
+		stored := bytes.Repeat([]byte{0x7E}, hmacKeyLen)
+		be := &hmacStubBackend{getValue: stored}
+		svc := NewWithBackend(be, "")
+
+		var buf bytes.Buffer
+		orig := slog.Default()
+		slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+		defer slog.SetDefault(orig)
+
+		key, err := svc.EnsureHMACKey(context.Background())
+		Expect(err).NotTo(HaveOccurred(), "EnsureHMACKey: %v", err)
+		Expect(key).To(Equal(stored), "stored key not returned verbatim")
+		Expect(buf.String()).NotTo(ContainSubstring("wrong length"),
+			"a valid key warned about its length: %s", buf.String())
+	})
+})
+
+var _ = Describe("EnsureHMACKey when another replica wins the race", func() {
+	// The re-read inside the lock is the load-bearing half of the fix: the lock
+	// alone would only order two overwrites, and it is the second look that
+	// makes the loser adopt the winner's key. hmacrace_test.go covers this
+	// concurrently; this pins it deterministically, so dropping the re-read
+	// fails instantly and without goroutines.
+	It("adopts the key it finds on the re-read instead of overwriting it", func() {
+		winner := bytes.Repeat([]byte{0x5A}, hmacKeyLen)
+		be := &sequencedHMACBackend{
+			gets: []struct {
+				value []byte
+				err   error
+			}{
+				// The unlocked look: absent, so we go on to take the lock.
+				{nil, &fs.PathError{Op: "get", Path: KeyHMACKey, Err: fs.ErrNotExist}},
+				// The re-read, once we hold it: another replica got there.
+				{winner, nil},
+			},
+		}
+		svc := NewWithBackend(be, "")
+
+		key, err := svc.EnsureHMACKey(context.Background())
+		Expect(err).NotTo(HaveOccurred(), "EnsureHMACKey: %v", err)
+		Expect(key).To(Equal(winner), "EnsureHMACKey returned %x; want the key found on the re-read (%x) — the re-read was skipped or its result discarded", key, winner)
+		Expect(be.putCalls).To(Equal(0), "Put called %d times; want 0 (a key found on the re-read must be adopted, not overwritten)", be.putCalls)
+		Expect(be.getCalls).To(Equal(2), "Get(%s) called %d times; want 2 (one unlocked look, one re-read under the lock)", KeyHMACKey, be.getCalls)
 	})
 })
 

@@ -264,11 +264,28 @@ var _ = Describe("MigrateServiceLocksBothBackends", func() {
 		Expect(err).NotTo(HaveOccurred(), "MigrateService")
 		Expect(report.Total()).To(Equal(len(want)), "Total")
 
-		for label, b := range map[string]*lockingBackend{"source": srcB, "destination": dstB} {
-			Expect(b.acquired).To(HaveLen(1), fmt.Sprintf("%s locks acquired = %v, want [%q]", label, b.acquired, migrateLockName))
-			Expect(b.acquired[0]).To(Equal(migrateLockName), fmt.Sprintf("%s locks acquired = %v, want [%q]", label, b.acquired, migrateLockName))
-			Expect(b.released).To(Equal(1), fmt.Sprintf("%s locks released", label))
-		}
+		// The source is only read from, so it takes the migrate lock and
+		// nothing else.
+		Expect(srcB.acquired).To(Equal([]string{migrateLockName}),
+			fmt.Sprintf("source locks acquired = %v, want [%q]", srcB.acquired, migrateLockName))
+		Expect(srcB.released).To(Equal(1), "source locks released")
+
+		// The destination takes a second lock nested inside the first:
+		// MigrateService rebuilds its inventory HMAC while still holding the
+		// migrate lock, and seedCA's hmac_key is deliberately not hmacKeyLen
+		// bytes, so EnsureHMACKey regenerates it — under lockNameHMACKey.
+		//
+		// This pins the nesting itself: migrate lock outermost, HMAC key
+		// inside, never the reverse. It does *not* police the two names being
+		// different — lockingBackend hands out a lock that never blocks, so
+		// under a shared name this spec records the same string twice and
+		// still passes. The spec that would catch that is "does not deadlock
+		// when reached from inside the migration lock" in hmacrace_test.go,
+		// which locks a real non-reentrant mutex; verified by setting
+		// lockNameHMACKey to migrateLockName and watching only that one fail.
+		Expect(dstB.acquired).To(Equal([]string{migrateLockName, lockNameHMACKey}),
+			fmt.Sprintf("destination locks acquired = %v, want [%q %q]", dstB.acquired, migrateLockName, lockNameHMACKey))
+		Expect(dstB.released).To(Equal(2), "destination locks released")
 
 		// The data was actually copied under the lock.
 		got, err := dstB.Get(ctx, KeyCACert)
