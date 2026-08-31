@@ -1268,8 +1268,9 @@ The user running `openvox-ca` must own (or have write access to) `--cadir` —
 and so must anything else that touches the store. `openvox-ca-ctl` and the
 offline `openvox-ca` subcommands take the same locks the server does, so run
 them as that user rather than under `sudo`: a root-owned lock file left in
-`locks/` will fail the server's next acquisition of that name. See [running a
-second process against a live
+`locks/` will fail the server's next acquisition of that name. They also require
+the server to be stopped, because the filesystem backend supports a single
+running instance. See [running a second process against a live
 store](storage-backends.md#running-a-second-process-against-a-live-store).
 
 ## Graceful shutdown
