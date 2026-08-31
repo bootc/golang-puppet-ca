@@ -132,7 +132,7 @@ behind a Go build tag and driven by a `mage` target:
 | `mage test:backendsMySQL` | SQL backend integration suite against MySQL — under `-race`; needs cgo and a C compiler |
 | `mage test:backendsEtcd` | etcd backend integration suite (embedded etcd) — under `-race`; needs cgo and a C compiler |
 | `mage test:backendsRedis` | Redis backend full-stack bash TAP suite (Puppet topology) |
-| `mage test:backendsRedisGo` | Redis backend Go integration suite (build tag `redis_integration`) |
+| `mage test:backendsRedisGo` | Redis backend Go integration suite (build tag `redis_integration`), under `-race` — needs cgo and a C compiler |
 | `mage test:backendsOpenBao` | OpenBao Transit signer integration suite (build tag `openbao_integration`) |
 
 See [storage backends](../storage-backends.md) and

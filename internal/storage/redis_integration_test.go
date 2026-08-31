@@ -473,18 +473,20 @@ var _ = Describe("RedisIntegrationPruneAtScale", func() {
 		for i := 0; i < subjects; i++ {
 			subject := fmt.Sprintf("node%d", i)
 			recs = append(recs,
-				// Expired: pruned.
-				CertRecord{InventoryEntry: InventoryEntry{
-					Serial:    fmt.Sprintf("%06d", i*2+1),
-					NotBefore: "2020-01-01T00:00:00UTC",
-					NotAfter:  "2021-01-01T00:00:00UTC",
-					Subject:   subject,
-				}},
 				// Still valid: survives, and becomes the repoint target.
 				CertRecord{InventoryEntry: InventoryEntry{
-					Serial:    fmt.Sprintf("%06d", i*2+2),
+					Serial:    fmt.Sprintf("%06d", i*2+1),
 					NotBefore: "2024-01-01T00:00:00UTC",
 					NotAfter:  "2039-01-01T00:00:00UTC",
+					Subject:   subject,
+				}},
+				// Expired: pruned. Seeded second so by-subject points at it,
+				// which is what makes the repoint a real write rather than one
+				// that stores the value already there.
+				CertRecord{InventoryEntry: InventoryEntry{
+					Serial:    fmt.Sprintf("%06d", i*2+2),
+					NotBefore: "2020-01-01T00:00:00UTC",
+					NotAfter:  "2021-01-01T00:00:00UTC",
 					Subject:   subject,
 				}})
 		}
@@ -512,8 +514,32 @@ var _ = Describe("RedisIntegrationPruneAtScale", func() {
 		// repointed at its surviving issuance.
 		_, err = svc.ReadInventory(ctx)
 		Expect(err).NotTo(HaveOccurred(), "ReadInventory verifies the rewritten head")
-		serial, err := svc.LatestSerialForSubject(ctx, "node0")
-		Expect(err).NotTo(HaveOccurred(), "LatestSerialForSubject")
-		Expect(serial).To(Equal("000002"), "node0 must point at its surviving issuance")
+
+		// ReadInventory's chain covers inventory:entries only, so it says
+		// nothing about the index hashes the prune also rewrites. Check every
+		// subject rather than a sample: the repoint list is applied in strides
+		// of 500 *elements*, and a by-subject repoint is a field/value pair,
+		// so one chunk carries 250 subjects and the boundaries fall at
+		// 249/250, 499/500 and so on up to 4999. Asserting only node0 — chunk
+		// 1 of 20 — would pass with the stride arithmetic broken for every
+		// later chunk, which is the whole of what apply() exists to get right.
+		bySubject, err := b.client.HGetAll(ctx, b.invPhys(redisInvSubjectSub)).Result()
+		Expect(err).NotTo(HaveOccurred(), "HGetAll by-subject")
+		Expect(bySubject).To(HaveLen(subjects), "one by-subject field per subject")
+		for i := 0; i < subjects; i++ {
+			subject := fmt.Sprintf("node%d", i)
+			Expect(bySubject[subject]).To(Equal(fmt.Sprintf("%06d", i*2+1)),
+				"%s must point at its surviving issuance", subject)
+		}
+
+		// And the public path agrees, sampled either side of the first two
+		// chunk boundaries and at the last subject.
+		for _, i := range []int{0, 249, 250, 499, 500, subjects - 1} {
+			subject := fmt.Sprintf("node%d", i)
+			serial, lerr := svc.LatestSerialForSubject(ctx, subject)
+			Expect(lerr).NotTo(HaveOccurred(), "LatestSerialForSubject(%s)", subject)
+			Expect(serial).To(Equal(fmt.Sprintf("%06d", i*2+1)),
+				"%s must point at its surviving issuance", subject)
+		}
 	})
 })

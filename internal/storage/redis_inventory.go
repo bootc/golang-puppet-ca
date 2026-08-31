@@ -68,6 +68,15 @@ import (
 // who owns the Redis instance, who holds both the key and the entries and can
 // recompute a consistent head.
 //
+// What decomposition does not change is durability. Redis atomicity is
+// single-primary, and replication under Sentinel is asynchronous, so a
+// failover can lose an entry the primary had already acknowledged — the same
+// window AcquireLock documents for locks, and no better or worse than the
+// append-only blob this replaces. The chain notices afterwards (the head will
+// not verify against the entries that survived), which is detection, not
+// durability. Deployments that need a committed write to survive a leader
+// change want the etcd or SQL backends.
+//
 // Appends are O(1) in the inventory size (a handful of hash writes), where
 // the blob path was O(size-of-entire-inventory) per certificate issued. The
 // by-serial guard gives Redis the cross-replica duplicate-serial guarantee

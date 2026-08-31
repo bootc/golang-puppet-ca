@@ -151,8 +151,12 @@ The inventory itself is decomposed into one hash field per issued certificate
 in `inventory:entries`, with `inventory:seq` acting as sequence allocator and
 mutation fence and `inventory:by-serial` / `inventory:by-subject` as index
 hashes. Every mutation is one server-side Lua script — atomic by construction,
-so appends across replicas lose nothing and duplicate serials are rejected
-cluster-wide. See
+so an append either applies whole or not at all, and duplicate serials are
+rejected cluster-wide. That atomicity is the primary's: unlike etcd's
+consensus-backed writes above, Redis replication under Sentinel is
+asynchronous, so a failover can still lose an entry the primary had
+acknowledged but not yet replicated. Decomposition does not change that — it
+is the same caveat `AcquireLock` documents for locks. See
 [the inventory store](inventory-store.md#the-redis-decomposition) for the full
 key family and the rules that keep it coherent.
 

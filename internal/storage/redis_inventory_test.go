@@ -618,6 +618,81 @@ var _ = Describe("RedisInventoryPrune", func() {
 	})
 })
 
+var _ = Describe("RedisPruneChunkBoundary", func() {
+	It("repoints every subject across the Lua apply() chunk boundaries", func() {
+		ctx := context.Background()
+		_, cli, stop := newMiniredis()
+		defer stop()
+		b := newRedisBackend(cli, redisTestPrefix)
+		svc := NewWithBackend(b, "")
+		Expect(svc.TouchInventory(ctx)).To(Succeed(), "TouchInventory")
+		Expect(svc.InitHMAC(ctx)).To(Succeed(), "InitHMAC")
+
+		// redisPruneLua applies the by-subject repoint list in strides of 500
+		// *elements*, and a repoint is a field/value pair, so one chunk carries
+		// 250 subjects. 600 subjects gives three chunks with boundaries at
+		// 249/250 and 499/500 — enough to catch stride arithmetic that happens
+		// to work for the first chunk only. The integration suite proves the
+		// same property at the 5000 cap against a real server; this proves it
+		// here, because miniredis runs gopher-lua, which has no unpack ceiling
+		// and so needs neither the scale nor the server.
+		// Order matters, and is the difference between a real assertion and a
+		// vacuous one. by-subject takes the last entry appended for a subject,
+		// so the *expired* issuance is seeded second: the prune then removes
+		// the entry by-subject points at, and every subject must be repointed
+		// back to its surviving one. Seeded the other way round the repoint
+		// writes the value already there, and a chunk-truncation bug is
+		// invisible however many subjects the assertion checks.
+		const subjects = 600
+		var buf strings.Builder
+		for i := 0; i < subjects; i++ {
+			subject := fmt.Sprintf("node%d", i)
+			buf.WriteString(canonicalInventoryLine(InventoryEntry{
+				Serial:    fmt.Sprintf("%06d", i*2+1),
+				NotBefore: "2024-01-01T00:00:00UTC",
+				NotAfter:  "2039-01-01T00:00:00UTC",
+				Subject:   subject,
+			}))
+			buf.WriteByte('\n')
+			buf.WriteString(canonicalInventoryLine(InventoryEntry{
+				Serial:    fmt.Sprintf("%06d", i*2+2),
+				NotBefore: "2020-01-01T00:00:00UTC",
+				NotAfter:  "2021-01-01T00:00:00UTC",
+				Subject:   subject,
+			}))
+			buf.WriteByte('\n')
+		}
+		Expect(b.Put(ctx, KeyInventory, []byte(buf.String()), BlobPrivate)).
+			To(Succeed(), "seed inventory")
+		Expect(svc.RebuildInventoryHMAC(ctx)).To(Succeed(), "RebuildInventoryHMAC")
+
+		cutoff, err := time.Parse(InventoryTimeFormat, "2023-01-01T00:00:00UTC")
+		Expect(err).NotTo(HaveOccurred())
+		removed, err := svc.PruneInventory(ctx, func(e InventoryEntry) bool {
+			notAfter, perr := time.Parse(InventoryTimeFormat, e.NotAfter)
+			Expect(perr).NotTo(HaveOccurred())
+			return !notAfter.Before(cutoff)
+		})
+		Expect(err).NotTo(HaveOccurred(), "PruneInventory")
+		Expect(removed).To(HaveLen(subjects), "one expired issuance per subject")
+
+		// Asserted per subject rather than as one map comparison: a whole-map
+		// Equal on 600 entries prints a truncated wall of text, and the useful
+		// fact is which subject is wrong — the first failure names the chunk.
+		bySubject := hashFields(cli, invKey(redisInvSubjectSub))
+		Expect(bySubject).To(HaveLen(subjects), "one by-subject field per subject")
+		for i := 0; i < subjects; i++ {
+			subject := fmt.Sprintf("node%d", i)
+			Expect(bySubject[subject]).To(Equal(fmt.Sprintf("%06d", i*2+1)),
+				"%s (chunk %d) must be repointed at its surviving issuance",
+				subject, i/250+1)
+		}
+
+		_, err = svc.ReadInventory(ctx)
+		Expect(err).NotTo(HaveOccurred(), "ReadInventory verifies the rewritten head")
+	})
+})
+
 var _ = Describe("RedisPrunePlan", func() {
 	// planRedisPrune owns the per-call bound and the index repairs, and is
 	// pure — testing it directly is the only practical way to cover a bound

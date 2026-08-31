@@ -24,7 +24,7 @@ Task. Invoke targets with `go run mage.go <Target>` or the `mage` binary:
 | `mage test:backendsMySQL` | SQL backend integration suite against MySQL, under `-race` — needs cgo and a C compiler |
 | `mage test:backendsEtcd` | etcd backend integration suite (embedded etcd), under `-race` — needs cgo and a C compiler |
 | `mage test:backendsRedis` | Redis backend full-stack bash TAP suite (Puppet topology) |
-| `mage test:backendsRedisGo` | Redis backend Go integration suite (build tag `redis_integration`) |
+| `mage test:backendsRedisGo` | Redis backend Go integration suite (build tag `redis_integration`), under `-race` — needs cgo and a C compiler |
 | `mage test:backendsOpenBao` | OpenBao Transit signer integration suite (build tag `openbao_integration`, `test/compose-backends-openbao.yml`) |
 | `mage chart:lint` | Run `helm lint --strict` over the Helm chart, once per fixture in `charts/openvox-ca/ci/` |
 | `mage chart:validate` | Lint the Helm chart and check every rendered fixture against the Kubernetes schemas (needs `helm` and `kubeconform`; caches the remote schemas under `.test-output/kubeconform-cache/`, which `mage dev:clean` removes) |

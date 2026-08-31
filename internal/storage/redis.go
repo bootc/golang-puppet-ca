@@ -140,7 +140,7 @@ type RedisBackend struct {
 	invDropHeadScript      *redis.Script
 	invSetRecordScript     *redis.Script
 
-	appendMu sync.Mutex // serialises inventory mutations within this process
+	appendMu sync.Mutex // serialises AppendLine and inventory mutations in-process
 
 	// importBatchHook, when non-nil, runs after each committed import script;
 	// appendHeadHook runs between an append's head read and its guarded
