@@ -19,8 +19,9 @@ guide is the human-friendly entry point; where the two overlap, AGENTS.md wins.
   `go install github.com/magefile/mage@latest` (or run targets with
   `go run mage.go <Target>`)
 - A C compiler (gcc or clang; `build-essential` on Debian/Ubuntu, the Xcode
-  Command Line Tools on macOS), because `mage test:unit` runs the suite under
-  the race detector, which needs cgo — see
+  Command Line Tools on macOS), because `mage test:unit` and
+  `mage test:backendsRedisGo` run their suites under the race detector, which
+  needs cgo — see
   [Testing](docs/development/testing.md). Present by default on most systems; a
   slim container image may not have one. The product build is unaffected — it
   is still `CGO_ENABLED=0`.

@@ -78,8 +78,11 @@ Storage-layer and backend-internal locks live beside the code that takes them,
 for the same import-direction reason: `lockNameHMACKey` (`"hmac-key"`) in
 [storage.go](../../internal/storage/storage.go) and `etcdDecomposeLockName`
 (`"inventory-decompose"`) in
-[etcd_inventory.go](../../internal/storage/etcd_inventory.go). They are no
-less protocol for it.
+[etcd_inventory.go](../../internal/storage/etcd_inventory.go), which
+`redisDecomposeLockName` in
+[redis_inventory.go](../../internal/storage/redis_inventory.go) deliberately
+aliases — a deployment only ever has one backend, so the two can never
+contend. They are no less protocol for it.
 
 One name in `internal/storage` is not a lock in that sense at all:
 `lockProbeName` in [storage.go](../../internal/storage/storage.go) defines
@@ -95,7 +98,7 @@ flight — see its row below.
 | `subject:<name>` | The whole lifecycle of one subject: evict/save CSR/sign/delete CSR/renew/import/clean/revoke/generate | `SaveRequest`, `Sign`, `SignWithTTL`, `DeleteRequest`, `Renew`, `AutoRenew`, `Clean`, `ImportCertificate`, `Revoke`, `Generate`/`GenerateWithOptions` |
 | `hmac-key` | Generating and persisting the inventory HMAC key when none is usable — a cold start, or a stored blob of the wrong length | `StorageService.EnsureHMACKey`, reached from `CA.Init` → `InitHMAC` and from `MigrateService` → `RebuildInventoryHMAC`. Deliberately **not** `bootstrap`: the migration already holds that name across the rebuild, and `WithLock` is not reentrant |
 | `sql-schema-migrate` | One schema-migration run, so two replicas starting at once do not migrate concurrently (SQL backends only) | `SQLBackend.EnsureReady` |
-| `inventory-decompose` | One-time legacy inventory blob conversion (etcd backend only) on the first start after upgrading | `EtcdBackend.decomposeLegacyInventory`, from `EnsureReady` |
+| `inventory-decompose` | One-time legacy inventory blob conversion (etcd and redis backends) on the first start after upgrading | `EtcdBackend.decomposeLegacyInventory` and `RedisBackend.decomposeLegacyInventory`, from `EnsureReady` |
 | `capability-probe` | Nothing. Acquired and released immediately by `StorageService.SupportsDistributedLocking` to find out whether this backend coordinates locks across processes at all | The offline `openvox-ca generate` pre-flight. The name sits deliberately outside every namespace above so a probe can never contend with an operation in flight |
 
 How each backend provides the distributed lock (a summary — the full per-backend
@@ -460,11 +463,12 @@ path — still provides no cross-replica guarantee anyway.
    `AppendInventory`'s duplicate-serial check (`ErrDuplicateSerial`) is the
    worked example: it is a cluster-wide guarantee on the structured backends —
    SQL via the database's unique index, etcd via the `by-serial` key's
-   `CreateRevision == 0` guard inside the append transaction — but on the
-   remaining blob backends (filesystem, redis) the scan runs under the
+   `CreateRevision == 0` guard inside the append transaction, redis via the
+   `by-serial` hash field the append script refuses to overwrite — but on the
+   filesystem backend, the only remaining blob one, the scan runs under the
    process-local `inventoryMu` only (the doc comment on `ErrDuplicateSerial`
    in [storage.go](../../internal/storage/storage.go) spells this out, and
-   the blob-backend gap is tracked as
+   the remaining gap is tracked as
    [#204](https://github.com/voxpupuli/openvox-ca/issues/204)).
 7. **New lock names are protocol.** There are three homes, one per layer that
    takes a lock. Define CA-layer names as constants in
@@ -655,14 +659,24 @@ state when the document was last updated and is not guaranteed exhaustive.
   locks and can still interleave an `AppendInventory` and its HMAC rewrite.
   That is the blob-backend gap below, and closing it closes the filesystem case
   with it.
-- [#204](https://github.com/voxpupuli/openvox-ca/issues/204) — nothing wraps
-  `AppendInventory` in a cluster lock on any blob backend, so its
-  duplicate-serial check is not cross-writer on filesystem or Redis, and the
-  whole-blob HMAC rewrite can cover a blob that never existed. The etcd half of
-  that gap was closed by the decomposed inventory's atomic `by-serial` guard
-  ([#138](https://github.com/voxpupuli/openvox-ca/issues/138)). Whatever lock
-  the fix takes, the single-node backends will get it cross-process for free
-  now that `WithLock` reaches a same-host tier.
+- ~~[#204](https://github.com/voxpupuli/openvox-ca/issues/204) — nothing wraps
+  `AppendInventory` in a cluster lock, so on a blob backend its
+  duplicate-serial check is not cross-writer and the whole-blob HMAC rewrite
+  can cover a blob that never existed.~~ Fixed: #204's scope is the
+  *distributed* blob backends, and both halves are closed by their decomposed
+  inventories' atomic `by-serial` guards
+  ([#138](https://github.com/voxpupuli/openvox-ca/issues/138) for etcd,
+  [#139](https://github.com/voxpupuli/openvox-ca/issues/139) for Redis); the
+  Redis half also removed the read-compute-write whole-blob HMAC update that
+  made it a live CI flake rather than a theoretical gap. The filesystem backend
+  still takes no cluster lock around the append — `SameHostLocker` excludes per
+  lock *name*, and two processes issuing for different subjects hold different
+  `subject:<name>` locks — but that is outside #204's scope and is not a
+  tracked defect: two processes writing one filesystem store is an unsupported
+  configuration. Enforcing it is
+  [#275](https://github.com/voxpupuli/openvox-ca/issues/275), a cadir-wide lock
+  that would stop a second instance starting at all. See
+  [storage backends](../storage-backends.md).
   The offline `generate` still reports both capabilities in its pre-flight, via
   `SupportsDistributedLocking`/`SupportsAtomicInventory`, and still tells the
   operator to stop the server: neither is made true by the same-host tier, and
@@ -734,11 +748,19 @@ state when the document was last updated and is not guaranteed exhaustive.
   gate, and deliberately so: it issues *for* a subject rather than renewing a
   certificate someone presented, so a revoked certificate for that name is
   evicted and replaced rather than refused.
-- On blob backends (filesystem/redis), an inventory append and its HMAC
-  update are two writes, not one atomic unit; the failure window is documented
-  at the write site in `AppendInventory` and the structured (SQL, etcd)
-  inventory — which commits the entry and its integrity head in one
-  transaction — is the durable answer. See
+- On the filesystem backend, an inventory append and its HMAC update are two
+  writes to two files (`inventory.txt` and `.inventory.hmac`). `Put` is already
+  atomic per file — write to a temporary and `rename(2)` — but no POSIX
+  primitive makes a *pair* of renames atomic, so a crash between them leaves the
+  digest covering the previous state. This is a structural consequence of
+  keeping the Puppet-compatible on-disk layout, not a defect awaiting a fix:
+  one file would break that format, and reordering fails either way round —
+  HMAC-first covers content that does not exist yet, inventory-first leaves a
+  digest covering the previous state.
+  [#188](https://github.com/voxpupuli/openvox-ca/issues/188) is the mitigation,
+  a supported way to rebuild the HMAC; it does not close the window. The
+  structured inventory is the durable answer — SQL and etcd commit the entry and
+  its integrity head in one transaction, redis in one Lua script. See
   [the inventory store](inventory-store.md).
 
 ## Tests
@@ -798,11 +820,8 @@ deadlocking the suite to its timeout, which is how an inversion otherwise
 presents: every backend serialises same-process callers on a mutex that ignores
 the context deadline. These run under the race detector on every unit
 run: `mage test:unit` passes `-race` over every unit package, `internal/ca`
-included. Of the backend suites, `backendsEtcd`, `backendsPostgres` and
-`backendsMySQL` run under it too; `backendsRedisGo` does not, and
-[PR #212](https://github.com/voxpupuli/openvox-ca/pull/212) adds it. The
-residue is tracked as
-[#205](https://github.com/voxpupuli/openvox-ca/issues/205).
+included. Of the backend suites, `backendsEtcd`, `backendsPostgres`,
+`backendsMySQL` and `backendsRedisGo` run under it too.
 
 That is only the suites this document cares about. For the exhaustive list of
 every `go test` the repository invokes and whether each is raced — including the

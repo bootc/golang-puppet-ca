@@ -18,7 +18,7 @@ interface. Every backend serves the following logical keys:
 | `crl` | Certificate Revocation List (PEM). May hold several concatenated CRLs when a chain has been imported: this CA's own first, ancestors after it. The re-sign path (`readStoredCRL`) and every reader that parses a single CRL (`loadCRLCache`, the metrics collector, `/expirations`) take block 0; the whole-blob consumers are `GET`/`PUT /certificate_revocation_list/ca`, the Kubernetes exporter, and — to preserve ancestor blocks — `crlChainLocked` on the re-sign path and `storedCRLChain` on the import path. Revocation questions are answered from `cachedCRL`, which `loadCRLCache` fills with the block this CA signed — the newest block it signed, wherever it sits, so a stale copy of ours at block 0 is passed over as readily as an ancestor's | bootstrap, revoke, rotate, import, seed |
 | `serial` | Next leaf certificate serial counter | sign / seed |
 | `inventory` | Append-only log of issued/revoked certificates | sign / revoke / seed |
-| `inventory_hmac` | Inventory integrity head (blob HMAC, or hash chain on the structured backends: SQL, etcd) | sign / revoke |
+| `inventory_hmac` | Inventory integrity head (blob HMAC, or hash chain on the structured backends: SQL, etcd, redis) | sign / revoke |
 | `hmac_key` | Integrity key for `inventory_hmac` | first run |
 | `superseded` | JSON list of certificates a renewal has replaced and that are awaiting delayed revocation: `{serial, subject, revoke_at}` per entry. Absent until the first supersession, which needs `superseded_cert_revoke_after_sec` set. Read-modify-written whole, under the cluster `crl` lock so an append and the sweep's rewrite exclude each other | renew / auto-renew / revoke / supersession sweep |
 | `csr/<subject>` | Pending certificate signing request (PEM), per subject | CSR submission |
@@ -135,7 +135,7 @@ separator):
 | `ca_key` | `puppet-ca:ca:key` |
 | `crl` | `puppet-ca:ca:crl` |
 | `serial` | `puppet-ca:serial` |
-| `inventory` | `puppet-ca:inventory:data` |
+| `inventory` | `puppet-ca:inventory:data` (presence marker only; see below) |
 | `inventory_hmac` | `puppet-ca:inventory:hmac` |
 | `hmac_key` | `puppet-ca:private:hmac_key` |
 | `superseded` | `puppet-ca:superseded` |
@@ -143,9 +143,22 @@ separator):
 | `cert/<subject>` | `puppet-ca:signed:<subject>` |
 
 Stored values carry an 8-byte big-endian `time.UnixNano` mtime prefix so
-`ModTime` is answered from the same round-trip as the value. Inventory appends
-are performed by a Lua script on the server, making a read-modify-write
-single-step atomic across all replicas.
+`ModTime` is answered from the same round-trip as the value.
+
+The certificate inventory is not stored at `inventory:data` — that key is only
+a presence marker (and the location pre-decomposition versions kept the blob).
+The inventory itself is decomposed into one hash field per issued certificate
+in `inventory:entries`, with `inventory:seq` acting as sequence allocator and
+mutation fence and `inventory:by-serial` / `inventory:by-subject` as index
+hashes. Every mutation is one server-side Lua script — atomic by construction,
+so an append either applies whole or not at all, and duplicate serials are
+rejected cluster-wide. That atomicity is the primary's: unlike etcd's
+consensus-backed writes above, Redis replication under Sentinel is
+asynchronous, so a failover can still lose an entry the primary had
+acknowledged but not yet replicated. Decomposition does not change that — it
+is the same caveat `AcquireLock` documents for locks. See
+[the inventory store](inventory-store.md#the-redis-decomposition) for the full
+key family and the rules that keep it coherent.
 
 ### Cross-node coordination
 
