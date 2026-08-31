@@ -838,16 +838,18 @@ Some things worth knowing before you rely on it:
   operator set the window to 0. On a CA that has never recorded a supersession
   each pass is a single absent-key read taking no cluster lock: the sweep rules
   the work out before acquiring one.
-- **Each due entry costs one CRL re-sign, under the shared CRL lock.** The sweep
-  revokes entries one at a time, and every revocation is a full read, re-sign
-  and write of the CRL. A large backlog coming due at once — after a fleet-wide
-  outage, say — therefore drains at a rate set by CRL re-sign cost rather than
-  by the sweep interval, and it holds the lock that every revocation on every
-  replica needs while it does. A pass stops before its budget is spent and logs
-  what it deferred to the next one, so a backlog that is not draining is visible
-  rather than silent: a deferred pass raises `puppetca_supersede_failures_total`
-  and logs `ran out of budget; deferring the rest`, and the entries it defers
-  stay on the list. Batching those re-signs into one is a separate change.
+- **A pass costs one CRL re-sign, whatever the backlog.** The sweep collects
+  every due entry and amends the CRL once — one read, one signature, one write —
+  however many certificates come due together, and holds the shared CRL lock
+  that every revocation on every replica needs for that single amendment rather
+  than for one per entry. Under
+  [`ca_key_provider: openbao`](openbao-transit.md) it is likewise one remote
+  Transit round trip rather than one per entry. That matters most in the case
+  the sweep used to handle worst: a large backlog coming due at once, after a
+  fleet-wide outage or a passphrase rotation. A pass that cannot amend the CRL
+  fails as a whole — it leaves every entry it attempted on the list, raises
+  `puppetca_supersede_failures_total`, and the next pass retries them
+  together.
 - **Revoking a subject retires its pending predecessor too.** `revoke --certname`
   and `DELETE /certificate_status` retire the subject's current certificate
   *and* anything of that subject's still inside its window, in the same call —

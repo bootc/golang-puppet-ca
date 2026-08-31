@@ -174,8 +174,9 @@ func NewCollector(c *ca.CA) *Collector {
 				"something newer has taken its place, so this is the live measure of the exposure "+
 				"superseded_cert_revoke_after_sec buys. It returns to zero as the sweep drains "+
 				"the list; a value that does not fall means the sweep is not completing — check "+
-				"puppetca_supersede_failures_total, which a pass that failed or ran out of budget "+
-				"both raise, and the log for 'ran out of budget; deferring the rest'. Absent, "+
+				"puppetca_supersede_failures_total, which a failing pass raises once however many "+
+				"entries were due, and the log for 'Could not revoke superseded certificates'. "+
+				"Absent, "+
 				"rather than zero, when the list could not be read: zero is what a drained list "+
 				"reports, so it must not also be what an unreadable one reports.",
 			nil, nil),

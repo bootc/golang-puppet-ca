@@ -516,11 +516,16 @@ var _ = Describe("Delayed supersession", func() {
 
 	Describe("ReconcileSuperseded when a revocation fails", func() {
 		// The retry half of the sweep's failure handling. The alert text tells
-		// operators to distinguish "Could not revoke superseded certificate"
+		// operators to distinguish "Could not revoke superseded certificates"
 		// (recorded, will retry) from "Discarding" (gone for good), and only the
 		// second was pinned. A change that dropped failed entries instead of
 		// carrying them forward would turn a retryable failure into a
 		// permanently valid credential and move no assertion.
+		//
+		// This is also the carry-forward case #176 had to preserve when it
+		// batched the re-sign. Batched, the failure is all-or-nothing rather
+		// than per entry — but where the entries end up is unchanged, which is
+		// the part that decides whether a certificate stays tracked.
 		It("carries the entry forward rather than dropping it, and counts the pass once", func() {
 			first := issue("node-r")
 			second := issue("node-s")
@@ -528,9 +533,9 @@ var _ = Describe("Delayed supersession", func() {
 				{Serial: hexSerial(first.SerialNumber), Subject: "node-r", RevokeAt: time.Now().UTC().Add(-time.Minute)},
 				{Serial: hexSerial(second.SerialNumber), Subject: "node-s", RevokeAt: time.Now().UTC().Add(-time.Minute)},
 			})
-			// An unparseable CRL makes revokeSerialLocked fail for every entry
-			// without making any of them unrevocable — the distinction the two
-			// arms turn on.
+			// An unparseable CRL fails the batch's own read without making any
+			// of its entries unrevocable — the distinction the two arms turn
+			// on.
 			Expect(store.UpdateCRL(ctx, []byte("not a valid CRL"))).To(Succeed())
 			before := myCA.SupersedeFailures()
 

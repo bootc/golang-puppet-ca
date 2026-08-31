@@ -237,18 +237,24 @@ var _ = Describe("drainDueLocked", func() {
 	})
 
 	// Guards the one thing #176's godoc tells a batched implementation it must
-	// not do: hand a malformed serial to the batch. Here that is visible as the
-	// malformed entry never reaching revokeSerialLocked — with a healthy CRL,
-	// a batch containing it would have failed the valid entries too.
+	// not do: hand a malformed serial to the batch. Now that the re-sign is
+	// batched this is no longer one lost entry — the whole batch shares a
+	// single signature, so a serial that cannot be parsed fails every valid
+	// entry beside it, and since a failed batch carries all of its entries
+	// forward it does so again on every pass after this one. One unrevocable
+	// entry would stall every pending revocation on the CA.
 	It("never offers an unrevocable serial to the revocation step", func() {
 		due := []supersededEntry{{Serial: "not-hex", Subject: "bad.test"}, entry(0)}
 		out := drain(ctx, due)
 
-		Expect(out.discarded).To(Equal(1))
+		Expect(out.revoked).To(Equal(1),
+			"the valid entry beside a malformed one must still be revoked; a batch that "+
+				"accepted the malformed serial would have failed this one too")
 		Expect(out.failed).To(BeEmpty(),
 			"the malformed entry must be filtered out before revocation, not fail inside it")
-		Expect(out.revoked).To(Equal(1),
-			"and the valid entry beside it must still be revoked")
+		Expect(out.discarded).To(Equal(1),
+			"and it must be discarded rather than carried forward: it can never be revoked, "+
+				"so retrying it would stall the batch on every pass forever")
 	})
 
 	// countingCAKey wraps the CA's signing key and counts the signatures taken
@@ -330,15 +336,17 @@ var _ = Describe("drainDueLocked", func() {
 		out := drain(ctx, due)
 		Expect(out.revoked).To(Equal(3))
 
+		// Per serial before the count, deliberately: a length check fails first
+		// and reports a number, leaving the reader to work out which entry went
+		// missing. These name it.
 		listed := crlSerials()
-		Expect(listed).To(HaveLen(3),
-			"one CRL entry per due entry: fewer means the batch lost one, more means it "+
-				"appended a duplicate")
 		for _, e := range due {
 			Expect(listed).To(ContainElement(e.Serial),
 				"the batch reported this entry revoked, so the CRL must list it: "+e.Serial+
 					" ("+e.Subject+")")
 		}
+		Expect(listed).To(HaveLen(3),
+			"and no more: an entry appended twice grows the CRL without bound")
 	})
 
 	// A pass over entries another replica has already revoked must cost

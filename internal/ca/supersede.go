@@ -488,7 +488,7 @@ func (c *CA) retireSupersededForSubjectLocked(ctx context.Context, subject strin
 //
 //	revoked   — on the CRL now
 //	failed    — revocation was attempted and refused; stays listed, retried
-//	deferred  — never attempted, the pass ran out of budget; stays listed
+//	deferred  — never attempted; stays listed (always empty, see below)
 //	discarded — can never be revoked; dropped from the list, loudly
 //
 // That total is not bookkeeping pedantry. The list is the only record that a
