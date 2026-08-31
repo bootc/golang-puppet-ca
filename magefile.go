@@ -3371,6 +3371,24 @@ func (Test) Puppet() error {
 	return sh.RunV("bash", "test/puppet/puppet-stack.sh", "--up")
 }
 
+// MigrationHelpers runs the regression suite for the migration suite's HTTP
+// helpers (test/migration/http-helpers.sh): the retry bound and the failure
+// diagnostics that issue #208 was filed about. It drives them against a real
+// curl talking to a deliberately unreliable local server, so the truncated
+// transfer, refused connection and 5xx cases are exercised rather than
+// simulated.
+//
+// Runs on the host in seconds and needs no container runtime, which is why it
+// is a separate target from Migration below rather than a step inside it --
+// nothing here should have to wait on a JVM Puppet Server booting. CI runs it
+// ahead of Migration in the same job.
+//
+// Requires bash, curl and python3.
+func (Test) MigrationHelpers() error {
+	fmt.Println("Running migration HTTP helper tests...")
+	return sh.RunV("bash", "test/migration/http-helpers-test.sh")
+}
+
 // Migration builds the openvox-ca image and runs the migration integration test
 // suite: imports a genuine VoxPupuli Puppet Server CA into openvox-ca, then
 // verifies that the migrated CA can serve old certs, sign new ones, revoke,

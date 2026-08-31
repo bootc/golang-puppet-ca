@@ -185,9 +185,12 @@ FAILURE_LOG_TAIL=200
 # Shared by the readiness aborts and cleanup()'s failure dump, both of which
 # need the container's own account of what went wrong. Deliberately a copy of
 # the helper in test/backends/redis-stack.sh rather than a shared sourced file:
-# nothing under test/ is sourced today, and these two harnesses already keep
-# independent copies of their engine detection, argument parsing and TAP
-# helpers, so a lone shared file would be the odd one out.
+# these two harnesses already keep independent copies of their engine
+# detection, argument parsing and TAP helpers, and this helper is coupled to
+# each one's `_COMPOSE` array, so sharing it would mean sharing that too.
+# (test/migration/http-helpers.sh *is* sourced, by two files in its own
+# directory -- so "nothing under test/ is sourced" stopped being the reason
+# here as of #208. The coupling above is.)
 dump_logs() {  # service-name
     local _svc="$1" _tail="$FAILURE_LOG_TAIL"
     printf '# ---- last %s log lines from %s ----\n' "$_tail" "$_svc" >&2
