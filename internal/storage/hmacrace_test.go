@@ -327,7 +327,7 @@ var _ = Describe("EnsureHMACKey lock discipline", func() {
 
 	// EnsureHMACKey is reachable from inside WithLock(migrateLockName):
 	// MigrateService holds that lock across RebuildInventoryHMAC, which calls
-	// EnsureHMACKey. WithLock is not reentrant at any tier (issue #201), so if
+	// EnsureHMACKey. WithLock is not reentrant at any tier (see its godoc), so if
 	// the HMAC key's lock shared the migration's name, a migration that met a
 	// corrupt stored key would hang instead of repairing it.
 	//
