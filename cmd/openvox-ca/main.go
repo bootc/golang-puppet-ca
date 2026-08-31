@@ -34,6 +34,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"syscall"
 	"time"
 
@@ -185,6 +186,7 @@ func applyCAConfig(myCA *ca.CA, cfg *serverConfig) error {
 	myCA.PromoteCNToSAN = cfg.PromoteCNToSAN
 	myCA.RevokeOnAutoRenew = cfg.RevokeOnAutoRenew
 	myCA.SupersedeAfter = cfg.supersededCertRevokeAfter()
+	myCA.SigningConcurrency = resolveSigningConcurrency(cfg.CASigningConcurrency)
 	myCA.KeyPassphrase = ca.KeyPassphraseConfig{
 		PassphraseFile: cfg.CAKeyPassphraseFile,
 	}
@@ -216,6 +218,34 @@ func resolveCSRRateLimit(configured int) int {
 		return defaultCSRRateLimit
 	}
 	return configured
+}
+
+// minSigningConcurrency is the floor under the built-in CA signing bound.
+// GOMAXPROCS alone would give a single-CPU container a bound of 1, serialising
+// issuance behind the OCSP responder and making a certificate request wait on
+// verifier traffic. Four keeps a small deployment working while staying far
+// below anything that could saturate a signer.
+const minSigningConcurrency = 4
+
+// resolveSigningConcurrency maps a configured CA signing concurrency to the
+// value handed to the CA, following the CSRRateLimit convention exactly: -1
+// ("unset") takes the built-in default, an explicit 0 disables the bound, and
+// positive values pass through.
+//
+// The default is max(4, GOMAXPROCS). Scaling with the CPU count is right for
+// the two backends where a signature is CPU-bound — a software key in process,
+// and the default isolated signer, where it is CPU-bound in the signer child —
+// because past that point extra concurrency buys latency and memory rather
+// than throughput. It is deliberately a safe ceiling and not a tuned value: the
+// right number is a property of the deployment's signer, and for a remote one
+// (ca_key_provider: openbao) an operator should set the limit to that signer's
+// capacity. What the default guarantees is only that the number is finite,
+// which is the property #274 is about.
+func resolveSigningConcurrency(configured int) int {
+	if configured >= 0 {
+		return configured
+	}
+	return max(minSigningConcurrency, runtime.GOMAXPROCS(0))
 }
 
 func main() {
@@ -251,6 +281,7 @@ func newRootCmd() *cobra.Command {
 		crlURL                  string
 		metricsListen           string
 		csrRateLimit            int
+		caSigningConcurrency    int
 		configFile              string
 		encryptCAKey            bool
 		caKeyPassphraseFile     string
@@ -368,6 +399,9 @@ func newRootCmd() *cobra.Command {
 			}
 			if cmd.Flags().Changed("csr-rate-limit") {
 				cfg.CSRRateLimit = csrRateLimit
+			}
+			if cmd.Flags().Changed("ca-signing-concurrency") {
+				cfg.CASigningConcurrency = caSigningConcurrency
 			}
 			if cmd.Flags().Changed("encrypt-ca-key") {
 				cfg.EncryptCAKey = encryptCAKey
@@ -918,6 +952,7 @@ func newRootCmd() *cobra.Command {
 	f.StringVar(&crlURL, "crl-url", "", "CRL distribution point URL to embed in issued certificates (e.g. http://openvox-ca:8140/puppet-ca/v1/certificate_revocation_list/ca)")
 	f.StringVar(&metricsListen, "metrics-listen", "", "Address for the Prometheus metrics exporter (e.g. 127.0.0.1:9140 or :9140); empty disables it. Serves /metrics over plain HTTP on a separate listener; restrict to a trusted network as it reveals node hostnames")
 	f.IntVar(&csrRateLimit, "csr-rate-limit", -1, "Max CSR submissions per IP per minute on the public PUT /certificate_request endpoint (0 disables; unset uses the default of 60)")
+	f.IntVar(&caSigningConcurrency, "ca-signing-concurrency", -1, "Max concurrent CA-key signatures across issuance, CRL re-signing and the OCSP responder (0 disables the bound; unset uses max(4, GOMAXPROCS)). Lower it to a remote signer's capacity")
 	f.BoolVar(&encryptCAKey, "encrypt-ca-key", false, "Encrypt the CA private key at rest (AES-256-GCM + Argon2id); a passphrase is auto-generated if not provided")
 	f.StringVar(&caKeyPassphraseFile, "ca-key-passphrase-file", "", "Path to file containing the CA key passphrase (first line used)")
 	f.BoolVar(&singleProcess, "single-process", false, "Disable CA key isolation (run signer and frontend in a single process)")
