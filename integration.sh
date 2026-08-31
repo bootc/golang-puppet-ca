@@ -4,403 +4,184 @@ set -eu -o pipefail
 # Rebuild the throwaway `integration` branch: merge every open PR branch into a
 # worktree, apply the fixes no single branch can carry, and force-push it.
 #
-# Companion scripts:
+# Companions:
 #   integration-trial.sh         which branches conflict, read-only, no worktree
 #   integration-verify-merge.sh  what a resolution dropped; runs below, mid-merge
 #
-# The image built from this branch is consumed: a deployment pins
-# ghcr.io/bootc/openvox-ca:integration-alpine by digest and re-pins from a named
-# build. Report the digest after a push, not just that it happened.
+# The image is consumed: a deployment pins
+# ghcr.io/bootc/openvox-ca:integration-alpine by digest. Report the digest after
+# a push, not just that it happened.
 #
 # ---------------------------------------------------------------------------
 # CARRIED FIXES — integration-fixes.patch, applied after the merge loop
 #
-#   capability_test.go  #189 x #212. The file lives ONLY on #189's branch, and
-#                       its "SupportsAtomicInventory is false for every backend
-#                       that appends to the inventory blob" table lists redis.
-#                       #212 gives RedisBackend a decomposed inventory, so the
-#                       capability — a type assertion for InventoryStore —
-#                       becomes true and that entry fails. The fix moves the
-#                       redis Entry to the "is true" table.
-#
-#                       Neither branch can make it. #189's own comment says so:
-#                       "Redis stays here until #212 decomposes its inventory
-#                       the way #154 did etcd's; that branch moves this entry to
-#                       the table below." #212 cannot, because the file does not
-#                       exist there. It retires when #212 merges and #189
-#                       performs the move on its own branch.
+#   capability_test.go  #189 x #212. The file exists ONLY on #189, whose
+#                       "SupportsAtomicInventory is false for every backend that
+#                       appends to the inventory blob" table lists redis. #212
+#                       gives RedisBackend a decomposed inventory, so that
+#                       becomes true and the entry fails. The fix moves redis to
+#                       the "is true" table. Neither branch can make it: #212
+#                       does not have the file. Retires when #212 merges and
+#                       #189 does the move on its own branch.
 #
 # A carried fix is a spec correct on its own branch and wrong only once another
-# is merged beside it, so it is never a defect in the branch whose file it
-# edits.
+# is merged beside it. Rules this one set produced:
 #
-# Rules this set has produced:
-#
-#   - A fix is scoped to a SET of merged branches, not to the file it edits.
-#     When a branch leaves BRANCHES, every hunk depending on it leaves in the
-#     same edit, or the build fails in a file whose own branch is blameless.
-#   - Retiring is two steps separated by a rebuild: it leaves the patch
-#     immediately, but stays in any build that already merged the old head.
-#   - Check the owning branch before retiring OR re-adding. A fix carried past
-#     its owner is a duplicate declaration, not a no-op — the last one added a
-#     second `grantedLock` after #168 grew its own, and failed typecheck.
-#   - "The patch stopped applying" usually means the owner absorbed the fix, not
-#     that the fix needs rebuilding. Check that first.
-#   - CHECK THE ENTRIES, NOT THE SHAPE. The capability_test.go fix was retired
-#     on 2026-08-17 after confirming #189 carried "both tables" — which it did,
-#     with redis still in the false one, because on #189 alone that is correct.
-#     What matters is whether the entries are right for the SET OF BRANCHES THIS
-#     BUILD MERGES, and a table can be present, well-formed and wrong. It cost a
-#     failed pre-push to find, which is the cheap version; the expensive version
-#     is a fix retired while its collision is still live.
+#   - Scoped to a SET of merged branches, not to the file it edits. When a
+#     branch leaves BRANCHES, every hunk depending on it leaves in the same edit.
+#   - Check the owning branch before retiring OR re-adding: a fix carried past
+#     its owner is a duplicate declaration, not a no-op.
+#   - "The patch stopped applying" usually means the owner absorbed it.
+#   - CHECK THE ENTRIES, NOT THE SHAPE. This fix was once retired after
+#     confirming #189 carried "both tables" — it did, with redis still in the
+#     wrong one, which is correct on #189 alone. A table can be present,
+#     well-formed, and wrong for the set this build merges.
 #
 # ---------------------------------------------------------------------------
 # HAZARD
 #
-# Never run `git history` in this repo without --update-refs=head, and run
+# Never run `git history` here without --update-refs=head, and run
 # `git branch --contains <commit>` first. It defaults to --update-refs=branches,
-# which rewrites *every* local branch descending from the commit — and
-# `integration` descends from every PR branch below while checked out in
-# ../openvox-ca-integration. Every agent working this repo has a worktree on the
+# which rewrites every local branch descending from the commit — and
+# `integration` descends from every PR branch below. Several worktrees share the
 # one object store (`git worktree list`), so this is repo-wide.
-#
-# ---------------------------------------------------------------------------
-# DISCHARGED: the auto-merge pairing check
-#
-# This file carried a standing check from 2026-08-16: before merging anything
-# that widened ci.yml's `pull_request:` trigger, verify in the same tree that the
-# `automerge` job carried its own base condition, because the job's scoping to
-# main was inherited from the trigger and widening one without pinning the other
-# would let a Renovate PR merge itself into a feature branch unreviewed.
-#
-# #218 merged on 2026-08-24 and BOTH halves landed together. Verified on main:
-# the pull_request trigger is unfiltered (0 base filters) and the automerge job
-# carries base.ref (1 occurrence). The split never happened, which is what the
-# check was for.
-#
-# What replaces it is better than a note: `mage dev:check` now enforces it, via
-# verifyAutomergeBasePinIn and verifyPullRequestUnfilteredIn on main. Read the
-# expression as well as running the check — the guard proves the base ref is
-# CONSULTED, not that the condition is correct, so `A && (B && C || D)` contains
-# the pin, passes, and still lets one bot through.
-#
-# ---------------------------------------------------------------------------
-# THE TWO AUTO-MERGE GUARDS — now #218 versus main, not branch versus branch
-#
-# #239 merged (91d4e9a6cdea), so everything else this block held is discharged:
-# the hold instruction, the three pre-computed resolutions, the force-push
-# history, the Rekor note. The build ran it, signing verified end to end, and
-# the branch is gone. This paragraph is what did NOT expire — it changed sides.
-#
-# Verified on main at d74253a04e4a: verifyAutomergeLabelExclusion and
-# automergeRequiredClauses are there, as a SEPARATE list from the base pin, and
-# magefile.go carries a note addressed to whoever rebases #218 onto it. #218 is
-# still open (c19d4cd5c62e) and still has automergeBasePin of its own.
-#
-# So KEEP TWO GUARDS still binds, and now binds #218's rebase rather than this
-# build's merge. Do not carry #218's shape toward main's or vice versa on the
-# grounds that one looks stricter. They encode different contracts:
-#
-#   - Folding the base pin into automergeRequiredClauses as a fourth EXACT
-#     string rejects `== 'main'`, a legitimate spelling #218 ruled in.
-#   - Reducing the label clause to fragments reopens a decoy hole: a
-#     neighbouring `!contains(...title, 'WIP')` supplies every fragment while
-#     the real clause is inverted.
-#   - An anti-pin is a FORBIDDEN substring and has no home in a list of required
-#     ones. A list has one polarity; these need two.
-#
-# The class both guards converged on, which is why the fold keeps looking
-# tempting: each was defeated by INVERSION, and each was found by the other's
-# author within an hour. What holds is to require the upright comparison and
-# SEPARATELY refuse the inverse — a decoy can supply an upright form, it cannot
-# remove an inverted one.
-#
-# Nothing here is this build's to resolve any more. It is recorded because this
-# build is where the two met first, and whoever rebases #218 inherits the
-# question with only main's side of the story in front of them.
 #
 # ---------------------------------------------------------------------------
 # MERGE OBLIGATIONS THAT NO CONFLICT WILL ANNOUNCE
 #
-# Two pairs among the lock branches owe an edit to whichever of them merges
-# SECOND. Neither is a textual conflict, so git will merge both sides cleanly and
-# say nothing. Recorded from the owning sessions' analysis and worth checking by
-# hand after those merges:
+# Both concern #261, the last of the lock trio still open — #259 and #264 are in
+# main as of 2026-08-30.
 #
-#   #259 x #261  the second to land adds `"hmac-key": 4` to reservedLockOrdinals.
-#                This one DOES fail: SQLReservedLockKeys asserts an exact Equal,
-#                so a missing entry turns the suite red and names itself.
+#   reservedLockOrdinals   main carries `"hmac-key": 4` (from #259) and so does
+#                          #261 — one entry each. What must not happen is #261's
+#                          merge producing two. Fails loudly if it does:
+#                          SQLReservedLockKeys asserts an exact Equal.
 #
-#   #261 x #264  WITHDRAWN 2026-08-30 — there is NO such obligation, and acting
-#                on it would have been a defect. It said the second to land must
-#                add `bootstrap` -> `hmac-key` to allowedLockNesting. Verified
-#                against both heads while merging #264:
+#   #202/#203 retirements  in docs/development/locking.md, and now ASYMMETRIC.
+#                          #259 retired #203 and has merged; #261 retires #202
+#                          and carries BOTH markers. So #261's own tree is right
+#                          and the whole risk sits in the merge: a resolution
+#                          taking main's side of that hunk drops #202's
+#                          retirement and looks clean doing it. Check both are
+#                          PRESENT — "zero conflict markers" is satisfied by
+#                          either wrong answer:
 #
-#                  * The only holder of that pair is MigrateService, and it is
-#                    in internal/storage (migrate.go:90 defines migrateLockName
-#                    as "bootstrap", independently of internal/ca's identical
-#                    constant — the two are coupled only by the literal).
-#                  * CA.Init does NOT hold it. It calls InitHMAC *before* taking
-#                    bootstrap, and init.go says so outright: "This stays
-#                    *outside* the bootstrap lock taken below, and that is the
-#                    point rather than an oversight."
-#                  * allowedLockNesting is in package ca, so no WithLock-level
-#                    observer there can ever see a pair taken in the storage
-#                    package. lockNameHMACKey is unexported and unreferenced
-#                    from internal/ca.
+#                            grep -cF -- '~~[#202]' docs/development/locking.md
+#                            grep -cF -- '~~[#203]' docs/development/locking.md
 #
-#                #264's own rule 12 excludes exactly this, using `bootstrap` ->
-#                `sql-schema-migrate` as the precedent: "Do not add either pair
-#                to satisfy this rule — adding them would make the table claim
-#                coverage it does not have." The nesting is real and belongs in
-#                the Lock ordering PROSE, which it now has on both #261 and
-#                #264; it does not belong in the table.
+#                          -F matters: both needles contain [ ], which an
+#                          unescaped grep reads as a character class matching
+#                          neither, so the check would pass silently.
 #
-# WHY THIS ONE SURVIVED SO LONG, because the shape recurs. Every check anyone
-# ran was "is the entry present?" — and the entry was genuinely absent, so the
-# obligation looked confirmed every time. Nobody asked the prior question of
-# whether the pair was in scope, which is answered by reading what takes the
-# locks rather than by grepping the table. Three sessions and two coordinators
-# carried it forward on the strength of the absence alone.
+# DO NOT RE-ADD `bootstrap` -> `hmac-key` to allowedLockNesting. It was carried
+# as a live obligation for days and is not one: that pair is taken only by
+# MigrateService in internal/storage, CA.Init calls InitHMAC outside the
+# bootstrap lock deliberately, allowedLockNesting is package ca so no observer
+# there can see it, and #264's rule 12 excludes it explicitly. Adding it makes
+# the table claim coverage it does not have.
 #
-# A silent obligation is a claim about the CODE, so verify it against the code
-# before honouring it. "Nothing goes red" is equally consistent with an omission
-# that matters and with a rule that does not apply here.
-#
-# #259 x #261 OWE A SECOND CHECK, in docs/development/locking.md, and this one
-# has a positive test rather than an absence. Each branch retires a different
-# known gap and the two retirements INTERLEAVE across the conflict boundary:
-#
-#     #259 (fix/sql-lock-key-aliasing)  retires #203 -> `~~[#203]`
-#     #261 (fix/hmac-key-init-race)     retires #202 -> `~~[#202]`
-#     main has NEITHER marker.
-#
-# Taking either side of that hunk whole reverts the other's retirement to an open
-# gap. Verified here on 2026-08-28 by counting the markers per ref, after the
-# coordinator raised it; three sessions derived it independently.
-#
-# The check is BOTH MARKERS PRESENT, not zero conflict markers — either wrong
-# resolution satisfies the second. After merging #259 and #261:
-#
-#     grep -cF -- '~~[#202]' docs/development/locking.md   # want 1
-#     grep -cF -- '~~[#203]' docs/development/locking.md   # want 1
-#
-# Note -F: both needles contain [ ] and would otherwise be a character class
-# matching neither. This is the general shape worth stealing — an obligation
-# stated as "this string must be present" is checkable in one command, where
-# "resolve it correctly" is not.
-#
-# Two more found in the 2026-08-24 build, both prose, both silent, and both
-# pointing the same way: a branch that predates another carries the OLD claim
-# unchanged, in a region the newer branch never touches, so there is no conflict.
-#
-#   #264 x #189  DISCHARGED 2026-08-28 at #264 head 99018ae05246, verified
-#                here, not taken on report. Was: locking.md called `Generate`
-#                unlocked and hard-coded 20 + 2 = 22 WithLock sites, where #189
-#                makes it locked (internal/ca/generate.go:229) and 23.
-#                #264's owner took the whole thing rather than leaving it to
-#                merge order: the sentence is gone, the counts are replaced by
-#                the counting RULE, and the `#195` back-pointer is dropped.
-#                The four surviving `#195` mentions are byte-identical on main
-#                in files #264 never touches, and #189 retires all four itself
-#                (api.md, locking.md x2, signing.go: main=4, #189=0). So it is
-#                clean in BOTH merge orders, which a one-sided fix would not be.
-#
-#                Keep the shape, not the item. It found a fourth consequence
-#                neither session had: post-#189 the observer's BeforeEach calls
-#                Generate, which then supplies `subject:<name>` -> `crl` — the
-#                very edge the table asserts — so a membership check is answered
-#                by setup and four specs stayed green with Clean's entire
-#                CRL-locked revoke deleted. Fixed by counting edges before and
-#                after rather than testing membership. A doc claim going stale
-#                and a spec quietly losing its power are the SAME merge, and
-#                only the first announces itself.
-#
-#   #267 x main  docs/metrics.md says `openvox-ca-ctl revoke --serial` "is the
-#                only way to retire a superseded certificate". #267's sweep is a
-#                second way. The adjacent "not counted on that arm at all" is now
-#                true only where superseded_cert_revoke_after_sec is 0.
-#
-# Reported to the coordinator; the edits belong on the PRs, not carried here —
-# nothing about them breaks a build, which is exactly why they need writing down.
-#
-# THE GENERAL FORM, worth applying to every doc conflict in this repo: when one
-# side of a hunk is a branch's own new prose and the other is the same paragraph
-# from an older base, taking either side whole is wrong. #267 alone carried FOUR
-# such paragraphs — api.md's Generate sentence (pre-#189), locking.md's lock-name
-# table (pre-#212 redis, pre-#189 capability-probe, no hmac-key or
-# sql-schema-migrate), metrics.md's mixin alert list (pre-#168 chain, pre-#221
-# OCSP), and background_jobs_test.go's ConsistOf assertions. Union the content,
-# then re-check every claim against the merged CODE.
+# The general form, three of these having now been wrong: a silent obligation is
+# a claim about the CODE, so verify it against the code before honouring it.
+# "Nothing goes red" fits an omission that matters and a rule that does not
+# apply here equally well.
 #
 # ---------------------------------------------------------------------------
-# TWO THINGS A BUILD MUST NOT BE READ AS EVIDENCE FOR
+# WHAT A GREEN BUILD IS NOT EVIDENCE FOR
 #
-# #263 makes the demos WARN on every start. It adds two WARN lines when
-# `tls_cert` resolves to a certificate that cannot serve TLS, and compose.yml and
-# docs/container-images.md still point at ca_crt.pem deliberately, for
-# one-command startability. So the warnings are expected output, not a
-# regression. Its author verified nothing in test/ or .github/workflows/ asserts
-# on log content.
-#
-# #266 carries a constraint this build cannot discharge: do NOT push a `v*` tag
-# until #250 lands. release.yml, container-images.yml and helm-chart.yml each
-# trigger on `v*` independently with no `needs:` between them, so a premature tag
-# publishes images — including the mutable `latest` — and the chart, regardless
-# of release.yml failing. This build pushes a BRANCH and never a tag, so a green
-# integration run says nothing either way about the tagging path. Do not let its
-# success be read as clearance.
+# #266: do NOT push a `v*` tag until issue #250 lands. release.yml,
+# container-images.yml and helm-chart.yml each trigger on `v*` independently
+# with no `needs:` between them, so a premature tag publishes images — including
+# the mutable `latest` — and the chart, regardless of release.yml failing. This
+# build pushes a BRANCH and never a tag, so its success says nothing either way
+# about the tagging path.
 #
 # ---------------------------------------------------------------------------
 # WHEN A BRANCH FAILS: HOLD THE BUILD, DO NOT DROP THE BRANCH
 #
-# Once a PR is in BRANCHES it stays in. If it will not merge, or merges and goes
-# red, the build waits for a fix — it does not ship without it. A build that
-# quietly omits a branch is worse than no build: it looks like a full
-# integration, so a green result is read as evidence about a set that was never
-# assembled, and the branch that was dropped is the one nobody then tests.
-#
-# On 2026-08-22 #223 was dropped so the rest could ship. Chris ruled against it:
-# hold the build instead. The pushed ec487382cf99 predates that ruling and does
-# not contain #223.
-#
-# So on a failure: stop, report which branch and why, and leave BRANCHES alone.
-# Removing an entry is a scope decision and belongs to Chris, not to whatever
-# went wrong that day.
+# Once a PR is in BRANCHES it stays in. A build that quietly omits a branch is
+# worse than no build: it looks like a full integration, so a green result is
+# read as evidence about a set that was never assembled, and the dropped branch
+# is the one nobody then tests. Chris ruled on this after #223 was dropped so
+# the rest could ship. On a failure: stop, report which branch and why, and
+# leave BRANCHES alone — removing an entry is a scope decision and his call.
 #
 # ---------------------------------------------------------------------------
 # RESOLVING CONFLICTS
 #
-# `git merge` succeeding is not evidence a resolution is right. rerere replays
-# on matching conflict TEXT, and its cache is shared by every worktree here, so
-# a build inherits resolutions recorded against trees that have since moved.
-# integration-verify-merge.sh runs below and reports lines one side added that
-# the resolution dropped; advisory, because dropping a line is often correct.
-# The 2026-08-16 build lost two lines this way and passed every suite, both in
-# prose no test covers.
+# rerere is not verification. It replays on matching conflict TEXT from a cache
+# shared by every worktree here, so a build inherits resolutions recorded
+# against trees that have since moved. It has silently dropped a section-header
+# comment and reverted two prose lines no test covers.
+# integration-verify-merge.sh reports what a resolution dropped: advisory, and
+# it false-positives on re-wrapped prose, where the content survives and only
+# the line breaks moved.
 #
-# docs/development/locking.md is the surface to watch: sole conflict for most
-# rebases here, and every merge into main tips two or three open branches onto
-# it in a set nobody predicts. Its lock-ordering list is an enumeration of the
-# world, so a take-one resolution leaves a file that reads correctly while
-# documenting an order missing a path. Read both sides, and check whether a line
-# only main has is being dropped.
+# THE SURFACE IS THE PARAGRAPH, NOT THE FILE. The same few paragraphs recur
+# across locking.md, metrics.md, configuration.md, operator-cli.md and
+# mixin/README.md because they describe one behaviour from different angles, and
+# several branches each amend one for their own correct reason.
 #
-# BUT THE SURFACE IS THE PARAGRAPH, NOT THE FILE. On 2026-08-23 #223's rebase
-# collided twice in docs/metrics.md, one directory over from where this note
-# points: it had added a same-host clause to the uncounted-revocations
-# paragraph, and the branch had rewritten that same paragraph twice to separate
-# the subject lock from the CRL lock. Either side taken whole drops the other.
-# Naming a file trains the eye on the wrong unit — what recurs is a PARAGRAPH
-# several branches are each amending for their own correct reason, and the same
-# few paragraphs recur across locking.md, metrics.md, configuration.md and
-# operator-cli.md because they describe the same locking behaviour from
-# different angles. Ask which paragraph a branch touches, not which file.
+# A BRANCH THAT PREDATES ANOTHER CARRIES THE OLD CLAIM UNCHANGED, in a region
+# the newer one never touches, so nothing conflicts. Where one side of a hunk is
+# a branch's own new prose and the other is the same paragraph from an older
+# base, neither is takeable whole: union, then re-check every claim against the
+# merged CODE.
 #
-# A sharper silent-revert check than diffing the whole branch, for a rebase:
-# of the lines MAIN GAINED in the commits being rebased over, which does this
-# branch remove?
-#
-#   comm -12 <(git diff <old-base>..origin/main -- "$f" | grep '^+[^+]' | sed 's/^+//' | sort -u) \
-#            <(git diff origin/main            -- "$f" | grep '^-[^-]' | sed 's/^-//' | sort -u)
-#
-# Comparing the whole branch against main lists every line it legitimately
-# rewrites — 29 in one file, all noise. This form cut the same case to five, all
-# genuine. integration-verify-merge.sh answers the merge-time version of that
-# question from the index stages; this is the rebase-time one.
-#
-# A CONFLICT BLOCK DOES NOT HAVE TO START OR END ON A COMPLETE CONSTRUCT, and a
-# marker-strip union is only valid when it does. Three times in the 2026-08-24
-# build the two sides ended MID-construct, with the closing token sitting in the
-# shared context AFTER the end marker, where it closes one side only:
-#
-#   internal/metrics/collector.go  both sides ended mid struct-literal field; the
-#       shared `nil, nil),` closed theirs, leaving ours' last field unterminated.
-#       A second block had ours opening `for ... {` and theirs `if ... {` around a
-#       SHARED closing `}` — the union nested theirs inside ours' loop.
-#
-#   mixin/tests.yaml  twice, on #267 and again on #166, identically. Two conflict
-#       blocks separated by five lines that look like shared context and are in
-#       fact the common PREFIX of each side's final alert expectation
-#       (exp_alerts: / - exp_labels: / severity / job / instance). git aligns them
-#       because both sides' last alert opens the same way.
-#
-# The tell is cheap: print the FIRST and LAST line of each side and the first
-# lines after the end marker. If either side's last line is not a complete
-# statement, block or list item, the shared tail belongs to one side and the
-# other needs its own copy. Reconstruct each side WHOLE — ours1 + shared + ours2
-# + tail, and the same for theirs — and only then union at the level the file is
-# actually made of: whole test groups by name, whole struct fields, whole
-# sections. Two markers in one file are not necessarily two independent
+# A CONFLICT BLOCK NEED NOT START OR END ON A COMPLETE CONSTRUCT, and a
+# marker-strip union is only valid when it does. Both sides can end mid-construct
+# with the closing token in the shared context AFTER the end marker, where it
+# closes one side only — seen in Go struct literals, in an `if`/`for` pair
+# sharing one `}`, and repeatedly in mixin/tests.yaml, where the lines between
+# two blocks are the common PREFIX of each side's last alert rather than shared
+# context. The tell: print the first and last line of each side and what follows
+# the end marker. If a last line is not a complete construct, reconstruct each
+# side WHOLE — ours1 + shared + ours2 + tail, likewise theirs — then union at the
+# level the file is made of: whole test groups by name, whole struct fields,
+# whole sections. Two markers in one file are not necessarily two independent
 # conflicts.
 #
-# gofmt/`go build` catch the Go version of this instantly; nothing catches the
-# YAML one except parsing the result and counting the groups. `mage test:mixin`
-# does run `promtool test rules` against tests.yaml, so it is a real check —
-# but a malformed union can still parse. Assert the group count and that no two
-# groups share a name.
+# gofmt and `go build` catch the Go version instantly; nothing catches the YAML
+# one. `mage test:mixin` does run `promtool test rules`, but a malformed union
+# can still parse — assert the group count and that no two groups share a name.
 
 # ---------------------------------------------------------------------------
 # WHAT BELONGS IN BRANCHES: FEATURE AND FIX PRs, NOT DEPENDENCY BUMPS
 #
-# Renovate PRs stay OUT. Chris ruled on #271, #272 and #273 on 2026-08-28, and
-# the ruling is about KIND rather than those three, so it stands after they
-# merge and applies to whatever Renovate opens next.
+# Renovate PRs stay OUT — Chris ruled on 2026-08-28, and the ruling is about
+# KIND, so it survives those particular PRs merging. This build rehearses how
+# the FEATURE branches interact; a dependency bump is independent of that by
+# construction, merges on its own, and would spend the conflict budget on work
+# that does not collide.
 #
-# The reason, because the outcome alone does not survive re-derivation: this
-# build exists to rehearse how the FEATURE branches interact — where they
-# collide, what they break in each other, which obligations nobody's diff
-# raises. A dependency bump is independent of that by construction. It merges on
-# its own, and putting it here spends the build's conflict budget on work that
-# does not collide.
-#
-# EXPECT THIS TO LOOK LIKE DRIFT, AND DO NOT "FIX" IT. Comparing BRANCHES against
-# `gh pr list` will always show some non-draft PRs absent, and the number grows
-# on its own between builds. On 2026-08-28 a coordinator read that gap as ten
-# absent PRs and reported the build was missing a third of the open work; it was
-# three, all Renovate. Two different numbers, two different meanings — "the
-# build is missing a third of the work, so its green result means much less than
-# it appears" versus "the list is current on everything substantive". Only the
-# second was true.
-#
-# So the check is not "does BRANCHES match the open PR list". It is: subtract
-# the two sets and look at the KIND of what is left. Anything that is not a
-# dependency bump is a real omission and probably a held branch (see the
-# hold-the-build rule above); a Renovate branch is this rule working.
+# So a gap between BRANCHES and `gh pr list` is EXPECTED, not drift. The check
+# is not "do the sets match" but "what KIND is left over": anything that is not
+# a dependency bump is a real omission, probably a held branch. A coordinator
+# once read that gap as ten absent PRs and reported the build was missing a
+# third of the open work; it was three, all Renovate.
 #
 #   eval "$(sed -n '/^BRANCHES=(/,/^)/p' integration.sh)"
 #   comm -23 <(gh pr list --state open --json isDraft,headRefName \
 #                --jq '.[] | select(.isDraft|not) | .headRefName' | sort) \
 #            <(printf '%s\n' "${BRANCHES[@]}" | sed 's|^origin/||' | sort)
 #
-# eval rather than a hand-copied list: the two cannot disagree that way. And
-# note local/integration-setup will show on the other side of the comm — it is
-# this branch, and it has no PR by design.
+# eval rather than a hand-copied list, so the two cannot disagree.
+# local/integration-setup shows on the other side of the comm, by design.
 
 BRANCHES=(
   # Always keep
   local/integration-setup
 
   # Open non-draft PRs. origin/ refs so each build integrates what is on the PR
-  # rather than a stale local copy. Two are stacked and must follow their base;
+  # rather than a stale local copy. One pair is stacked and must follow its base;
   # everything else is order-independent, so the order below is chosen rather
   # than forced — see the notes after the list.
   origin/feature/redis-inventory          # PR #212
   origin/feature/crl-chain-distribution   # PR #168
   origin/feature/offline-generate         # PR #189
-  origin/fix/ocsp-index-sync              # PR #221
-  origin/fix/ocsp-signing-lock-scope      # PR #265 — STACKED on #221, must follow it
+  origin/fix/ocsp-signing-lock-scope      # PR #265
   origin/fix/codeql-log-injection         # PR #224
-
-  # The lock-ordinal trio, kept adjacent deliberately — see the merge
-  # obligations below, which no conflict will announce.
-  origin/fix/sql-lock-key-aliasing        # PR #259
   origin/fix/hmac-key-init-race           # PR #261
-  origin/fix/lock-ordering-race           # PR #264
-
   origin/fix/migration-diagnostics        # PR #260
-  origin/fix/k8sexport-per-target-isolation  # PR #262
-  origin/fix/tls-cert-example             # PR #263
   origin/feature/release-packaging        # PR #266
 
   # Late on purpose: the busiest branch open, touching signing.go, storage.go,
@@ -412,12 +193,16 @@ BRANCHES=(
   # Descendant of #168, so it stays after it. Last because it is stacked, not
   # because it is least important.
   origin/feature/client-trust-domains     # PR #166 — STACKED on #168
-
-  # Drafts, still CONFLICTING, still carrying cherry-picked copies of commits
-  # already in main. They want a rebase before coming off the bench.
-  # feature/tls-self-provision              # PR #165
-  # feature/tls-self-provision-integration  # PR #167
 )
+
+# LEFT THE LIST 2026-08-30. Merged, so their code arrives via origin/main now:
+# #221, #259, #262, #263, #264. Closed and not returning: #165 and #167 — they
+# sat here commented out as drafts awaiting a rebase, which is no longer what
+# they are, so the lines are gone rather than left as a bench nobody is on. If
+# that work comes back it comes back as new PRs.
+#
+# #265 is no longer stacked: it read "STACKED on #221" while #221 was open, and
+# is now rebased onto main. #166 -> #168 is still real and still ordered.
 
 
 # Branches excluded for a REASON, as opposed to merely not listed. Commenting a
@@ -499,29 +284,22 @@ for BRANCH in "${BRANCHES[@]}"; do
   fi
 done
 
-# Carried fixes, as a patch rather than a branch: some of the files they edit do
+# Carried fixes ride in as a patch rather than a branch: some files they edit do
 # not exist on main, so a branch would have to *add* them and would collide with
-# whichever PR owns each one. The patch rides in on local/integration-setup — a
-# path no PR touches — and is applied last, once every file it edits is merged.
+# whichever PR owns each. The patch arrives on local/integration-setup — a path
+# no PR touches — and is applied last, once every file it edits is merged.
 #
-# PATCH_PATHS is the declaration of what is carried, and drives everything:
+# PATCH_PATHS declares what is carried, and drives everything:
 #
-#   non-empty  a patch is REQUIRED, and may touch only these paths. Missing is
-#              an abort, because it runs in the WORKTREE and so must be
-#              committed on local/integration-setup to be here at all — an
-#              untracked copy in the main checkout does not arrive, and `[ -f ]`
-#              alone made that indistinguishable from success. The path
-#              allowlist exists because regeneration is a `git diff`, which
-#              cannot tell the fixes from a half-resolved conflict or a stray
-#              edit made in the conflict shell above, and the patch is applied
-#              and committed unattended in every later build.
-#   empty      no fixes are carried, deliberately. A patch present anyway is an
+#   non-empty  a patch is REQUIRED and may touch only these paths. Missing is an
+#              abort: this runs in the WORKTREE, so the patch must be committed
+#              on local/integration-setup to be here at all — an untracked copy
+#              in the main checkout does not arrive, and `[ -f ]` alone made
+#              that indistinguishable from success. The allowlist exists because
+#              regeneration is a `git diff`, which cannot tell the fixes from a
+#              half-resolved conflict or a stray edit made in the conflict shell.
+#   empty      no fixes carried, deliberately. A patch present anyway is an
 #              abort, since nothing declares what it may contain.
-#
-# Empty today. The last entry, the crlchain_test.go fixture, was absorbed by
-# #168 on 2026-08-17 — which the guard below caught: the patch stopped applying
-# because the fix it supplies was already there. That is the mechanism working,
-# not a failure.
 PATCH_PATHS="internal/storage/capability_test.go"
 
 if [ -n "$PATCH_PATHS" ] && [ ! -f integration-fixes.patch ]; then
@@ -571,29 +349,26 @@ else
   echo "No carried fixes: PATCH_PATHS is empty and no patch is present." >&2
 fi
 
-# container-images.yml must keep BOTH contributions: this branch's trigger, and
-# main's signing rewrite. The two are lost by opposite mistakes, and the second
-# is the bigger one.
+# container-images.yml must keep BOTH contributions, and they are lost by
+# opposite mistakes:
 #
 #   - integration / type=edge,branch=main   THIS branch adds them. Without the
-#     first, main triggers on main and v* tags only, so a push here builds no
-#     image at all — the branch stops producing anything and nothing fails.
+#     first, main triggers on main and v* only, so a push here builds no image
+#     at all and nothing fails.
 #
-#   cosign sign --yes --recursive           MAIN has this, from #239. Four of the
-#     open branches still carry a pre-#239 copy of the file, differing from main
-#     by ~239 lines with ONE signing-related line against main's 49. Taking any
-#     of their sides wholesale reverts the entire signing rewrite out of the
-#     build.
+#   cosign sign --yes --recursive           MAIN has this, from #239. Branches
+#     predating it carry a file differing from main by ~239 lines with ONE
+#     signing-related line against main's 49, so taking their side wholesale
+#     reverts the entire signing rewrite out of the build.
 #
 # The second needle exists because the first does not cover it. A wholesale take
-# of a stale branch's file loses the trigger too, so the trigger check fires —
-# but by accident, and the obvious human repair defeats it: take the stale file,
-# notice no image is produced, re-add `- integration`, and the build goes green
-# with signing silently gone. Signing runs in the merge job, so its absence
-# looks like a job that had nothing to do rather than like a failure.
-#
-# So assert main's contribution as well as this branch's. A guard that only
-# checks what YOU added cannot see what someone else's side removed.
+# loses the trigger too, so the trigger check fires — but by accident, and the
+# obvious repair defeats it: take the stale file, notice no image is produced,
+# re-add `- integration`, and the build goes green with signing silently gone.
+# Signing runs in the merge job, so its absence looks like a job that had nothing
+# to do rather than a failure. So assert main's contribution as well as this
+# branch's: a guard that checks only what YOU added cannot see what someone
+# else's side removed.
 for NEEDLE in '- integration' 'type=edge,branch=main' 'cosign sign --yes --recursive'; do
   # -- before the pattern: "- integration" starts with a dash and grep would
   # otherwise parse it as an option, which fails loudly here but would be a
