@@ -117,6 +117,45 @@ func resolveRuntime(ctx context.Context, cfg *serverConfig, withKeyProvider bool
 	return rt, nil
 }
 
+// lockStoreInstance takes the store-wide lock permitting one running instance,
+// opening the configured store for no other purpose and closing it again at
+// once.
+//
+// Used by the two entry points that have no runtime of their own to hang the
+// lock on: the launcher, which forks children that open the store themselves,
+// and the single-process server, which opens it moments later. Closing the
+// store here is deliberate and safe — the lock is an flock(2) on a descriptor
+// the Unlocker owns outright, so it outlives the backend handle that led us to
+// it. That is what keeps a cluster backend from carrying a connection it has no
+// use for: the probe dials, answers "distributed", and everything opened for it
+// is released before the server proper starts.
+//
+// The caller must Unlock for as long as it intends to be the running instance.
+func lockStoreInstance(ctx context.Context, cfg *serverConfig) (storage.Unlocker, error) {
+	rt, err := resolveRuntime(ctx, cfg, false)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rt.Close() }()
+	return rt.Store.AcquireInstanceLock(ctx)
+}
+
+// holdInstanceLock takes the store's instance lock and ties its release to rt,
+// for callers that already hold a runtime.
+//
+// The release is inserted at the front of the closer list rather than appended,
+// because Close runs closers in reverse: the lock must be given up after the
+// backend it protects has been closed, not before, so no other process can
+// claim the store while this one is still shutting its handles.
+func holdInstanceLock(ctx context.Context, rt *caRuntime) error {
+	ul, err := rt.Store.AcquireInstanceLock(ctx)
+	if err != nil {
+		return err
+	}
+	rt.closers = append([]func() error{ul.Unlock}, rt.closers...)
+	return nil
+}
+
 // resolveRuntimeForRole resolves the runtime a process running as role should
 // operate on, deciding key-provider access from the role itself.
 //

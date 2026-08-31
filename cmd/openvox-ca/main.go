@@ -465,6 +465,38 @@ func newRootCmd() *cobra.Command {
 				return fmt.Errorf("unrecognised PUPPET_CA_ROLE %q: expected \"signer\", \"frontend\", or unset", role)
 			}
 
+			// --- One running instance, unless the backend can coordinate more ---
+			// A backend with distributed locking may run multiple instances, on
+			// one host or on many; every other backend permits exactly one,
+			// because nothing reconciles the serial index, OCSP cache and cached
+			// CRL each process holds. AcquireInstanceLock decides which of those
+			// this backend is by capability rather than by name, and is a no-op
+			// for the former, so HA deployments are untouched.
+			//
+			// Taken here, before the role dispatch below, because the unit of
+			// exclusion is the *instance* and not the process. With
+			// PUPPET_CA_ROLE unset this is either the launcher, which forks a
+			// signer and a frontend that each open the store for themselves, or
+			// the single-process server. Both are one instance. Taking it any
+			// deeper -- in resolveRuntime, the obvious shared place -- would put
+			// the launcher's two children in a race to lock their own parent
+			// out, and the default topology on the default backend would
+			// deadlock against itself at startup.
+			//
+			// Held until this process exits: the kernel drops the flock when the
+			// descriptor closes, however the process ends.
+			if role == "" {
+				instanceLock, err := lockStoreInstance(ctx, cfg)
+				if err != nil {
+					return err
+				}
+				defer func() {
+					if err := instanceLock.Unlock(); err != nil {
+						slog.Warn("Failed to release the store's instance lock", "error", err)
+					}
+				}()
+			}
+
 			// Signer mode: load key, serve signing requests on socketpair, exit.
 			if role == "signer" {
 				return runSignerMode(ctx, cfg, absCADir)

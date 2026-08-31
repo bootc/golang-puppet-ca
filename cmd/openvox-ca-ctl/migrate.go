@@ -115,11 +115,29 @@ local filesystem under cadir, never in a storage backend.`,
 			}
 			defer func() { _ = srcSvc.Backend().Close() }()
 
+			// Both ends, and the source is not the lenient one. Migrating from a
+			// live store reads an inventory the server is still appending to, so
+			// the copy can be internally inconsistent even though nothing here
+			// writes to it. On a backend that supports one running instance this
+			// says so at once and names the server, instead of the indefinite
+			// wait for the bootstrap lock that migrate used to sit in.
+			srcLock, err := srcSvc.AcquireInstanceLock(cmd.Context())
+			if err != nil {
+				return fmt.Errorf("source backend: %w", err)
+			}
+			defer func() { _ = srcLock.Unlock() }()
+
 			dstSvc, err := storage.NewServiceFromSpec(dstSpec)
 			if err != nil {
 				return fmt.Errorf("opening destination backend: %w", err)
 			}
 			defer func() { _ = dstSvc.Backend().Close() }()
+
+			dstLock, err := dstSvc.AcquireInstanceLock(cmd.Context())
+			if err != nil {
+				return fmt.Errorf("destination backend: %w", err)
+			}
+			defer func() { _ = dstLock.Unlock() }()
 
 			report, err := storage.MigrateService(cmd.Context(), srcSvc, dstSvc, storage.MigrateOptions{
 				Force: force,

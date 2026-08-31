@@ -208,6 +208,23 @@ before a server exists.`,
 				return err
 			}
 
+			// Refuse while a server holds the store. On a backend without
+			// distributed locking exactly one process may run against it, and
+			// this command mints a certificate a running server would never
+			// learn of. The refusal names the holder, which is the answer the
+			// operator needs; waiting for a lock they were never going to get is
+			// not.
+			//
+			// Taken *after* the checks above and before the first write, rather
+			// than at the top with the runtime. Acquiring creates the lock file,
+			// and the refusals above promise to leave the cadir exactly as they
+			// found it -- a command that declines to act should not leave a
+			// locks/ directory in a cadir that has no CA in it. Everything
+			// between here and the checks only reads.
+			if err := holdInstanceLock(ctx, rt); err != nil {
+				return err
+			}
+
 			if err := myCA.Init(ctx); err != nil {
 				return fmt.Errorf("loading the CA: %w", err)
 			}
