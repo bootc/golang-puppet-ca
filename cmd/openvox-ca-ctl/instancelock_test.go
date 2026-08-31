@@ -22,6 +22,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"sync"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -173,4 +174,88 @@ func holdStoreLock(cadir string) {
 	ul, err := storage.New(cadir).AcquireInstanceLock(context.Background())
 	Expect(err).NotTo(HaveOccurred(), "the store must be free before the spec holds it")
 	DeferCleanup(func() { _ = ul.Unlock() })
+}
+
+var _ = Describe("lockStore release ordering", func() {
+	It("closes the backend before releasing the lock", func() {
+		// The invariant, asserted rather than trusted. Releasing the store-wide
+		// lock first re-opens, for the gap between the two, exactly the window
+		// the lock exists to close: another process may take a store this one
+		// still holds an open connection to. On SQLite that connection is to the
+		// database file itself.
+		//
+		// A defer pair at the call site gets this backwards, LIFO running Unlock
+		// first, which is why the ordering lives in one helper.
+		rec := &recordingBackend{base: storage.NewFilesystemBackend(GinkgoT().TempDir())}
+		svc := storage.NewWithBackend(rec, filepath.Join(GinkgoT().TempDir(), "private"))
+
+		release, err := lockStore(context.Background(), svc)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(rec.events()).To(BeEmpty(), "nothing is given back until the caller says so")
+
+		release()
+
+		Expect(rec.events()).To(Equal([]string{"close", "unlock"}),
+			"the lock must outlive the backend handle it protects")
+	})
+
+	It("closes the backend when the lock cannot be taken, rather than leaking it", func() {
+		cadir := GinkgoT().TempDir()
+		holdStoreLock(cadir)
+
+		rec := &recordingBackend{base: storage.NewFilesystemBackend(cadir)}
+		svc := storage.NewWithBackend(rec, filepath.Join(GinkgoT().TempDir(), "private"))
+
+		release, err := lockStore(context.Background(), svc)
+		Expect(err).To(HaveOccurred())
+		Expect(release).To(BeNil())
+		Expect(rec.events()).To(Equal([]string{"close"}),
+			"the caller has no cleanup to run, so the handle must be closed here")
+	})
+})
+
+// recordingBackend notes the order in which the store is given back. It records
+// Close itself and, through the unlocker it wraps, the release of the
+// store-wide lock.
+type recordingBackend struct {
+	storage.Backend
+	base *storage.FilesystemBackend
+
+	mu  sync.Mutex
+	log []string
+}
+
+func (b *recordingBackend) note(event string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.log = append(b.log, event)
+}
+
+func (b *recordingBackend) events() []string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return append([]string(nil), b.log...)
+}
+
+func (b *recordingBackend) Close() error {
+	b.note("close")
+	return b.base.Close()
+}
+
+func (b *recordingBackend) AcquireInstanceLock() (storage.Unlocker, error) {
+	ul, err := b.base.AcquireInstanceLock()
+	if err != nil {
+		return nil, err
+	}
+	return &recordingUnlocker{backend: b, wrapped: ul}, nil
+}
+
+type recordingUnlocker struct {
+	backend *recordingBackend
+	wrapped storage.Unlocker
+}
+
+func (u *recordingUnlocker) Unlock() error {
+	u.backend.note("unlock")
+	return u.wrapped.Unlock()
 }

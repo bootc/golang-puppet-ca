@@ -25,6 +25,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -230,6 +231,26 @@ var _ = Describe("Store instance lock", func() {
 			Expect(ul.Unlock()).To(Succeed())
 		})
 
+		It("permits the instance when the backend implements no InstanceLocker", func() {
+			// A backend with neither distributed locking nor a store-wide lock
+			// to offer. It is not broken -- it is one where the rule has to rest
+			// on the operator -- so it must be permitted rather than refused,
+			// and the caller must not read the nil error as "the lock was
+			// taken".
+			b := &plainBackend{Backend: NewFilesystemBackend(GinkgoT().TempDir())}
+
+			var asInstanceLocker any = b
+			_, isInstanceLocker := asInstanceLocker.(InstanceLocker)
+			Expect(isInstanceLocker).To(BeFalse(), "precondition: this backend offers no store-wide lock")
+			distributed, err := svc(b).SupportsDistributedLocking(ctx)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(distributed).To(BeFalse(), "precondition: and no distributed locking either")
+
+			ul, err := svc(b).AcquireInstanceLock(ctx)
+			Expect(err).NotTo(HaveOccurred(), "a backend that cannot offer the lock must not be refused startup")
+			Expect(ul.Unlock()).To(Succeed())
+		})
+
 		It("permits the instance when the backend offers no store lock", func() {
 			// An in-memory SQLite database is private to the process that
 			// opened it, so there is no second instance for a lock to exclude
@@ -310,6 +331,97 @@ var _ = Describe("Store instance lock", func() {
 		})
 	})
 
+	Describe("a hostile holder record", func() {
+		It("strips control characters and terminal escapes before reporting it", func() {
+			// The record is read back out of a file and interpolated into an
+			// error a terminal renders. The writer is another instance of this
+			// program, but the file is only as trustworthy as the directory it
+			// sits in -- and a store on a shared or misowned path is exactly the
+			// case the permission handling in filelock.go exists for. An escape
+			// sequence surviving to the terminal could rewrite what the operator
+			// sees around it.
+			cadir := GinkgoT().TempDir()
+			locks := newFileLocks(filepath.Join(cadir, fsLockDir))
+
+			ul, err := locks.acquireInstance()
+			Expect(err).NotTo(HaveOccurred())
+			DeferCleanup(func() { _ = ul.Unlock() })
+
+			path := filepath.Join(cadir, fsLockDir, fileLockFileName(instanceLockName))
+			hostile := "openvox-ca (pid 1)\x1b[2J\x1b[1;31m ALL CERTIFICATES REVOKED\x00\x07" +
+				"\nnot-the-current-holder (pid 2)\n"
+			Expect(os.WriteFile(path, []byte(hostile), FilePermPrivate)).To(Succeed())
+
+			_, err = svc(NewFilesystemBackend(cadir)).AcquireInstanceLock(ctx)
+			var locked *StoreLockedError
+			Expect(errors.As(err, &locked)).To(BeTrue())
+
+			Expect(locked.Holder).NotTo(BeEmpty(), "a sanitised record is still a record")
+			Expect(locked.Holder).NotTo(ContainSubstring("\x1b"), "no terminal escapes")
+			Expect(locked.Holder).NotTo(ContainSubstring("\x00"), "no NUL")
+			Expect(locked.Holder).NotTo(ContainSubstring("\x07"), "no BEL")
+			for _, r := range locked.Holder {
+				Expect(r).To(BeNumerically(">=", 0x20), "control character %q survived", r)
+				Expect(r).NotTo(Equal(rune(0x7f)), "DEL survived")
+			}
+
+			// Only the first line, so a record cannot forge extra lines of
+			// output around itself.
+			Expect(locked.Holder).NotTo(ContainSubstring("not-the-current-holder"))
+			Expect(locked.Error()).NotTo(ContainSubstring("\n"))
+		})
+
+		It("caps how much of the file it will report", func() {
+			cadir := GinkgoT().TempDir()
+			locks := newFileLocks(filepath.Join(cadir, fsLockDir))
+
+			ul, err := locks.acquireInstance()
+			Expect(err).NotTo(HaveOccurred())
+			DeferCleanup(func() { _ = ul.Unlock() })
+
+			path := filepath.Join(cadir, fsLockDir, fileLockFileName(instanceLockName))
+			Expect(os.WriteFile(path, []byte(strings.Repeat("A", 64*1024)), FilePermPrivate)).To(Succeed())
+
+			_, err = svc(NewFilesystemBackend(cadir)).AcquireInstanceLock(ctx)
+			var locked *StoreLockedError
+			Expect(errors.As(err, &locked)).To(BeTrue())
+			Expect(len(locked.Holder)).To(BeNumerically("<=", instanceHolderLimit),
+				"a lock file is not a licence to print 64KB into an operator's terminal")
+		})
+	})
+
+	Describe("the capability probe's bound", func() {
+		It("does not hang startup when the probe never answers", func() {
+			// The bound lives inside AcquireInstanceLock rather than at its
+			// callers precisely so no caller can forget it. Untested it is a
+			// claim; this is the property: a backend whose AcquireLock blocks
+			// for ever must cost the configured bound and then be permitted, not
+			// hang the server that is starting.
+			original := instanceProbeTimeout
+			instanceProbeTimeout = 100 * time.Millisecond
+			DeferCleanup(func() { instanceProbeTimeout = original })
+
+			s := svc(&blockingLocker{Backend: NewFilesystemBackend(GinkgoT().TempDir())})
+
+			done := make(chan error, 1)
+			start := time.Now()
+			go func() {
+				ul, err := s.AcquireInstanceLock(context.Background())
+				if err == nil {
+					_ = ul.Unlock()
+				}
+				done <- err
+			}()
+
+			var err error
+			Eventually(done, "5s").Should(Receive(&err),
+				"an unbounded probe hangs startup; that is the outage this bound exists to prevent")
+			Expect(err).NotTo(HaveOccurred(), "a probe that timed out must permit, not refuse")
+			Expect(time.Since(start)).To(BeNumerically(">=", 100*time.Millisecond),
+				"it must actually have waited on the probe rather than skipped it")
+		})
+	})
+
 	Describe("the reserved lock name", func() {
 		It("cannot collide with a lock a running instance takes", func() {
 			// The store-wide lock is held for the whole life of the process, so
@@ -322,3 +434,23 @@ var _ = Describe("Store instance lock", func() {
 		})
 	})
 })
+
+// plainBackend hides every optional locking interface its embedded backend
+// implements, standing in for a backend that offers neither distributed nor
+// store-wide locking. The embedded field is an interface deliberately: an
+// embedded concrete type would promote AcquireInstanceLock and make the spec
+// assert the opposite of what it says.
+type plainBackend struct {
+	Backend
+}
+
+// blockingLocker advertises distributed locking and never grants it, which is
+// an unreachable cluster backend as AcquireInstanceLock meets one.
+type blockingLocker struct {
+	Backend
+}
+
+func (b *blockingLocker) AcquireLock(ctx context.Context, _ string) (Unlocker, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}

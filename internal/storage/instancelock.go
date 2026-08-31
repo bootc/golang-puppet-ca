@@ -70,7 +70,13 @@ const instanceLockName = "store-instance"
 // safety check into an outage: the probe takes and releases a real lock, so on
 // an unreachable cluster backend an unbounded one would hang startup for ever
 // instead of failing. A caller's own deadline still applies if it is shorter.
-const instanceProbeTimeout = 10 * time.Second
+//
+// A variable rather than a constant so a spec can drive the bound itself, in the
+// same way and for the same reason tryLock is indirected in filelock.go: the
+// property worth pinning is that a probe which never returns cannot hang a
+// startup, and a ten-second wait is not something a unit suite can sit through.
+// Production never changes it.
+var instanceProbeTimeout = 10 * time.Second
 
 // instanceHolderLimit caps how much of a lock file is read back when reporting
 // who holds it. The record is one short line; anything longer is not ours.
