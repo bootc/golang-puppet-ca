@@ -423,12 +423,24 @@ replica holds a lock. The pattern:
   `c.mu.RLock`. A *cacheable* miss — no nonce, and a definite status — is not
   wholly a read path: it ends by taking the write lock to re-check and store.
   It still takes its snapshot under the same `RLock` and signs outside it, so
-  what it holds these readers off across is a map write rather than a signer
-  round trip; Go's `RWMutex` gives that waiting writer priority, so the store
-  does briefly stall new `RLock` acquisitions. The guarantee is about the
-  signature, not about never blocking. A nonced miss and an `unknown` are never
-  cached, so they take no write lock at all — which matters, because the nonced
-  request is the motivating case: it misses on every request.
+  what it holds these readers off across is **a CRL scan plus a map write**,
+  rather than a signer round trip. The scan is `decideOCSPStatus` re-deciding
+  the status before the entry is stored — the check that makes the race guard
+  sound — and it is linear in the number of revoked certificates, so it is the
+  part of that window which grows with the CRL. Naming only the map write would
+  understate it by leaving out the one term that scales. Go's `RWMutex` gives
+  that waiting writer priority, so the store does briefly stall new `RLock`
+  acquisitions.
+
+  That window is not a cost #197 added: the pre-#197 code ran the same scan
+  under the same exclusive lock, and a signature besides. What changed is that
+  the signer round trip left it, which is the whole of the improvement — but
+  the remaining window is a scan and a map write, not a map write. The
+  guarantee is about the signature, not about never blocking.
+
+  A nonced miss and an `unknown` are never cached, so they take no write lock at
+  all — which matters, because the nonced request is the motivating case: it
+  misses on every request.
 - **HTTP GETs** (certificate, CRL, status listings) read straight through
   `StorageService` getters, which take only the relevant tier-2 read lock.
 - `ReadInventory` verifies the integrity HMAC under `inventoryMu.RLock` but

@@ -21,6 +21,7 @@ import (
 	"context"
 	"crypto"
 	"crypto/rand"
+	"errors"
 	"io"
 	"os"
 	"sync"
@@ -129,6 +130,21 @@ func (p *parkingSigner) Release() {
 	default:
 		close(p.release)
 	}
+}
+
+// failingSigner refuses to sign. It is the other half of what parkingSigner
+// does: parking pins a signature open, this one makes it fail, and both exist
+// because the interesting behaviour of AnswerOCSP is what happens around the
+// signature rather than in it.
+type failingSigner struct {
+	inner crypto.Signer
+	err   error
+}
+
+func (f *failingSigner) Public() crypto.PublicKey { return f.inner.Public() }
+
+func (f *failingSigner) Sign(io.Reader, []byte, crypto.SignerOpts) ([]byte, error) {
+	return nil, f.err
 }
 
 // The OCSP responder signs its answers. Until #197 it did so holding c.mu
@@ -397,6 +413,29 @@ var _ = Describe("OCSP response signing and the CA lock", func() {
 				"the handler must answer internalError rather than malformedRequest")
 		Expect(signer.Calls()).To(BeZero(),
 			"the signer should never have been entered for an abandoned request")
+	})
+
+	// A signer that fails is a *server* fault, and the classification is the
+	// whole point: ErrInternal reaches the HTTP layer as RFC 6960 internalError,
+	// which a verifier may retry, where malformedRequest tells it not to and
+	// blames its request for an outage that was never its fault.
+	//
+	// Worth pinning rather than trusting, because the failure is silent in the
+	// direction that matters. If this regressed, responses would still be
+	// produced, nothing would error in CI, and the only symptom would be
+	// verifiers declining to retry a signer outage — visible in their logs, not
+	// ours. internal/api/ocsp_test.go pins the HTTP half.
+	It("reports a signer failure as an internal error, not a malformed request", func() {
+		reqDER := issueFor("ocsp-lock-signer-fails")
+		myCA.CAKey = &failingSigner{inner: myCA.CAKey, err: errors.New("signer unavailable")}
+
+		_, err := myCA.AnswerOCSP(ctx, reqDER)
+		Expect(err).To(HaveOccurred())
+		Expect(err).To(MatchError(ca.ErrInternal),
+			"a failed CA signature is a server fault; the handler must answer "+
+				"internalError rather than malformedRequest")
+		Expect(err.Error()).To(ContainSubstring("signer unavailable"),
+			"the underlying signer error should survive for the operator's log")
 	})
 
 	// The prune half of the same guard, and not a duplicate of the revocation
