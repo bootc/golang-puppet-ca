@@ -15,31 +15,37 @@ set -eu -o pipefail
 # ---------------------------------------------------------------------------
 # CARRIED FIXES — integration-fixes.patch, applied after the merge loop
 #
-#   capability_test.go  #212. Main's "SupportsAtomicInventory is false for every
-#                       backend that appends to the inventory blob" table lists
-#                       redis, which is correct on main. #212 gives RedisBackend
-#                       a decomposed inventory, so the capability — a type
-#                       assertion for InventoryStore — becomes true and that
-#                       entry fails. The fix moves the redis Entry to the "is
-#                       true" table.
+# NONE. PATCH_PATHS is empty and there must be no patch file; the guard below
+# aborts if one appears, since nothing then declares what it may contain.
 #
-#                       #212 cannot make the edit itself: it predates the file,
-#                       which arrived on main with #189 on 2026-08-31. (Until
-#                       then this was a #189 x #212 pair and the file existed
-#                       only on #189's branch.) Retires when #212 merges.
+# The last was capability_test.go, retired 2026-08-31 when #212 absorbed it at
+# 46bd9a4cdfd1: redis now sits inside `DescribeTable("is true for every backend
+# with a structured inventory")` and the "Redis stays here until #212" comment
+# is gone. Verified by which table the Entry falls in, and by the patch ceasing
+# to apply.
 #
 # A carried fix is a spec correct on its own branch and wrong only once another
-# is merged beside it. Rules this one set produced:
+# is merged beside it. Rules this one set produced, all still load-bearing:
 #
-#   - Scoped to a SET of merged branches, not to the file it edits. When a
-#     branch leaves BRANCHES, every hunk depending on it leaves in the same edit.
+#   - Scoped to a SET of merged branches, not to the file it edits.
 #   - Check the owning branch before retiring OR re-adding: a fix carried past
 #     its owner is a duplicate declaration, not a no-op.
-#   - "The patch stopped applying" usually means the owner absorbed it.
-#   - CHECK THE ENTRIES, NOT THE SHAPE. This fix was once retired after
+#   - "The patch stopped applying" usually means the owner absorbed it. That is
+#     how this one ended.
+#   - CHECK THE ENTRIES, NOT THE SHAPE. This fix was once retired wrongly after
 #     confirming #189 carried "both tables" — it did, with redis still in the
 #     wrong one, which is correct on #189 alone. A table can be present,
 #     well-formed, and wrong for the set this build merges.
+#   - A BRANCH THAT LEAVES BY MERGING DOES NOT TAKE ITS FIXES WITH IT. The
+#     scoping rule above is about a branch leaving the SET; a merge moves its
+#     content into the base instead, so the collision survives. #189 merged on
+#     2026-08-31 without moving redis — correct, because #212 was still
+#     unlanded — and reading the scoping rule as covering that would have
+#     retired this fix for the second wrong time. What retires a fix is the
+#     owner absorbing it, which is a fact about a file, not about a list.
+#   - Grep for the entry with CONTEXT, not a closed paren: the real line is
+#     `Entry("redis", func() Backend {...},` so `Entry("redis")` matches nothing
+#     in a file that plainly contains it, and returns a confident zero.
 #
 # ---------------------------------------------------------------------------
 # HAZARD
@@ -289,7 +295,7 @@ done
 #              half-resolved conflict or a stray edit made in the conflict shell.
 #   empty      no fixes carried, deliberately. A patch present anyway is an
 #              abort, since nothing declares what it may contain.
-PATCH_PATHS="internal/storage/capability_test.go"
+PATCH_PATHS=""
 
 if [ -n "$PATCH_PATHS" ] && [ ! -f integration-fixes.patch ]; then
   echo "PATCH_PATHS declares carried fixes but integration-fixes.patch is not in" >&2
