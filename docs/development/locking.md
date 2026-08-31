@@ -338,8 +338,10 @@ The costs of this choice are deliberate and documented:
   this process next writes them: `cachedCRL` staleness for authentication is
   [#171](https://github.com/voxpupuli/openvox-ca/issues/171) (being fixed by
   [PR #182](https://github.com/voxpupuli/openvox-ca/pull/182)'s background
-  sync), and `serialIndex`/`ocspCache` staleness for OCSP is
-  [#183](https://github.com/voxpupuli/openvox-ca/issues/183).
+  sync), and `serialIndex`/`ocspCache` staleness for OCSP was
+  [#183](https://github.com/voxpupuli/openvox-ca/issues/183), now reconciled by
+  `SyncSerialIndex` on `ocsp_index_sync_interval_sec` — see the entry below for
+  the lock discipline that pass uses, which is not this section's.
 - A read racing a mutation sees either the old or the new state, never a torn
   one — every backend's `Put` is atomic with respect to readers (see the
   `Backend` contract in [backend.go](../../internal/storage/backend.go)).
@@ -510,10 +512,50 @@ state when the document was last updated and is not guaranteed exhaustive.
   revoked elsewhere until this process re-signs the CRL.
   [PR #182](https://github.com/voxpupuli/openvox-ca/pull/182) fixes it with a
   background poll (monotonic in the CRL number, deliberately lock-free).
-- [#183](https://github.com/voxpupuli/openvox-ca/issues/183) — OCSP's
+- ~~[#183](https://github.com/voxpupuli/openvox-ca/issues/183) — OCSP's
   `serialIndex` is built once at startup, so certificates issued on another
   replica answer `unknown`; the `ocspCache` half can even keep serving a
-  pre-signed `good` for a certificate revoked elsewhere.
+  pre-signed `good` for a certificate revoked elsewhere.~~ Fixed, in two
+  halves. `CA.SyncSerialIndex` reconciles the index from the inventory on
+  `ocsp_index_sync_interval_sec`, and every write of `c.cachedCRL` now goes
+  through `installCachedCRLLocked`, which drops the cached responses the
+  incoming CRL contradicts — previously only `SyncCRLCache` and
+  `revokeSerialLocked` did, so whichever path installed a peer's revocation
+  first decided whether a stale `good` survived.
+
+  **The sync's lock discipline is a deliberate exception to tier 3.** The rule
+  above is that a mutation holds `c.mu` across the storage access and the cache
+  update together. `SyncSerialIndex` does not: it samples `serialIndexEpoch`
+  under `RLock`, reads the inventory holding no `c.mu` at all, then takes the
+  write lock to reconcile. Holding `c.mu` across a whole-inventory read would
+  block every OCSP answer and every issuance on this replica for the duration,
+  once per interval — the cost tier 3 exists to avoid. The epoch counter is
+  what makes the gap safe: an issuance landing inside it moves the counter, and
+  a pass that sees it moved applies its additions but stands its removals down,
+  because it cannot then tell "pruned elsewhere" from "signed here, after I
+  read". Additions are always safe, removals never are.
+
+  The exception is bounded rather than free. The reconciliation still holds the
+  write lock for O(n) map *reads* over the inventory, so a very large fleet
+  pays a brief pause on the admission path once per interval; it writes only
+  where storage and the index disagree, so the steady-state pass — the
+  overwhelmingly common one — stores nothing. `SyncCRLCache` takes
+  the same shape for the same reason and is ordered instead by CRL number.
+
+  `InventoryEntries` exists for this path: `ReadInventory` verifies and then
+  fetches, and its verification recomputes from storage, so every call
+  materialises the whole inventory twice — on both backend families — and a job
+  on a timer should not pay that. It fetches once and folds the integrity value
+  over the rows it already holds.
+
+  **It verifies on every backend**, which is where it parts company with
+  `SubjectForSerial`. That method skips the check on `InventoryStore` backends
+  because doing so "would cost a second full fetch of every row"; here it costs
+  no fetch at all, so the reason to skip does not apply. The distinction matters
+  for this caller in particular, because it drives *removals*: a row deleted out
+  of band takes a serial out of the index, and an index miss downgrades the
+  responder's answer for that serial from `revoked` to `unknown` before the CRL
+  is consulted. Tampering has to fail closed here.
 - ~~[#196](https://github.com/voxpupuli/openvox-ca/issues/196) —
   `DELETE /certificate_request/{subject}` deleted the CSR directly through
   `StorageService`, bypassing the subject lock.~~ Fixed: the handler now goes

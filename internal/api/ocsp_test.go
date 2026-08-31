@@ -277,6 +277,68 @@ var _ = Describe("OCSP HTTP Handler", func() {
 		Expect(maxAge).To(Equal(int64(ca.OCSPValidity.Seconds())))
 	})
 
+	// The header is the half of the staleness fix that reaches past this
+	// process. An `unknown` means "this replica has not read that serial yet",
+	// which its index sync corrects within minutes — so telling a shared proxy
+	// to keep it for four hours would have it replayed to every client behind
+	// that proxy long after the CA itself would answer differently.
+	It("GET response for an unknown serial forbids storing it", func() {
+		// A certificate from an unrelated CA: a serial this one never issued,
+		// which is the same shape as one a peer replica issued and this process
+		// has not yet indexed.
+		_, foreignPEM, _, err := testutil.GenerateTestCA()
+		Expect(err).NotTo(HaveOccurred())
+		block, _ := pem.Decode(foreignPEM)
+		Expect(block).NotTo(BeNil())
+		foreign, err := x509.ParseCertificate(block.Bytes)
+		Expect(err).NotTo(HaveOccurred())
+
+		reqDER := ocspReqDER(foreign, myCA.CACert)
+		b64Escaped := url.PathEscape(base64.StdEncoding.EncodeToString(reqDER))
+
+		req := httptest.NewRequest(http.MethodGet, "/ocsp/"+b64Escaped, nil)
+		rr := httptest.NewRecorder()
+		mux.ServeHTTP(rr, req)
+
+		Expect(rr.Code).To(Equal(http.StatusOK))
+		resp, err := xocsp.ParseResponse(rr.Body.Bytes(), myCA.CACert)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(resp.Status).To(Equal(xocsp.Unknown), "precondition: this must be an unknown")
+
+		Expect(rr.Header().Get("Cache-Control")).To(Equal("no-store"))
+		Expect(rr.Header().Get("Cache-Control")).NotTo(ContainSubstring("max-age"),
+			"an unknown must carry no reuse window at all")
+	})
+
+	// The nonce half of the no-store rule, at the boundary that emits the
+	// header. The ca-level spec pins MaxAge=0 for a nonced answer; this pins
+	// that the handler turns it into `no-store` rather than a max-age. RFC 8954
+	// §3: a nonced response answers one request and no other, so a proxy that
+	// stored it would serve it to somebody who never asked for it — the same
+	// failure the unknown case above prevents, reached by a different status.
+	It("GET response for a nonced request forbids storing it, even when good", func() {
+		cert := signCert(myCA, "nonced-cc-node")
+		nonce := make([]byte, 16)
+		_, err := rand.Read(nonce)
+		Expect(err).NotTo(HaveOccurred())
+		reqDER, err := testutil.BuildOCSPRequestWithNonce(cert, myCA.CACert, nonce)
+		Expect(err).NotTo(HaveOccurred())
+		b64Escaped := url.PathEscape(base64.StdEncoding.EncodeToString(reqDER))
+
+		req := httptest.NewRequest(http.MethodGet, "/ocsp/"+b64Escaped, nil)
+		rr := httptest.NewRecorder()
+		mux.ServeHTTP(rr, req)
+
+		Expect(rr.Code).To(Equal(http.StatusOK))
+		resp, err := xocsp.ParseResponse(rr.Body.Bytes(), myCA.CACert)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(resp.Status).To(Equal(xocsp.Good),
+			"precondition: a nonced query about a signed certificate is still answered good")
+
+		Expect(rr.Header().Get("Cache-Control")).To(Equal("no-store"))
+		Expect(rr.Header().Get("Cache-Control")).NotTo(ContainSubstring("max-age"))
+	})
+
 	It("POST response does NOT carry a Cache-Control header", func() {
 		cert := signCert(myCA, "no-cc-ocsp-node")
 		reqDER := ocspReqDER(cert, myCA.CACert)

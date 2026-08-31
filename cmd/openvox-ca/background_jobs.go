@@ -23,15 +23,37 @@ import (
 	"time"
 
 	"github.com/voxpupuli/openvox-ca/internal/ca"
+	"github.com/voxpupuli/openvox-ca/internal/storage"
 )
+
+// sharedStorageBackend reports whether name is a backend more than one CA
+// process can be serving from at once, and echoes the parsed kind for logging.
+//
+// Only filesystem and SQLite are not: both are a local file with no
+// cross-process coordination (see docs/development/locking.md on #187), so a
+// second writer is not a configuration this project supports rather than one it
+// merely does not expect. Everything else is reachable by several replicas by
+// design, which is what makes an in-memory index built at startup go stale.
+//
+// A name that will not parse is treated as shared. The cost of that mistake is
+// a periodic inventory read; the cost of the opposite one is a responder
+// quietly answering `unknown` for certificates its peers have signed.
+func sharedStorageBackend(name string) (bool, storage.BackendKind) {
+	kind, err := storage.ParseBackendKind(name)
+	if err != nil {
+		return true, storage.BackendKind(name)
+	}
+	return kind != storage.BackendFilesystem && kind != storage.BackendSQLite, kind
+}
 
 // Background job names, as reported by backgroundJobs. Constants rather than
 // literals so a spec asserting which jobs a configuration starts cannot drift
 // from the thing it is asserting about.
 const (
-	jobCRLRefresh  = "crl-refresh"
-	jobCRLSync     = "crl-sync"
-	jobCertCleanup = "expired-cert-cleanup"
+	jobCRLRefresh    = "crl-refresh"
+	jobCRLSync       = "crl-sync"
+	jobOCSPIndexSync = "ocsp-index-sync"
+	jobCertCleanup   = "expired-cert-cleanup"
 )
 
 // backgroundJob is one periodic job the serve command runs for the lifetime of
@@ -84,6 +106,48 @@ func backgroundJobs(cfg *serverConfig, myCA *ca.CA) []backgroundJob {
 	jobs = append(jobs, backgroundJob{jobCRLSync, func(ctx context.Context) {
 		runCRLSync(ctx, myCA, syncInterval)
 	}})
+
+	// Reloads the inventory into the serial index this process's OCSP responder
+	// answers from, so a certificate signed on another replica stops being
+	// reported as `unknown` within an interval rather than never. Read-only and
+	// takes no cluster lock.
+	//
+	// Not gated on ocsp_url: the /ocsp endpoint answers whatever that setting
+	// says, so gating on it would leave the responder wrong for anyone
+	// distributing the URL another way. It *is* gated on the backend, which is a
+	// different question with a different answer.
+	//
+	// The staleness needs a second process *issuing* certificates this one will
+	// never hear about. Issuing, specifically — not merely writing: since #187
+	// was closed, SameHostLocker coordinates several processes writing to a
+	// filesystem or SQLite store on one host, so second writers there are
+	// supported and expected. What no second writer does today is mint a
+	// certificate. As of main 65a00adb51f9, nothing under cmd/ outside the
+	// server calls AppendInventory, issueLeafLocked, CA.Generate or
+	// SignWithTTL, so no inventory row can appear that a running server did not
+	// write itself, and its index cannot fall behind. Running the job on those
+	// two backends would read the whole inventory every interval, for ever, on
+	// the default backend, to detect something that cannot yet happen.
+	//
+	// That enumeration is the whole justification, so here is what voids it: the
+	// day any command other than the server issues a certificate — an offline
+	// `generate` is the one in flight — this reason is gone and the gate has to
+	// be re-decided, not merely re-worded. Re-run the enumeration above against
+	// the tree in front of you rather than trusting this paragraph.
+	//
+	// An unrecognised backend name runs the job. Being wrong in that direction
+	// costs a periodic read; being wrong in the other costs correct OCSP
+	// answers, silently, until a restart.
+	if shared, kind := sharedStorageBackend(cfg.StorageBackend); shared {
+		ocspIndexInterval := cfg.ocspIndexSyncInterval()
+		jobs = append(jobs, backgroundJob{jobOCSPIndexSync, func(ctx context.Context) {
+			runOCSPIndexSync(ctx, myCA, ocspIndexInterval)
+		}})
+	} else {
+		slog.Info("OCSP serial index sync not started: the storage backend is single-node, "+
+			"so no other process can issue certificates this one would not already know about",
+			"backend", kind)
+	}
 
 	// Prunes certificates that expired more than the retention grace period ago
 	// from the inventory and the CRL. Opt-in; safe on every replica.
