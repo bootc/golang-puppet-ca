@@ -83,6 +83,13 @@ type StorageService struct {
 // waits for another replica or another process, not for another goroutine here,
 // which is why an inverted lock order deadlocks rather than timing out. See
 // docs/development/locking.md.
+//
+// For the same reason WithLock is *not reentrant*, at any tier: re-acquiring a
+// name this goroutine already holds blocks on a mutex only this goroutine can
+// release, and no deadline ends that wait, so it hangs rather than failing.
+// Work that must run under a lock the caller may already hold belongs in a
+// ...Locked variant the caller selects — CA.finishLoadExisting takes its
+// seeding function from its caller for exactly this reason (issue #201).
 func (s *StorageService) WithLock(ctx context.Context, name string, fn func() error) error {
 	if lk, ok := s.backend.(Locker); ok {
 		ul, err := lk.AcquireLock(ctx, name)
@@ -1145,7 +1152,7 @@ const hmacKeyLen = 32
 // another only by agreeing on the string.
 //
 // Deliberately *not* "bootstrap", the name CA.Init and MigrateService use.
-// WithLock is not reentrant at any tier (issue #201), and MigrateService
+// WithLock is not reentrant at any tier (see its godoc), and MigrateService
 // already reaches RebuildInventoryHMAC -> EnsureHMACKey from inside
 // WithLock(ctx, migrateLockName), which is "bootstrap". Sharing the name would
 // turn a corrupt stored key met during a migration into a hang. The two names

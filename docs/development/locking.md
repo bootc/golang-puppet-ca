@@ -378,9 +378,11 @@ written as two.
   inversion itself is safe only because `Init` runs to completion before
   the server starts serving, so nothing else can be holding a distributed lock
   while waiting on `c.mu`; do not copy this pattern into anything that runs
-  while serving. Init also has a *separate*, unfixed hazard on the same lock —
-  its slow path can re-enter `bootstrap` and deadlock startup
-  ([#201](https://github.com/voxpupuli/openvox-ca/issues/201)); see known gaps.
+  while serving. Init also *had* a separate hazard on the same lock — its slow
+  path re-entered `bootstrap` and deadlocked startup
+  ([#201](https://github.com/voxpupuli/openvox-ca/issues/201)). Fixed; the rule
+  that produced it is not, because `WithLock` is still not reentrant at any
+  tier. See known gaps.
 - `bootstrap` → `hmac-key` is the first nesting in which a name owned by
   `StorageService` sits inside one owned by the CA layer, and the only one taken
   entirely within `internal/storage`. It is not the only nesting of two
@@ -764,11 +766,30 @@ state when the document was last updated and is not guaranteed exhaustive.
     is reported as RFC 6960 `internalError` rather than `malformedRequest` —
     the latter tells a verifier not to retry and logs an outage as a client
     error.
-- [#201](https://github.com/voxpupuli/openvox-ca/issues/201) — `CA.Init`'s slow
+- ~~[#201](https://github.com/voxpupuli/openvox-ca/issues/201) — `CA.Init`'s slow
   path can re-enter the `bootstrap` lock (via `finishLoadExisting` →
   `seedSupportingState`) and deadlock startup, because `WithLock` is not
   reentrant and its process-local gate ignores the context. Reachable when a
-  replica loads a CA bootstrapped elsewhere but then finds the CRL absent.
+  replica loads a CA bootstrapped elsewhere but then finds the CRL absent.~~
+  Fixed: the seeding is split into `seedSupportingStateLocked`, which does the
+  work, and `seedSupportingState`, which acquires `bootstrap` around it.
+  `finishLoadExisting` takes the variant to use from its caller, so the choice
+  is made where the lock state is known — the fast path holds nothing and
+  passes the acquiring one, the slow path is already inside the lock and passes
+  the other. What is **not** fixed is the property underneath: `WithLock` is
+  still not reentrant at any tier and its per-name gate is still a plain
+  `sync.Mutex` that ignores the context, so a second acquisition on one
+  goroutine still hangs rather than failing at the lock timeout. This closed one
+  call site, not a mechanism.
+  [initreentrancy_test.go](../../internal/ca/initreentrancy_test.go) pins both
+  halves. The slow path is driven against a backend that refuses the first
+  CA-certificate read, and the spec fails on a bounded wait for `Init` to
+  return — neither of the two shapes the Tests section below describes, because
+  a re-entrant acquisition never returns to be counted and waits on nobody else
+  to be parked behind. The fast path is the before/after acquisition count that
+  section does describe, and it is there because moving *both* call sites onto
+  the `...Locked` variant would cure the hang and leave two replicas racing to
+  seed — which the first spec alone cannot tell from a fix.
 - ~~[#202](https://github.com/voxpupuli/openvox-ca/issues/202) — `hmac_key`
   initialisation (`EnsureHMACKey`, called by `InitHMAC` *before* the
   `bootstrap` lock) is an unlocked read-modify-write, so two replicas
@@ -781,9 +802,11 @@ state when the document was last updated and is not guaranteed exhaustive.
   `bootstrap` lock, deliberately: `InitHMAC` runs on every start, and the fast
   path immediately below it loads an already-bootstrapped CA *without* a
   distributed lock. Moving it inside `bootstrap` would make every replica's
-  every start contend for that lock and would enlarge
-  [#201](https://github.com/voxpupuli/openvox-ca/issues/201)'s re-entrancy
-  hazard rather than avoid it. A separate reason, and a separate claim, is why
+  every start contend for that lock, and would enlarge the `bootstrap` critical
+  section that
+  [#201](https://github.com/voxpupuli/openvox-ca/issues/201)'s re-entrancy was
+  found inside. That gap is fixed above; the contention argument stands on its
+  own. A separate reason, and a separate claim, is why
   the new name is not *called* `bootstrap`: `MigrateService` reaches
   `EnsureHMACKey` from inside that lock and `WithLock` is not reentrant, so a
   shared name would turn a migration that met a corrupt key into a hang —
