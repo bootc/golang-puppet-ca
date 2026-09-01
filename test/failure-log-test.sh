@@ -212,11 +212,59 @@ LATE_REASON='FATAL: signing CSR for puppet-master: certificate already revoked'
     printf 'puppet-master-1  | %s\n' "$LATE_REASON"
 } > "$WORK_DIR/logs/puppet-master.log"
 
+LATE_LINES=$(awk 'END { print NR }' "$WORK_DIR/logs/puppet-master.log")
+
 OUT=$(dump puppet-master)
 ok_contains "a single-attempt log is reported as one attempt" \
     "(start attempt 1 of 1)" "$OUT"
 ok_contains "a late failure's reason is still reachable through the tail" \
     "$LATE_REASON" "$OUT"
+
+# This log is longer than FAILURE_LOG_HEAD, so the head view is clamped.  Pin
+# the headcount and the truncation banner, not just their presence: an
+# operator triaging a restart loop reads those two numbers to know how much
+# was cut, and clamp arithmetic that drifted would still print a plausible
+# line.  Derived from the constant rather than written out, so the assertion
+# says what the relationship is and survives a change of depth.
+ok_contains "a clamped head view reports how much of the log it is showing" \
+    "# ---- first $FAILURE_LOG_HEAD of $LATE_LINES log lines from puppet-master (start attempt 1 of 1) ----" \
+    "$OUT"
+ok_contains "a clamped head view says how much of the attempt it cut" \
+    "# ---- ($(( LATE_LINES - FAILURE_LOG_HEAD )) more lines of attempt 1 not shown) ----" \
+    "$OUT"
+
+# ═════════════════════════════════════════════════════════════════════════════
+# A restart loop whose first attempt is itself longer than the clamp
+# ═════════════════════════════════════════════════════════════════════════════
+# Both bounds bite at once here, which is what separates them: the remainder
+# must be counted against the end of *attempt 1*, not the end of the log.  In
+# the fixture above the two coincide, so `last - shown` and `NR - shown` would
+# both look right; here they differ, and only one of them is.
+SLOW_BANNER='openvox-ca-1  | Waiting for Redis at redis:6379...'
+SLOW_ATTEMPT_LINES=130
+{
+    printf '%s\n' "$SLOW_BANNER"
+    for _i in $(seq 2 "$SLOW_ATTEMPT_LINES"); do
+        printf 'openvox-ca-1  | bootstrap step %d of a slow first attempt\n' "$_i"
+    done
+    for _a in 2 3; do
+        printf '%s\n' "$SLOW_BANNER"
+        printf 'openvox-ca-1  | Redis is reachable.\n'
+        printf 'openvox-ca-1  | Waiting for loopback CA...\n'
+    done
+} > "$WORK_DIR/logs/slow-ca.log"
+
+SLOW_LINES=$(awk 'END { print NR }' "$WORK_DIR/logs/slow-ca.log")
+
+OUT=$(dump slow-ca)
+ok_contains "a clamped first attempt still reports the attempt count" \
+    "# ---- first $FAILURE_LOG_HEAD of $SLOW_LINES log lines from slow-ca (start attempt 1 of 3) ----" \
+    "$OUT"
+ok_contains "the remainder is counted to the end of attempt 1, not the end of the log" \
+    "# ---- ($(( SLOW_ATTEMPT_LINES - FAILURE_LOG_HEAD )) more lines of attempt 1 not shown) ----" \
+    "$OUT"
+ok_lacks "the remainder is not counted to the end of the log" \
+    "($(( SLOW_LINES - FAILURE_LOG_HEAD )) more lines of attempt 1 not shown)" "$OUT"
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Degenerate logs

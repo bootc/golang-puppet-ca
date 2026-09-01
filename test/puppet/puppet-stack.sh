@@ -12,12 +12,16 @@
 #
 # Output: TAP format.  Exit 0 on all pass, exit 1 on any failure.
 #
-# On failure, an --up run replays the tail of every stack service's container
-# log to stderr (all but puppet-client, whose log is empty by construction)
-# before tearing the stack down, since teardown is
-# what makes those logs unrecoverable. --up --keep skips that teardown dump and
-# leaves the containers up for `compose logs` instead; a readiness timeout
-# still prints the timed-out service's own log either way.
+# On failure, an --up run replays every stack service's container log to
+# stderr (all but puppet-client, whose log is empty by construction) before
+# tearing the stack down, since teardown is what makes those logs
+# unrecoverable. Each service is replayed from its *first* start attempt --
+# under run-puppet-stack-on-redis.sh this same script drives CA replicas that
+# restart on failure, so a tail alone would only ever show the last futile
+# attempts (#281) -- with a tail beneath it for a service that failed late
+# without restarting. --up --keep skips that teardown dump and leaves the
+# containers up for `compose logs` instead; a readiness timeout still prints
+# the timed-out service's own log either way.
 #
 # NOTE: Group 6 revokes the client cert.  clean_client_cert() revokes any
 # stale cert and clears the client SSL dir before Groups 3 and 8.
