@@ -95,6 +95,17 @@ you have raised OpenBao's login timeout substantially, note that the signer
 child's own call is bounded at roughly twice it — well inside two minutes at
 the 10s default, but worth knowing the ceiling exists.
 
+An abandoned call also leaves a small entry in the RPC client's pending table,
+which is only reclaimed if a reply eventually arrives. Against a signer that is
+wedged rather than dead none ever does, so during such an incident the frontend
+accumulates roughly a megabyte a day — bounded at `ca_signing_concurrency`
+entries per two minutes, because every signature passes through that bound
+first. It is a deliberate trade: without the deadline the frontend instead
+accumulated stuck goroutines and never got its signing slots back. Nothing
+needs doing about it beyond fixing the signer; the frontend cannot re-dial,
+since the socketpair is inherited once at spawn, so restarting the service is
+what clears it.
+
 Fronting `/ocsp` with a cache or a proxy-level rate limit remains worthwhile
 where it is reachable by untrusted clients: the cap stops CA-key work growing
 without limit, but it does not stop the connections, handshakes and goroutines

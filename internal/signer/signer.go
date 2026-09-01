@@ -316,6 +316,33 @@ func (r *RemoteSigner) Sign(_ io.Reader, digest []byte, opts crypto.SignerOpts) 
 		// stops callers accumulating against a wedged signer, which is what
 		// makes the concurrency bound's slots recoverable; it does not reduce
 		// the load on the signer itself.
+		//
+		// Abandoning the wait also leaves the call in the client's internal
+		// pending map: net/rpc removes an entry only when a reply for that
+		// sequence arrives, or when the connection tears down and every
+		// pending call is failed at once. Against a signer that is wedged
+		// rather than dead — the exact fault this deadline exists for — no
+		// reply ever comes and the entry stays. Two things bound what that
+		// costs, and neither is reconnecting: the socketpair fd is inherited
+		// once at spawn and consumed by DialConn, so there is no second dial
+		// to flush the map with.
+		//
+		//   - The signing bound rate-limits it. Every Sign goes through
+		//     ca_signing_concurrency, so at most `limit` calls can be
+		//     outstanding at a time and each holds its slot for this whole
+		//     timeout. Entries therefore accrue at limit/timeout, not per
+		//     request — single-digit entries per minute at the shipped
+		//     default, a few hundred bytes each.
+		//   - It self-heals whenever a reply does arrive, so a merely slow
+		//     signer drains rather than accumulating.
+		//
+		// What is left is a permanently wedged signer, which is already an
+		// outage someone is fixing, leaking on the order of a megabyte a day.
+		// That is a deliberate trade against the alternative this replaced:
+		// before the deadline, Sign blocked forever, so the caller never
+		// returned to make a second call and the map could not grow — at the
+		// cost of a stuck goroutine per request and a signing bound whose
+		// slots never came back. See docs/ca-key-security.md.
 		return nil, fmt.Errorf("remote sign: %w", ErrSignTimeout)
 	}
 }
