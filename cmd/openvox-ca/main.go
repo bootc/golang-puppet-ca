@@ -430,6 +430,25 @@ func newRootCmd() *cobra.Command {
 					slog.Warn("--daemon is incompatible with a service manager that expects notifications; " +
 						"run in the foreground (Type=notify) instead")
 				}
+				// Check the single-instance rule here, in the process that still
+				// has somewhere to print. The child's stdout and stderr are
+				// discarded four lines below, so a refusal there is invisible:
+				// the operator would be told "started in background", get exit 0,
+				// and watch the child die silently. That is the deployment shape
+				// most likely to hit a second-instance conflict getting the least
+				// useful diagnostic, from the feature whose entire purpose is
+				// naming the holder.
+				//
+				// A pre-flight rather than a handover. This takes the lock and
+				// gives it straight back; the child takes the real one. Another
+				// process could still win the gap between the two, and then the
+				// child dies as silently as it always would have -- but the
+				// ordinary case, a service already running against this store, is
+				// now refused here, by name, before anything is forked.
+				if err := preflightInstanceLock(ctx, cfg); err != nil {
+					return err
+				}
+
 				exe, err := os.Executable()
 				if err != nil {
 					return fmt.Errorf("failed to determine executable: %w", err)

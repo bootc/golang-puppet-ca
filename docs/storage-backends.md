@@ -229,11 +229,19 @@ against a live store](#running-a-second-process-against-a-live-store).
 Two things to expect of them. There is one per distinct lock name, and that
 **includes one per subject**, so on a large fleet the directory holds roughly as
 many files as `signed/` and never shrinks — retiring a node with
-`openvox-ca-ctl clean` removes its certificate, not its lock file. And the files
-are always empty whether the lock is held or not, so their contents tell you
-nothing; whether a lock is held is visible only to `fuser`/`lsof`. Do not delete
-them while anything may be using the store — see the deletion hazard in
-[locking and concurrency](development/locking.md). Sweeping them while
+`openvox-ca-ctl clean` removes its certificate, not its lock file.
+
+And with one exception their contents tell you nothing: the per-name lock files
+are empty whether the lock is held or not, and whether one is held is visible
+only to `fuser`/`lsof`. The exception is the store-wide instance lock, which
+records the process holding it — binary name, pid, host and the time it started
+— so that a refused second instance can name it. A non-empty lock file is
+therefore normal and is **not** a sign of corruption; the record may equally
+well name a process that has since exited, because the file outlives every
+holder and the kernel releases the lock without erasing it.
+
+Do not delete them while anything may be using the store — see the deletion
+hazard in [locking and concurrency](development/locking.md). Sweeping them while
 everything is stopped is safe, and backing them up is harmless.
 
 ### Configuration
@@ -613,8 +621,11 @@ only; bootstrap against a scratch directory, then point a SQLite-backed
 `openvox-ca` at a fresh database.
 
 Alongside the database, `openvox-ca` keeps a hidden `.<database>.locks/`
-directory — `.ca.db.locks/` for the DSN above — holding the empty lock files
-that stop a second process on the host writing behind a running server's back.
+directory — `.ca.db.locks/` for the DSN above — holding the lock files that stop
+a second process on the host writing behind a running server's back, and the
+store-wide lock that refuses a second instance outright. They are empty but for
+that last one, which records its holder; see the note under [the filesystem
+backend](#filesystem-backend-default).
 The database file itself is never locked this way; SQLite locks that. See
 [Running a second process against a live
 store](#running-a-second-process-against-a-live-store).
@@ -939,7 +950,7 @@ Notes:
 | CA key exposure | local file | in DB unless `ca_key_file` set | in DB unless `ca_key_file` set | in etcd unless `ca_key_file` set | in Redis unless `ca_key_file` set |
 | Backup/restore | tar `<cadir>/` | copy `.db` (+ WAL) + local dirs | DB dump + local dirs | etcd snapshot + local dirs | RDB/AOF + local dirs |
 | Cross-node consistency | single node | single node | strong | strongest | strong (narrow failover window) |
-| Two processes, one host | coordinated (`flock`) | coordinated (`flock`) | coordinated (cluster lock) | coordinated (cluster lock) | coordinated (cluster lock) |
+| Second instance, same store | refused (`flock`) | refused (`flock`) | supported | supported | supported |
 | Drop-in for OpenVox/Puppet Server CA | yes | no (key paths change) | no (key paths change) | no (key paths change) | no (key paths change) |
 
 > **If you publish an upstream CRL chain**, note that `openvox-ca-ctl import`

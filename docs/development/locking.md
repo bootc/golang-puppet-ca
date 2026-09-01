@@ -858,9 +858,14 @@ state when the document was last updated and is not guaranteed exhaustive.
   lock *name*, and two processes issuing for different subjects hold different
   `subject:<name>` locks — but that is outside #204's scope and is not a
   tracked defect: two processes writing one filesystem store is an unsupported
-  configuration. Enforcing it is
-  [#275](https://github.com/voxpupuli/openvox-ca/issues/275), a cadir-wide lock
-  that would stop a second instance starting at all. See
+  configuration. That is now **enforced** rather than merely stated:
+  [#275](https://github.com/voxpupuli/openvox-ca/issues/275) added the
+  store-wide `store-instance` lock, held for the life of the process, so a
+  second instance is refused at startup and an `openvox-ca-ctl` or offline
+  command run beside a live server is told which process holds the store. The
+  enforcement is best-effort by design — `flock(2)` says nothing useful over
+  NFS, and a process on another host cannot be excluded at all — so the rule,
+  not the lock, remains the guarantee. See
   [storage backends](../storage-backends.md).
   The offline `generate` still reports both capabilities in its pre-flight, via
   `SupportsDistributedLocking`/`SupportsAtomicInventory`, and still tells the

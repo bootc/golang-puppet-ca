@@ -18,11 +18,13 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"os"
 	"path/filepath"
 	"strconv"
+	"sync"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -153,6 +155,138 @@ var _ = Describe("the store instance lock", func() {
 		})
 	})
 
+	Describe("holdInstanceLock", func() {
+		// The helper the offline subcommands share. It exists to carry an
+		// ordering invariant that a hand-written defer pair gets backwards, and
+		// until now nothing pinned the helper itself -- only the callers that
+		// happened to use it.
+		newRuntime := func(rec *recordingBackend) *caRuntime {
+			rt := &caRuntime{Store: storage.NewWithBackend(rec, filepath.Join(GinkgoT().TempDir(), "private"))}
+			// resolveRuntime registers the backend's Close first, so Close runs
+			// it last. Reproduced here, because the invariant is about where the
+			// release lands relative to it.
+			rt.closers = append(rt.closers, rec.Close)
+			return rt
+		}
+
+		It("releases the lock only after the backend it protects is closed", func() {
+			// Close runs closers in reverse, so the release has to be inserted at
+			// the FRONT to run last. Append it instead and the store is given up
+			// while this process still holds an open handle to it -- on SQLite, a
+			// pooled connection to the database file the lock exists to keep to
+			// one writer.
+			rec := &recordingBackend{base: storage.NewFilesystemBackend(GinkgoT().TempDir())}
+			rt := newRuntime(rec)
+
+			Expect(holdInstanceLock(ctx, rt)).To(Succeed())
+			Expect(rec.events()).To(BeEmpty(), "nothing is given back before Close")
+
+			Expect(rt.Close()).To(Succeed())
+			Expect(rec.events()).To(Equal([]string{"close", "unlock"}),
+				"the lock must outlive the backend handle it protects")
+		})
+
+		It("refuses when another instance holds the store, and leaves rt closable", func() {
+			cadir := GinkgoT().TempDir()
+			holdStore(cadir)
+
+			rec := &recordingBackend{base: storage.NewFilesystemBackend(cadir)}
+			rt := newRuntime(rec)
+
+			err := holdInstanceLock(ctx, rt)
+			var locked *storage.StoreLockedError
+			Expect(errors.As(err, &locked)).To(BeTrue())
+
+			// No release was registered, so Close must still close the backend
+			// exactly once and must not try to unlock a lock never taken.
+			Expect(rt.Close()).To(Succeed())
+			Expect(rec.events()).To(Equal([]string{"close"}))
+		})
+	})
+
+	Describe("the offline subcommands that share holdInstanceLock", func() {
+		// generate is covered above. These are the other two call sites, which
+		// exercised no lock behaviour at all.
+		It("refuses csr while another instance holds the store", func() {
+			caDir := GinkgoT().TempDir()
+			bootstrapCAInDir(caDir, "puppet.example.com")
+			holdStore(caDir)
+
+			_, _, err := runCSRStreams("--cadir", caDir,
+				"--out", filepath.Join(GinkgoT().TempDir(), "ca-request.pem"))
+
+			Expect(err).To(MatchError(ContainSubstring("already running against this store")))
+			Expect(err).To(MatchError(ContainSubstring("pid " + strconv.Itoa(os.Getpid()))))
+		})
+
+		It("refuses import-ca-cert while another instance holds the store", func() {
+			caDir := GinkgoT().TempDir()
+			bootstrapCAInDir(caDir, "puppet.example.com")
+			holdStore(caDir)
+
+			_, err := runImport("--cadir", caDir,
+				"--cert-bundle", filepath.Join(caDir, "ca_crt.pem"))
+
+			Expect(err).To(MatchError(ContainSubstring("already running against this store")))
+			Expect(err).To(MatchError(ContainSubstring("pid " + strconv.Itoa(os.Getpid()))))
+		})
+	})
+
+	Describe("the server's own startup", func() {
+		It("refuses to start, through the command an operator actually runs", func() {
+			// Every other spec here drives the mechanism. This one drives the top
+			// level: the refusal has to survive flag parsing, config resolution
+			// and role dispatch to reach the operator as a non-zero exit.
+			caDir := GinkgoT().TempDir()
+			bootstrapCAInDir(caDir, "puppet.example.com")
+			holdStore(caDir)
+
+			cmd := newRootCmd()
+			cmd.SetOut(GinkgoWriter)
+			cmd.SetErr(GinkgoWriter)
+			cmd.SetArgs([]string{"--cadir", caDir, "--host", "127.0.0.1", "--port", "0"})
+
+			// Bounded rather than called directly, because of what sits
+			// immediately after the check: if enforcement regressed, the next
+			// thing this command does is fork the launcher and supervise it for
+			// ever. A spec that hangs on regression is worse than one that
+			// fails, and a plain Execute() here does exactly that -- confirmed
+			// by mutating the guard away, which hung the run rather than
+			// reporting anything.
+			done := make(chan error, 1)
+			go func() { done <- cmd.Execute() }()
+
+			var err error
+			Eventually(done, "30s").Should(Receive(&err),
+				"the refusal must come before the launcher forks; a hang here means it does not")
+			Expect(err).To(MatchError(ContainSubstring("already running against this store")),
+				"a second server must be refused before it forks anything")
+			Expect(err).To(MatchError(ContainSubstring("stop the running one first")))
+		})
+
+		It("refuses under --daemon instead of reporting success", func() {
+			// --daemon discards the child's stdout and stderr, so a refusal
+			// raised there reaches nobody: the operator is told the CA started,
+			// gets exit 0, and the child dies in silence. The one deployment
+			// shape most likely to hit this conflict must not be the one that
+			// hides it.
+			caDir := GinkgoT().TempDir()
+			bootstrapCAInDir(caDir, "puppet.example.com")
+			holdStore(caDir)
+
+			cmd := newRootCmd()
+			var out bytes.Buffer
+			cmd.SetOut(&out)
+			cmd.SetErr(GinkgoWriter)
+			cmd.SetArgs([]string{"--cadir", caDir, "--host", "127.0.0.1", "--port", "0", "--daemon"})
+
+			err := cmd.Execute()
+			Expect(err).To(MatchError(ContainSubstring("already running against this store")))
+			Expect(out.String()).NotTo(ContainSubstring("started in background"),
+				"reporting a background start for a process that was refused is the failure")
+		})
+	})
+
 	Describe("the isolated child roles", func() {
 		// The reason the lock is taken before the role dispatch and not in
 		// resolveRuntime. With PUPPET_CA_ROLE unset the process is either the
@@ -188,3 +322,48 @@ var _ = Describe("the store instance lock", func() {
 		)
 	})
 })
+
+// recordingBackend notes the order in which the store is given back: its own
+// Close, and the release of the store-wide lock through the unlocker it wraps.
+type recordingBackend struct {
+	storage.Backend
+	base *storage.FilesystemBackend
+
+	mu  sync.Mutex
+	log []string
+}
+
+func (b *recordingBackend) note(event string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.log = append(b.log, event)
+}
+
+func (b *recordingBackend) events() []string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return append([]string(nil), b.log...)
+}
+
+func (b *recordingBackend) Close() error {
+	b.note("close")
+	return b.base.Close()
+}
+
+func (b *recordingBackend) AcquireInstanceLock() (storage.Unlocker, error) {
+	ul, err := b.base.AcquireInstanceLock()
+	if err != nil {
+		return nil, err
+	}
+	return &recordingUnlocker{backend: b, wrapped: ul}, nil
+}
+
+type recordingUnlocker struct {
+	backend *recordingBackend
+	wrapped storage.Unlocker
+}
+
+func (u *recordingUnlocker) Unlock() error {
+	u.backend.note("unlock")
+	return u.wrapped.Unlock()
+}

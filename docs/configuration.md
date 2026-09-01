@@ -1237,7 +1237,8 @@ csr_pem=$(cat)
                       the first supersession) — see "Delayed supersession" above
   signed/             Issued certificates
   requests/           Pending CSRs
-  locks/              Same-host lock files (empty, mode 0600) — see below
+  locks/              Same-host lock files (mode 0600; empty but for the store-wide
+                      instance lock, which records its holder) — see below
   private/
     ca_key.pem              CA private key (mode 0600; encrypted PEM when --encrypt-ca-key)
     .ca_key_passphrase      Auto-generated passphrase file (mode 0600; only when --encrypt-ca-key

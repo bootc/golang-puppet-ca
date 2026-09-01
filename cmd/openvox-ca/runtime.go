@@ -140,6 +140,23 @@ func lockStoreInstance(ctx context.Context, cfg *serverConfig) (storage.Unlocker
 	return rt.Store.AcquireInstanceLock(ctx)
 }
 
+// preflightInstanceLock reports whether another instance already holds the
+// store, without keeping the lock.
+//
+// For the one caller that is about to hand startup to a process whose
+// diagnostics nobody will read: `--daemon` discards the child's stderr, so a
+// refusal raised there reaches no one. Taking the lock and immediately
+// releasing it answers the question while there is still somewhere to print the
+// answer. It is a check, not a guarantee -- the child takes the real lock, and
+// the gap between the two belongs to whoever wants it.
+func preflightInstanceLock(ctx context.Context, cfg *serverConfig) error {
+	ul, err := lockStoreInstance(ctx, cfg)
+	if err != nil {
+		return err
+	}
+	return ul.Unlock()
+}
+
 // holdInstanceLock takes the store's instance lock and ties its release to rt,
 // for callers that already hold a runtime.
 //
