@@ -20,12 +20,15 @@
 package ca
 
 import (
+	"bytes"
 	"context"
 	"crypto"
 	"crypto/x509"
 	"encoding/pem"
 	"fmt"
 	"io"
+	"log/slog"
+	"math/big"
 	"strings"
 	"sync"
 	"time"
@@ -35,10 +38,11 @@ import (
 	"github.com/voxpupuli/openvox-ca/internal/storage"
 )
 
-// drainDueLocked is the seam issue #176 replaces when it batches the CRL
-// re-sign. These specs pin the contract that replacement has to keep, so the
-// batched version is checked against a property rather than against the shape
-// of the loop it replaces.
+// drainDueLocked is the batched drain issue #176 produced: one CRL read, one
+// signature and one write for all the due entries, where it used to be one of
+// each per entry. These specs state the contract that batching had to keep, and
+// they were written against the per-entry loop before it was replaced — so they
+// check a property rather than the shape of either implementation.
 //
 // The property is drainOutcome's total: every entry handed in comes back in
 // exactly one disposition. An entry that falls out of all four is a certificate
@@ -209,11 +213,23 @@ var _ = Describe("drainDueLocked", func() {
 		// of its entries unrevocable.
 		Expect(store.UpdateCRL(ctx, []byte("not a valid CRL"))).To(Succeed())
 		due := []supersededEntry{entry(0), entry(1)}
+		before := myCA.CRLUpdateFailures()
 		out := drain(ctx, due)
 
 		Expect(accounted(out)).To(Equal(len(due)))
 		Expect(out.failed).To(HaveLen(2), "a failed revocation must be retried, so it stays listed")
 		Expect(out.revoked).To(BeZero())
+
+		// The cardinality this PR told operators to expect. Two entries failed
+		// together and the counter moved once, because one re-sign covers the
+		// batch — mixin/alerts.libsonnet and docs/metrics.md both say a rising
+		// puppetca_crl_update_failures_total counts failed CRL amendments
+		// rather than certificates left unrevoked, and nothing else pins that.
+		// Equal, not BeNumerically(">"): counting once per entry here is
+		// precisely the pre-batch behaviour, and it would satisfy a
+		// greater-than.
+		Expect(myCA.CRLUpdateFailures()).To(Equal(before+1),
+			"a failed pass must move crl_update_failures once, not once per due entry")
 	})
 
 	It("returns an empty outcome for no entries", func() {
@@ -294,6 +310,29 @@ var _ = Describe("drainDueLocked", func() {
 		return serials
 	}
 
+	// captureLogs collects what fn logs, the same way revokeserial_test.go does.
+	captureLogs := func(fn func()) string {
+		var buf bytes.Buffer
+		orig := slog.Default()
+		slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})))
+		defer slog.SetDefault(orig)
+		fn()
+		return buf.String()
+	}
+
+	// crlEntryTimes maps each canonical serial on the stored CRL to the
+	// revocation time recorded for it.
+	crlEntryTimes := func() map[string]time.Time {
+		GinkgoHelper()
+		stored, err := myCA.parseStoredCRL(ctx)
+		Expect(err).NotTo(HaveOccurred())
+		times := make(map[string]time.Time, len(stored.own.RevokedCertificateEntries))
+		for _, e := range stored.own.RevokedCertificateEntries {
+			times[serialHexStr(e.SerialNumber)] = e.RevocationTime
+		}
+		return times
+	}
+
 	// crlNumber is the sequence number of the stored CRL. signCRLLocked bumps
 	// it by exactly one per re-sign, so its delta counts CRL writes the way
 	// countingCAKey counts signatures.
@@ -365,6 +404,103 @@ var _ = Describe("drainDueLocked", func() {
 		Expect(counter.count()).To(BeZero(), "nothing changed, so nothing may be signed")
 		Expect(crlNumber()).To(Equal(before), "and nothing may be written")
 		Expect(crlSerials()).To(HaveLen(2), "and no entry may be appended twice")
+	})
+
+	// The mixed batch: some serials already on the CRL, some not. Every other
+	// spec here drives one extreme or the other — all new, or all already
+	// listed — and the dedup loop's two arms only meet in one call in this
+	// case. It is also the realistic recovery shape: a replica that wrote the
+	// CRL and then failed to prune the pending list leaves an already-revoked
+	// serial due again beside genuinely new ones on the next pass.
+	It("appends only the new serials when the batch overlaps the CRL", func() {
+		// Revoke leaf 0 on its own, so the second drain meets it already listed.
+		Expect(drain(ctx, []supersededEntry{entry(0)}).revoked).To(Equal(1))
+		wasRevokedAt := crlEntryTimes()[entry(0).Serial]
+		Expect(wasRevokedAt).NotTo(BeZero(), "the setup must actually have revoked leaf 0")
+
+		counter := countSignatures()
+		beforeNumber := crlNumber()
+		out := drain(ctx, []supersededEntry{entry(0), entry(1)})
+
+		Expect(out.revoked).To(Equal(2),
+			"both entries name a certificate that is on the CRL once this returns, so both "+
+				"may be pruned from the pending list")
+		Expect(out.failed).To(BeEmpty())
+
+		// One signature, not zero and not two: the batch has something new to
+		// add, so the appended==0 short-circuit must not fire, and the entry it
+		// already had must not be appended again.
+		Expect(counter.count()).To(Equal(1),
+			"a batch with anything new in it re-signs exactly once")
+		Expect(crlNumber()).To(Equal(beforeNumber + 1))
+
+		listed := crlSerials()
+		Expect(listed).To(ContainElement(entry(1).Serial),
+			"the new entry must be appended: "+entry(1).Serial)
+		Expect(listed).To(ContainElement(entry(0).Serial),
+			"and the one already listed must survive the re-sign: "+entry(0).Serial)
+		Expect(listed).To(HaveLen(2),
+			"exactly one entry added; a second copy of the already-listed serial is the "+
+				"unbounded-growth defect the dedup exists to prevent")
+
+		// The re-sign must carry the entry it already had through unchanged
+		// rather than rebuilding it at the current time.
+		Expect(crlEntryTimes()[entry(0).Serial]).To(Equal(wasRevokedAt),
+			"re-revoking a listed serial must not restamp it on the CRL")
+	})
+
+	// The revocation time appendCRLEntriesLocked reports back, which is what
+	// drainDueLocked hands markCertRevokedIndex. Asserted on the returned map
+	// rather than through a drain, deliberately: the index projection is where
+	// a restamp would show, and this fixture's filesystem backend has no
+	// certificate index, so MarkCertRevoked is a no-op and a spec driving the
+	// drain would assert nothing. The CRL check above cannot stand in for it —
+	// the CRL keeps the original entry either way.
+	It("reports the original revocation time for a serial the CRL already listed", func() {
+		Expect(drain(ctx, []supersededEntry{entry(0)}).revoked).To(Equal(1))
+		wasRevokedAt := crlEntryTimes()[entry(0).Serial]
+		Expect(wasRevokedAt).NotTo(BeZero())
+
+		var got map[string]time.Time
+		Expect(store.WithLock(ctx, lockNameCRL, func() error {
+			myCA.mu.Lock()
+			defer myCA.mu.Unlock()
+			var err error
+			got, err = myCA.appendCRLEntriesLocked(ctx,
+				[]*big.Int{leaves[0].SerialNumber, leaves[1].SerialNumber})
+			return err
+		})).To(Succeed())
+
+		Expect(got).To(HaveKey(entry(0).Serial))
+		Expect(got[entry(0).Serial]).To(Equal(wasRevokedAt),
+			"a serial already on the CRL must report when it was revoked, not when this "+
+				"pass noticed it; the certificate index records what this returns")
+		Expect(got[entry(1).Serial]).NotTo(Equal(wasRevokedAt),
+			"and a serial this call appended must carry this call's timestamp")
+	})
+
+	// Batching collapsed N revocations into one re-sign, and it must not also
+	// collapse N identities into a count. These certificates are still valid
+	// credentials past the window their supersession granted them, and
+	// PuppetCASupersedeFailing's runbook closes by telling an operator to
+	// retire what the sweep will not with `openvox-ca-ctl revoke --serial
+	// <hex>` — a serial the failure line has to carry for that instruction to
+	// be followable. The per-entry loop named each one as it failed.
+	It("names every certificate it could not revoke, not just how many", func() {
+		Expect(store.UpdateCRL(ctx, []byte("not a valid CRL"))).To(Succeed())
+		due := []supersededEntry{entry(0), entry(1)}
+
+		var out drainOutcome
+		logs := captureLogs(func() { out = drain(ctx, due) })
+		Expect(out.failed).To(HaveLen(2), "the batch must actually have failed")
+
+		for _, e := range due {
+			Expect(logs).To(ContainSubstring(e.Serial),
+				"the operator's remedy takes this serial as its argument, so the failure "+
+					"line must carry it: "+e.Serial+" ("+e.Subject+")")
+			Expect(logs).To(ContainSubstring(e.Subject),
+				"and the subject is what an operator recognises: "+e.Subject)
+		}
 	})
 
 	// Inventory serials are not canonical — a store migrated from Puppet

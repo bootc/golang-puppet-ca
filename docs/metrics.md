@@ -311,8 +311,8 @@ sweep is not completing — check the failure counter.
 > that renewal but is left for the sweep to count, so one corrupt blob cannot
 > become a counter storm on a busy CA; a sweep pass that could not take the CRL
 > lock or write the list back; a predecessor a subject revocation could not
-> retire; and each pass that left an entry unrevoked, deferred one for want of
-> budget, or discarded one whose serial it could never revoke. A pass counts
+> retire; and each pass that left an entry unrevoked or discarded one whose
+> serial it could never revoke. A pass counts
 > once however many entries it failed on, so this is a count of bad passes
 > rather than of lost certificates.
 >

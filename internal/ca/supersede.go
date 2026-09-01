@@ -355,12 +355,17 @@ func (c *CA) ReconcileSuperseded(ctx context.Context) (int, error) {
 		}()
 		revoked = outcome.revoked
 
-		// Deferrals count too. Once the entries survive the pass, a backlog the
-		// sweep cannot keep up with looks like a high pending gauge that never
-		// falls and nothing else — and the gauge's own guidance sends the
-		// operator to this counter. A pass that left certificates past their
-		// window unrevoked is the condition this counter exists to surface,
-		// whichever of the three reasons it was.
+		// A pass that left certificates past their window unrevoked is the
+		// condition this counter exists to surface, for either of the two
+		// reasons that can now produce one: a batch that could not be written,
+		// and an entry discarded as unrevocable. Without it a backlog looks like
+		// a high pending gauge that never falls and nothing else — and the
+		// gauge's own guidance sends the operator to this counter.
+		//
+		// outcome.deferred is still tested rather than dropped from the
+		// condition, because drainOutcome keeps the field for a future
+		// implementation that has to stop part-way; see its godoc. It is always
+		// empty today, so the middle term never fires.
 		if len(outcome.failed) > 0 || len(outcome.deferred) > 0 || outcome.discarded > 0 {
 			c.supersedeFailures.Add(1)
 		}
@@ -368,9 +373,10 @@ func (c *CA) ReconcileSuperseded(ctx context.Context) (int, error) {
 		// budget, and that is exactly when a partial pass is most likely. The
 		// write-back has to survive it or the pass loses its own bookkeeping:
 		// entries it revoked would stay on the list, the pending gauge would
-		// never fall, and every later pass would re-walk them — each re-walk
-		// still costing a CRL read per entry — while holding the CRL lock for
-		// the full budget. Same reasoning, and the same modest extra budget, as
+		// never fall, and every later pass would re-walk them — a re-walk that
+		// now costs one CRL read for the whole pass rather than one per entry,
+		// but is still a pass that can never finish — while holding the CRL lock
+		// for the full budget. Same reasoning, and the same modest budget, as
 		// CleanupExpiredCerts gives its post-prune cleanup: the CRL lock is
 		// still held, and a concurrent revocation waits on it with a LockTimeout
 		// of its own.
@@ -628,12 +634,33 @@ func (c *CA) drainDueLocked(ctx context.Context, due []supersededEntry) drainOut
 		// so none of these is on the CRL. They stay listed and the next pass
 		// retries them, which is what the per-entry loop did for each failure
 		// it saw.
-		slog.Warn("Could not revoke superseded certificates; will retry",
-			"entries", len(batch), "error", err)
+		//
+		// Every affected identity is named, not just counted. These
+		// certificates are still valid credentials past the window their
+		// supersession granted them, so "which ones" is the question
+		// PuppetCASupersedeFailing sends an operator to the log to answer, and
+		// that alert's runbook closes by telling them to retire what the sweep
+		// will not with `openvox-ca-ctl revoke --serial <hex>` — which needs a
+		// serial this line has to carry. The per-entry loop named each one as
+		// it failed; collapsing N revocations into one re-sign must not also
+		// collapse N identities into a count.
+		//
+		// Both slices, in the same order, on the one line the runbook greps
+		// for: the serial is what the remedy takes as an argument and the
+		// subject is what an operator recognises. One line rather than N keeps
+		// the alert text accurate, and is less log volume than the success path
+		// below already emits for the same batch.
+		failedSerials := make([]string, 0, len(batch))
+		failedSubjects := make([]string, 0, len(batch))
 		out.failed = make([]supersededEntry, 0, len(batch))
 		for _, d := range batch {
+			failedSerials = append(failedSerials, d.canon)
+			failedSubjects = append(failedSubjects, d.entry.Subject)
 			out.failed = append(out.failed, d.entry)
 		}
+		slog.Warn("Could not revoke superseded certificates; will retry",
+			"entries", len(batch), "serials", failedSerials,
+			"subjects", failedSubjects, "error", err)
 		return out
 	}
 
