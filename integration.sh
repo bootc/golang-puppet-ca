@@ -173,16 +173,16 @@ BRANCHES=(
 
   # Open non-draft PRs. origin/ refs so each build integrates what is on the PR
   # rather than a stale local copy, and so a head moving needs no edit here.
-  origin/fix/init-bootstrap-reentrancy    # PR #283 — issue #201
   origin/feat/one-instance-unless-distributed-locking  # PR #284
-  origin/fix/ocsp-signing-concurrency-bound  # PR #285
-  origin/fix/281-first-start-attempt-logs # PR #288
-  origin/perf/batch-supersession-crl-resign  # PR #289 — issue #176
+  origin/issue-258-chart-docs             # PR #296 — issue #258
 
-  # The packaging pair, last because #282 is the furthest behind and still
-  # moving. They are the ONLY pair that conflicts with each other — on
-  # magefile.go — so they sit adjacent and it surfaces once. #266 is approved
-  # and held behind #282, so they land together anyway.
+  # Collide on cmd/openvox-ca/config.go, so they sit together.
+  origin/fix/ocsp-signing-concurrency-bound  # PR #285
+  origin/fix/293-allow-subject-alt-names  # PR #294 — issue #293
+
+  # The packaging pair, collides on magefile.go. Last because #266 is the
+  # furthest behind main by a wide margin and #282 is still moving; #266 is
+  # approved and held behind #282, so they land together anyway.
   origin/feature/release-packaging        # PR #266
   origin/feature/package-payload          # PR #282
 )
@@ -190,9 +190,9 @@ BRANCHES=(
 # LEFT THE LIST, all merged, so their code arrives via origin/main now:
 # 2026-08-30  #221 #259 #262 #263 #264
 # 2026-08-31  #224 #260 #261 #267 #189, then #166 #168 #212 #265
+# 2026-09-02  #283 #288 #289
 #
-# #165 and #167 are CLOSED and not returning. They sat here commented out as
-# drafts awaiting a rebase, which is no longer what they are.
+# #165 and #167 are CLOSED and not returning.
 #
 # MEMBERSHIP is the only thing that needs editing here. Heads move constantly
 # and cost nothing, because the entries are refs rather than shas — so "wait
