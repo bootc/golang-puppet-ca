@@ -516,11 +516,16 @@ var _ = Describe("Delayed supersession", func() {
 
 	Describe("ReconcileSuperseded when a revocation fails", func() {
 		// The retry half of the sweep's failure handling. The alert text tells
-		// operators to distinguish "Could not revoke superseded certificate"
+		// operators to distinguish "Could not revoke superseded certificates"
 		// (recorded, will retry) from "Discarding" (gone for good), and only the
 		// second was pinned. A change that dropped failed entries instead of
 		// carrying them forward would turn a retryable failure into a
 		// permanently valid credential and move no assertion.
+		//
+		// This is also the carry-forward case #176 had to preserve when it
+		// batched the re-sign. Batched, the failure is all-or-nothing rather
+		// than per entry — but where the entries end up is unchanged, which is
+		// the part that decides whether a certificate stays tracked.
 		It("carries the entry forward rather than dropping it, and counts the pass once", func() {
 			first := issue("node-r")
 			second := issue("node-s")
@@ -528,9 +533,9 @@ var _ = Describe("Delayed supersession", func() {
 				{Serial: hexSerial(first.SerialNumber), Subject: "node-r", RevokeAt: time.Now().UTC().Add(-time.Minute)},
 				{Serial: hexSerial(second.SerialNumber), Subject: "node-s", RevokeAt: time.Now().UTC().Add(-time.Minute)},
 			})
-			// An unparseable CRL makes revokeSerialLocked fail for every entry
-			// without making any of them unrevocable — the distinction the two
-			// arms turn on.
+			// An unparseable CRL fails the batch's own read without making any
+			// of its entries unrevocable — the distinction the two arms turn
+			// on.
 			Expect(store.UpdateCRL(ctx, []byte("not a valid CRL"))).To(Succeed())
 			before := myCA.SupersedeFailures()
 
@@ -720,13 +725,18 @@ var _ = Describe("Delayed supersession", func() {
 		})
 	})
 
-	// The deferral arm. Every other sweep spec runs on context.Background(), so
-	// the reserve is never reached and this path shipped untested in round 1 —
-	// which is how it shipped erasing the entries it claimed to defer.
-	// ReconcileSuperseded's own WithTimeout keeps an earlier parent deadline, so
-	// a caller deadline below the reserve reaches the branch with no sleeping.
-	Describe("ReconcileSuperseded when the budget runs low", func() {
-		It("leaves the entries it defers on the list rather than erasing them", func() {
+	// This used to be the deferral arm: below the reserve the per-entry loop
+	// retired one entry and carried the rest to the next pass, because N
+	// entries cost N CRL re-signs and a backlog could not fit in one lock hold.
+	// #176 collapsed those into one re-sign, so the reserve is gone and a pass
+	// on the same deadline clears the whole backlog. The spec is kept, aimed at
+	// the property that replaced it — every other sweep spec runs on
+	// context.Background(), so without this one nothing exercises the sweep
+	// with a deadline near enough to matter at all. ReconcileSuperseded's own
+	// WithTimeout keeps an earlier parent deadline, so the short context here
+	// really is the one the pass runs under.
+	Describe("ReconcileSuperseded on a deadline that used to ration the pass", func() {
+		It("drains the whole backlog rather than deferring part of it", func() {
 			first := issue("node-y")
 			second := issue("node-z")
 			writePending([]pendingEntry{
@@ -735,31 +745,27 @@ var _ = Describe("Delayed supersession", func() {
 			})
 			before := myCA.SupersedeFailures()
 
-			// Below the reserve, so the loop breaks after the first entry.
+			// Below what the old reserve check (LockTimeout/2) allowed, so the
+			// pre-batch sweep revoked node-y here and deferred node-z.
 			shortCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 			defer cancel()
 			count, err := myCA.ReconcileSuperseded(shortCtx)
 			Expect(err).NotTo(HaveOccurred())
 
-			// Always at least one: a pass that revoked nothing while entries
-			// were due would make no progress, every time, forever.
-			Expect(count).To(Equal(1), "a pass must attempt at least one entry even with no budget left")
-			Expect(revoked(first.SerialNumber)).To(BeTrue(),
-				"oldest-first: the entry superseded longest ago is the one retired")
+			Expect(count).To(Equal(2),
+				"one re-sign covers both entries, so a deadline that used to stop the pass "+
+					"after the first no longer rations it")
+			// Anchored on each serial, so a batch that lost one fails here
+			// naming it rather than passing on a count that happens to match.
+			Expect(revoked(first.SerialNumber)).To(BeTrue(), "node-y must be on the CRL")
+			Expect(revoked(second.SerialNumber)).To(BeTrue(), "node-z must be on the CRL")
 
-			// The deferred entry is the whole point. Anchored on its serial, so
-			// this fails for the deferral and not for some other survivor.
-			entries := pending()
-			Expect(entries).To(HaveLen(1),
-				"an entry the budget deferred must still be on the list for the next pass; "+
-					"nothing else records that it is owed a revocation")
-			Expect(entries[0].Serial).To(Equal(hexSerial(second.SerialNumber)),
-				"and it must be the deferred entry, not some other survivor")
-			Expect(revoked(second.SerialNumber)).To(BeFalse())
-
-			Expect(myCA.SupersedeFailures()).To(Equal(before+1),
-				"a deferred backlog must be counted, or a sweep that cannot keep up looks "+
-					"identical to one that is keeping up")
+			Expect(pending()).To(BeEmpty(),
+				"an entry that is on the CRL is no longer owed a revocation, so the pass "+
+					"must prune it")
+			Expect(myCA.SupersedeFailures()).To(Equal(before),
+				"a pass that left nothing unrevoked is not a failure, and counting it as one "+
+					"would fire PuppetCASupersedeFailing on every healthy sweep")
 		})
 	})
 

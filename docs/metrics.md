@@ -311,13 +311,13 @@ sweep is not completing — check the failure counter.
 > that renewal but is left for the sweep to count, so one corrupt blob cannot
 > become a counter storm on a busy CA; a sweep pass that could not take the CRL
 > lock or write the list back; a predecessor a subject revocation could not
-> retire; and each pass that left an entry unrevoked, deferred one for want of
-> budget, or discarded one whose serial it could never revoke. A pass counts
+> retire; and each pass that left an entry unrevoked or discarded one whose
+> serial it could never revoke. A pass counts
 > once however many entries it failed on, so this is a count of bad passes
 > rather than of lost certificates.
 >
 > The cases differ in what you have to do about them, and the log line is what
-> tells them apart. `Could not revoke superseded certificate` retries on the
+> tells them apart. `Could not revoke superseded certificates` retries on the
 > next pass by itself. `failed to retire replaced certificate` and `Discarding`
 > are both gone for good — nothing will rediscover them, and the certificate
 > stays valid for its full remaining life. Retire those by serial with
@@ -330,9 +330,12 @@ sweep is not completing — check the failure counter.
 > A sweep that cannot read the list at all counts once per pass and omits
 > `puppetca_supersede_pending` rather than reporting zero, so the two signals
 > cannot both read clean while the list stops draining. A sweep that *can* read
-> it but runs out of budget counts too, and logs `ran out of budget; deferring
-> the rest to the next pass` — that is the shape a backlog draining slower than
-> it accrues takes, and the entries it defers stay on the list.
+> it but cannot amend the CRL counts once per pass too, not once per entry: the
+> re-sign covers the whole pass, so every certificate that pass attempted stays
+> on the list and is retried together. A pending gauge that does not fall while
+> this counter rises is a sweep failing outright rather than one falling behind
+> — the sweep no longer paces itself, so there is no longer a backlog it
+> declines to attempt.
 
 ### Client trust domains
 
