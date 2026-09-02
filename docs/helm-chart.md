@@ -515,8 +515,26 @@ networkPolicy:
             protocol: TCP
 ```
 
-Turning egress on means you must enumerate everything the CA talks to — its
-storage backend, OpenBao, the Kubernetes API. DNS is always allowed.
+Turning egress on means you must enumerate everything **the pod** talks to. DNS
+is always allowed; everything else is yours to list. Two things about that are
+easy to get wrong:
+
+- **The policy governs the whole pod, not the server container.** A
+  `NetworkPolicy` selects pods, so every `initContainers` and `extraContainers`
+  entry you add is bound by the same rules. A sidecar that fetches something
+  over the network — an upstream CRL chain is the common case, see [trust and
+  revocation across CAs](#trust-and-revocation-across-cas) — needs its own
+  destination listed, or it fails with a timeout and no file, which several of
+  these features read as "nothing to say" rather than as an error.
+- **OpenBao's Kubernetes auth needs no egress to the Kubernetes API.** The pod
+  presents its own projected ServiceAccount token, which it reads from a mounted
+  file, and OpenBao performs the `TokenReview` itself — so the API server is
+  OpenBao's peer here, not the CA's. Egress to the API is needed for
+  [Kubernetes export](#kubernetes-export), which really does call it. Listing it
+  unconditionally opens a hole the deployment does not use.
+
+So the list is: your storage backend, OpenBao if the key lives there, anything
+your sidecars fetch, and the Kubernetes API only if you export.
 
 ## Kubernetes export
 
@@ -698,6 +716,15 @@ the `crl-chain-refresh` job picks the change up within
 > file, because `subPath` is the reflex for mounting one file without hiding the
 > rest of a directory — and here the volume has a directory to itself, so there
 > is nothing to hide and no reason to reach for it.
+>
+> **`subPath` is the sharpest instance of a wider rule: whatever delivers this
+> file must refresh on the *CRL's* schedule, not on yours.** A ConfigMap of CRLs
+> committed to Git and applied with the release has the same silent ending
+> without `subPath` anywhere in sight — it is perfectly current the day you
+> apply it and goes stale on the upstream's publication interval thereafter,
+> reading successfully the whole time. Choosing a mount shape here means taking
+> ownership of a refresh mechanism; the shapes below differ mainly in who owns
+> it.
 
 Leave `defaultMode` alone. The chart's `podSecurityContext.fsGroup: 1000`
 makes the default `0644` projection readable to the unprivileged container; a
@@ -723,7 +750,8 @@ In Kubernetes the fix is a **native sidecar** — an `initContainer` with
 ```yaml
 extraVolumes:
   - name: upstream-crls
-    emptyDir: {}
+    emptyDir:
+      medium: Memory       # a shared tmpfs; never touches the node's disk
 extraVolumeMounts:
   - name: upstream-crls
     mountPath: /run/crl-chain
@@ -754,7 +782,7 @@ config:
   crl_chain_file: /run/crl-chain/upstream-crls.pem
 ```
 
-Three details in that carry the weight:
+Four details in that carry the weight:
 
 - **`test -s`, not `test -f`.** Probe for a *non-empty* file. A zero-byte file
   is a deliberate statement here — it means "publish nothing extra" — so a probe
@@ -764,10 +792,21 @@ Three details in that carry the weight:
   so a read never catches a partial write. A file not ending on a PEM block
   boundary is refused rather than acted on, and until the next complete write
   lands, revocation fails.
+- **A `startupProbe` and no `readinessProbe`.** The startup probe is what gates
+  the server; a readiness probe on the writer would be actively harmful, because
+  a sidecar's readiness feeds the pod's, so a later fetch failure would take a
+  perfectly healthy CA out of the Service. A stale chain is far better than no
+  CA: the writer's job is to block the *first* start, not to keep voting on the
+  pod's fitness afterwards.
 - **`initContainers` runs through `tpl`**, so the image can reference `.Values`
   and the chart's helpers if you would rather not hard-code it.
   `extraVolumeMounts` does **not** — it is the one member of this group that is
   passed through as written.
+
+If you have `networkPolicy.egress` enabled, the sidecar's own destination must
+be listed in it. The policy binds the whole pod, and a blocked fetch leaves no
+file at all — which this feature reads as "no statement" rather than as a
+failure, so nothing goes red. See [network policy](#network-policy).
 
 ### Trusting client certificates from another CA
 
@@ -801,6 +840,22 @@ with its own `crl_file`.
 **4. Put the anchor and the CRL in a Secret, and mount it.** Both files, one
 volume, no `subPath` — `crl_file` is re-read on a timer exactly as
 `crl_chain_file` is, so the trap above applies to it identically.
+
+> **`crl_file` does not cover the CA named beside it.** An operator who has
+> carefully wired up a `crl_file` will reasonably assume it covers the issuer in
+> the same block. It does not: it covers what that CA **issued**, never that CA
+> itself. The anchor is never revocation-checked, because it is trusted by
+> configuration rather than by anything it presents, and it has no issuer inside
+> the chain to attest for it. So **revoking a trusted domain is an operator
+> action** — remove or replace the `client_ca` entry and roll — and no CRL you
+> can put in that file will do it for you.
+
+This is also why the two features do not share a delivery path, despite both
+being "a file of CRLs". `crl_chain_file` publishes ancestors' CRLs outbound and
+accepts only CRLs signed by a certificate in this CA's own bundle;
+`client_ca[].crl_file` is a separate inbound mechanism, verified per entry
+against that entry's own anchors. Neither file can stand in for the other, and
+adding an issuer to one has no effect on the other.
 
 **5. Write the entry, and grant deliberately.** Both foreign grants default to
 off, so an entry with neither adds an issuer that can authenticate and do
