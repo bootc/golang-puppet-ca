@@ -224,7 +224,7 @@ which is exactly when this procedure is required.
 ## Diagnosing a failed compose suite
 
 When `test:puppet`, `test:puppetFIPS` or `test:backendsRedis` fails, the
-harness replays the tail of each stack service's container log to stderr
+harness replays each stack service's container log to stderr
 before tearing the stack down: the CA (both replicas for the Redis
 topology), the puppet master, OpenVoxDB, PostgreSQL, and Redis for the
 backend suite. `puppet-client` is the one exception, and there is nothing to
@@ -234,12 +234,54 @@ failing CI job is therefore self-sufficient — the TAP `not ok` line is
 followed by the containers' own account of what went wrong, which teardown
 would otherwise destroy.
 
+Each service is replayed in two views, and which one you want depends on how
+it failed. First its **first start attempt**, headed with what you are
+looking at:
+
+```
+# ---- first 4 of 244 log lines from openvox-ca (start attempt 1 of 81) ----
+```
+
+Then a tail of the newest lines beneath it. A service under
+`restart: on-failure` — the two CA replicas in
+`test/compose-backends-redis.yml` are the only ones under `test/` carrying it
+— has a log that is several concatenated start attempts, and it is the first
+that holds the reason it never came up; everything behind it is the futile
+retries. A tail cannot reach that first attempt, and a deeper tail moves it
+further away rather than closer, so the depth is not the knob to reach for
+(#281). The tail is kept because it remains the right view for the other
+shape of failure, a service that failed once, late, without restarting, and
+it is suppressed when the log is short enough that it would only reprint the
+head.
+
+The attempt boundary comes from the log's own content, because compose
+concatenates restarts with no separator of its own: a restart re-runs the
+entrypoint from the top and replays the log's opening line, which makes that
+line both the banner and the attempt counter. When it never recurs the count
+is one — the right answer for every service without a `restart:` policy.
+
+Read the attempt count before you read the attempt. Under `restart:
+on-failure` a first attempt that aborted is not by itself the failure: a CA
+replica that loses the bootstrap race is *expected* to abort and recover on
+its next attempt, which is why that policy is there. What the first attempt
+gives you is the reason the process gave, which a tail had destroyed; it does
+not tell you the run failed because of it.
+
 To keep the stack for interactive inspection instead, run the script
 directly with `--up --keep` and use `compose logs`. The teardown dump is
 deliberately skipped in that mode: nothing is being destroyed, so the logs
 are still there to be read. A readiness timeout still prints the timed-out
 service's log either way, since that is the one thing worth reading
 immediately.
+
+Both harnesses dump through one shared helper, `test/failure-log.sh`, which
+takes the compose command as an argument rather than reading either one's
+`_COMPOSE` array. `mage test:failureLogHelpers` is its regression suite: it
+needs bash and no container runtime, runs on the host in under a second, and
+CI runs it in the unit job rather than inside any one compose suite. It runs
+*alongside* those suites, not ahead of them: it does not gate them, because a
+broken dump cannot change whether a compose suite passes — only what that
+suite prints when it fails.
 
 `test:migration` dumps on failure too, but what it dumps is not a container
 log. Its old Puppet Server is a compose service whose output already reaches
@@ -249,3 +291,9 @@ go to a file, and the suite replays the tail to stderr from its `EXIT` trap
 whenever the run exits non-zero or any assertion failed — including the early
 exit taken when the server never becomes ready, which is the case that most
 needs it.
+
+A tail is the whole story there, and deliberately so: that process is started
+exactly once, `test/compose-migration.yml` declares no `restart:` policy, and
+so there is one attempt for a tail to reach. The distinction that matters when
+reading any of these dumps is whether the service restart-loops, not whether
+the code that dumps it happens to call `tail`.

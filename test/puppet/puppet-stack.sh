@@ -12,17 +12,32 @@
 #
 # Output: TAP format.  Exit 0 on all pass, exit 1 on any failure.
 #
-# On failure, an --up run replays the tail of every stack service's container
-# log to stderr (all but puppet-client, whose log is empty by construction)
-# before tearing the stack down, since teardown is
-# what makes those logs unrecoverable. --up --keep skips that teardown dump and
-# leaves the containers up for `compose logs` instead; a readiness timeout
-# still prints the timed-out service's own log either way.
+# On failure, an --up run replays every stack service's container log to
+# stderr (all but puppet-client, whose log is empty by construction) before
+# tearing the stack down, since teardown is what makes those logs
+# unrecoverable. Each service is replayed from its *first* start attempt --
+# under run-puppet-stack-on-redis.sh this same script drives CA replicas that
+# restart on failure, so a tail alone would only ever show the last futile
+# attempts (#281) -- with a tail beneath it for a service that failed late
+# without restarting. --up --keep skips that teardown dump and leaves the
+# containers up for `compose logs` instead; a readiness timeout still prints
+# the timed-out service's own log either way.
 #
 # NOTE: Group 6 revokes the client cert.  clean_client_cert() revokes any
 # stale cert and clears the client SSL dir before Groups 3 and 8.
 
 set -uo pipefail
+
+# Failure-log dump helpers, shared with test/backends/redis-stack.sh.
+#
+# Sourced by a path relative to the working directory rather than to
+# ${BASH_SOURCE[0]}: test/backends/run-puppet-stack-on-redis.sh execs a
+# sed-rewritten *copy* of this script from a temp directory, where a
+# source-relative path would not resolve. Both callers already require the
+# project root as the working directory -- every `compose -f` path below is
+# relative to it.
+# shellcheck source=test/failure-log.sh
+. test/failure-log.sh
 
 # -- Container engine / compose detection ----------------------------------
 if [[ -n "${CONTAINER_ENGINE:-}" ]]; then
@@ -177,33 +192,30 @@ run_master_agent() {
         "$@" 2>&1
 }
 
-# -- How much of each container's log to replay when the run fails ---------
-# One knob for every dump site, deliberately: when the readiness abort dumped
-# the timed-out service at its own shallower depth, the culprit ended up with
-# the least log of anything in the run.
-FAILURE_LOG_TAIL=200
-
 # -- Helper: replay a service's container logs to our stderr ---------------
 # Shared by the readiness aborts and cleanup()'s failure dump, both of which
-# need the container's own account of what went wrong. Deliberately a copy of
-# the helper in test/backends/redis-stack.sh rather than a shared sourced file:
-# these two harnesses already keep independent copies of their engine
-# detection, argument parsing and TAP helpers, and this helper is coupled to
-# each one's `_COMPOSE` array, so sharing it would mean sharing that too.
-# (test/migration/http-helpers.sh *is* sourced, by two files in its own
-# directory -- so "nothing under test/ is sourced" stopped being the reason
-# here as of #208. The coupling above is.)
+# need the container's own account of what went wrong.
+#
+# This used to be a deliberate copy of the helper in
+# test/backends/redis-stack.sh, on the grounds that it was coupled to each
+# harness's `_COMPOSE` array so sharing it would mean sharing that too. Issue
+# #281 was the cost of that: the same tail-only bug had to be fixed in both
+# copies, and one fix would have left the other. The shared version in
+# test/failure-log.sh takes the compose command as an argument, so the
+# coupling that was the reason is gone.
+#
+# It matters here and not only in the backends harness because
+# test/backends/run-puppet-stack-on-redis.sh runs a sed-rewritten copy of this
+# script against test/compose-backends-redis.yml, whose two CA replicas carry
+# `restart: on-failure` -- so the service this dumps really can be a stack of
+# concatenated start attempts, even though the puppet stack's own compose file
+# declares no restart policy. (Do not name that file here: the wrapper
+# sed-rewrites every mention of it, and a comment rewritten mid-sentence would
+# then assert the opposite of what it says.)
+#
+# To stderr, so it cannot corrupt the TAP stream a consumer is parsing.
 dump_logs() {  # service-name
-    local _svc="$1" _tail="$FAILURE_LOG_TAIL"
-    printf '# ---- last %s log lines from %s ----\n' "$_tail" "$_svc" >&2
-    # Send both the container's stdout and stderr to our stderr. Do NOT add
-    # `2>/dev/null`: with `>&2` alone, fd1 is redirected to the current stderr
-    # and fd2 already points there, so both streams reach the operator. A
-    # `2>/dev/null` would instead route the command's stderr to the bit-bucket
-    # -- and under `podman logs` a container's stderr (where Go services write
-    # their startup/abort diagnostics) is replayed to *our* stderr, so the very
-    # lines that explain the failed bootstrap would be discarded.
-    "${_COMPOSE[@]}" logs --tail "$_tail" "$_svc" >&2 || true
+    failure_log_dump "$1" "${_COMPOSE[@]}" >&2
 }
 
 # -- Every container worth hearing from when the run fails -----------------

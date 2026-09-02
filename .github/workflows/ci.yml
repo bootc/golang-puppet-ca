@@ -213,6 +213,23 @@ jobs:
         run: go install github.com/magefile/mage@v1.17.2
       - name: Run unit tests
         run: mage test:unit
+      # Host-side and sub-second, with no container runtime, so it rides in the
+      # cheapest job rather than inside the container jobs whose diagnostics it
+      # covers. It guards the failure-log dump both compose harnesses share, so
+      # pinning it to either the puppet or the backends job would have run it
+      # twice or covered one of them only.
+      #
+      # It does not gate those jobs, and that is deliberate rather than an
+      # oversight: this job and the compose jobs are siblings with no `needs:`
+      # edge, so a failure here appears beside them rather than stopping them.
+      # `needs:` would be right if a broken helper could change whether a
+      # compose suite passes -- the way test:migrationHelpers guards a retry
+      # bound its suite's assertions depend on -- but this one only decides
+      # what gets printed once something else has already failed. Gating would
+      # serialise the compose jobs behind this one on every green run to save
+      # compute on a rare red one.
+      - name: Run failure-log helper tests
+        run: mage test:failureLogHelpers
       - name: Coverage summary
         if: always()
         continue-on-error: true

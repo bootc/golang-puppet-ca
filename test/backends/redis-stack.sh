@@ -17,16 +17,25 @@
 #
 # Output: TAP format. Exit 0 on all pass, exit 1 on any failure.
 #
-# On failure, an --up run replays the tail of every stack service's container
-# log to stderr (all but puppet-client, whose log is empty by construction)
-# before tearing the stack down, since teardown is
-# what makes those logs unrecoverable. --up --keep skips that teardown dump and
+# On failure, an --up run replays every stack service's container log to
+# stderr (all but puppet-client, whose log is empty by construction) before
+# tearing the stack down, since teardown is what makes those logs
+# unrecoverable. Each service is replayed from its *first* start attempt --
+# the CA replicas restart on failure, so a tail alone would only ever show the
+# last futile attempts (#281) -- with a tail beneath it for a service that
+# failed late without restarting. --up --keep skips that teardown dump and
 # leaves the containers up for `compose logs` instead; a readiness timeout
 # still prints the timed-out service's own log either way.
 
 set -uo pipefail
 
 cd "$(dirname "$0")/../.." || exit 1
+
+# Failure-log dump helpers, shared with test/puppet/puppet-stack.sh. Sourced
+# by a path relative to the working directory the cd above just established,
+# matching how puppet-stack.sh sources it (see the note there).
+# shellcheck source=test/failure-log.sh
+. test/failure-log.sh
 
 COMPOSE_FILE="test/compose-backends-redis.yml"
 REDIS_PREFIX="openvox-ca-integ"
@@ -66,33 +75,20 @@ for arg in "$@"; do
     esac
 done
 
-# -- How much of each container's log to replay when the run fails ---------
-# One knob for every dump site, deliberately: when the readiness abort dumped
-# the timed-out service at its own shallower depth, the culprit ended up with
-# the least log of anything in the run. Deep enough matters most for the two
-# CA replicas, the only services here with restart: on-failure -- their log is
-# several concatenated start attempts, and it is the first one that holds the
-# reason.
-FAILURE_LOG_TAIL=200
-
 # -- Helper: replay a service's container logs to our stderr ---------------
 # Shared by the readiness aborts and the end-of-run failure dump, both of
 # which need the container's own account of what went wrong.
 #
-# A copy of this helper, the tail constant and dump_failure_logs below lives in
-# test/puppet/puppet-stack.sh (which explains why they are copied rather than
-# sourced) -- keep the two in step.
+# The depth knobs and the dump itself live in test/failure-log.sh, sourced
+# above, because this harness and test/puppet/puppet-stack.sh had a copy each
+# and issue #281 was true of both at once: they dumped a *tail*, and the two
+# CA replicas here are the only services under test/ with restart: on-failure,
+# so their log is several concatenated start attempts and it is the first one
+# -- the one a tail cannot reach -- that holds the reason.
+#
+# To stderr, so it cannot corrupt the TAP stream a consumer is parsing.
 dump_logs() {  # service-name
-    local _svc="$1" _tail="$FAILURE_LOG_TAIL"
-    printf '# ---- last %s log lines from %s ----\n' "$_tail" "$_svc" >&2
-    # Send both the container's stdout and stderr to our stderr. Do NOT add
-    # `2>/dev/null`: with `>&2` alone, fd1 is redirected to the current stderr
-    # and fd2 already points there, so both streams reach the operator. A
-    # `2>/dev/null` would instead route the command's stderr to the bit-bucket
-    # -- and under `podman logs` a container's stderr (where Go services write
-    # their startup/abort diagnostics) is replayed to *our* stderr, so the very
-    # lines that explain the failed bootstrap would be discarded.
-    "${_COMPOSE[@]}" logs --tail "$_tail" "$_svc" >&2 || true
+    failure_log_dump "$1" "${_COMPOSE[@]}" >&2
 }
 
 # -- Every container worth hearing from when the run fails -----------------
