@@ -248,6 +248,40 @@ func resolveSigningConcurrency(configured int) int {
 	return max(minSigningConcurrency, runtime.GOMAXPROCS(0))
 }
 
+// warnIfSigningBoundIsCPUDerived says so when the CA signing bound was left
+// unset on a deployment whose signer is reached over the network.
+//
+// The default is CPU-shaped and the work is not. Under `ca_key_provider:
+// openbao` every signature is a round trip to a Transit key, so GOMAXPROCS
+// measures this host's cores and says nothing about what that key — possibly
+// shared with other consumers — can sustain. On a well-provisioned node the
+// derived number is likely far above what the provider wants, and the
+// deployment has no way to notice.
+//
+// Deriving a *different* default instead would be worse: it would invent a
+// number for a capacity openvox-ca cannot discover, which is exactly what #265
+// declined to do and what resolveSigningConcurrency's own doc disclaims. So say
+// it once, plainly, and leave the number to the operator who can measure it.
+//
+// Not warned for the isolated signer, which is the default topology: signing
+// there is CPU-bound in the signer child, so a CPU-derived ceiling is the right
+// shape and lowering it is a tuning rather than a correction.
+//
+// Serve only. The offline commands share applyCAConfig but sign one certificate
+// at a time, so the bound never binds and the warning would be noise.
+func warnIfSigningBoundIsCPUDerived(cfg *serverConfig, resolved int) {
+	if !cfg.UsesOpenBao() || cfg.CASigningConcurrency >= 0 {
+		return
+	}
+	slog.Warn("ca_signing_concurrency is unset, so the CA-key signing bound was derived from this "+
+		"host's CPU count — which says nothing about what an OpenBao Transit key can sustain. "+
+		"Set it to that signer's capacity; the bound is per process, so N replicas permit N times "+
+		"this value against one shared key.",
+		"ca_signing_concurrency", resolved,
+		"derived_from", "GOMAXPROCS",
+		"ca_key_provider", cfg.CAKeyProvider)
+}
+
 func main() {
 	cmd := newRootCmd()
 	if err := cmd.Execute(); err != nil {
@@ -675,6 +709,7 @@ func newRootCmd() *cobra.Command {
 			if err := applyCAConfig(myCA, cfg); err != nil {
 				return err
 			}
+			warnIfSigningBoundIsCPUDerived(cfg, myCA.SigningConcurrency)
 
 			// SECURITY: In frontend mode, use the remote signer: the CA private
 			// key is never loaded into this process's address space.

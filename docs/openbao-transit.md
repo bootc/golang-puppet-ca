@@ -534,7 +534,10 @@ failure and throughput profile; plan for it:
   count — a number with no relationship to what your Transit key can sustain,
   especially where other consumers share it. Set it to that key's capacity. The
   bound is per process, so N replicas permit N × the limit against one shared
-  key; size it against your replica count too. See
+  key; size it against your replica count too. Leaving it unset here logs a
+  warning at startup naming the derived value, because a CPU-derived ceiling is
+  the wrong shape for a signer reached over the network — it is not an error,
+  but it is almost certainly not the number you want. See
   [bounding CA-key signing](configuration.md#bounding-ca-key-signing).
 
   This matters most on `/ocsp`, which is unauthenticated and signs on a cache

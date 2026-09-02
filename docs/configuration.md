@@ -815,7 +815,7 @@ discover:
 | Deployment | Guidance |
 | --- | --- |
 | Isolated signer (the default) | The built-in default is sized for this: signing is CPU-bound in the signer child, so past `GOMAXPROCS` extra concurrency buys latency and memory rather than throughput. |
-| `ca_key_provider: openbao` | **Set this explicitly.** Every signature is a network round trip to a Transit key that other consumers may share, and the default — derived from this host's CPU count — has no relationship to what that key can sustain. |
+| `ca_key_provider: openbao` | **Set this explicitly.** Every signature is a network round trip to a Transit key that other consumers may share, and the default — derived from this host's CPU count — has no relationship to what that key can sustain. The server logs a warning at startup if you leave it unset here, naming the value it derived. |
 | Single-process software key | The default is fine. |
 
 The shipped default is a *ceiling*, not a tuning. Its only job is to keep the
