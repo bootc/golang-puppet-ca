@@ -38,7 +38,7 @@ certificate with no running server.
 | `--ca-cert-file` | `""` | Keep the CA certificate at this local path regardless of backend |
 | `--ca-key-file` | `""` | Keep the CA private key at this local path regardless of backend |
 | `--ca-key-provider` | `file` | CA private key custody: `file` (default) or `openbao` (OpenBao Transit key). See [OpenBao Transit-engine CA key](openbao-transit.md) for the full `--openbao-*` flag reference |
-| `--daemon` | `false` | Fork to background (not recommended in containers; incompatible with the `Type=notify` systemd unit — see [running under systemd](systemd.md)) |
+| `--daemon` | `false` | Fork to background (not recommended in containers; incompatible with the `Type=notify` systemd unit — see [running under systemd](systemd.md)). The single-instance check runs *before* the fork, so starting a second instance against a `filesystem` or `sqlite` store fails here with a non-zero exit rather than in a child whose output is discarded |
 | `--logfile` | `""` | Write JSON logs to this file instead of stderr |
 | `--verbosity` / `-v` | `0` | Verbosity: `0`=Info, `1`=Debug, `2`=Trace |
 | `--version` | | Print the version and exit; includes commit metadata when built from a git checkout |

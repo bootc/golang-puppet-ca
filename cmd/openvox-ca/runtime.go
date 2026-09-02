@@ -164,8 +164,8 @@ func preflightInstanceLock(ctx context.Context, cfg *serverConfig) error {
 // because Close runs closers in reverse: the lock must be given up after the
 // backend it protects has been closed, not before, so no other process can
 // claim the store while this one is still shutting its handles.
-func holdInstanceLock(ctx context.Context, rt *caRuntime) error {
-	ul, err := rt.Store.AcquireInstanceLock(ctx)
+func holdInstanceLock(ctx context.Context, rt *caRuntime, opts ...storage.InstanceLockOption) error {
+	ul, err := rt.Store.AcquireInstanceLock(ctx, opts...)
 	if err != nil {
 		return err
 	}

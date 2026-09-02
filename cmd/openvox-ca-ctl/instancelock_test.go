@@ -22,12 +22,12 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
-	"sync"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
 	"github.com/voxpupuli/openvox-ca/internal/storage"
+	"github.com/voxpupuli/openvox-ca/internal/testutil"
 )
 
 // The commands that reach storage directly must refuse while a server is
@@ -186,16 +186,16 @@ var _ = Describe("lockStore release ordering", func() {
 		//
 		// A defer pair at the call site gets this backwards, LIFO running Unlock
 		// first, which is why the ordering lives in one helper.
-		rec := &recordingBackend{base: storage.NewFilesystemBackend(GinkgoT().TempDir())}
+		rec := testutil.NewRecordingBackend(GinkgoT().TempDir())
 		svc := storage.NewWithBackend(rec, filepath.Join(GinkgoT().TempDir(), "private"))
 
 		release, err := lockStore(context.Background(), svc)
 		Expect(err).NotTo(HaveOccurred())
-		Expect(rec.events()).To(BeEmpty(), "nothing is given back until the caller says so")
+		Expect(rec.Events()).To(BeEmpty(), "nothing is given back until the caller says so")
 
 		release()
 
-		Expect(rec.events()).To(Equal([]string{"close", "unlock"}),
+		Expect(rec.Events()).To(Equal([]string{"close", "unlock"}),
 			"the lock must outlive the backend handle it protects")
 	})
 
@@ -203,59 +203,13 @@ var _ = Describe("lockStore release ordering", func() {
 		cadir := GinkgoT().TempDir()
 		holdStoreLock(cadir)
 
-		rec := &recordingBackend{base: storage.NewFilesystemBackend(cadir)}
+		rec := testutil.NewRecordingBackend(cadir)
 		svc := storage.NewWithBackend(rec, filepath.Join(GinkgoT().TempDir(), "private"))
 
 		release, err := lockStore(context.Background(), svc)
 		Expect(err).To(HaveOccurred())
 		Expect(release).To(BeNil())
-		Expect(rec.events()).To(Equal([]string{"close"}),
+		Expect(rec.Events()).To(Equal([]string{"close"}),
 			"the caller has no cleanup to run, so the handle must be closed here")
 	})
 })
-
-// recordingBackend notes the order in which the store is given back. It records
-// Close itself and, through the unlocker it wraps, the release of the
-// store-wide lock.
-type recordingBackend struct {
-	storage.Backend
-	base *storage.FilesystemBackend
-
-	mu  sync.Mutex
-	log []string
-}
-
-func (b *recordingBackend) note(event string) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.log = append(b.log, event)
-}
-
-func (b *recordingBackend) events() []string {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return append([]string(nil), b.log...)
-}
-
-func (b *recordingBackend) Close() error {
-	b.note("close")
-	return b.base.Close()
-}
-
-func (b *recordingBackend) AcquireInstanceLock() (storage.Unlocker, error) {
-	ul, err := b.base.AcquireInstanceLock()
-	if err != nil {
-		return nil, err
-	}
-	return &recordingUnlocker{backend: b, wrapped: ul}, nil
-}
-
-type recordingUnlocker struct {
-	backend *recordingBackend
-	wrapped storage.Unlocker
-}
-
-func (u *recordingUnlocker) Unlock() error {
-	u.backend.note("unlock")
-	return u.wrapped.Unlock()
-}

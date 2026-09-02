@@ -98,6 +98,15 @@ directory beside the database file for `sqlite`. So:
   holding process dies, however it dies. There is no stale lock to remove and no
   lock file that needs deleting — see the note on `locks/` under
   [the filesystem backend](#filesystem-backend-default).
+- **Under `--daemon` the refusal comes before the fork.** That flag re-execs the
+  server and discards the child's output, so a refusal raised there would reach
+  nobody: you would be told the CA had started, get a zero exit, and have the
+  child die in silence. The check therefore runs in the process you started,
+  which fails with a non-zero exit and names the holder. It is a pre-flight — it
+  takes the lock and releases it again, and the child takes the real one — so a
+  third process that wins the moment between them still produces the silent
+  failure. A server that is already running does not, which is the case this
+  exists for.
 
 Under the default isolated-process topology the lock is held by the supervisor
 process, once, on behalf of the signer and frontend children it starts. One
@@ -927,12 +936,16 @@ honoured on both ends.
 
 Notes:
 
-- **Stop the server first.** Run `migrate` while no `openvox-ca` is serving
-  either backend, so the copy sees a consistent snapshot. It no longer races one
-  that is: `migrate` takes the `bootstrap` lock cross-process on every backend
-  and applies no timeout, so beside a live server it logs one `Waiting for the
-  CA lock` line and waits indefinitely. See [running a second process against a
-  live store](#running-a-second-process-against-a-live-store).
+- **Stop the server first**, on both ends. Run `migrate` while no `openvox-ca`
+  is serving either backend, so the copy sees a consistent snapshot. It does not
+  race one that is, and it no longer waits for one either: on a backend that
+  supports a single running instance it is refused at once, naming the process
+  holding the store, for the source as well as the destination — reading a live
+  store still copies an inventory the server is appending to. Pointing
+  `--source-config` and `--dest-config` at the same store is refused for the
+  same reason, rather than waiting for ever on a lock it has already taken
+  itself. See [running a second process against a live
+  store](#running-a-second-process-against-a-live-store).
 - **Overwrite protection.** `migrate` refuses to write into a destination that
   already holds a CA certificate. Pass `--force` to overwrite it.
 - **Re-runnable.** The copy is idempotent per item; an interrupted run can be

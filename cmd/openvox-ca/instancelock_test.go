@@ -24,12 +24,12 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
-	"sync"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
 	"github.com/voxpupuli/openvox-ca/internal/storage"
+	"github.com/voxpupuli/openvox-ca/internal/testutil"
 )
 
 // The single-instance rule as the commands see it: on a backend with no
@@ -160,7 +160,7 @@ var _ = Describe("the store instance lock", func() {
 		// ordering invariant that a hand-written defer pair gets backwards, and
 		// until now nothing pinned the helper itself -- only the callers that
 		// happened to use it.
-		newRuntime := func(rec *recordingBackend) *caRuntime {
+		newRuntime := func(rec *testutil.RecordingBackend) *caRuntime {
 			rt := &caRuntime{Store: storage.NewWithBackend(rec, filepath.Join(GinkgoT().TempDir(), "private"))}
 			// resolveRuntime registers the backend's Close first, so Close runs
 			// it last. Reproduced here, because the invariant is about where the
@@ -175,14 +175,14 @@ var _ = Describe("the store instance lock", func() {
 			// while this process still holds an open handle to it -- on SQLite, a
 			// pooled connection to the database file the lock exists to keep to
 			// one writer.
-			rec := &recordingBackend{base: storage.NewFilesystemBackend(GinkgoT().TempDir())}
+			rec := testutil.NewRecordingBackend(GinkgoT().TempDir())
 			rt := newRuntime(rec)
 
 			Expect(holdInstanceLock(ctx, rt)).To(Succeed())
-			Expect(rec.events()).To(BeEmpty(), "nothing is given back before Close")
+			Expect(rec.Events()).To(BeEmpty(), "nothing is given back before Close")
 
 			Expect(rt.Close()).To(Succeed())
-			Expect(rec.events()).To(Equal([]string{"close", "unlock"}),
+			Expect(rec.Events()).To(Equal([]string{"close", "unlock"}),
 				"the lock must outlive the backend handle it protects")
 		})
 
@@ -190,7 +190,7 @@ var _ = Describe("the store instance lock", func() {
 			cadir := GinkgoT().TempDir()
 			holdStore(cadir)
 
-			rec := &recordingBackend{base: storage.NewFilesystemBackend(cadir)}
+			rec := testutil.NewRecordingBackend(cadir)
 			rt := newRuntime(rec)
 
 			err := holdInstanceLock(ctx, rt)
@@ -200,7 +200,7 @@ var _ = Describe("the store instance lock", func() {
 			// No release was registered, so Close must still close the backend
 			// exactly once and must not try to unlock a lock never taken.
 			Expect(rt.Close()).To(Succeed())
-			Expect(rec.events()).To(Equal([]string{"close"}))
+			Expect(rec.Events()).To(Equal([]string{"close"}))
 		})
 	})
 
@@ -322,48 +322,3 @@ var _ = Describe("the store instance lock", func() {
 		)
 	})
 })
-
-// recordingBackend notes the order in which the store is given back: its own
-// Close, and the release of the store-wide lock through the unlocker it wraps.
-type recordingBackend struct {
-	storage.Backend
-	base *storage.FilesystemBackend
-
-	mu  sync.Mutex
-	log []string
-}
-
-func (b *recordingBackend) note(event string) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.log = append(b.log, event)
-}
-
-func (b *recordingBackend) events() []string {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return append([]string(nil), b.log...)
-}
-
-func (b *recordingBackend) Close() error {
-	b.note("close")
-	return b.base.Close()
-}
-
-func (b *recordingBackend) AcquireInstanceLock() (storage.Unlocker, error) {
-	ul, err := b.base.AcquireInstanceLock()
-	if err != nil {
-		return nil, err
-	}
-	return &recordingUnlocker{backend: b, wrapped: ul}, nil
-}
-
-type recordingUnlocker struct {
-	backend *recordingBackend
-	wrapped storage.Unlocker
-}
-
-func (u *recordingUnlocker) Unlock() error {
-	u.backend.note("unlock")
-	return u.wrapped.Unlock()
-}

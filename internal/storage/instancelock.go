@@ -26,6 +26,7 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode"
 )
 
 // The store-wide instance lock, which permits exactly one running instance on a
@@ -148,6 +149,10 @@ type InstanceLocker interface {
 //     over a lock that is unavailable rather than held would take down a CA
 //     that worked before this check existed.
 //
+// A caller that has already asked SupportsDistributedLocking may pass the
+// answer with WithKnownDistributedLocking and skip the probe here; without it
+// this method probes for itself, so it is always safe to call knowing nothing.
+//
 // On a probe error it warns and permits, which is the safe direction here even
 // though it reads like the unsafe one. The error path is unreachable for the
 // backends this rule governs: FilesystemBackend implements no Locker at all, so
@@ -158,11 +163,19 @@ type InstanceLocker interface {
 // momentarily unreachable — where refusing to start would be a restriction on
 // precisely the deployments this rule exempts, and where the process will fail
 // loudly on its own first locked operation anyway if the backend is really down.
-func (s *StorageService) AcquireInstanceLock(ctx context.Context) (Unlocker, error) {
-	probeCtx, cancel := context.WithTimeout(ctx, instanceProbeTimeout)
-	defer cancel()
+func (s *StorageService) AcquireInstanceLock(ctx context.Context, opts ...InstanceLockOption) (Unlocker, error) {
+	var cfg instanceLockConfig
+	for _, opt := range opts {
+		opt(&cfg)
+	}
 
-	distributed, err := s.SupportsDistributedLocking(probeCtx)
+	distributed, err := cfg.knownDistributed, error(nil)
+	if cfg.known == nil {
+		probeCtx, cancel := context.WithTimeout(ctx, instanceProbeTimeout)
+		defer cancel()
+		distributed, err = s.SupportsDistributedLocking(probeCtx)
+	}
+
 	switch {
 	case err != nil:
 		slog.Warn("Could not determine whether this storage backend coordinates locks across processes; "+
@@ -196,6 +209,39 @@ func (s *StorageService) AcquireInstanceLock(ctx context.Context) (Unlocker, err
 	default:
 		// Includes StoreLockedError, which is the point of the whole exercise.
 		return nil, err
+	}
+}
+
+// InstanceLockOption adjusts one AcquireInstanceLock call.
+type InstanceLockOption func(*instanceLockConfig)
+
+type instanceLockConfig struct {
+	// known is nil unless a caller supplied the capability, so that "not told"
+	// and "told false" stay distinguishable.
+	known            *bool
+	knownDistributed bool
+}
+
+// WithKnownDistributedLocking supplies an answer the caller has already had
+// from SupportsDistributedLocking, so this call does not buy it twice.
+//
+// Optional by design. The probe acquires and releases a real lock, so on a
+// cluster backend it is a round trip, and `openvox-ca generate` was paying for
+// two: one for the capability report it prints, one for the lock. But a caller
+// that knows nothing must stay able to call AcquireInstanceLock and get a
+// correct answer -- csr and import-ca-cert do exactly that -- so this is a hint
+// rather than a parameter. Making it required would push the probe out to the
+// call sites that currently do the right thing by not thinking about it.
+//
+// Pass only a definite answer. SupportsDistributedLocking has three outcomes,
+// and its error is not a "false": a caller whose own probe failed should omit
+// this and let AcquireInstanceLock re-probe, so the documented warn-and-permit
+// policy for an undetermined capability applies in one place rather than being
+// reimplemented by each caller.
+func WithKnownDistributedLocking(distributed bool) InstanceLockOption {
+	return func(c *instanceLockConfig) {
+		c.known = &distributed
+		c.knownDistributed = distributed
 	}
 }
 
@@ -331,7 +377,15 @@ func readInstanceHolder(f *os.File) string {
 		record = record[:i]
 	}
 	return strings.Map(func(r rune) rune {
-		if r < 0x20 || r == 0x7f {
+		// unicode.IsPrint rather than a control-character range. The range
+		// caught C0 and DEL and let every Unicode format character through --
+		// U+202E RIGHT-TO-LEFT OVERRIDE and the isolates U+2066..U+2069 among
+		// them, which reorder the text a terminal draws around them. IsPrint
+		// excludes category Cf as well as Cc, so those go, and it keeps letters
+		// outside ASCII, so a legitimate non-ASCII hostname in a holder record
+		// survives intact. Enumerating the dangerous ranges instead would be
+		// incomplete again the next time somebody looked.
+		if !unicode.IsPrint(r) {
 			return -1
 		}
 		return r

@@ -423,6 +423,11 @@ written as two.
   rather than a parked goroutine, which is what a stack dump will show. Since
   `MigrateService` applies no deadline it waits forever, announcing itself once.
   Migrating a store onto itself is unsupported.
+  That is the behaviour of `MigrateService` called directly. `openvox-ca-ctl
+  migrate` no longer reaches it: since #275 the command takes the store-wide
+  instance lock on both ends first, so a store pointed at itself is refused
+  immediately rather than deadlocking, and so is either end held by a running
+  server.
 
 ## Read paths take no distributed locks — by design
 
@@ -578,7 +583,10 @@ path — still provides no cross-replica guarantee anyway.
    concurrent `Sign` still take different names and do not exclude each other,
    so stop the server. `MigrateService` also inherits the caller's context with
    no `lockTimeout`, so it waits indefinitely on a contended `bootstrap` lock
-   (see Tier 1).
+   (see Tier 1). Reaching that wait through `openvox-ca-ctl migrate` is no
+   longer possible on a backend that supports a single running instance: the
+   command takes the store-wide instance lock on both ends before any of this
+   and is refused, by name, if a server holds either.
 10. **A lock name is now also a filename.** On the single-node backends each
     name maps to `sha256(name).lock` in the store's lock directory. The mapping
     is protocol for the same reason the names are: a server and a `ctl` command

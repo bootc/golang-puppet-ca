@@ -25,6 +25,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -349,6 +350,7 @@ var _ = Describe("Store instance lock", func() {
 
 			path := filepath.Join(cadir, fsLockDir, fileLockFileName(instanceLockName))
 			hostile := "openvox-ca (pid 1)\x1b[2J\x1b[1;31m ALL CERTIFICATES REVOKED\x00\x07" +
+				"\u202e detrever setacifitrec lla \u2066spoofed\u2069\u200b" +
 				"\nnot-the-current-holder (pid 2)\n"
 			Expect(os.WriteFile(path, []byte(hostile), FilePermPrivate)).To(Succeed())
 
@@ -358,6 +360,13 @@ var _ = Describe("Store instance lock", func() {
 
 			Expect(locked.Holder).NotTo(BeEmpty(), "a sanitised record is still a record")
 			Expect(locked.Holder).NotTo(ContainSubstring("\x1b"), "no terminal escapes")
+			// Format characters reorder what a terminal draws around them
+			// without being control characters, so a C0-and-DEL filter lets them
+			// straight through.
+			for _, bidi := range []string{"\u202e", "\u202d", "\u2066", "\u2067", "\u2068", "\u2069", "\u200b"} {
+				Expect(locked.Holder).NotTo(ContainSubstring(bidi),
+					"a Unicode format character survived the sanitiser")
+			}
 			Expect(locked.Holder).NotTo(ContainSubstring("\x00"), "no NUL")
 			Expect(locked.Holder).NotTo(ContainSubstring("\x07"), "no BEL")
 			for _, r := range locked.Holder {
@@ -422,6 +431,63 @@ var _ = Describe("Store instance lock", func() {
 		})
 	})
 
+	Describe("a caller that already knows the capability", func() {
+		It("skips the probe when told, and probes when not", func() {
+			// The probe acquires and releases a real lock, so on a cluster
+			// backend it is a round trip. `openvox-ca generate` was paying for
+			// two: one for the capability report it prints and one for this.
+			cadir := GinkgoT().TempDir()
+
+			probed := &countingLocker{FilesystemBackend: NewFilesystemBackend(cadir)}
+			told, err := svc(probed).AcquireInstanceLock(ctx, WithKnownDistributedLocking(true))
+			Expect(err).NotTo(HaveOccurred())
+			Expect(probed.calls()).To(BeZero(), "a supplied answer must not be bought again")
+			Expect(told.Unlock()).To(Succeed())
+
+			unprompted := &countingLocker{FilesystemBackend: NewFilesystemBackend(cadir)}
+			ul, err := svc(unprompted).AcquireInstanceLock(ctx)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(unprompted.calls()).To(Equal(1),
+				"knowing nothing must still get a correct answer; the hint is optional")
+			Expect(ul.Unlock()).To(Succeed())
+		})
+
+		It("honours a hint of false by enforcing the rule", func() {
+			// The hint must decide the outcome, not merely save a call. Told
+			// "not distributed", it has to take the store-wide lock and refuse
+			// the second instance.
+			cadir := GinkgoT().TempDir()
+
+			first, err := svc(&countingLocker{FilesystemBackend: NewFilesystemBackend(cadir)}).
+				AcquireInstanceLock(ctx, WithKnownDistributedLocking(false))
+			Expect(err).NotTo(HaveOccurred())
+			DeferCleanup(func() { _ = first.Unlock() })
+
+			_, err = svc(NewFilesystemBackend(cadir)).AcquireInstanceLock(ctx)
+			var locked *StoreLockedError
+			Expect(errors.As(err, &locked)).To(BeTrue(), "a hint of false must still enforce")
+		})
+
+		It("honours a hint of true by exempting the store", func() {
+			// And the other way: told the backend coordinates, it must take no
+			// store lock, exactly as if it had probed and been told so.
+			cadir := GinkgoT().TempDir()
+			lockDir := filepath.Join(cadir, fsLockDir)
+
+			first, err := svc(NewFilesystemBackend(cadir)).
+				AcquireInstanceLock(ctx, WithKnownDistributedLocking(true))
+			Expect(err).NotTo(HaveOccurred())
+			DeferCleanup(func() { _ = first.Unlock() })
+
+			second, err := svc(NewFilesystemBackend(cadir)).
+				AcquireInstanceLock(ctx, WithKnownDistributedLocking(true))
+			Expect(err).NotTo(HaveOccurred(), "a hint of true must exempt the store")
+			DeferCleanup(func() { _ = second.Unlock() })
+
+			Expect(countLockFiles(lockDir)).To(BeZero())
+		})
+	})
+
 	Describe("the reserved lock name", func() {
 		It("cannot collide with a lock a running instance takes", func() {
 			// The store-wide lock is held for the whole life of the process, so
@@ -453,4 +519,28 @@ type blockingLocker struct {
 func (b *blockingLocker) AcquireLock(ctx context.Context, _ string) (Unlocker, error) {
 	<-ctx.Done()
 	return nil, ctx.Err()
+}
+
+// countingLocker counts the capability probes made against it. The embedded
+// concrete backend is deliberate, as in bothLocker: an embedded interface would
+// not promote AcquireInstanceLock, and the specs that assert a lock was or was
+// not taken would be measuring the stub rather than the store.
+type countingLocker struct {
+	*FilesystemBackend
+
+	mu sync.Mutex
+	n  int
+}
+
+func (c *countingLocker) AcquireLock(context.Context, string) (Unlocker, error) {
+	c.mu.Lock()
+	c.n++
+	c.mu.Unlock()
+	return noopUnlocker{}, nil
+}
+
+func (c *countingLocker) calls() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.n
 }
