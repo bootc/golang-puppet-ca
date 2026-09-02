@@ -278,8 +278,10 @@ Both harnesses dump through one shared helper, `test/failure-log.sh`, which
 takes the compose command as an argument rather than reading either one's
 `_COMPOSE` array. `mage test:failureLogHelpers` is its regression suite: it
 needs bash and no container runtime, runs on the host in under a second, and
-CI runs it in the unit job — ahead of every compose suite it protects, rather
-than inside any one of them.
+CI runs it in the unit job rather than inside any one compose suite. It runs
+*alongside* those suites, not ahead of them: it does not gate them, because a
+broken dump cannot change whether a compose suite passes — only what that
+suite prints when it fails.
 
 `test:migration` dumps on failure too, but what it dumps is not a container
 log. Its old Puppet Server is a compose service whose output already reaches

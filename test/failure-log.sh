@@ -87,8 +87,11 @@ failure_log_first_attempt() {  # service-name  max-lines
             printf "# ---- first %d of %d log lines from %s (start attempt 1 of %d) ----\n", \
                 shown, NR, svc, attempts
             for (i = 1; i <= shown; i++) print line[i]
-            if (last > shown)
-                printf "# ---- (%d more lines of attempt 1 not shown) ----\n", last - shown
+            if (last > shown) {
+                cut = last - shown
+                printf "# ---- (%d more %s of attempt 1 not shown) ----\n", \
+                    cut, (cut == 1 ? "line" : "lines")
+            }
         }
     '
 }

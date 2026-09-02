@@ -267,6 +267,55 @@ ok_lacks "the remainder is not counted to the end of the log" \
     "($(( SLOW_LINES - FAILURE_LOG_HEAD )) more lines of attempt 1 not shown)" "$OUT"
 
 # ═════════════════════════════════════════════════════════════════════════════
+# The exact point where the tail starts earning its place
+# ═════════════════════════════════════════════════════════════════════════════
+# The head/tail split turns on `_lines > FAILURE_LOG_HEAD`, and an off-by-one
+# lives on that comparison rather than on either side of it.  The fixtures
+# above straddle it; these two sit on it, one line apart, so a `-ge` and a
+# `-gt HEAD+1` are each caught by one of them.
+#
+# write_lines FILE COUNT PREFIX -- a single-attempt log of exactly COUNT lines,
+# first line distinct so it cannot recur and be read as a restart banner.
+write_lines() {
+    local _file="$1" _count="$2" _prefix="$3" _i
+    {
+        printf '%s  | starting up\n' "$_prefix"
+        for _i in $(seq 2 "$_count"); do
+            printf '%s  | line %d\n' "$_prefix" "$_i"
+        done
+    } > "$_file"
+}
+
+write_lines "$WORK_DIR/logs/exact-head.log" "$FAILURE_LOG_HEAD" exact-head-1
+OUT=$(dump exact-head)
+ok_contains "a log of exactly the head depth is shown whole" \
+    "# ---- first $FAILURE_LOG_HEAD of $FAILURE_LOG_HEAD log lines from exact-head (start attempt 1 of 1) ----" \
+    "$OUT"
+ok_lacks "a log of exactly the head depth is not then repeated as a tail" \
+    "# ---- last " "$OUT"
+ok_lacks "a log of exactly the head depth reports nothing cut" \
+    "not shown" "$OUT"
+
+write_lines "$WORK_DIR/logs/over-head.log" "$(( FAILURE_LOG_HEAD + 1 ))" over-head-1
+OUT=$(dump over-head)
+ok_contains "one line past the head depth brings the tail back" \
+    "# ---- last $(( FAILURE_LOG_HEAD + 1 )) of $(( FAILURE_LOG_HEAD + 1 )) log lines from over-head ----" \
+    "$OUT"
+# Also the singular: the one place the count can be 1, and "1 more lines"
+# would be the only ungrammatical line the dump can emit.
+ok_contains "one line past the head depth reports exactly that one line cut" \
+    "# ---- (1 more line of attempt 1 not shown) ----" "$OUT"
+
+# The tail header's count comes from `_lines < FAILURE_LOG_TAIL ? _lines :
+# FAILURE_LOG_TAIL`.  The restart-loop fixture above pins the FAILURE_LOG_TAIL
+# arm; this pins the other one.  `tail -n` does not complain when N exceeds
+# what it is given, so an arm chosen wrongly prints the right lines under a
+# wrong count -- visible only in the header, and only if something reads it.
+OUT=$(dump puppet-master)
+ok_contains "a log shorter than the tail depth reports its own length" \
+    "# ---- last $LATE_LINES of $LATE_LINES log lines from puppet-master ----" "$OUT"
+
+# ═════════════════════════════════════════════════════════════════════════════
 # Degenerate logs
 # ═════════════════════════════════════════════════════════════════════════════
 {
