@@ -680,6 +680,16 @@ environment encoding at all — it is a list of structures, file-only like
 
 ### Publishing an upstream CRL chain
 
+Before the mount, one decision that is not a chart decision at all: a CRL is
+only published if a certificate in this CA's **stored bundle** signed it, so
+publishing an ancestor's CRL means adding that ancestor to the bundle — and the
+bundle is what `GET /certificate/ca` serves every agent. Make that choice with
+[the bundle note in the operator CLI
+guide](operator-cli.md#offline-subcommands-on-the-server-binary) in front of
+you; it is the authoritative statement and it covers the case that catches
+people, which is that ending the bundle at a root admits every sibling sub-CA
+beneath it. Nothing about it changes under Helm.
+
 Mount the bundle from its own volume and point `config.crl_chain_file` at it:
 
 ```yaml
