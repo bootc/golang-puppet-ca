@@ -376,8 +376,14 @@ func (c *CA) AnswerOCSP(ctx context.Context, reqDER []byte) (OCSPAnswer, error) 
 	// caCert/caKey, not c.CACert/c.CAKey: no lock is held here, and the
 	// snapshot taken under the single RLock above is the whole reason this can
 	// sign without one.
-	respDER, err := ocsp.CreateResponse(caCert, caCert, template, caKey)
-	c.releaseSigningSlot()
+	// Released by a deferred call inside this closure; see releaseSigningSlot.
+	// This is the site where it matters most: /ocsp is unauthenticated, so a
+	// panic reachable from a request an anonymous caller can shape would leak
+	// slots on demand.
+	respDER, err := func() ([]byte, error) {
+		defer c.releaseSigningSlot()
+		return ocsp.CreateResponse(caCert, caCert, template, caKey)
+	}()
 	if err != nil {
 		// ErrInternal, so the handler answers RFC 6960 `internalError` rather
 		// than `malformedRequest`. A failed CA signature is a server fault and

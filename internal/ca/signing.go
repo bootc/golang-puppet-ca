@@ -562,8 +562,14 @@ func (c *CA) issueLeafLocked(ctx context.Context, subject string, subjectName pk
 	if err := c.acquireSigningSlot(ctx); err != nil {
 		return nil, fmt.Errorf("waiting for a CA signing slot to sign for %s: %w", subject, err)
 	}
-	certBytes, err := x509.CreateCertificate(rand.Reader, template, c.CACert, pubKey, c.CAKey)
-	c.releaseSigningSlot()
+	// Released by a deferred call inside this closure; see releaseSigningSlot.
+	// The same shape rule 4 of docs/development/locking.md prescribes for the
+	// mutexes, and for the same reason: a panic must not wedge the thing it was
+	// holding.
+	certBytes, err := func() ([]byte, error) {
+		defer c.releaseSigningSlot()
+		return x509.CreateCertificate(rand.Reader, template, c.CACert, pubKey, c.CAKey)
+	}()
 	if err != nil {
 		return nil, fmt.Errorf("failed to sign certificate for %s: %w", subject, err)
 	}

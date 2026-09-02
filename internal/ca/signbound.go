@@ -137,6 +137,28 @@ func (c *CA) acquireSigningSlotOrShed(ctx context.Context) error {
 // releaseSigningSlot returns a slot taken by acquireSigningSlot or
 // acquireSigningSlotOrShed. Safe to call on an unbounded CA, where it is a
 // no-op, so call sites can defer it unconditionally.
+//
+// MUST be deferred, not called sequentially after the signature. A panic
+// crossing the signing call would otherwise leak the slot, and that is not
+// self-correcting the way a panic usually is here: two of the three call sites
+// are reachable from an HTTP handler, and net/http's conn.serve recovers a
+// handler panic, logs it and drops that one connection — the process survives.
+// Nothing in this repository calls recover() itself, so it is that recovery,
+// not ours, that turns a crash into permanent capacity loss.
+//
+// The consequence is worse than it first looks, because the pool is meant to be
+// small. `ca_signing_concurrency` defaults to max(4, GOMAXPROCS), but operators
+// running a remote signer are explicitly told to lower it to that signer's
+// capacity, so 1 or 2 is an ordinary setting rather than a pathological one.
+// There, a single leaked slot wedges issuance and CRL re-signing — both queue,
+// and under c.mu — and sheds every OCSP request with `tryLater` until restart:
+// a permanent denial of service inside the control added to bound one.
+//
+// Use the closure-with-defer shape at the call sites so the slot is held for
+// the signature alone: a function-scoped defer would keep it across storage
+// writes that follow. This is rule 4 of docs/development/locking.md applied to
+// the bound, and signing.go's "a panic mid-sign still frees the lock rather
+// than wedging the CA" is the same argument for c.mu.
 func (c *CA) releaseSigningSlot() {
 	if c.signSlots == nil {
 		return
