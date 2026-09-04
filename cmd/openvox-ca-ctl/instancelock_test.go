@@ -38,16 +38,6 @@ import (
 // operator listing certificates against a live CA is an ordinary thing to do.
 
 var _ = Describe("openvox-ca-ctl and the store instance lock", func() {
-	// holdStore takes the store's instance lock the way a running server does.
-	// A separate StorageService over the same cadir is an exact stand-in for a
-	// second process: flock(2) is held by an open file description.
-	holdStore := func(cadir string) {
-		GinkgoHelper()
-		ul, err := storage.New(cadir).AcquireInstanceLock(context.Background())
-		Expect(err).NotTo(HaveOccurred(), "the store must be free before the spec holds it")
-		DeferCleanup(func() { _ = ul.Unlock() })
-	}
-
 	// refusal asserts the shape every one of these commands must produce: the
 	// condition, the holder, and what to do about it.
 	refusal := func(err error) {
@@ -60,7 +50,7 @@ var _ = Describe("openvox-ca-ctl and the store instance lock", func() {
 
 	It("refuses to initialise a cadir a server is running against", func() {
 		caDir := GinkgoT().TempDir()
-		holdStore(caDir)
+		holdStoreLock(caDir)
 
 		cmd := newRootCmd()
 		cmd.SetOut(GinkgoWriter)
@@ -99,7 +89,7 @@ var _ = Describe("openvox-ca-ctl and the store instance lock", func() {
 		Expect(setup.Execute()).To(Succeed())
 
 		target := GinkgoT().TempDir()
-		holdStore(target)
+		holdStoreLock(target)
 
 		cmd := newRootCmd()
 		cmd.SetOut(GinkgoWriter)
@@ -169,6 +159,10 @@ var _ = Describe("migrate and the store instance lock", func() {
 
 // holdStoreLock takes a cadir's instance lock for the rest of the spec, the way
 // a running server holds it.
+//
+// A separate StorageService over the same cadir is an exact stand-in for a
+// second process: flock(2) is held by an open file description, so it excludes
+// this one whether or not a fork separates them.
 func holdStoreLock(cadir string) {
 	GinkgoHelper()
 	ul, err := storage.New(cadir).AcquireInstanceLock(context.Background())

@@ -161,9 +161,9 @@ func preflightInstanceLock(ctx context.Context, cfg *serverConfig) error {
 // for callers that already hold a runtime.
 //
 // The release is inserted at the front of the closer list rather than appended,
-// because Close runs closers in reverse: the lock must be given up after the
-// backend it protects has been closed, not before, so no other process can
-// claim the store while this one is still shutting its handles.
+// because Close runs closers in reverse and the lock must outlive the backend
+// handle it protects. Why that ordering matters, and why openvox-ca-ctl reaches
+// it by a different route, is stated once on StorageService.AcquireInstanceLock.
 func holdInstanceLock(ctx context.Context, rt *caRuntime, opts ...storage.InstanceLockOption) error {
 	ul, err := rt.Store.AcquireInstanceLock(ctx, opts...)
 	if err != nil {

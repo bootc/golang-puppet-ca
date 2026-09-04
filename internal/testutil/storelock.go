@@ -18,6 +18,7 @@
 package testutil
 
 import (
+	"context"
 	"sync"
 
 	"github.com/voxpupuli/openvox-ca/internal/storage"
@@ -89,4 +90,30 @@ type recordingUnlocker struct {
 func (u *recordingUnlocker) Unlock() error {
 	u.backend.note("unlock")
 	return u.wrapped.Unlock()
+}
+
+// UnreachableLockBackend advertises distributed locking and never delivers it,
+// which is what a cluster backend having a bad moment looks like to a
+// capability probe.
+//
+// The distinction it exists to test is the one that matters most about
+// SupportsDistributedLocking: its error is a third answer, not a "no". Reporting
+// an unreachable lock service as "this backend has no distributed locking"
+// would apply the single-instance rule to a deployment that is entitled to run
+// many, which is the one restriction #275 forbids.
+type UnreachableLockBackend struct {
+	storage.Backend
+	err error
+}
+
+// NewUnreachableLockBackend wraps a filesystem backend rooted at dir whose lock
+// acquisition always fails with err.
+func NewUnreachableLockBackend(dir string, err error) *UnreachableLockBackend {
+	return &UnreachableLockBackend{Backend: storage.NewFilesystemBackend(dir), err: err}
+}
+
+// AcquireLock always fails, and never with a sentinel — a sentinel would be
+// classified as "no distributed locking" rather than "could not tell".
+func (b *UnreachableLockBackend) AcquireLock(context.Context, string) (storage.Unlocker, error) {
+	return nil, b.err
 }

@@ -176,16 +176,11 @@ local filesystem under cadir, never in a storage backend.`,
 // gives both the store and the lock back.
 //
 // A helper rather than two pairs of defers at the call site, because the order
-// inside it is load-bearing and a defer pair gets it backwards. The backend is
-// closed FIRST and the lock released after, so the lock outlives the handle it
-// protects: release it first and, for the gap between the two, a second process
-// could take a store this one still holds an open connection to -- on SQLite a
-// pooled connection to the very database file the lock exists to keep to one
-// writer. Two defers run LIFO and would put Unlock first.
-//
-// cmd/openvox-ca/runtime.go's holdInstanceLock keeps the same invariant by
-// inserting its release at the front of a closer list that runs in reverse.
-// Both are covered by specs that assert the order rather than trusting it.
+// inside it is load-bearing and a defer pair gets it backwards: two defers run
+// LIFO and would release the lock before closing the backend. Why that ordering
+// matters, and why openvox-ca reaches it by a different route, is stated once on
+// StorageService.AcquireInstanceLock. Both routes are covered by specs that
+// assert the order rather than trusting it.
 //
 // On failure to acquire, the backend is closed here: the caller has nothing to
 // release and would otherwise leak the handle.

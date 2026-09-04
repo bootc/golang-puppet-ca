@@ -153,6 +153,22 @@ type InstanceLocker interface {
 // answer with WithKnownDistributedLocking and skip the probe here; without it
 // this method probes for itself, so it is always safe to call knowing nothing.
 //
+// # Releasing it
+//
+// Release the lock AFTER closing the backend it protects, never before. Between
+// the two, a second process that took the store would find this one still
+// holding an open handle to it -- on SQLite a pooled connection to the very
+// database file the lock exists to keep to one writer.
+//
+// The mechanism differs by caller because their lifetimes do, and neither can
+// borrow the other's: `openvox-ca` hangs the release off a runtime whose closer
+// list runs in reverse, so it inserts the release at the front
+// (cmd/openvox-ca/runtime.go, holdInstanceLock); `openvox-ca-ctl` has no such
+// list and returns one cleanup that does both in order
+// (cmd/openvox-ca-ctl/migrate.go, lockStore). What they share is this rule and
+// the spec helper that asserts it, testutil.RecordingBackend -- so the
+// invariant is stated once here rather than argued twice there.
+//
 // On a probe error it warns and permits, which is the safe direction here even
 // though it reads like the unsafe one. The error path is unreachable for the
 // backends this rule governs: FilesystemBackend implements no Locker at all, so
@@ -312,7 +328,7 @@ func (l *fileLocks) acquireInstance() (Unlocker, error) {
 	// Record who we are, for the next process that is refused. Best-effort:
 	// failing to write the record loses the name in somebody else's error
 	// message, which is not worth surrendering a lock we hold.
-	if err := writeInstanceHolder(f); err != nil {
+	if err := writeHolder(f); err != nil {
 		slog.Warn("Could not record this process in the store's instance lock file; "+
 			"another process refused by it will not be able to name this one",
 			"lock_file", path, "error", err)
@@ -320,6 +336,15 @@ func (l *fileLocks) acquireInstance() (Unlocker, error) {
 
 	return &fileUnlocker{f: f, local: local, path: path}, nil
 }
+
+// writeHolder is indirected through a variable so a spec can drive the
+// best-effort branch above, which no filesystem `go test` can reach on demand:
+// the descriptor is open O_RDWR and valid, so the write does not fail. The
+// branch matters out of proportion to its size — getting it wrong surrenders a
+// lock this process holds over a cosmetic failure — which is worth one seam.
+// Same pattern, and the same reason, as tryLock in filelock.go. Production
+// always uses the real implementation.
+var writeHolder = writeInstanceHolder
 
 // writeInstanceHolder replaces the lock file's contents with a description of
 // this process.

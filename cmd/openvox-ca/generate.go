@@ -221,6 +221,7 @@ before a server exists.`,
 			// found it -- a command that declines to act should not leave a
 			// locks/ directory in a cadir that has no CA in it. Everything
 			// between here and the checks only reads.
+			//
 			// Reuse the answer the capability report just paid for, when it got
 			// one. Omitting it on an undetermined capability is deliberate: that
 			// case has a policy and it belongs in one place.

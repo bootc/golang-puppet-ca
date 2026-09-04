@@ -287,6 +287,58 @@ var _ = Describe("the store instance lock", func() {
 		})
 	})
 
+	Describe("the capability hint generate passes on", func() {
+		// The hint saves a probe. Its dangerous branch is the one where the
+		// probe *failed*: an error is a third answer, and coercing it into
+		// "false" would apply the single-instance rule to an HA backend having
+		// a bad moment -- refusing a deployment entitled to run many, which is
+		// the one restriction #275 forbids.
+		It("reports the capability as unknown when the probe fails, and hints nothing", func() {
+			probeErr := errors.New("cluster unreachable")
+			store := storage.NewWithBackend(
+				testutil.NewUnreachableLockBackend(GinkgoT().TempDir(), probeErr),
+				filepath.Join(GinkgoT().TempDir(), "private"))
+
+			var out bytes.Buffer
+			distributed, known := reportBackendCapabilities(ctx, &out, store)
+
+			Expect(known).To(BeFalse(), "a failed probe is not an answer to pass on")
+			Expect(distributed).To(BeFalse())
+			Expect(out.String()).To(ContainSubstring("could not determine"),
+				"the operator is told it is unknown, not told it is absent")
+		})
+
+		It("does not enforce the rule on a backend whose capability could not be determined", func() {
+			// The end the wiring exists to protect. Omitting the hint sends
+			// AcquireInstanceLock back to its own probe, which fails the same
+			// way and applies warn-and-permit -- so no store lock is taken and
+			// an HA backend is not refused. Passing a hint of false here
+			// instead would take the lock and enforce.
+			cadir := GinkgoT().TempDir()
+			store := storage.NewWithBackend(
+				testutil.NewUnreachableLockBackend(cadir, errors.New("cluster unreachable")),
+				filepath.Join(GinkgoT().TempDir(), "private"))
+
+			var out bytes.Buffer
+			distributed, known := reportBackendCapabilities(ctx, &out, store)
+			Expect(known).To(BeFalse(), "precondition: the probe failed")
+
+			var opts []storage.InstanceLockOption
+			if known {
+				opts = append(opts, storage.WithKnownDistributedLocking(distributed))
+			}
+
+			first, err := store.AcquireInstanceLock(ctx, opts...)
+			Expect(err).NotTo(HaveOccurred())
+			DeferCleanup(func() { _ = first.Unlock() })
+
+			second, err := storage.New(cadir).AcquireInstanceLock(ctx)
+			Expect(err).NotTo(HaveOccurred(),
+				"an undetermined capability must not be enforced as though it were absent")
+			Expect(second.Unlock()).To(Succeed())
+		})
+	})
+
 	Describe("the isolated child roles", func() {
 		// The reason the lock is taken before the role dispatch and not in
 		// resolveRuntime. With PUPPET_CA_ROLE unset the process is either the

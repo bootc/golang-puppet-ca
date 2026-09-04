@@ -488,6 +488,34 @@ var _ = Describe("Store instance lock", func() {
 		})
 	})
 
+	Describe("when the holder record cannot be written", func() {
+		It("keeps the lock rather than surrendering it over a cosmetic failure", func() {
+			// The record exists so a refusal can name the holder. Failing to
+			// write it loses a name in somebody else's error message; failing to
+			// keep the lock would let a second instance run. The branch has to
+			// prefer the lock, and it is short enough to look obviously right
+			// while being wrong.
+			cadir := GinkgoT().TempDir()
+
+			original := writeHolder
+			writeHolder = func(*os.File) error { return errors.New("no space left on device") }
+			DeferCleanup(func() { writeHolder = original })
+
+			first, err := svc(NewFilesystemBackend(cadir)).AcquireInstanceLock(ctx)
+			Expect(err).NotTo(HaveOccurred(), "a failed record must not cost us the lock")
+			DeferCleanup(func() { _ = first.Unlock() })
+
+			// And the lock is real, not merely returned: the exclusion is the
+			// part that would be silently lost.
+			writeHolder = original
+			_, err = svc(NewFilesystemBackend(cadir)).AcquireInstanceLock(ctx)
+			var locked *StoreLockedError
+			Expect(errors.As(err, &locked)).To(BeTrue(), "the lock must still exclude a second instance")
+			Expect(locked.Holder).To(BeEmpty(), "there is no record, so there is no name to report")
+			Expect(locked.Error()).To(ContainSubstring("unidentified process"))
+		})
+	})
+
 	Describe("the reserved lock name", func() {
 		It("cannot collide with a lock a running instance takes", func() {
 			// The store-wide lock is held for the whole life of the process, so
