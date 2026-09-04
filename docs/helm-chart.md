@@ -711,6 +711,14 @@ fetches your root's CRL — a CronJob, a config-management run, cert-manager —
 the `crl-chain-refresh` job picks the change up within
 `crl_chain_refresh_interval_sec` (an hour by default).
 
+**Turn it on in a separate `helm upgrade` from the one that bumps the chart.**
+A Deployment rolls rather than recreates, so for the length of a rollout you
+have old and new pods serving at once — and a replica running a build from
+before chain preservation re-signs the CRL as a single block and silently drops
+the chain, which one revocation in that window makes permanent for the whole
+fleet. Upgrade first, let the rollout finish, then set `config.crl_chain_file`.
+See [rolling upgrades](configuration.md#publishing-an-upstream-crl-chain).
+
 > **Never mount it with `subPath`.** A `subPath`-mounted ConfigMap or Secret
 > never receives updates: the file reads successfully forever and never changes,
 > so the whole feature becomes a silent no-op while every metric reports health.
@@ -736,12 +744,19 @@ the `crl-chain-refresh` job picks the change up within
 > ownership of a refresh mechanism; the shapes below differ mainly in who owns
 > it.
 
-Leave `defaultMode` alone. The chart's `podSecurityContext.fsGroup: 1000`
-makes the default `0644` projection readable to the unprivileged container; a
-hand-set `0400` leaves it root-owned and unreadable, which is the **present but
-unreadable** row of [what each failure to read the file
+You need not set `defaultMode`. With `fsGroup` in play the kubelet chowns a
+projected volume to `root:fsGroup` and **ORs** a read mask into whatever mode is
+there, so the container reads the file whether you set a restrictive mode or
+leave the default alone — the same mechanism [the TLS section](#tls-the-charts-most-important-setting)
+describes, and the one the chart's own `0600` key-material Secrets rely on.
+
+Where that does bite is if you replace `podSecurityContext` wholesale and drop
+`fsGroup`: the projection is then root-owned with no group access and the CA
+cannot read it, which is the **present but unreadable** row of [what each
+failure to read the file
 does](configuration.md#what-each-failure-to-read-the-file-does) — the refresh
-fails, and revocation is blocked with it.
+fails, and revocation is blocked with it. Keep `fsGroup` aligned with
+`runAsUser`/`runAsGroup`, as that section already says.
 
 #### Order the writer before the server
 
@@ -755,7 +770,17 @@ CRL alone and does not look again for an hour, and every agent on the default
 interval.
 
 In Kubernetes the fix is a **native sidecar** — an `initContainer` with
-`restartPolicy: Always` whose `startupProbe` gates the containers after it:
+`restartPolicy: Always` whose `startupProbe` gates the containers after it.
+
+> **This shape needs Kubernetes 1.29 or newer.** `restartPolicy` on an init
+> container enters the API in 1.28, behind the `SidecarContainers` feature gate,
+> and is on by default from 1.29. Older clusters do not have it: the field is
+> not part of their pod schema, so the container is an ordinary init container
+> that this example's `while true` loop never lets finish. The chart's own
+> `kubeVersion` floor is `>=1.26.0-0`, which is deliberately wider than this
+> one recipe — check your cluster rather than the chart. On 1.26 or 1.27, order
+> the writer with a one-shot init container that fetches once and exits instead,
+> and accept that nothing keeps the file fresh between restarts.
 
 ```yaml
 extraVolumes:
@@ -770,7 +795,7 @@ extraVolumeMounts:
 initContainers:
   - name: fetch-upstream-crls
     image: curlimages/curl:8.11.1
-    restartPolicy: Always          # native sidecar: starts before, runs alongside
+    restartPolicy: Always          # native sidecar (Kubernetes 1.29+): starts before, runs alongside
     command: ["/bin/sh", "-c"]
     args:
       - |
@@ -934,13 +959,25 @@ renders, not Secrets you mount yourself — so the new anchor sits on disk,
 unread, until something else restarts the pod, and the old one goes on being
 trusted. Nothing reports this.
 
-To rotate an anchor, use the supported procedure and let the chart do the
-rolling: **add the new anchor as a second `client_ca` entry, roll the fleet,
-then remove the old entry and roll again.** Both halves are `config` changes, so
-each `helm upgrade` moves the checksum annotation and rolls the pods by itself.
-Changing `admin_cns` is a restart-shaped change for the same reason, and gets
-the same treatment for free — only domain zero's own admin allow list is
-reloadable through `SIGHUP`.
+To rotate an anchor, use the supported procedure: **add the new anchor as a
+second `client_ca` entry, roll the fleet, then remove the old entry and roll
+again.** Both halves are `config` changes, so on a default install each `helm
+upgrade` moves the checksum annotation and rolls the pods for you. Changing
+`admin_cns` is a restart-shaped change for the same reason, and gets the same
+treatment — only domain zero's own admin allow list is reloadable through
+`SIGHUP`.
+
+> **Confirm the pods actually rolled before you treat the old anchor as
+> untrusted.** The annotation is rendered only when `configChecksumAnnotation`
+> is true *and* `existingConfigMap` is unset, and both of those are supported
+> configurations. With either in play the `helm upgrade` that removes an entry
+> updates the ConfigMap and leaves the running pods alone — so the issuer you
+> just withdrew, and every CN in its `admin_cns`, goes on authenticating
+> administrators until something else restarts them. Nothing reports this: the
+> release succeeded, and the pods are healthy on the trust configuration you
+> meant to delete. Roll them yourself (`kubectl rollout restart deployment/...`,
+> or whatever reloader you run in place of the annotation), and treat the
+> withdrawal as complete only once they have.
 
 ## OpenBao CA key custody
 

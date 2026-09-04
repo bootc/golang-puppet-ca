@@ -43,10 +43,18 @@ config:
   # The two cross-CA features, which the chart models with no value of its own:
   # both are `config` plus a mount, and both are worked through in
   # docs/helm-chart.md, "Trust and revocation across CAs". Carried here so the
-  # documented shapes are rendered and schema-validated on every run rather
-  # than only when someone reads the guide. Each file gets a volume to itself:
-  # a subPath mount never receives updates, which would freeze the CRLs while
-  # every metric went on reporting health.
+  # guide's example renders on every run rather than only when someone reads it,
+  # and so the paths below stay in step with the mounts further down.
+  #
+  # Be clear about how far that goes: values.schema.json types `config` as a
+  # bare object, and the block is emitted as an opaque config.yaml string, so
+  # nothing here validates a key name. `crlFile` for `crl_file` would render,
+  # lint and pass kubeconform while the server silently ignored it. The
+  # extraVolumes/extraVolumeMounts entries below ARE schema-checked, because
+  # they render into the pod spec. Only the server-side spelling is on trust.
+  #
+  # Each file gets a volume to itself: a subPath mount never receives updates,
+  # which would freeze the CRLs while every metric went on reporting health.
   crl_chain_file: /run/secrets/upstream-crls/upstream-crls.pem
   client_revocation_policy: require
   client_crl_refresh_interval_sec: 900
