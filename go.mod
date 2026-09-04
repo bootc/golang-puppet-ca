@@ -5,7 +5,7 @@ go 1.27.0
 require (
 	github.com/alicebob/miniredis/v2 v2.38.0
 	github.com/caarlos0/env/v11 v11.4.1
-	github.com/go-sql-driver/mysql v1.10.0
+	github.com/go-sql-driver/mysql v1.10.1
 	github.com/google/go-containerregistry v0.22.0
 	github.com/magefile/mage v1.17.2
 	github.com/onsi/ginkgo/v2 v2.32.1
