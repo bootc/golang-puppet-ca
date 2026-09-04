@@ -931,12 +931,13 @@ CA you do not control. Enabling it warns at startup.
 
 **6. Keep the CRL current.** Refresh the Secret by whatever already delivers it;
 each entry's `crl_file` is re-read every `client_crl_refresh_interval_sec` (an
-hour by default) and openvox-ca only notices. A reload that fails, that would
-cover fewer anchors, or that would move an anchor backwards is refused and the
-previous set kept — right for availability, and invisible on every other series,
-because the retained CRLs are still being served. The signal is
-`puppetca_client_crl_last_reload_timestamp_seconds` going stale, which
-`PuppetCAClientCRLStale` alerts on. Alert on `PuppetCAClientCRLUnusable` and
+hour by default) and openvox-ca only notices. Not every reload is applied: four
+conditions make one untrustworthy enough to refuse, and [the revocation
+section](configuration.md#revocation) lists them. What matters here is the shape
+they share — the previous set is kept, which is right for availability and
+invisible on every other series, because the retained CRLs are still being
+served. The signal is `puppetca_client_crl_last_reload_timestamp_seconds` going
+stale, which `PuppetCAClientCRLStale` alerts on. Alert on `PuppetCAClientCRLUnusable` and
 `PuppetCAClientCRLRefusals` too: under `require` an entry with no current CRL
 rejects every one of its clients, and the first symptom is otherwise an
 agent-side 403 three layers away.
