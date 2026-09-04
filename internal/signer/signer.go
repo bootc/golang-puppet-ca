@@ -327,14 +327,28 @@ func (r *RemoteSigner) Sign(_ io.Reader, digest []byte, opts crypto.SignerOpts) 
 		// once at spawn and consumed by DialConn, so there is no second dial
 		// to flush the map with.
 		//
-		//   - The signing bound rate-limits it. Every Sign goes through
-		//     ca_signing_concurrency, so at most `limit` calls can be
-		//     outstanding at a time and each holds its slot for this whole
-		//     timeout. Entries therefore accrue at limit/timeout, not per
-		//     request — single-digit entries per minute at the shipped
+		//   - The signing bound rate-limits it, *while it is enabled*. Every
+		//     Sign goes through ca_signing_concurrency, so at most `limit`
+		//     calls can be outstanding at a time and each holds its slot for
+		//     this whole timeout. Entries therefore accrue at limit/timeout,
+		//     not per request — single-digit entries per minute at the shipped
 		//     default, a few hundred bytes each.
 		//   - It self-heals whenever a reply does arrive, so a merely slow
 		//     signer drains rather than accumulating.
+		//
+		// The first of those has a hole worth naming rather than leaving for a
+		// reader to find: `ca_signing_concurrency: 0` is a documented, supported
+		// value meaning unbounded signing, and it takes the rate limit with it.
+		// There, entries accrue per in-flight request rather than per timeout
+		// window, bounded only by how many requests the frontend is serving —
+		// which on the unauthenticated /ocsp path is chosen by the caller.
+		//
+		// That is a consequence of the opt-out rather than a defect in it: an
+		// operator who disables the bound has accepted unbounded concurrent
+		// signing, and unbounded pending entries is the same acceptance seen
+		// from the other side. It is called out because the sentence above
+		// would otherwise read as an unconditional guarantee, and the whole
+		// argument for leaving this leak in place rests on it.
 		//
 		// What is left is a permanently wedged signer, which is already an
 		// outage someone is fixing, leaking on the order of a megabyte a day.

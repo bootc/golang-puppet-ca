@@ -77,12 +77,20 @@ func (s *Server) handleOCSP(w http.ResponseWriter, r *http.Request) {
 		case http.StatusInternalServerError:
 			slog.Error("OCSP internal error", "error", err)
 		case http.StatusServiceUnavailable:
-			// Warn, not Error: a shed is the bound working. It is worth an
-			// operator's attention because it may mean the configured limit is
-			// below what the deployment needs, but it is not a fault. The
-			// counter behind puppetca_ca_signing_shed_total is the thing to
-			// alert on; this line is for working out which caller provoked it.
-			slog.Warn("OCSP response shed: CA signing concurrency limit reached",
+			// Debug, not Warn, and the level is the point. A shed is the bound
+			// working, and this fires once per refused request on an
+			// unauthenticated endpoint — so at Warn an anonymous caller chooses
+			// how much this CA writes to disk, turning a request flood into a
+			// log flood and amplifying exactly the load the bound exists to
+			// shed.
+			//
+			// Nothing is lost by dropping it: puppetca_ca_signing_shed_total
+			// counts every one of these, and the metric is already what the
+			// docs tell operators to alert on. This line only adds which caller
+			// provoked it, which is a debugging question rather than a
+			// monitoring one — so it belongs at the level you turn on when you
+			// are asking it.
+			slog.Debug("OCSP response shed: CA signing concurrency limit reached",
 				"client_ip", clientIP(r))
 		default:
 			slog.Warn("OCSP request error", "error", err)

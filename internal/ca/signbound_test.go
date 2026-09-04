@@ -248,5 +248,30 @@ var _ = Describe("The CA-key signing bound", func() {
 			Expect(err).NotTo(HaveOccurred())
 			Expect(answer.DER).NotTo(BeEmpty())
 		})
+
+		// The property that keeps the bound from being felt in normal service.
+		// A cached response is returned under the read lock before the bound is
+		// consulted at all, so ordinary verifier traffic — which is repeat
+		// queries for a handful of serials — is answered while the bound is
+		// saturated. Without this, a full bound would shed every request rather
+		// than only the ones that would actually sign, and the shed rate would
+		// stop meaning what the metric says it means.
+		It("serves a cached response while the bound is full, without shedding", func() {
+			// Populate the cache: known serial, no nonce, so this signs once
+			// and stores the answer.
+			first, err := c.AnswerOCSP(ctx, reqDER)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(first.MaxAge).To(BeNumerically(">", 0), "must be cacheable for the rest to mean anything")
+
+			// Now saturate the bound and ask again.
+			c.signSlots <- struct{}{}
+			DeferCleanup(func() { <-c.signSlots })
+
+			cached, err := c.AnswerOCSP(ctx, reqDER)
+			Expect(err).NotTo(HaveOccurred(), "a cache hit must not need a signing slot")
+			Expect(cached.DER).To(Equal(first.DER))
+			Expect(c.SigningShedTotal()).To(BeZero(),
+				"a cache hit is not a shed, and must not be counted as one")
+		})
 	})
 })
