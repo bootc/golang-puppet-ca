@@ -373,10 +373,16 @@ envFrom: []
 # cleanup. Raise the limit before a growing inventory reaches it — crossing it
 # is an OOMKill, and with the Recreate strategy a persistence-enabled
 # install derives, that is CA downtime.
-# The launcher divides this ceiling between the three server processes it
-# supervises, claiming 90% of it (memory_budget_percent) and leaving the rest as
-# headroom, so the Go runtimes collect harder rather than hitting the cliff — no
-# GOMEMLIMIT needed. With `persistence.enabled: false` and the default
+# The launcher divides this cgroup v2 ceiling between the three server processes
+# it supervises, claiming 90% of it (config.memory_budget_percent) and leaving
+# the rest as headroom, so the Go runtimes collect harder rather than hitting the
+# cliff — no GOMEMLIMIT needed. On a cgroup v1 node nothing is derived; set
+# GOMEMLIMIT explicitly there.
+#
+# Dividing needs at least 63Mi. Below that the ceiling is left undivided (with a
+# warning) and NO process gets a memory limit at all, so the cliff is back. At
+# this 64Mi default the frontend's share is 25.6Mi, after 8Mi for the launcher
+# and 24Mi for the signer. With `persistence.enabled: false` and the default
 # `medium: Memory`, the cadir tmpfs counts against this limit too and shares that
 # headroom. If you do set GOMEMLIMIT via `env` it names the budget for the whole
 # process tree, not one process, and is used in place of the ceiling derived from

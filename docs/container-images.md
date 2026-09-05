@@ -69,6 +69,13 @@ $ docker run -d --name openvox-ca \
     --tls-cert=/data/ca_crt.pem --tls-key=/data/private/ca_key.pem
 ```
 
+If you set a memory limit — `--memory`, podman's `-m`, or a compose `mem_limit`
+— the launcher reads it from the container's **cgroup v2** ceiling and divides it across the
+three processes it runs (a supervisor, an isolated signer and the frontend),
+rather than letting each apply the whole of it. `GOMEMLIMIT` set on the
+container likewise names the budget for the whole tree, not for one process. See
+[memory budget](configuration.md#memory-budget).
+
 On first run this bootstraps a new CA under `/data` and serves HTTPS on port
 8140, using the CA's own certificate as the TLS server certificate. (The
 server refuses plain HTTP on a non-loopback address unless `--no-tls-required`

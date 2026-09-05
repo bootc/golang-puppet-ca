@@ -294,11 +294,11 @@ stands; set `GOMEMLIMIT` explicitly there.
 It does not claim the whole ceiling. `GOMEMLIMIT` bounds Go runtime memory only,
 while the binary's resident text, kernel memory charged to the cgroup and a
 memory-backed cadir all count against the same limit from outside it, so the
-launcher claims `memory_budget_percent` of the ceiling (default 90%) and leaves
+launcher claims `config.memory_budget_percent` of the ceiling (default 90%) and leaves
 the rest as headroom. **With `persistence.enabled: false` and the default
 `emptyDir.medium: Memory` the cadir tmpfs shares that headroom**, and tmpfs pages
 cannot be reclaimed without swap; on a small limit with a busy cadir, lower
-`memory_budget_percent` or set `GOMEMLIMIT` explicitly.
+`config.memory_budget_percent` or set `GOMEMLIMIT` explicitly.
 
 If you do set it, **`GOMEMLIMIT` names the budget for the whole process tree**,
 not for one process. An explicit value takes precedence over the cgroup ceiling
@@ -314,16 +314,37 @@ env:
   GOMEMLIMIT: 240MiB
 ```
 
-The launcher and signer take fixed shares (`memory_reserve_launcher`,
-`memory_reserve_signer`) and the frontend takes the remainder. The signer's share
-is the one you can outgrow: its startup peak is fleet-proportional at roughly 420
-bytes per certificate, and **raising `resources.limits.memory` does not reach
-it**, so past about 60,000 certificates raise `memory_reserve_signer` as well.
+The launcher and signer take fixed shares (`config.memory_reserve_launcher`,
+`config.memory_reserve_signer`) and the frontend takes the remainder. The
+signer's share is the one you can outgrow: its startup peak is
+fleet-proportional at roughly 420 bytes per certificate, and **raising
+`resources.limits.memory` does not reach it**, so past about 60,000 certificates
+raise `config.memory_reserve_signer` as well:
+
+```yaml
+config:
+  memory_reserve_signer: 128Mi
+```
 
 A budget too small to leave the frontend a workable share is left undivided
 rather than split into shares that would cause continuous GC. That case and a
 malformed `GOMEMLIMIT` are logged as warnings; a host that states no ceiling at
-all is logged at debug level, since there is nothing to act on.
+all is logged at debug level, since there is nothing to act on. `--single-process`
+divides nothing either, because there is no tree to divide. A `GOMEMLIMIT` the Go
+runtime cannot parse is not one of these cases: the runtime rejects it during
+startup, before any of this runs, and the process dies with `fatal error:
+malformed GOMEMLIMIT`.
+
+Dividing needs a ceiling of at least **63Mi** under the default reservations, so
+`resources.limits.memory` below that is left undivided — and then no process gets
+a limit at all, so the cliff is back. At the shipped 64Mi default the tree budget
+is 57.6Mi and the frontend's share is **25.6Mi**, the launcher's 8Mi and the
+signer's 24Mi; the startup log line reports all four. If that is tighter than
+your fleet needs, raise `resources.limits.memory` — every byte above the two
+fixed reservations goes to the frontend.
+
+These three keys go under `config`; see
+[memory budget](configuration.md#memory-budget) for their grammar and defaults.
 
 ### Shutdown and drain
 

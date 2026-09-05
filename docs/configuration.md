@@ -1309,12 +1309,37 @@ roughly 420 bytes per certificate, and **raising the container limit does not
 reach it**, so a fleet beyond about 60,000 certificates should raise
 `memory_reserve_signer`.
 
-Nothing is divided when no ceiling is stated anywhere, on cgroup v1, or when the
-budget is too small to leave the frontend a workable share — splitting a very
-small total would trade a visible OOMKill for a silent GC death spiral. The
-first case is logged at debug level, since an unlimited host is unremarkable;
-the other two are logged as warnings, because the operator stated a limit and
-did not get the division.
+`memory_reserve_launcher` and `memory_reserve_signer` take an integer with an
+optional IEC suffix, with or without the trailing `B`: `24MiB` and `24Mi` are
+both accepted, as is a bare `25165824`. SI spellings are not — `64MB`, `64M`,
+`64 MiB` and `1.5GiB` are all rejected, because SI and IEC differ by 5% and
+guessing which was meant is worse than refusing. Neither may be below 8MiB: a
+share under the Go runtime's own footprint is arithmetically valid and
+operationally a process that collects continuously. A `memory_budget_percent`
+outside 1-100 is likewise rejected. In every one of these cases the built-in
+default is used and **the launcher logs a warning naming the key and the value
+it ignored**, so a mistyped reservation does not pass unnoticed.
+
+Nothing is divided at all in three cases. One is logged as a **warning**,
+because the operator stated a ceiling and did not get the division: a budget too
+small to leave the frontend a workable share, which under the default
+reservations means a ceiling below 63Mi on the derived path (the three shares
+need 56MiB between them, and a derived ceiling is scaled to 90% first).
+Splitting a very small total would trade a visible OOMKill for a silent GC death
+spiral, so it is left undivided — and then no process gets a limit at all.
+
+The other two are logged at **debug** level, since there is nothing to act on:
+no ceiling stated anywhere — which includes every cgroup v1 host, because
+`memory.limit_in_bytes` is deliberately not read — and `GOMEMLIMIT=off`. On
+cgroup v1, set `GOMEMLIMIT` explicitly.
+
+A `GOMEMLIMIT` that is not a byte count is not one of these cases. The Go
+runtime parses it during startup, before any of this runs, and aborts with
+`fatal error: malformed GOMEMLIMIT` — so the symptom is a process that does not
+start, not a division that did not happen.
+
+`--single-process` divides nothing either, because there is no tree to divide;
+those installs should set `GOMEMLIMIT` in the ordinary per-process way.
 
 ## Graceful shutdown
 
