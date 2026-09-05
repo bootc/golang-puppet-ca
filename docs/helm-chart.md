@@ -285,15 +285,26 @@ reaches it.
 
 You do not normally need to set `GOMEMLIMIT`. The server runs as three
 processes — a launcher supervising an isolated signer and the frontend, see
-[CA key security](ca-key-security.md#process-isolation) — and the launcher
-reads the pod's cgroup memory ceiling and divides it between them, so the Go
-runtimes collect harder instead of hitting the cgroup wall with no
-configuration at all.
+[CA key security](ca-key-security.md#process-isolation) — and the launcher reads
+the pod's **cgroup v2** memory ceiling and divides it between them, so the Go
+runtimes collect harder instead of hitting the cgroup wall with no configuration
+at all. On a cgroup v1 node nothing is derived and the pre-change behaviour
+stands; set `GOMEMLIMIT` explicitly there.
+
+It does not claim the whole ceiling. `GOMEMLIMIT` bounds Go runtime memory only,
+while the binary's resident text, kernel memory charged to the cgroup and a
+memory-backed cadir all count against the same limit from outside it, so the
+launcher claims `memory_budget_percent` of the ceiling (default 90%) and leaves
+the rest as headroom. **With `persistence.enabled: false` and the default
+`emptyDir.medium: Memory` the cadir tmpfs shares that headroom**, and tmpfs pages
+cannot be reclaimed without swap; on a small limit with a busy cadir, lower
+`memory_budget_percent` or set `GOMEMLIMIT` explicitly.
 
 If you do set it, **`GOMEMLIMIT` names the budget for the whole process tree**,
 not for one process. An explicit value takes precedence over the cgroup ceiling
-and is divided the same way, so set it at or just under
-`resources.limits.memory` — never to a per-process share:
+and is taken at face value — no headroom is withheld, because naming a number is
+choosing your own — so set it at or just under `resources.limits.memory`, never
+above it and never to a per-process share:
 
 ```yaml
 resources:
@@ -303,12 +314,16 @@ env:
   GOMEMLIMIT: 240MiB
 ```
 
-A budget too small to leave the frontend a workable share is left undivided
-rather than split into shares that would cause continuous GC; the launcher logs
-the reason when that happens.
+The launcher and signer take fixed shares (`memory_reserve_launcher`,
+`memory_reserve_signer`) and the frontend takes the remainder. The signer's share
+is the one you can outgrow: its startup peak is fleet-proportional at roughly 420
+bytes per certificate, and **raising `resources.limits.memory` does not reach
+it**, so past about 60,000 certificates raise `memory_reserve_signer` as well.
 
-With `persistence.enabled: false` and the default `emptyDir.medium: Memory`, the
-cadir tmpfs counts against the same limit.
+A budget too small to leave the frontend a workable share is left undivided
+rather than split into shares that would cause continuous GC. That case and a
+malformed `GOMEMLIMIT` are logged as warnings; a host that states no ceiling at
+all is logged at debug level, since there is nothing to act on.
 
 ### Shutdown and drain
 

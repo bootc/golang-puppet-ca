@@ -374,11 +374,14 @@ envFrom: []
 # is an OOMKill, and with the Recreate strategy a persistence-enabled
 # install derives, that is CA downtime.
 # The launcher divides this ceiling between the three server processes it
-# supervises, so the Go runtimes collect harder rather than hitting the cliff —
-# no GOMEMLIMIT needed. If you do set GOMEMLIMIT via `env`, it names the budget
-# for the whole process tree, not one process, and it takes precedence over
-# this limit. With `persistence.enabled: false` and the default
-# `medium: Memory`, the cadir tmpfs counts against this limit too.
+# supervises, claiming 90% of it (memory_budget_percent) and leaving the rest as
+# headroom, so the Go runtimes collect harder rather than hitting the cliff — no
+# GOMEMLIMIT needed. With `persistence.enabled: false` and the default
+# `medium: Memory`, the cadir tmpfs counts against this limit too and shares that
+# headroom. If you do set GOMEMLIMIT via `env` it names the budget for the whole
+# process tree, not one process, and is used in place of the ceiling derived from
+# this limit. It does NOT raise this limit — crossing that is still an OOMKill —
+# so set it at or just under this value, never above.
 resources:
   requests:
     cpu: 10m
