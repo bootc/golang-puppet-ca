@@ -280,10 +280,20 @@ grows with the size of the fleet: it keeps a serial index and a cache of
 pre-signed OCSP responses, one entry per known certificate, pruned only on
 revocation or expired-certificate cleanup. Crossing the limit is an OOMKill, and
 with the Recreate strategy that persistence-enabled installs default to, that
-is CA downtime. Raise
-`resources.limits.memory` before a growing inventory reaches it, and consider
-setting `GOMEMLIMIT` just under it through `env` so the Go runtime collects
-harder instead of hitting the cgroup wall:
+is CA downtime. Raise `resources.limits.memory` before a growing inventory
+reaches it.
+
+You do not normally need to set `GOMEMLIMIT`. The server runs as three
+processes — a launcher supervising an isolated signer and the frontend, see
+[CA key security](ca-key-security.md#process-isolation) — and the launcher
+reads the pod's cgroup memory ceiling and divides it between them, so the Go
+runtimes collect harder instead of hitting the cgroup wall with no
+configuration at all.
+
+If you do set it, **`GOMEMLIMIT` names the budget for the whole process tree**,
+not for one process. An explicit value takes precedence over the cgroup ceiling
+and is divided the same way, so set it at or just under
+`resources.limits.memory` — never to a per-process share:
 
 ```yaml
 resources:
@@ -292,6 +302,10 @@ resources:
 env:
   GOMEMLIMIT: 240MiB
 ```
+
+A budget too small to leave the frontend a workable share is left undivided
+rather than split into shares that would cause continuous GC; the launcher logs
+the reason when that happens.
 
 With `persistence.enabled: false` and the default `emptyDir.medium: Memory`, the
 cadir tmpfs counts against the same limit.
