@@ -492,6 +492,19 @@ var _ = Describe("dividing the memory budget across the process tree", func() {
 			Entry("GOMEMLIMIT off", memLimitEnv("off"), budgetNoCeiling),
 		)
 
+		It("names the launcher's own key in its note, not the signer's", func() {
+			// byteCountOrDefault takes the key name as a string, and only the
+			// signer's was ever asserted: a copy-paste making both resolvers
+			// pass "memory_reserve_signer" would warn about the wrong key.
+			cfg := &serverConfig{MemoryReserveLauncher: "64MB"}
+			budget, kind, _ := resolveMemoryBudget(cfg, memLimitEnv("256MiB"), missingPath())
+
+			Expect(kind).To(Equal(budgetApplied))
+			joined := strings.Join(budget.notes, "\n")
+			Expect(joined).To(ContainSubstring("memory_reserve_launcher"))
+			Expect(joined).NotTo(ContainSubstring("memory_reserve_signer"))
+		})
+
 		It("names the key when a reservation is below the floor, not only when it is malformed", func() {
 			// Both note-producing arms of byteCountOrDefault: the unparseable
 			// one is covered above, this is the below-floor one. Returning an
@@ -696,7 +709,12 @@ var _ = Describe("dividing the memory budget across the process tree", func() {
 				applyMemoryBudget(defaultCfg(), memLimitEnv("256MiB"), missingPath(), func(int64) int64 { return 0 })
 			})
 			Expect(applied).To(ContainSubstring("level=INFO"))
-			Expect(applied).To(ContainSubstring("frontend_bytes"), "the operator must be able to read all four shares")
+			// Values, not key names: a dropped attribute, or one bound to the
+			// wrong share, still contains the key.
+			Expect(applied).To(ContainSubstring("launcher_bytes=8388608"))
+			Expect(applied).To(ContainSubstring("signer_bytes=25165824"))
+			Expect(applied).To(ContainSubstring("frontend_bytes=234881024"))
+			Expect(applied).To(ContainSubstring("total_bytes=268435456"))
 
 			// A ceiling was stated and not divided: the operator asked for
 			// something and did not get it, so this one has to be visible at
@@ -705,6 +723,15 @@ var _ = Describe("dividing the memory budget across the process tree", func() {
 				applyMemoryBudget(defaultCfg(), memLimitEnv("32MiB"), missingPath(), func(int64) int64 { return 0 })
 			})
 			Expect(tooSmall).To(ContainSubstring("level=WARN"))
+
+			// Zero must not reach setLimit on this path either, not only on the
+			// no-ceiling one: the budget is the zero value here too.
+			var appliedWhenSmall []int64
+			captureLogs(slog.LevelDebug, func() {
+				applyMemoryBudget(defaultCfg(), memLimitEnv("32MiB"), missingPath(),
+					func(n int64) int64 { appliedWhenSmall = append(appliedWhenSmall, n); return 0 })
+			})
+			Expect(appliedWhenSmall).To(BeEmpty())
 
 			// No ceiling anywhere is every unlimited host: unremarkable.
 			none := captureLogs(slog.LevelDebug, func() {

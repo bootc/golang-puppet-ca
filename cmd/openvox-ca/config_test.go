@@ -950,6 +950,7 @@ var _ = Describe("applyServerEnv each variable", func() {
 		setEnv("PUPPET_CA_CA_VALIDITY_DAYS", "not-a-number")
 		setEnv("PUPPET_CA_LEAF_VALIDITY_DAYS", "bad")
 		setEnv("PUPPET_CA_CA_PATH_LENGTH", "not-a-number")
+		setEnv("PUPPET_CA_MEMORY_BUDGET_PERCENT", "ninety")
 
 		cfg := &serverConfig{Port: 8140, Verbosity: 0, CAPathLength: -1}
 		applyServerEnv(cfg)

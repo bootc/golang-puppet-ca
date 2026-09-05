@@ -91,14 +91,17 @@ type serverConfig struct {
 	// none of them is needed for the defaults to be sensible.
 	//
 	// MemoryReserveLauncher and MemoryReserveSigner are the fixed shares the
-	// launcher and signer receive, as byte counts in the same grammar as
-	// GOMEMLIMIT ("24MiB", "25165824"). The frontend takes the remainder,
+	// launcher and signer receive, as an integer with an optional IEC suffix,
+	// with or without the trailing B ("24MiB", "24Mi", "25165824"). That is
+	// deliberately wider than GOMEMLIMIT's own grammar, which requires the B;
+	// see parseConfiguredByteCount. The frontend takes the remainder,
 	// because in steady state it is the process whose footprint grows with the
 	// fleet. The signer's share is the one an operator can outgrow: its startup
 	// peak is fleet-proportional at roughly 420 bytes per certificate, and
-	// raising the container limit does not reach it, so a fleet beyond about
-	// 60,000 certificates should raise memory_reserve_signer. Empty selects the
-	// built-in defaults.
+	// raising the container limit does not reach it. The share also carries the
+	// runtime's own footprint, so the usable headroom in the 24MiB default is
+	// nearer 16MiB: raise memory_reserve_signer beyond roughly 40,000
+	// certificates. Empty selects the built-in defaults.
 	MemoryReserveLauncher string `yaml:"memory_reserve_launcher"`
 	MemoryReserveSigner   string `yaml:"memory_reserve_signer"`
 

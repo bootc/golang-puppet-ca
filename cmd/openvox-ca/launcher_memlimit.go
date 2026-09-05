@@ -93,8 +93,10 @@ const (
 	// defaultSignerReservation must cover the signer's *peak*, which falls
 	// during ca.Init and is fleet-proportional at roughly 420 bytes per
 	// certificate: buildSerialIndex plus the []CertRecord that rebuildCertIndex
-	// materialises. 24MiB therefore covers on the order of 60,000
-	// certificates.
+	// materialises. The share must also carry the runtime's own mapped
+	// footprint -- the same few MiB minProcessReservation exists to protect --
+	// so the usable headroom in 24MiB is nearer 16MiB, covering on the order of
+	// 40,000 certificates rather than the 60,000 the raw division suggests.
 	//
 	// This share does NOT scale with the tree total, so raising the container
 	// limit does not reach the signer. Above roughly that fleet size, raise
@@ -428,8 +430,9 @@ func parseConfiguredByteCount(s string) (int64, bool) {
 // reimplemented rather than approximated with a general size parser because the
 // value has to round-trip: anything this accepts but the runtime rejects would
 // be divided here and then refused by the child, and anything the runtime
-// accepts but this rejects would silently fall through to the cgroup and
-// override the operator.
+// accepts but this rejects would be reported as budgetInvalid and nothing
+// divided, leaving all three processes to inherit the operator's value and
+// apply the whole of it each -- the defect this file exists to remove.
 //
 // The runtime's "off" is handled by the caller rather than here, because it is
 // not a byte count: it names the absence of a limit.
