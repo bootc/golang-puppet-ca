@@ -23,6 +23,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -47,12 +48,25 @@ func memLimitEnv(v string) func(string) string {
 // the built-in defaults apply.
 func defaultCfg() *serverConfig { return &serverConfig{} }
 
-// writeCgroupFile writes a memory.max fixture and returns its path. The path is
-// a file rather than a mount root, which readCgroupMemoryMax reads directly.
+// writeCgroupFile writes a memory.max fixture and returns the mount ROOT holding
+// it, which is the shape production passes. Returning the file itself let an
+// earlier shortcut in cgroupMemoryMaxCandidates answer directly, so the two
+// filepath.Join constructions that are the only thing production runs were never
+// exercised by any spec.
 func writeCgroupFile(contents string) string {
-	path := filepath.Join(GinkgoT().TempDir(), "memory.max")
-	Expect(os.WriteFile(path, []byte(contents), 0o600)).To(Succeed())
-	return path
+	root := GinkgoT().TempDir()
+	Expect(os.WriteFile(filepath.Join(root, "memory.max"), []byte(contents), 0o600)).To(Succeed())
+	return root
+}
+
+// stubSelfCgroup makes selfCgroupPathFn report rel for the current spec, so the
+// candidate ordering can be driven on a host whose own /proc/self/cgroup says
+// nothing useful (macOS) as well as one where it does.
+func stubSelfCgroup(rel string) {
+	GinkgoHelper()
+	previous := selfCgroupPathFn
+	selfCgroupPathFn = func() string { return rel }
+	DeferCleanup(func() { selfCgroupPathFn = previous })
 }
 
 // missingPath names a file that does not exist, standing in for a host with no
@@ -149,6 +163,46 @@ var _ = Describe("dividing the memory budget across the process tree", func() {
 			Entry("a negative count", "-1\n"),
 		)
 
+		It("reads memory.max from under the mount root it is given", func() {
+			// The production shape: cgroupMountRoot is a directory, and the
+			// candidate paths are built by joining onto it. Renaming
+			// cgroupMemoryMax or dropping either join fails here.
+			root := writeCgroupFile("268435456\n")
+			budget, kind, reason := resolveMemoryBudget(defaultCfg(), noEnv, root)
+
+			Expect(kind).To(Equal(budgetApplied), "reason: %s", reason)
+			Expect(budget.ceiling).To(Equal(int64(256 << 20)))
+			Expect(budget.source).To(ContainSubstring(filepath.Join(root, "memory.max")),
+				"the source must name the file actually read")
+		})
+
+		It("prefers this process's own cgroup over the mount root", func() {
+			// What makes a systemd unit's MemoryMax= work: the service's cgroup
+			// is system.slice/<unit>, not the root. Reversing the candidate
+			// order fails here.
+			root := GinkgoT().TempDir()
+			Expect(os.WriteFile(filepath.Join(root, "memory.max"), []byte("1073741824\n"), 0o600)).To(Succeed())
+			own := filepath.Join(root, "system.slice", "openvox-ca.service")
+			Expect(os.MkdirAll(own, 0o700)).To(Succeed())
+			Expect(os.WriteFile(filepath.Join(own, "memory.max"), []byte("268435456\n"), 0o600)).To(Succeed())
+			stubSelfCgroup("/system.slice/openvox-ca.service")
+
+			budget, kind, reason := resolveMemoryBudget(defaultCfg(), noEnv, root)
+
+			Expect(kind).To(Equal(budgetApplied), "reason: %s", reason)
+			Expect(budget.ceiling).To(Equal(int64(256<<20)),
+				"the unit's own ceiling must win over the mount root's")
+		})
+
+		It("falls back to the mount root when the process's own cgroup states nothing", func() {
+			root := writeCgroupFile("268435456\n")
+			stubSelfCgroup("/system.slice/openvox-ca.service") // no memory.max written there
+
+			budget, kind, _ := resolveMemoryBudget(defaultCfg(), noEnv, root)
+			Expect(kind).To(Equal(budgetApplied))
+			Expect(budget.ceiling).To(Equal(int64(256 << 20)))
+		})
+
 		It("accepts a ceiling written without a trailing newline", func() {
 			// Gives the "max" case above a sibling it is checked against: without
 			// an accepted fixture, deleting the max clause would send it to
@@ -189,6 +243,28 @@ var _ = Describe("dividing the memory budget across the process tree", func() {
 			Expect(budget.total).To(Equal(int64(1) << 29))
 		})
 
+		It("does not wrap on a ceiling large enough to overflow the multiply", func() {
+			// scalePercent multiplies before dividing, so above MaxInt64/100 the
+			// product would wrap negative and the budget would be refused as too
+			// small. Deleting the guard fails here.
+			budget, kind, reason := resolveMemoryBudget(defaultCfg(), noEnv,
+				writeCgroupFile("9223372036854775807\n"))
+
+			Expect(kind).To(Equal(budgetApplied), "reason: %s", reason)
+			Expect(budget.total).To(BeNumerically(">", int64(0)), "a wrapped total goes negative")
+			Expect(budget.total).To(Equal(int64(9223372036854775807) / 100 * defaultMemoryBudgetPercent))
+		})
+
+		It("takes the exact path just below the overflow threshold", func() {
+			// The other arm of the guard: at or below MaxInt64/100 the multiply
+			// is used, which is exact.
+			const ceiling = int64(92233720368547758) // math.MaxInt64 / 100
+			budget, kind, _ := resolveMemoryBudget(defaultCfg(), noEnv,
+				writeCgroupFile("92233720368547758\n"))
+			Expect(kind).To(Equal(budgetApplied))
+			Expect(budget.total).To(Equal(ceiling * defaultMemoryBudgetPercent / 100))
+		})
+
 		DescribeTable("a percentage outside 1-100 falls back to the default",
 			func(percent int) {
 				cfg := &serverConfig{MemoryBudgetPercent: percent}
@@ -200,6 +276,21 @@ var _ = Describe("dividing the memory budget across the process tree", func() {
 			Entry("negative", -10),
 			Entry("above 100", 101),
 		)
+
+		DescribeTable("both endpoints of the accepted range are honoured",
+			func(percent int, want int64) {
+				cfg := &serverConfig{MemoryBudgetPercent: percent}
+				// 8GiB, so even 1% clears the divisibility floor and the
+				// endpoint is exercised rather than refused for being small.
+				budget, kind, reason := resolveMemoryBudget(cfg, noEnv, writeCgroupFile("8589934592\n"))
+				Expect(kind).To(Equal(budgetApplied), "reason: %s", reason)
+				Expect(budget.total).To(Equal(want))
+			},
+			// Without these, >= 1 could become > 1 and <= 100 become < 100 with
+			// the suite still green, silently giving an operator the default.
+			Entry("the lowest accepted percentage", 1, int64(85899345)),
+			Entry("the whole ceiling", 100, int64(8589934592)),
+		)
 	})
 
 	Describe("how the total is divided", func() {
@@ -208,8 +299,12 @@ var _ = Describe("dividing the memory budget across the process tree", func() {
 			budget, kind, reason := resolveMemoryBudget(defaultCfg(), memLimitEnv("256MiB"), missingPath())
 
 			Expect(kind).To(Equal(budgetApplied), "reason: %s", reason)
-			Expect(budget.launcher).To(Equal(int64(defaultLauncherReservation)))
-			Expect(budget.signer).To(Equal(int64(defaultSignerReservation)))
+			// Absolute, not the constants that produce them: asserting a value
+			// against its own constant cannot fail when the constant moves, and
+			// launcher 16MiB / signer 16MiB would otherwise pass every spec
+			// while halving the signer's documented startup-peak share.
+			Expect(budget.launcher).To(Equal(int64(8 << 20)))
+			Expect(budget.signer).To(Equal(int64(24 << 20)))
 			Expect(budget.frontend).To(Equal(int64(total - defaultLauncherReservation - defaultSignerReservation)))
 		})
 
@@ -255,10 +350,8 @@ var _ = Describe("dividing the memory budget across the process tree", func() {
 		// The two specs above pin the STRICTNESS of the floor comparison but not
 		// its value: their totals are derived from the same constants, so the
 		// boundary moves with a mutation and both stay green with the floor set
-		// to a single byte (verified by mutation). These two bracket it with
-		// absolute totals instead, and they are the chart's own requests.memory
-		// and limits.memory, so the bracket is a configuration that really
-		// occurs rather than an arbitrary pair.
+		// to a single byte (verified by mutation). These bracket it with
+		// absolute totals instead.
 		It("refuses 48MiB, which clears both reservations but leaves the frontend under its floor", func() {
 			// 48 - 8 launcher - 24 signer leaves 16MiB. This fails if the floor
 			// drops to 16MiB or below.
@@ -266,12 +359,44 @@ var _ = Describe("dividing the memory budget across the process tree", func() {
 			Expect(kind).To(Equal(budgetTooSmall))
 		})
 
-		It("divides 64MiB, the chart's default limit, leaving the frontend 32MiB", func() {
+		It("divides an explicit 64MiB, leaving the frontend 32MiB", func() {
 			// Fails if the floor rises above 32MiB. With the spec above, the
-			// floor is bracketed to (16MiB, 32MiB].
+			// floor is bracketed to (16MiB, 32MiB] on the face-value path.
 			budget, kind, reason := resolveMemoryBudget(defaultCfg(), memLimitEnv("64MiB"), missingPath())
 			Expect(kind).To(Equal(budgetApplied), "reason: %s", reason)
 			Expect(budget.frontend).To(Equal(int64(32 << 20)))
+		})
+
+		// The specs above drive an explicit GOMEMLIMIT, which is taken at face
+		// value. The chart sets no GOMEMLIMIT: its limits.memory arrives as a
+		// cgroup ceiling and is scaled to 90% first, so those specs say nothing
+		// about the shipped configuration. These pin it, and the figures the
+		// chart and helm-chart.md publish.
+		It("divides the chart's shipped 64Mi limit on the cgroup path", func() {
+			budget, kind, reason := resolveMemoryBudget(defaultCfg(), noEnv, writeCgroupFile("67108864\n"))
+
+			Expect(kind).To(Equal(budgetApplied), "reason: %s", reason)
+			Expect(budget.total).To(Equal(int64(60397977)), "the documented 57.6Mi tree budget")
+			Expect(budget.frontend).To(Equal(int64(26843545)), "the documented 25.6Mi frontend share")
+			Expect(budget.launcher).To(Equal(int64(8 << 20)))
+			Expect(budget.signer).To(Equal(int64(24 << 20)))
+		})
+
+		It("divides at the documented 63Mi threshold and refuses just below it", func() {
+			// The published figure. 62Mi does NOT divide -- the smallest ceiling
+			// that does is 65244729 bytes, 62.22Mi -- which is why the docs say
+			// 63Mi. A spec at 62Mi would have caught the original wrong figure.
+			_, tooSmall, _ := resolveMemoryBudget(defaultCfg(), noEnv, writeCgroupFile("65244728\n"))
+			Expect(tooSmall).To(Equal(budgetTooSmall), "one byte below the threshold must be refused")
+
+			_, exact, reason := resolveMemoryBudget(defaultCfg(), noEnv, writeCgroupFile("65244729\n"))
+			Expect(exact).To(Equal(budgetApplied), "reason: %s", reason)
+
+			_, at62, _ := resolveMemoryBudget(defaultCfg(), noEnv, writeCgroupFile("65011712\n"))
+			Expect(at62).To(Equal(budgetTooSmall), "62Mi must not divide; the docs say 63Mi")
+
+			_, at63, _ := resolveMemoryBudget(defaultCfg(), noEnv, writeCgroupFile("66060288\n"))
+			Expect(at63).To(Equal(budgetApplied), "63Mi is the first whole MiB that divides")
 		})
 
 		It("names the source in the too-small reason, so the advice is actionable", func() {
@@ -301,18 +426,66 @@ var _ = Describe("dividing the memory budget across the process tree", func() {
 			Expect(budget.frontend).To(Equal(int64(512<<20 - 64<<20 - 16<<20)))
 		})
 
-		DescribeTable("a malformed reservation falls back to its default rather than failing",
+		DescribeTable("an unusable reservation falls back to its default rather than failing",
 			func(value string) {
 				cfg := &serverConfig{MemoryReserveSigner: value}
 				budget, kind, _ := resolveMemoryBudget(cfg, memLimitEnv("256MiB"), missingPath())
 				Expect(kind).To(Equal(budgetApplied))
-				Expect(budget.signer).To(Equal(int64(defaultSignerReservation)))
+				Expect(budget.signer).To(Equal(int64(24 << 20)))
 			},
 			Entry("not a byte count", "enormous"),
 			Entry("zero", "0"),
 			Entry("negative", "-1"),
 			Entry("a decimal", "1.5GiB"),
+			// Below the floor is arithmetically valid and operationally a
+			// process that collects continuously. This is the share of the
+			// process holding the CA key, so "1" must not be taken at its word.
+			Entry("one byte", "1"),
+			Entry("well under the runtime's own footprint", "2MiB"),
+			Entry("one byte below the floor", "8388607"),
 		)
+
+		It("reports a reservation it could not use rather than substituting in silence", func() {
+			// memory_reserve_signer is the documented remedy for a fleet whose
+			// signer outgrows its share, so a value quietly ignored leaves the
+			// operator with the problem they had just tried to fix.
+			cfg := &serverConfig{MemoryReserveSigner: "64MB", MemoryBudgetPercent: 250}
+			budget, kind, _ := resolveMemoryBudget(cfg, memLimitEnv("256MiB"), missingPath())
+
+			Expect(kind).To(Equal(budgetApplied))
+			Expect(budget.notes).To(HaveLen(2), "both rejected settings must be reported")
+			Expect(strings.Join(budget.notes, "\n")).To(ContainSubstring("memory_reserve_signer"))
+			Expect(strings.Join(budget.notes, "\n")).To(ContainSubstring("memory_budget_percent"))
+		})
+
+		It("says nothing when every setting was usable", func() {
+			cfg := &serverConfig{MemoryReserveSigner: "64Mi"}
+			budget, kind, _ := resolveMemoryBudget(cfg, memLimitEnv("256MiB"), missingPath())
+			Expect(kind).To(Equal(budgetApplied))
+			Expect(budget.notes).To(BeEmpty())
+			Expect(budget.signer).To(Equal(int64(64<<20)), "the Kubernetes spelling must be accepted")
+		})
+
+		It("accepts a reservation exactly on the floor", func() {
+			// The other side of it, so the floor's value is pinned rather than
+			// merely its direction.
+			cfg := &serverConfig{MemoryReserveSigner: "8MiB"}
+			budget, kind, _ := resolveMemoryBudget(cfg, memLimitEnv("256MiB"), missingPath())
+			Expect(kind).To(Equal(budgetApplied))
+			Expect(budget.signer).To(Equal(int64(8 << 20)))
+		})
+
+		It("refuses reservations large enough to wrap the remainder", func() {
+			// Two MaxInt64 reservations made total-launcher-signer wrap positive
+			// and pass the frontend floor, admitting a division whose shares sum
+			// far above the budget.
+			cfg := &serverConfig{
+				MemoryReserveLauncher: "9223372036854775807",
+				MemoryReserveSigner:   "9223372036854775807",
+			}
+			_, kind, _ := resolveMemoryBudget(cfg, memLimitEnv("256MiB"), missingPath())
+			Expect(kind).To(Equal(budgetTooSmall))
+		})
 	})
 
 	Describe("which share reaches which process", func() {
@@ -381,7 +554,92 @@ var _ = Describe("dividing the memory budget across the process tree", func() {
 		Entry("one TiB past the overflow threshold", "4194305TiB", int64(0), false),
 		Entry("a count that overflows the shift wildly", "16777216TiB", int64(0), false),
 		Entry("digits that overflow ParseInt itself", "99999999999999999999", int64(0), false),
+		// The threshold itself, not only its neighbours: > could become >= with
+		// the pair either side still green.
+		Entry("exactly the largest shift that does not overflow", "4194304TiB", int64(1)<<62, true),
 	)
+
+	DescribeTable("parsing the byte counts a configuration file may use",
+		func(in string, want int64, valid bool) {
+			got, ok := parseConfiguredByteCount(in)
+			Expect(ok).To(Equal(valid), "validity of %q", in)
+			if valid {
+				Expect(got).To(Equal(want), "value of %q", in)
+			}
+		},
+		// Everything GOMEMLIMIT accepts, plus the trailing-B-less IEC spelling
+		// this project writes everywhere else: resources.limits.memory is
+		// "64Mi", and the shares are described in prose as "8Mi" and "24Mi".
+		// Rejecting that form and silently substituting a default was a trap.
+		Entry("the GOMEMLIMIT spelling", "24MiB", int64(24<<20), true),
+		Entry("the Kubernetes spelling", "24Mi", int64(24<<20), true),
+		Entry("a bare byte count", "25165824", int64(25165824), true),
+		Entry("KiB without the B", "1Ki", int64(1024), true),
+		Entry("GiB without the B", "2Gi", int64(2<<30), true),
+		Entry("TiB without the B", "1Ti", int64(1<<40), true),
+		// SI is still refused: it differs from IEC by 5% and guessing is worse
+		// than refusing.
+		Entry("SI megabytes", "64M", int64(0), false),
+		Entry("SI with a B", "64MB", int64(0), false),
+		Entry("a decimal", "1.5GiB", int64(0), false),
+		Entry("an embedded space", "24 MiB", int64(0), false),
+		Entry("lowercase", "24mi", int64(0), false),
+		Entry("the empty string", "", int64(0), false),
+	)
+
+	DescribeTable("extracting this process's cgroup path from /proc/self/cgroup",
+		func(content, want string) {
+			Expect(parseSelfCgroup(content)).To(Equal(want))
+		},
+		// Behind the stub point this resolver had no coverage at all: changing
+		// the "0::" prefix, or returning the whole line, would have broken the
+		// systemd MemoryMax= promise with every spec still green, because the
+		// mount-root candidate answers either way.
+		Entry("a systemd host, unified line last",
+			"12:pids:/system.slice/x.service\n0::/system.slice/openvox-ca.service\n",
+			"/system.slice/openvox-ca.service"),
+		Entry("a container with its own namespace, which the mount root covers", "0::/\n", ""),
+		Entry("no trailing newline", "0::/system.slice/x.service", "/system.slice/x.service"),
+		Entry("a v1-only file with no unified line", "12:pids:/system.slice/x.service\n", ""),
+		Entry("an empty unified path", "0::\n", ""),
+		Entry("empty content", "", ""),
+		// A near-miss prefix must not match: "0:" alone is a v1 controller line.
+		Entry("a v1 line whose prefix is a substring", "0:cpuset:/some/path\n", ""),
+	)
+
+	Describe("what the launcher applies to itself", func() {
+		// runLauncher has no test and cannot easily have one, so its three
+		// decisions live in applyMemoryBudget where a spec can reach them.
+		It("applies the launcher's own share, not a child's", func() {
+			// The transposition shareFor exists to prevent, at the one call site
+			// where the role is not already an argument. Distinct fixture values
+			// so signer and frontend cannot stand in for it.
+			var applied []int64
+			budget := applyMemoryBudget(defaultCfg(), memLimitEnv("256MiB"), missingPath(),
+				func(n int64) int64 { applied = append(applied, n); return 0 })
+
+			Expect(applied).To(HaveLen(1), "the limit must be applied exactly once")
+			Expect(applied[0]).To(Equal(budget.launcher))
+			Expect(applied[0]).NotTo(Equal(budget.signer))
+			Expect(applied[0]).NotTo(Equal(budget.frontend))
+		})
+
+		It("applies nothing when no budget was resolved", func() {
+			// Zero must never reach SetMemoryLimit: it would collapse the
+			// supervisor into permanent GC.
+			var applied []int64
+			applyMemoryBudget(defaultCfg(), noEnv, missingPath(),
+				func(n int64) int64 { applied = append(applied, n); return 0 })
+			Expect(applied).To(BeEmpty())
+		})
+
+		It("returns the budget it resolved, for the children to draw shares from", func() {
+			budget := applyMemoryBudget(defaultCfg(), memLimitEnv("256MiB"), missingPath(),
+				func(int64) int64 { return 0 })
+			Expect(budget.shareFor("signer")).To(Equal(int64(24 << 20)))
+			Expect(budget.shareFor("frontend")).To(Equal(int64(256<<20 - 8<<20 - 24<<20)))
+		})
+	})
 
 	Describe("what the child process actually receives", func() {
 		// These spawn a real child through the production spawnChild and read

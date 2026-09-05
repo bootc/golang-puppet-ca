@@ -472,6 +472,25 @@ func newRootCmd() *cobra.Command {
 
 			// Launcher mode (default): spawn isolated signer + frontend children.
 			if role == "" && !singleProcess {
+				// The launcher configures logging for itself, like the signer
+				// does. Without this it ran on Go's built-in default handler:
+				// its verbosity was fixed at info whatever the operator set, so
+				// the debug line explaining why no memory budget was divided
+				// could never appear, and its warnings bypassed log_file
+				// entirely.
+				launcherLog, err := setupLogger(cfg)
+				if err != nil {
+					return err
+				}
+				if launcherLog != nil {
+					defer func() {
+						// Report on stderr, not slog: the default logger writes
+						// to this very file, which is being closed here.
+						if cerr := launcherLog.Close(); cerr != nil {
+							fmt.Fprintf(os.Stderr, "failed to close log file: %v\n", cerr)
+						}
+					}()
+				}
 				return runLauncher(cfg, notifier, hupCh)
 			}
 

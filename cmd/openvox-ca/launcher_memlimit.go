@@ -103,6 +103,15 @@ const (
 	// and Init takes longer.
 	defaultSignerReservation = 24 << 20
 
+	// minProcessReservation is the floor for a CONFIGURED reservation. GOMEMLIMIT
+	// governs the runtime's whole mapped footprint, not live heap, and a limit
+	// below that baseline makes the collector run nearly continuously -- silently,
+	// since the process still makes progress. memory_reserve_signer names the
+	// share of the process holding the CA key, so a value of "1" is accepted
+	// arithmetic and a starved signer; below this floor the built-in default is
+	// used instead.
+	minProcessReservation = 8 << 20
+
 	// minFrontendMemoryShare is the floor below which dividing the budget is
 	// worse than leaving it undivided: the frontend is the process actually
 	// serving traffic, and squeezing it into a share near its live heap trades
@@ -153,6 +162,10 @@ type memoryBudget struct {
 	ceiling int64
 	// source names where the ceiling came from, for the operator-facing log.
 	source string
+	// notes carries operator-facing complaints about configured values that
+	// could not be used. Non-fatal by design -- a tuning knob should not stop
+	// the CA starting -- but never silent, which is what they used to be.
+	notes []string
 }
 
 // shareFor returns the limit for one role in the tree.
@@ -198,17 +211,32 @@ func resolveMemoryBudget(cfg *serverConfig, getenv func(string) string, cgroupPa
 		return memoryBudget{}, kind, reason
 	}
 
+	percent, percentNote := cfg.memoryBudgetPercent()
 	total := ceiling
 	if source != goMemLimitEnv {
 		// Withhold headroom only from a figure we derived. See
 		// serverConfig.MemoryBudgetPercent.
-		total = scalePercent(ceiling, cfg.memoryBudgetPercent())
+		total = scalePercent(ceiling, percent)
 	}
 
-	launcher := cfg.memoryReserveLauncher()
-	signer := cfg.memoryReserveSigner()
+	launcher, launcherNote := cfg.memoryReserveLauncher()
+	signer, signerNote := cfg.memoryReserveSigner()
+	notes := make([]string, 0, 3)
+	for _, n := range []string{percentNote, launcherNote, signerNote} {
+		if n != "" {
+			notes = append(notes, n)
+		}
+	}
 
-	frontend := total - launcher - signer
+	// Ordered so neither subtraction can wrap. A reservation is bounded only by
+	// ParseInt on the bare-decimal path, so two MaxInt64 reservations would make
+	// total-launcher-signer wrap positive and pass the floor check below --
+	// admitting a division whose shares sum far above the budget, which is the
+	// state this whole mechanism exists to prevent.
+	frontend := int64(0)
+	if launcher < total && signer < total-launcher {
+		frontend = total - launcher - signer
+	}
 	if frontend < minFrontendMemoryShare {
 		return memoryBudget{}, budgetTooSmall, fmt.Sprintf(
 			"%s gives a tree budget of %d bytes, which leaves the frontend %d after reserving "+
@@ -224,6 +252,7 @@ func resolveMemoryBudget(cfg *serverConfig, getenv func(string) string, cgroupPa
 		frontend: frontend,
 		ceiling:  ceiling,
 		source:   source,
+		notes:    notes,
 	}, budgetApplied, ""
 }
 
@@ -276,8 +305,10 @@ func treeMemoryCeiling(getenv func(string) string, cgroupPath string) (int64, st
 // process's own cgroup over the mount root, and returns the path it read.
 //
 // mountRoot is a parameter so a spec can point the whole lookup at a temporary
-// directory; passing a path that is itself a file (rather than a mount root)
-// reads that file directly, which keeps the single-file fixtures simple.
+// directory. It is a mount root in specs exactly as it is in production: an
+// earlier version short-circuited when handed a file, which let every spec
+// bypass the two filepath.Join constructions that are the only thing production
+// ever runs.
 func readCgroupMemoryMax(mountRoot string) (int64, string, bool) {
 	for _, candidate := range cgroupMemoryMaxCandidates(mountRoot) {
 		if n, ok := parseCgroupMemoryMax(candidate); ok {
@@ -290,26 +321,38 @@ func readCgroupMemoryMax(mountRoot string) (int64, string, bool) {
 // cgroupMemoryMaxCandidates lists the files that may hold this process's memory
 // ceiling, most specific first.
 func cgroupMemoryMaxCandidates(mountRoot string) []string {
-	// A fixture pointing straight at a file is used as-is.
-	if info, err := os.Stat(mountRoot); err == nil && !info.IsDir() {
-		return []string{mountRoot}
-	}
 	candidates := make([]string, 0, 2)
-	if rel := selfCgroupPath(); rel != "" {
+	if rel := selfCgroupPathFn(); rel != "" {
 		candidates = append(candidates, filepath.Join(mountRoot, rel, cgroupMemoryMax))
 	}
 	return append(candidates, filepath.Join(mountRoot, cgroupMemoryMax))
 }
 
+// selfCgroupPathFn is the resolver cgroupMemoryMaxCandidates uses. A variable so
+// a spec can drive the more-specific-wins ordering on a host whose own
+// /proc/self/cgroup says nothing useful, in the same style as pskPipeFn.
+var selfCgroupPathFn = selfCgroupPath
+
 // selfCgroupPath returns this process's cgroup v2 path relative to the mount
-// root, or "" when it cannot be determined. The unified hierarchy is the line
-// with an empty controller list, written "0::<path>".
+// root, or "" when it cannot be determined.
 func selfCgroupPath() string {
 	data, err := os.ReadFile(cgroupSelfPath)
 	if err != nil {
 		return ""
 	}
-	for _, line := range strings.Split(string(data), "\n") {
+	return parseSelfCgroup(string(data))
+}
+
+// parseSelfCgroup extracts the unified-hierarchy path from /proc/self/cgroup
+// content: the line with an empty controller list, written "0::<path>".
+//
+// Split from the file read so it can be driven directly. Behind a stub point,
+// the resolver itself had no coverage at all -- changing the "0::" prefix, or
+// returning the whole line instead of the path, would have broken the one thing
+// the systemd documentation promises (that a unit's MemoryMax= is honoured) with
+// every spec still green, because the mount-root candidate answers either way.
+func parseSelfCgroup(content string) string {
+	for _, line := range strings.Split(content, "\n") {
 		rest, ok := strings.CutPrefix(strings.TrimSpace(line), "0::")
 		if !ok {
 			continue
@@ -342,6 +385,34 @@ func parseCgroupMemoryMax(path string) (int64, bool) {
 		return 0, false
 	}
 	return n, true
+}
+
+// parseConfiguredByteCount parses a byte count written in a configuration file.
+// It accepts everything parseGoByteCount does, plus the IEC form without the
+// trailing "B" -- "24Mi" as well as "24MiB".
+//
+// The two grammars differ deliberately. GOMEMLIMIT has to match the runtime
+// exactly, because a value this accepted and the runtime did not would be
+// divided here and then abort the child at startup. A configured reservation
+// never reaches a child as a string -- spawnChild formats the resolved number
+// with strconv.FormatInt -- so nothing is lost by accepting the spelling this
+// project uses everywhere else: resources.limits.memory is "64Mi", MemoryMax= is
+// "512M", and the shares are described in prose as "8Mi" and "24Mi". Rejecting
+// the form the surrounding documentation writes, and silently substituting a
+// default, was a trap rather than a strictness.
+func parseConfiguredByteCount(s string) (int64, bool) {
+	if n, ok := parseGoByteCount(s); ok {
+		return n, true
+	}
+	// Retry the IEC form with the "B" the operator omitted. Only that: a bare
+	// "24M" stays invalid, since SI and IEC differ by 5% and guessing which was
+	// meant is worse than refusing.
+	for _, prefix := range []string{"Ki", "Mi", "Gi", "Ti"} {
+		if strings.HasSuffix(s, prefix) {
+			return parseGoByteCount(s + "B")
+		}
+	}
+	return 0, false
 }
 
 // parseGoByteCount mirrors the grammar the Go runtime accepts for GOMEMLIMIT,

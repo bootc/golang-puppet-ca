@@ -295,35 +295,59 @@ func (c *serverConfig) shutdownDrain() time.Duration {
 // outcome than running with a sensible number. An explicit GOMEMLIMIT gets the
 // opposite treatment (reported, not silently replaced) because it sets the
 // whole tree's budget rather than one share.
-func (c *serverConfig) memoryReserveLauncher() int64 {
-	return byteCountOrDefault(c.MemoryReserveLauncher, defaultLauncherReservation)
+// memoryReserveLauncher and memoryReserveSigner resolve the two fixed shares,
+// returning the built-in default and a non-empty note when the configured value
+// could not be used. The note exists because the alternative is what this used
+// to do: substitute the default in silence. memory_reserve_signer is the one
+// documented remedy for a fleet whose signer outgrows its share, so a value that
+// was quietly ignored left the operator with the problem they had just tried to
+// fix and nothing to see.
+func (c *serverConfig) memoryReserveLauncher() (int64, string) {
+	return byteCountOrDefault("memory_reserve_launcher", c.MemoryReserveLauncher, defaultLauncherReservation)
 }
 
-func (c *serverConfig) memoryReserveSigner() int64 {
-	return byteCountOrDefault(c.MemoryReserveSigner, defaultSignerReservation)
+func (c *serverConfig) memoryReserveSigner() (int64, string) {
+	return byteCountOrDefault("memory_reserve_signer", c.MemoryReserveSigner, defaultSignerReservation)
 }
 
 // memoryBudgetPercent resolves the share of a derived cgroup ceiling the tree
-// may claim. See serverConfig.MemoryBudgetPercent.
-func (c *serverConfig) memoryBudgetPercent() int {
-	if c.MemoryBudgetPercent >= 1 && c.MemoryBudgetPercent <= 100 {
-		return c.MemoryBudgetPercent
+// may claim, and a note when the configured value was out of range. See
+// serverConfig.MemoryBudgetPercent.
+func (c *serverConfig) memoryBudgetPercent() (int, string) {
+	if c.MemoryBudgetPercent == 0 {
+		return defaultMemoryBudgetPercent, ""
 	}
-	return defaultMemoryBudgetPercent
+	if c.MemoryBudgetPercent >= 1 && c.MemoryBudgetPercent <= 100 {
+		return c.MemoryBudgetPercent, ""
+	}
+	return defaultMemoryBudgetPercent, fmt.Sprintf(
+		"memory_budget_percent is %d, which is outside 1-100; using %d",
+		c.MemoryBudgetPercent, defaultMemoryBudgetPercent)
 }
 
 // byteCountOrDefault parses a configured byte count, returning fallback for
-// anything empty, malformed or non-positive.
-func byteCountOrDefault(raw string, fallback int64) int64 {
+// anything empty, malformed, or below minProcessReservation. The floor matters
+// as much as the parse: a reservation below the Go runtime's own footprint is
+// arithmetically valid and operationally a process that collects continuously,
+// and one of these two keys names the share of the process holding the CA key.
+func byteCountOrDefault(key, raw string, fallback int64) (int64, string) {
 	trimmed := strings.TrimSpace(raw)
 	if trimmed == "" {
-		return fallback
+		return fallback, ""
 	}
-	n, ok := parseGoByteCount(trimmed)
-	if !ok || n <= 0 {
-		return fallback
+	n, ok := parseConfiguredByteCount(trimmed)
+	if !ok {
+		return fallback, fmt.Sprintf(
+			"%s is %s, which is not a byte count (want an integer with an optional "+
+				"IEC suffix such as 24MiB or 24Mi); using %d bytes",
+			key, strconv.Quote(trimmed), fallback)
 	}
-	return n
+	if n < minProcessReservation {
+		return fallback, fmt.Sprintf(
+			"%s is %d bytes, below the %d-byte minimum a Go runtime needs; using %d bytes",
+			key, n, int64(minProcessReservation), fallback)
+	}
+	return n, ""
 }
 
 // defaultCRLRefreshInterval is how often the background job checks whether the

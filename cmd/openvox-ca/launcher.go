@@ -70,8 +70,8 @@ const (
 //
 // cfg supplies the frontend's graceful HTTP-drain budget (see
 // serverConfig.shutdownDrain) and the three memory-budget keys. The launcher
-// waits drain+launcherShutdownHeadroom
-// for both children to exit after forwarding SIGTERM before hard-killing them,
+// waits that drain plus launcherShutdownHeadroom for both children to exit
+// after forwarding SIGTERM before hard-killing them,
 // so the frontend always gets its full drain even though the launcher's timer
 // starts first.
 //
@@ -136,30 +136,7 @@ func runLauncher(cfg *serverConfig, notify *sdnotify.Notifier, hupCh <-chan os.S
 	// operator's whole value independently; see launcher_memlimit.go. A zero
 	// share means "leave the runtime default alone", which is what every child
 	// gets when no budget could be resolved.
-	budget, kind, reason := resolveMemoryBudget(cfg, os.Getenv, cgroupMountRoot)
-	switch kind {
-	case budgetApplied:
-		slog.Info("Dividing the memory budget across the process tree",
-			"source", budget.source,
-			"ceiling_bytes", budget.ceiling,
-			"total_bytes", budget.total,
-			"launcher_bytes", budget.launcher,
-			"signer_bytes", budget.signer,
-			"frontend_bytes", budget.frontend,
-		)
-		debug.SetMemoryLimit(budget.shareFor("launcher"))
-	case budgetTooSmall, budgetInvalid:
-		// A ceiling was stated and the division did not happen, so the operator
-		// asked for something and did not get it. Without this line the tree
-		// silently keeps the triple-counted behaviour the limit was meant to
-		// prevent -- and the documentation promises they are told.
-		slog.Warn("Not dividing the memory budget across the process tree", "reason", reason)
-	case budgetNoCeiling:
-		// Nothing stated a ceiling anywhere, which is every host that is not
-		// memory-limited. Unremarkable, so it does not warrant an operator's
-		// attention.
-		slog.Debug("No memory budget to divide across the process tree", "reason", reason)
-	}
+	budget := applyMemoryBudget(cfg, os.Getenv, cgroupMountRoot, debug.SetMemoryLimit)
 
 	// The frontend gets baseEnv untouched: it is the process that knows when
 	// the listener is accepting, so it is the one that reports READY=1.
@@ -208,6 +185,57 @@ func runLauncher(cfg *serverConfig, notify *sdnotify.Notifier, hupCh <-chan os.S
 		drain:    gracefulShutdownTimeout,
 		crash:    crashShutdownTimeout,
 	}).run()
+}
+
+// applyMemoryBudget resolves the tree budget, applies the launcher's own share
+// through setLimit, and reports the outcome at the level the documentation
+// promises. It returns the budget so the caller can hand it to each child.
+//
+// Extracted from runLauncher, which has no test and cannot easily have one, so
+// that its three decisions are pinned somewhere: that the launcher applies the
+// LAUNCHER's share and not one of the children's, that the lookup starts at the
+// cgroup mount root, and that each outcome reaches the level docs/configuration.md
+// names. All three were previously expressible only inside the untested function
+// -- swapping shareFor("launcher") for shareFor("signer") changed nothing any
+// spec could see.
+//
+// setLimit is a parameter rather than a direct debug.SetMemoryLimit call for the
+// same reason: a spec cannot observe the process-global limit without changing
+// it for every other spec in the suite.
+func applyMemoryBudget(cfg *serverConfig, getenv func(string) string, mountRoot string, setLimit func(int64) int64) memoryBudget {
+	budget, kind, reason := resolveMemoryBudget(cfg, getenv, mountRoot)
+
+	// Configured values that could not be used are reported whatever the
+	// outcome: they are the operator's own input, and substituting a default in
+	// silence is how a raised memory_reserve_signer went unnoticed.
+	for _, note := range budget.notes {
+		slog.Warn("Ignoring a memory-budget setting", "detail", note)
+	}
+
+	switch kind {
+	case budgetApplied:
+		slog.Info("Dividing the memory budget across the process tree",
+			"source", budget.source,
+			"ceiling_bytes", budget.ceiling,
+			"total_bytes", budget.total,
+			"launcher_bytes", budget.launcher,
+			"signer_bytes", budget.signer,
+			"frontend_bytes", budget.frontend,
+		)
+		setLimit(budget.shareFor("launcher"))
+	case budgetTooSmall, budgetInvalid:
+		// A ceiling was stated and the division did not happen, so the operator
+		// asked for something and did not get it. Without this line the tree
+		// silently keeps the triple-counted behaviour the limit was meant to
+		// prevent -- and the documentation promises they are told.
+		slog.Warn("Not dividing the memory budget across the process tree", "reason", reason)
+	case budgetNoCeiling:
+		// Nothing stated a ceiling anywhere, which is every host that is not
+		// memory-limited. Unremarkable, so it does not warrant an operator's
+		// attention.
+		slog.Debug("No memory budget to divide across the process tree", "reason", reason)
+	}
+	return budget
 }
 
 // childResult reports which child exited and why.

@@ -526,11 +526,31 @@ ca_subject_province: IL
 ca_path_length: 1
 ca_validity_days: 3650
 leaf_validity_days: 1825
+memory_reserve_launcher: 16Mi
+memory_reserve_signer: 64Mi
+memory_budget_percent: 75
 `
 		cfgFile := writeTempConfig(content)
 
 		cfg, err := loadServerConfig(cfgFile)
 		Expect(err).NotTo(HaveOccurred(), "unexpected error")
+
+		// The three memory keys are asserted through their resolvers rather than
+		// as raw strings, and with distinct values, so a yaml-tag typo or a
+		// transposition between the two adjacent same-typed reserve fields fails
+		// here. memory_reserve_signer is the one documented remedy for a fleet
+		// whose signer outgrows its share, and a tag that silently stopped
+		// binding would leave that remedy with no effect and no error.
+		launcherShare, launcherNote := cfg.memoryReserveLauncher()
+		Expect(launcherNote).To(BeEmpty())
+		Expect(launcherShare).To(Equal(int64(16<<20)), "memory_reserve_launcher")
+		signerShare, signerNote := cfg.memoryReserveSigner()
+		Expect(signerNote).To(BeEmpty())
+		Expect(signerShare).To(Equal(int64(64<<20)), "memory_reserve_signer")
+		percent, percentNote := cfg.memoryBudgetPercent()
+		Expect(percentNote).To(BeEmpty())
+		Expect(percent).To(Equal(75), "memory_budget_percent")
+
 		checks := []struct {
 			field string
 			got   interface{}
@@ -819,6 +839,16 @@ var _ = Describe("applyServerEnv each variable", func() {
 			func(c *serverConfig) bool { return c.OCSPUrl == "http://ocsp.example.com" }, "OCSPUrl"),
 		Entry("SHUTDOWN_TIMEOUT_SEC", "PUPPET_CA_SHUTDOWN_TIMEOUT_SEC", "45",
 			func(c *serverConfig) bool { return c.ShutdownTimeoutSec == 45 }, "ShutdownTimeoutSec"),
+		// Distinct values for the two reservations: they are adjacent same-typed
+		// fields with near-identical names, so a transposition would leave both
+		// "working" and silently make the documented remedy for a large fleet
+		// raise the launcher's share instead of the signer's.
+		Entry("MEMORY_RESERVE_LAUNCHER", "PUPPET_CA_MEMORY_RESERVE_LAUNCHER", "16MiB",
+			func(c *serverConfig) bool { return c.MemoryReserveLauncher == "16MiB" }, "MemoryReserveLauncher"),
+		Entry("MEMORY_RESERVE_SIGNER", "PUPPET_CA_MEMORY_RESERVE_SIGNER", "64MiB",
+			func(c *serverConfig) bool { return c.MemoryReserveSigner == "64MiB" }, "MemoryReserveSigner"),
+		Entry("MEMORY_BUDGET_PERCENT", "PUPPET_CA_MEMORY_BUDGET_PERCENT", "75",
+			func(c *serverConfig) bool { return c.MemoryBudgetPercent == 75 }, "MemoryBudgetPercent"),
 		Entry("CA_KEY_ALGO", "PUPPET_CA_CA_KEY_ALGO", "ecdsa",
 			func(c *serverConfig) bool { return c.CAKeyAlgo == "ecdsa" }, "CAKeyAlgo"),
 		Entry("CA_KEY_SIZE", "PUPPET_CA_CA_KEY_SIZE", "384",
