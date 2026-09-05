@@ -386,8 +386,9 @@ envFrom: []
 # `medium: Memory`, the cadir tmpfs counts against this limit too and shares that
 # headroom. If you do set GOMEMLIMIT via `env` it names the budget for the whole
 # process tree, not one process, and is used in place of the ceiling derived from
-# this limit. It does NOT raise this limit — crossing that is still an OOMKill —
-# so set it at or just under this value, never above.
+# this limit — taken at face value, with no headroom withheld, so choose your
+# own. It does NOT raise this limit — crossing that is still an OOMKill — so set
+# it at or just under this value, never above.
 resources:
   requests:
     cpu: 10m

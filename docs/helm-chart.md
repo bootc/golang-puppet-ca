@@ -327,9 +327,9 @@ config:
 ```
 
 A budget too small to leave the frontend a workable share is left undivided
-rather than split into shares that would cause continuous GC. That case and a
-malformed `GOMEMLIMIT` are logged as warnings; a host that states no ceiling at
-all is logged at debug level, since there is nothing to act on. `--single-process`
+rather than split into shares that would cause continuous GC. That case is
+logged as a warning; a host that states no ceiling at all is logged at debug
+level, since there is nothing to act on. `--single-process`
 divides nothing either, because there is no tree to divide. A `GOMEMLIMIT` the Go
 runtime cannot parse is not one of these cases: the runtime rejects it during
 startup, before any of this runs, and the process dies with `fatal error:
