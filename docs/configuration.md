@@ -1301,9 +1301,9 @@ memory-backed state directory count against the same ceiling from outside it.
 limit.
 
 The launcher and signer take fixed shares (`memory_reserve_launcher`,
-`memory_reserve_signer`, both byte counts in `GOMEMLIMIT`'s grammar such as
-`24MiB`) and the frontend takes the remainder, because in steady state the
-frontend is the process whose footprint grows with the fleet. The signer's share
+`memory_reserve_signer`, byte counts such as `24MiB` or `24Mi`; the exact
+grammar is below) and the frontend takes the remainder, because in steady state
+the frontend is the process whose footprint grows with the fleet. The signer's share
 is the one an operator can outgrow: its startup peak is fleet-proportional at
 roughly 420 bytes per certificate, and **raising the container limit does not
 reach it**. The share also has to carry the Go runtime's own footprint, a few
@@ -1326,9 +1326,11 @@ the launcher can see it, and the default is used silently.
 
 Nothing is divided at all in three cases. One is logged as a **warning**,
 because the operator stated a ceiling and did not get the division: a budget too
-small to leave the frontend a workable share, which under the default
-reservations means a ceiling below 63Mi on the derived path (the three shares
-need 56MiB between them, and a derived ceiling is scaled to 90% first).
+small to leave the frontend a workable share. The three shares need 56MiB
+between them and a derived ceiling is scaled to 90% first, so under the default
+reservations the exact floor is 65244729 bytes and 63Mi is the smallest whole
+MiB that divides. The frontend's own floor is **24MiB**, which is what a raised
+`memory_reserve_signer` has to leave room for.
 Splitting a very small total would trade a visible OOMKill for a silent GC death
 spiral, so it is left undivided. What that leaves depends on where the ceiling
 came from. On the derived path no process gets a limit at all. Where the

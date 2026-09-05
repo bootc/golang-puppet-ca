@@ -324,9 +324,18 @@ runtime's own footprint, so the usable headroom in the 24MiB default is nearer
 well:
 
 ```yaml
+resources:
+  limits:
+    memory: 256Mi
 config:
   memory_reserve_signer: 128Mi
 ```
+
+The raised limit is not optional. The ceiling has to leave the frontend at least
+**24Mi** after both reservations, and a derived ceiling is scaled to 90% first,
+so a 128Mi signer reserve needs roughly 178Mi before anything divides at all —
+at the shipped 64Mi limit this setting alone would switch the whole mechanism
+off.
 
 A budget too small to leave the frontend a workable share is left undivided
 rather than split into shares that would cause continuous GC. That case is
@@ -337,9 +346,16 @@ runtime cannot parse is not one of these cases: the runtime rejects it during
 startup, before any of this runs, and the process dies with `fatal error:
 malformed GOMEMLIMIT`.
 
-Dividing needs a ceiling of at least **63Mi** under the default reservations, so
-`resources.limits.memory` below that is left undivided — and then no process gets
-a limit at all, so the cliff is back. At the shipped 64Mi default the tree budget
+**63Mi** is the smallest whole MiB that divides under the default reservations
+(the exact floor is 65244729 bytes). Below it `resources.limits.memory` is left
+undivided — and then no process gets a limit at all, so the cliff is back.
+
+**Upgrading:** before the launcher divided anything, no process had a
+`GOMEMLIMIT` under the chart defaults, so the frontend could grow to most of the
+64Mi limit before being OOMKilled. After this change its share is 25.6Mi, and
+exceeding that is continuous GC rather than a restart — quieter, and easier to
+miss. If your fleet was running near the old limit, raise
+`resources.limits.memory` at upgrade time. At the shipped 64Mi default the tree budget
 is 57.6Mi and the frontend's share is **25.6Mi**, the launcher's 8Mi and the
 signer's 24Mi; the startup log line reports all four. If that is tighter than
 your fleet needs, raise `resources.limits.memory` — every byte above the two

@@ -379,10 +379,19 @@ envFrom: []
 # cliff — no GOMEMLIMIT needed. On a cgroup v1 node nothing is derived; set
 # GOMEMLIMIT explicitly there.
 #
-# Dividing needs at least 63Mi. Below that the ceiling is left undivided (with a
-# warning) and NO process gets a memory limit at all, so the cliff is back. At
-# this 64Mi default the frontend's share is 25.6Mi, after 8Mi for the launcher
-# and 24Mi for the signer. With `persistence.enabled: false` and the default
+# 63Mi is the smallest whole MiB that divides (the exact floor is 65244729
+# bytes). A smaller ceiling is left undivided, with a warning, and NO process
+# gets a memory limit at all, so the cliff is back — lowering this value past
+# the default disables the mechanism rather than tightening it.
+#
+# At this 64Mi default the frontend's share is 25.6Mi, after 8Mi for the
+# launcher and 24Mi for the signer. UPGRADING: before this division existed the
+# frontend's runtime was uncapped and could grow to most of the limit, so an
+# install upgraded without changing this value has its frontend headroom cut to
+# 25.6Mi. Crossing that is continuous GC rather than a restart, which is quieter
+# and harder to spot. If your fleet was near the old limit, raise this value at
+# upgrade time; every byte above the two fixed reservations goes to the
+# frontend. With `persistence.enabled: false` and the default
 # `medium: Memory`, the cadir tmpfs counts against this limit too and shares that
 # headroom. If you do set GOMEMLIMIT via `env` it names the budget for the whole
 # process tree, not one process, and is used in place of the ceiling derived from
