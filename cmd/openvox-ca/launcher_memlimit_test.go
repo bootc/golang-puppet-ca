@@ -672,6 +672,35 @@ var _ = Describe("dividing the memory budget across the process tree", func() {
 		Entry("the empty string", "", int64(0), false),
 	)
 
+	DescribeTable("containing the cgroup candidate path beneath the mount root",
+		func(root, path string, want bool) {
+			Expect(withinRoot(root, path)).To(Equal(want))
+		},
+		// New production code, so it needs its own coverage rather than
+		// borrowing the behavioural spec below.
+		Entry("a path directly beneath", "/sys/fs/cgroup", "/sys/fs/cgroup/memory.max", true),
+		Entry("a path nested beneath", "/sys/fs/cgroup", "/sys/fs/cgroup/system.slice/x/memory.max", true),
+		Entry("the root itself is not beneath it", "/sys/fs/cgroup", "/sys/fs/cgroup", false),
+		Entry("an escape", "/sys/fs/cgroup", "/etc/memory.max", false),
+		Entry("a sibling sharing a prefix", "/sys/fs/cgroup", "/sys/fs/cgroupX/memory.max", false),
+		Entry("an unclean root still contains", "/sys/fs/cgroup/", "/sys/fs/cgroup/memory.max", true),
+	)
+
+	It("drops a cgroup candidate whose relative path escapes the mount root", func() {
+		// The behaviour, not just the helper: a traversing rel must not produce
+		// a candidate, and the mount-root fallback must still answer so no
+		// deployment loses its ceiling.
+		root := writeCgroupFile("268435456\n")
+		stubSelfCgroup("/../../../etc")
+
+		budget, kind, reason := resolveMemoryBudget(defaultCfg(), noEnv, root)
+
+		Expect(kind).To(Equal(budgetApplied), "reason: %s", reason)
+		Expect(budget.source).To(ContainSubstring(root),
+			"the fallback under the mount root must be what answered")
+		Expect(budget.ceiling).To(Equal(int64(256 << 20)))
+	})
+
 	Describe("reading this process's cgroup path", func() {
 		// The parsing is table-driven below, but the read above it had no spec:
 		// with only selfCgroupPathFn stubbed, pointing the constant at a
