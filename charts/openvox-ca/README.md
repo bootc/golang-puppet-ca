@@ -173,7 +173,7 @@ tested floor rather than a ceiling; naming them here would go stale on its own.
 | `env` | `{}` | Literal environment variables, as a map |
 | `extraEnv` | `[]` | Environment variables in list form, for `valueFrom` |
 | `envFrom` | `[]` | `configMapRef`/`secretRef` sources, verbatim |
-| `resources` | 10m CPU / 48–64Mi | The memory limit is a hard cap and the footprint grows with the certificate count; raise it before a growing inventory reaches it |
+| `resources` | 10m CPU / 48–64Mi | The memory limit is a hard cap and the footprint grows with the certificate count; raise it before a growing inventory reaches it. The launcher also divides this ceiling across the three server processes, claiming 90% and giving the launcher 8Mi, the signer 24Mi and the frontend the remainder — 25.6Mi at the 64Mi default. That needs a limit of at least 63Mi: **below 63Mi nothing is divided and no process gets a memory limit at all**, so lowering this value past the default disables the mechanism rather than tightening it. See [sizing](https://github.com/voxpupuli/openvox-ca/blob/main/docs/helm-chart.md#sizing) |
 | `configChecksumAnnotation` | `true` | Roll the pods when the rendered config changes. Inert when `existingConfigMap` is set |
 | `podAnnotations` / `podLabels` | `{}` | |
 | `deploymentAnnotations` | `{}` | Annotations on the Deployment rather than the pods |
