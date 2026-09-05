@@ -289,15 +289,11 @@ func (c *serverConfig) shutdownDrain() time.Duration {
 }
 
 // memoryReserveLauncher and memoryReserveSigner resolve the two fixed shares of
-// the tree memory budget, falling back to the built-in defaults when unset or
-// unparseable. A malformed reservation is deliberately not fatal: it moves one
-// share, and refusing to start the CA over a tuning knob would be a worse
-// outcome than running with a sensible number. An explicit GOMEMLIMIT gets the
-// opposite treatment (reported, not silently replaced) because it sets the
-// whole tree's budget rather than one share.
-// memoryReserveLauncher and memoryReserveSigner resolve the two fixed shares,
-// returning the built-in default and a non-empty note when the configured value
-// could not be used. The note exists because the alternative is what this used
+// the tree memory budget, returning the built-in default and a non-empty note
+// when the configured value could not be used. A malformed reservation is
+// deliberately not fatal -- it moves one share, and refusing to start the CA
+// over a tuning knob would be worse than running with a sensible number -- but
+// it is never silent. The note exists because the alternative is what this used
 // to do: substitute the default in silence. memory_reserve_signer is the one
 // documented remedy for a fleet whose signer outgrows its share, so a value that
 // was quietly ignored left the operator with the problem they had just tried to

@@ -18,8 +18,10 @@
 package main
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/hex"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -42,6 +44,18 @@ func memLimitEnv(v string) func(string) string {
 		}
 		return ""
 	}
+}
+
+// captureLogs runs fn with the default logger redirected to a buffer at Debug
+// and above, so both the debug and warning branches are observable. Same shape
+// as internal/ca's helper.
+func captureLogs(level slog.Level, fn func()) string {
+	var buf bytes.Buffer
+	orig := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: level})))
+	defer slog.SetDefault(orig)
+	fn()
+	return buf.String()
 }
 
 // defaultCfg is the configuration with none of the three memory keys set, so
@@ -458,6 +472,50 @@ var _ = Describe("dividing the memory budget across the process tree", func() {
 			Expect(strings.Join(budget.notes, "\n")).To(ContainSubstring("memory_budget_percent"))
 		})
 
+		DescribeTable("reports an ignored setting whatever the ceiling lookup did",
+			func(getenv func(string) string, wantKind budgetKind) {
+				// The notes used to be built after the ceiling lookup and
+				// attached only to a divided budget, so a mistyped reservation
+				// went unreported on every host with no ceiling -- the shipped
+				// systemd unit, cgroup v1, any container without a limit -- and
+				// on the too-small path, where the warning then quoted the
+				// substituted defaults back as though they were configured.
+				cfg := &serverConfig{MemoryReserveSigner: "64MB"}
+				budget, kind, _ := resolveMemoryBudget(cfg, getenv, missingPath())
+
+				Expect(kind).To(Equal(wantKind))
+				Expect(strings.Join(budget.notes, "\n")).To(ContainSubstring("memory_reserve_signer"),
+					"the rejected key must be named on every path")
+			},
+			Entry("no ceiling anywhere", noEnv, budgetNoCeiling),
+			Entry("a budget too small to divide", memLimitEnv("32MiB"), budgetTooSmall),
+			Entry("GOMEMLIMIT off", memLimitEnv("off"), budgetNoCeiling),
+		)
+
+		It("names the key when a reservation is below the floor, not only when it is malformed", func() {
+			// Both note-producing arms of byteCountOrDefault: the unparseable
+			// one is covered above, this is the below-floor one. Returning an
+			// empty note here would restore silent substitution on the key that
+			// names the process holding the CA key.
+			cfg := &serverConfig{MemoryReserveSigner: "1MiB"}
+			budget, kind, _ := resolveMemoryBudget(cfg, memLimitEnv("256MiB"), missingPath())
+
+			Expect(kind).To(Equal(budgetApplied))
+			Expect(budget.signer).To(Equal(int64(24 << 20)))
+			Expect(strings.Join(budget.notes, "\n")).To(ContainSubstring("memory_reserve_signer"))
+			Expect(strings.Join(budget.notes, "\n")).To(ContainSubstring("minimum"))
+		})
+
+		It("keeps the strict runtime grammar for GOMEMLIMIT itself", func() {
+			// The two grammars differ deliberately: a configured key accepts
+			// "24Mi", GOMEMLIMIT must not, because it has to mirror what the Go
+			// runtime accepts. Swapping the parser at that call site would
+			// otherwise pass every spec.
+			_, kind, reason := resolveMemoryBudget(defaultCfg(), memLimitEnv("24Mi"), missingPath())
+			Expect(kind).To(Equal(budgetInvalid))
+			Expect(reason).To(ContainSubstring("24Mi"))
+		})
+
 		It("says nothing when every setting was usable", func() {
 			cfg := &serverConfig{MemoryReserveSigner: "64Mi"}
 			budget, kind, _ := resolveMemoryBudget(cfg, memLimitEnv("256MiB"), missingPath())
@@ -631,6 +689,38 @@ var _ = Describe("dividing the memory budget across the process tree", func() {
 			applyMemoryBudget(defaultCfg(), noEnv, missingPath(),
 				func(n int64) int64 { applied = append(applied, n); return 0 })
 			Expect(applied).To(BeEmpty())
+		})
+
+		It("logs the division, and each outcome at the level the docs promise", func() {
+			applied := captureLogs(slog.LevelDebug, func() {
+				applyMemoryBudget(defaultCfg(), memLimitEnv("256MiB"), missingPath(), func(int64) int64 { return 0 })
+			})
+			Expect(applied).To(ContainSubstring("level=INFO"))
+			Expect(applied).To(ContainSubstring("frontend_bytes"), "the operator must be able to read all four shares")
+
+			// A ceiling was stated and not divided: the operator asked for
+			// something and did not get it, so this one has to be visible at
+			// the default level.
+			tooSmall := captureLogs(slog.LevelDebug, func() {
+				applyMemoryBudget(defaultCfg(), memLimitEnv("32MiB"), missingPath(), func(int64) int64 { return 0 })
+			})
+			Expect(tooSmall).To(ContainSubstring("level=WARN"))
+
+			// No ceiling anywhere is every unlimited host: unremarkable.
+			none := captureLogs(slog.LevelDebug, func() {
+				applyMemoryBudget(defaultCfg(), noEnv, missingPath(), func(int64) int64 { return 0 })
+			})
+			Expect(none).To(ContainSubstring("level=DEBUG"))
+			Expect(none).NotTo(ContainSubstring("level=WARN"))
+		})
+
+		It("warns about an ignored setting even when nothing was divided", func() {
+			cfg := &serverConfig{MemoryReserveSigner: "64MB"}
+			out := captureLogs(slog.LevelDebug, func() {
+				applyMemoryBudget(cfg, noEnv, missingPath(), func(int64) int64 { return 0 })
+			})
+			Expect(out).To(ContainSubstring("level=WARN"))
+			Expect(out).To(ContainSubstring("memory_reserve_signer"))
 		})
 
 		It("returns the budget it resolved, for the children to draw shares from", func() {

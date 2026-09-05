@@ -206,19 +206,15 @@ func (b memoryBudget) shareFor(role string) int64 {
 // under /sys; cfg supplies the three tuning keys (memory_reserve_launcher,
 // memory_reserve_signer, memory_budget_percent).
 func resolveMemoryBudget(cfg *serverConfig, getenv func(string) string, cgroupPath string) (budget memoryBudget, kind budgetKind, reason string) {
-	ceiling, source, kind, reason := treeMemoryCeiling(getenv, cgroupPath)
-	if kind != budgetApplied {
-		return memoryBudget{}, kind, reason
-	}
-
+	// The configured keys are resolved BEFORE the ceiling lookup, so a value
+	// that could not be used is reported whatever the lookup does. Resolving
+	// them afterwards meant the notes were built only on the path that
+	// divided: a mistyped memory_reserve_signer went unreported on every host
+	// with no ceiling -- the shipped systemd unit, every cgroup v1 host, any
+	// container without a memory limit -- and, worse, on the too-small path,
+	// where the warning went on to quote the substituted defaults back at the
+	// operator as though they were what had been configured.
 	percent, percentNote := cfg.memoryBudgetPercent()
-	total := ceiling
-	if source != goMemLimitEnv {
-		// Withhold headroom only from a figure we derived. See
-		// serverConfig.MemoryBudgetPercent.
-		total = scalePercent(ceiling, percent)
-	}
-
 	launcher, launcherNote := cfg.memoryReserveLauncher()
 	signer, signerNote := cfg.memoryReserveSigner()
 	notes := make([]string, 0, 3)
@@ -226,6 +222,18 @@ func resolveMemoryBudget(cfg *serverConfig, getenv func(string) string, cgroupPa
 		if n != "" {
 			notes = append(notes, n)
 		}
+	}
+
+	ceiling, source, kind, reason := treeMemoryCeiling(getenv, cgroupPath)
+	if kind != budgetApplied {
+		return memoryBudget{notes: notes}, kind, reason
+	}
+
+	total := ceiling
+	if source != goMemLimitEnv {
+		// Withhold headroom only from a figure we derived. See
+		// serverConfig.MemoryBudgetPercent.
+		total = scalePercent(ceiling, percent)
 	}
 
 	// Ordered so neither subtraction can wrap. A reservation is bounded only by
@@ -238,7 +246,7 @@ func resolveMemoryBudget(cfg *serverConfig, getenv func(string) string, cgroupPa
 		frontend = total - launcher - signer
 	}
 	if frontend < minFrontendMemoryShare {
-		return memoryBudget{}, budgetTooSmall, fmt.Sprintf(
+		return memoryBudget{notes: notes}, budgetTooSmall, fmt.Sprintf(
 			"%s gives a tree budget of %d bytes, which leaves the frontend %d after reserving "+
 				"%d for the launcher and %d for the signer; it needs at least %d. Raise the limit, "+
 				"or lower memory_reserve_launcher / memory_reserve_signer",
