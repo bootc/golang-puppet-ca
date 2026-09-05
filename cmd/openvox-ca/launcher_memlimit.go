@@ -65,6 +65,12 @@ const goMemLimitEnv = "GOMEMLIMIT"
 // forgot the sentinel would derive an absurd budget and silently divide it --
 // worse than deriving nothing. An operator on v1 can still set GOMEMLIMIT
 // explicitly, which takes precedence anyway.
+// cgroupMountRootPath is where the lookup starts. A variable rather than a
+// parameter of applyMemoryBudget so runLauncher's one call site has no argument
+// to transpose: cgroupMountRoot and cgroupSelfPath are declared together and
+// swapping them disabled the derived path on every host with no spec noticing.
+var cgroupMountRootPath = cgroupMountRoot
+
 const (
 	cgroupMountRoot = "/sys/fs/cgroup"
 	cgroupSelfPath  = "/proc/self/cgroup"
@@ -333,9 +339,23 @@ func readCgroupMemoryMax(mountRoot string) (int64, string, bool) {
 func cgroupMemoryMaxCandidates(mountRoot string) []string {
 	candidates := make([]string, 0, 2)
 	if rel := selfCgroupPathFn(); rel != "" {
-		candidates = append(candidates, filepath.Join(mountRoot, rel, cgroupMemoryMax))
+		// Containment, not because a traversal is reachable -- /proc/self/cgroup
+		// is kernel-generated and a cgroup directory cannot be named ".." -- but
+		// because this is a path built from file content and joined onto a
+		// system root. filepath.Join cleans, so a rel of "/../.." would escape
+		// silently; dropping the candidate leaves the mount-root fallback, so
+		// no supported deployment loses its ceiling.
+		if p := filepath.Join(mountRoot, rel, cgroupMemoryMax); withinRoot(mountRoot, p) {
+			candidates = append(candidates, p)
+		}
 	}
 	return append(candidates, filepath.Join(mountRoot, cgroupMemoryMax))
+}
+
+// withinRoot reports whether path stays beneath root after cleaning.
+func withinRoot(root, path string) bool {
+	cleaned := filepath.Clean(root)
+	return strings.HasPrefix(path, cleaned+string(os.PathSeparator))
 }
 
 // selfCgroupPathFn is the resolver cgroupMemoryMaxCandidates uses. A variable so
@@ -345,8 +365,14 @@ var selfCgroupPathFn = selfCgroupPath
 
 // selfCgroupPath returns this process's cgroup v2 path relative to the mount
 // root, or "" when it cannot be determined.
+// cgroupSelfPathFile is the file selfCgroupPath reads. A variable for the same
+// reason mountRoot is a parameter: with only selfCgroupPathFn stubbed, the read
+// itself had no spec, so pointing it at a nonexistent path left every spec green
+// because the mount-root candidate answers either way.
+var cgroupSelfPathFile = cgroupSelfPath
+
 func selfCgroupPath() string {
-	data, err := os.ReadFile(cgroupSelfPath)
+	data, err := os.ReadFile(cgroupSelfPathFile)
 	if err != nil {
 		return ""
 	}
@@ -476,7 +502,14 @@ func parseGoByteCount(s string) (int64, bool) {
 		return 0, false
 	}
 	// Reject an overflowing shift rather than wrapping to a negative budget.
-	if shift > 0 && n > (1<<62)>>shift {
+	// The bound is the runtime's own -- math.MaxInt64 after scaling, as
+	// runtime.parseByteCount computes it -- not 1<<62, which this used to use.
+	// That was narrower than the runtime by a factor of two at the top of the
+	// range, so a suffixed count between 2^62 and 2^63 was accepted by the
+	// runtime and refused here, with the operator told it was "not a byte count
+	// the Go runtime accepts". Nothing is divided on that path, so all three
+	// processes would then inherit and apply the whole value each.
+	if shift > 0 && uint64(n) > uint64(math.MaxInt64)>>shift {
 		return 0, false
 	}
 	return n << shift, true

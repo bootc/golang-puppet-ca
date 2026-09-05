@@ -952,9 +952,15 @@ var _ = Describe("applyServerEnv each variable", func() {
 		setEnv("PUPPET_CA_CA_PATH_LENGTH", "not-a-number")
 		setEnv("PUPPET_CA_MEMORY_BUDGET_PERCENT", "ninety")
 
-		cfg := &serverConfig{Port: 8140, Verbosity: 0, CAPathLength: -1}
+		// MemoryBudgetPercent is seeded non-zero deliberately. Left at its zero
+		// value the assertion would be vacuous: strconv.Atoi("ninety") also
+		// returns 0, so dropping the error guard would leave the field at 0
+		// either way and correct and incorrect values would coincide.
+		cfg := &serverConfig{Port: 8140, Verbosity: 0, CAPathLength: -1, MemoryBudgetPercent: 42}
 		applyServerEnv(cfg)
 
+		Expect(cfg.MemoryBudgetPercent).To(Equal(42),
+			"MemoryBudgetPercent changed on bad input: got %d, want 42", cfg.MemoryBudgetPercent)
 		Expect(cfg.Port).To(Equal(8140), "Port changed on bad input: got %d, want 8140", cfg.Port)
 		Expect(cfg.Verbosity).To(Equal(0), "Verbosity changed on bad input: got %d, want 0", cfg.Verbosity)
 		Expect(cfg.NoTLSRequired).To(BeFalse(), "NoTLSRequired changed on bad input: want false")

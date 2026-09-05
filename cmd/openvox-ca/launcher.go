@@ -136,7 +136,7 @@ func runLauncher(cfg *serverConfig, notify *sdnotify.Notifier, hupCh <-chan os.S
 	// operator's whole value independently; see launcher_memlimit.go. A zero
 	// share means "leave the runtime default alone", which is what every child
 	// gets when no budget could be resolved.
-	budget := applyMemoryBudget(cfg, os.Getenv, cgroupMountRoot, debug.SetMemoryLimit)
+	budget := applyMemoryBudget(cfg, os.Getenv, debug.SetMemoryLimit)
 
 	// The frontend gets baseEnv untouched: it is the process that knows when
 	// the listener is accepting, so it is the one that reports READY=1.
@@ -195,15 +195,18 @@ func runLauncher(cfg *serverConfig, notify *sdnotify.Notifier, hupCh <-chan os.S
 // that its three decisions are pinned somewhere: that the launcher applies the
 // LAUNCHER's share and not one of the children's, that the lookup starts at the
 // cgroup mount root, and that each outcome reaches the level docs/configuration.md
-// names. All three were previously expressible only inside the untested function
+// names. The first and third are asserted by specs; the second is now structural,
+// since there is no mount-root argument to pass wrongly. All three were previously expressible only inside the untested function
 // -- swapping shareFor("launcher") for shareFor("signer") changed nothing any
 // spec could see.
 //
 // setLimit is a parameter rather than a direct debug.SetMemoryLimit call for the
 // same reason: a spec cannot observe the process-global limit without changing
-// it for every other spec in the suite.
-func applyMemoryBudget(cfg *serverConfig, getenv func(string) string, mountRoot string, setLimit func(int64) int64) memoryBudget {
-	budget, kind, reason := resolveMemoryBudget(cfg, getenv, mountRoot)
+// it for every other spec in the suite. The mount root is deliberately NOT a
+// parameter -- it comes from cgroupMountRootPath, which a spec stubs -- so this
+// call site has no path argument to get wrong.
+func applyMemoryBudget(cfg *serverConfig, getenv func(string) string, setLimit func(int64) int64) memoryBudget {
+	budget, kind, reason := resolveMemoryBudget(cfg, getenv, cgroupMountRootPath)
 
 	// Configured values that could not be used are reported whatever the
 	// outcome: they are the operator's own input, and substituting a default in

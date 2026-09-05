@@ -476,7 +476,7 @@ func newRootCmd() *cobra.Command {
 				// does. Without this it ran on Go's built-in default handler:
 				// its verbosity was fixed at info whatever the operator set, so
 				// the debug line explaining why no memory budget was divided
-				// could never appear, and its warnings bypassed log_file
+				// could never appear, and its warnings bypassed logfile
 				// entirely.
 				launcherLog, err := setupLogger(cfg)
 				if err != nil {

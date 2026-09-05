@@ -18,7 +18,6 @@
 package main
 
 import (
-	"bytes"
 	"crypto/rand"
 	"encoding/hex"
 	"log/slog"
@@ -46,11 +45,15 @@ func memLimitEnv(v string) func(string) string {
 	}
 }
 
-// captureLogs runs fn with the default logger redirected to a buffer at Debug
-// and above, so both the debug and warning branches are observable. Same shape
-// as internal/ca's helper.
+// captureLogs runs fn with the default logger redirected to a buffer at the
+// given level, so the debug and warning branches are both observable.
+//
+// syncBuffer, not bytes.Buffer: this replaces the PROCESS-GLOBAL default
+// logger, so any goroutine in the suite that logs during the window writes into
+// it, and launcher_test.go already records that bytes.Buffer is not safe to
+// read while another goroutine writes.
 func captureLogs(level slog.Level, fn func()) string {
-	var buf bytes.Buffer
+	var buf syncBuffer
 	orig := slog.Default()
 	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: level})))
 	defer slog.SetDefault(orig)
@@ -71,6 +74,15 @@ func writeCgroupFile(contents string) string {
 	root := GinkgoT().TempDir()
 	Expect(os.WriteFile(filepath.Join(root, "memory.max"), []byte(contents), 0o600)).To(Succeed())
 	return root
+}
+
+// stubMountRoot points the production lookup at a temporary root for the
+// current spec, since applyMemoryBudget no longer takes one as an argument.
+func stubMountRoot(root string) {
+	GinkgoHelper()
+	previous := cgroupMountRootPath
+	cgroupMountRootPath = root
+	DeferCleanup(func() { cgroupMountRootPath = previous })
 }
 
 // stubSelfCgroup makes selfCgroupPathFn report rel for the current spec, so the
@@ -621,13 +633,15 @@ var _ = Describe("dividing the memory budget across the process tree", func() {
 		// The shift-overflow guard. Without these the guard could be deleted
 		// with every other entry still green: the largest value above is 1TiB,
 		// which is nowhere near the threshold.
-		Entry("the largest TiB count that does not overflow", "4194303TiB", int64(4194303)<<40, true),
-		Entry("one TiB past the overflow threshold", "4194305TiB", int64(0), false),
+		// The boundary is the runtime's own: the largest n whose scaled value
+		// still fits int64. It moved when the guard stopped rejecting at 1<<62,
+		// which was narrower than the runtime by a factor of two.
+		Entry("a large TiB count well inside the bound", "4194303TiB", int64(4194303)<<40, true),
+		Entry("the largest TiB count that does not overflow", "8388607TiB", int64(8388607)<<40, true),
+		Entry("one TiB past the overflow threshold", "8388608TiB", int64(0), false),
 		Entry("a count that overflows the shift wildly", "16777216TiB", int64(0), false),
 		Entry("digits that overflow ParseInt itself", "99999999999999999999", int64(0), false),
-		// The threshold itself, not only its neighbours: > could become >= with
-		// the pair either side still green.
-		Entry("exactly the largest shift that does not overflow", "4194304TiB", int64(1)<<62, true),
+		Entry("the old, wrongly narrow 1<<62 bound is no longer a boundary", "4194304TiB", int64(1)<<62, true),
 	)
 
 	DescribeTable("parsing the byte counts a configuration file may use",
@@ -658,6 +672,30 @@ var _ = Describe("dividing the memory budget across the process tree", func() {
 		Entry("the empty string", "", int64(0), false),
 	)
 
+	Describe("reading this process's cgroup path", func() {
+		// The parsing is table-driven below, but the read above it had no spec:
+		// with only selfCgroupPathFn stubbed, pointing the constant at a
+		// nonexistent file left every spec green because the mount-root
+		// candidate answers either way.
+		It("returns the unified path from the file it is pointed at", func() {
+			f := filepath.Join(GinkgoT().TempDir(), "cgroup")
+			Expect(os.WriteFile(f, []byte("12:pids:/system.slice/x.service\n0::/system.slice/openvox-ca.service\n"), 0o600)).To(Succeed())
+			previous := cgroupSelfPathFile
+			cgroupSelfPathFile = f
+			DeferCleanup(func() { cgroupSelfPathFile = previous })
+
+			Expect(selfCgroupPath()).To(Equal("/system.slice/openvox-ca.service"))
+		})
+
+		It("reports nothing when the file cannot be read", func() {
+			previous := cgroupSelfPathFile
+			cgroupSelfPathFile = filepath.Join(GinkgoT().TempDir(), "absent")
+			DeferCleanup(func() { cgroupSelfPathFile = previous })
+
+			Expect(selfCgroupPath()).To(BeEmpty())
+		})
+	})
+
 	DescribeTable("extracting this process's cgroup path from /proc/self/cgroup",
 		func(content, want string) {
 			Expect(parseSelfCgroup(content)).To(Equal(want))
@@ -679,6 +717,12 @@ var _ = Describe("dividing the memory budget across the process tree", func() {
 	)
 
 	Describe("what the launcher applies to itself", func() {
+		// applyMemoryBudget reads cgroupMountRootPath rather than taking a root,
+		// so every spec here pins it at a path that states nothing. Without this
+		// the outcome would depend on whether the host running the suite is
+		// itself in a memory-limited cgroup.
+		BeforeEach(func() { stubMountRoot(missingPath()) })
+
 		// runLauncher has no test and cannot easily have one, so its three
 		// decisions live in applyMemoryBudget where a spec can reach them.
 		It("applies the launcher's own share, not a child's", func() {
@@ -686,7 +730,7 @@ var _ = Describe("dividing the memory budget across the process tree", func() {
 			// where the role is not already an argument. Distinct fixture values
 			// so signer and frontend cannot stand in for it.
 			var applied []int64
-			budget := applyMemoryBudget(defaultCfg(), memLimitEnv("256MiB"), missingPath(),
+			budget := applyMemoryBudget(defaultCfg(), memLimitEnv("256MiB"),
 				func(n int64) int64 { applied = append(applied, n); return 0 })
 
 			Expect(applied).To(HaveLen(1), "the limit must be applied exactly once")
@@ -699,14 +743,14 @@ var _ = Describe("dividing the memory budget across the process tree", func() {
 			// Zero must never reach SetMemoryLimit: it would collapse the
 			// supervisor into permanent GC.
 			var applied []int64
-			applyMemoryBudget(defaultCfg(), noEnv, missingPath(),
+			applyMemoryBudget(defaultCfg(), noEnv,
 				func(n int64) int64 { applied = append(applied, n); return 0 })
 			Expect(applied).To(BeEmpty())
 		})
 
-		It("logs the division, and each outcome at the level the docs promise", func() {
+		It("logs the division with every share the operator needs", func() {
 			applied := captureLogs(slog.LevelDebug, func() {
-				applyMemoryBudget(defaultCfg(), memLimitEnv("256MiB"), missingPath(), func(int64) int64 { return 0 })
+				applyMemoryBudget(defaultCfg(), memLimitEnv("256MiB"), func(int64) int64 { return 0 })
 			})
 			Expect(applied).To(ContainSubstring("level=INFO"))
 			// Values, not key names: a dropped attribute, or one bound to the
@@ -720,38 +764,51 @@ var _ = Describe("dividing the memory budget across the process tree", func() {
 			// something and did not get it, so this one has to be visible at
 			// the default level.
 			tooSmall := captureLogs(slog.LevelDebug, func() {
-				applyMemoryBudget(defaultCfg(), memLimitEnv("32MiB"), missingPath(), func(int64) int64 { return 0 })
+				applyMemoryBudget(defaultCfg(), memLimitEnv("32MiB"), func(int64) int64 { return 0 })
 			})
 			Expect(tooSmall).To(ContainSubstring("level=WARN"))
 
+		})
+
+		DescribeTable("reports each outcome at the level the documentation promises",
+			func(getenv func(string) string, wantLevel, notLevel string) {
+				out := captureLogs(slog.LevelDebug, func() {
+					applyMemoryBudget(defaultCfg(), getenv, func(int64) int64 { return 0 })
+				})
+				Expect(out).To(ContainSubstring(wantLevel))
+				if notLevel != "" {
+					Expect(out).NotTo(ContainSubstring(notLevel))
+				}
+			},
+			// A ceiling stated and not divided: the operator asked for something
+			// and did not get it, so it must be visible at the default level.
+			Entry("a budget too small to divide warns", memLimitEnv("32MiB"), "level=WARN", ""),
+			// No ceiling anywhere is every unlimited host: unremarkable.
+			Entry("no ceiling anywhere stays at debug", noEnv, "level=DEBUG", "level=WARN"),
+		)
+
+		It("applies nothing when the budget was too small to divide", func() {
 			// Zero must not reach setLimit on this path either, not only on the
 			// no-ceiling one: the budget is the zero value here too.
-			var appliedWhenSmall []int64
+			var applied []int64
 			captureLogs(slog.LevelDebug, func() {
-				applyMemoryBudget(defaultCfg(), memLimitEnv("32MiB"), missingPath(),
-					func(n int64) int64 { appliedWhenSmall = append(appliedWhenSmall, n); return 0 })
+				applyMemoryBudget(defaultCfg(), memLimitEnv("32MiB"),
+					func(n int64) int64 { applied = append(applied, n); return 0 })
 			})
-			Expect(appliedWhenSmall).To(BeEmpty())
-
-			// No ceiling anywhere is every unlimited host: unremarkable.
-			none := captureLogs(slog.LevelDebug, func() {
-				applyMemoryBudget(defaultCfg(), noEnv, missingPath(), func(int64) int64 { return 0 })
-			})
-			Expect(none).To(ContainSubstring("level=DEBUG"))
-			Expect(none).NotTo(ContainSubstring("level=WARN"))
+			Expect(applied).To(BeEmpty())
 		})
 
 		It("warns about an ignored setting even when nothing was divided", func() {
 			cfg := &serverConfig{MemoryReserveSigner: "64MB"}
 			out := captureLogs(slog.LevelDebug, func() {
-				applyMemoryBudget(cfg, noEnv, missingPath(), func(int64) int64 { return 0 })
+				applyMemoryBudget(cfg, noEnv, func(int64) int64 { return 0 })
 			})
 			Expect(out).To(ContainSubstring("level=WARN"))
 			Expect(out).To(ContainSubstring("memory_reserve_signer"))
 		})
 
 		It("returns the budget it resolved, for the children to draw shares from", func() {
-			budget := applyMemoryBudget(defaultCfg(), memLimitEnv("256MiB"), missingPath(),
+			budget := applyMemoryBudget(defaultCfg(), memLimitEnv("256MiB"),
 				func(int64) int64 { return 0 })
 			Expect(budget.shareFor("signer")).To(Equal(int64(24 << 20)))
 			Expect(budget.shareFor("frontend")).To(Equal(int64(256<<20 - 8<<20 - 24<<20)))
@@ -789,12 +846,19 @@ var _ = Describe("dividing the memory budget across the process tree", func() {
 			return limit
 		}
 
-		It("applies the share belonging to the role it spawned", func() {
-			const signerShare = 64 << 20
-			budget := memoryBudget{signer: signerShare, frontend: 512 << 20}
-			Expect(spawnReporting(envWithoutMemLimit(), budget, "signer")).
-				To(Equal(int64(signerShare)), "the signer must get the signer's share, not the frontend's")
-		})
+		DescribeTable("applies the share belonging to the role it spawned",
+			func(role string, want int64) {
+				// Both roles, with distinct values, so the two cannot coincide.
+				// Driving only "signer" left spawnChild free to pass a literal
+				// role to shareFor: the frontend would then come up on the
+				// signer's reservation, which under the defaults is exactly the
+				// floor the code refuses to divide below.
+				budget := memoryBudget{launcher: 8 << 20, signer: 64 << 20, frontend: 128 << 20}
+				Expect(spawnReporting(envWithoutMemLimit(), budget, role)).To(Equal(want))
+			},
+			Entry("the signer gets the signer's share", "signer", int64(64<<20)),
+			Entry("the frontend gets the frontend's share", "frontend", int64(128<<20)),
+		)
 
 		It("overrides a tree-wide GOMEMLIMIT the child would otherwise inherit", func() {
 			// The defect itself. The child's environment carries the operator's
