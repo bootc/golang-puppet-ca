@@ -86,6 +86,10 @@ verbosity: 0
 ocsp_url: ""
 crl_url: ""
 shutdown_timeout_sec: 0  # graceful HTTP-drain budget on SIGTERM; 0 = built-in default (25s)
+# Memory budget for the process tree (launcher + isolated signer + frontend).
+memory_reserve_launcher: ""  # launcher's fixed share; "" = built-in default (8MiB)
+memory_reserve_signer: ""    # signer's fixed share; "" = built-in default (24MiB)
+memory_budget_percent: 0     # share of a cgroup ceiling the tree may claim; 0 = default (90)
 # Key generation options (applied only when bootstrapping a new CA or generating leaf certs).
 ca_key_algo: ""       # "rsa" (default) or "ecdsa"
 ca_key_size: 0        # RSA: 2048/3072/4096 (default 4096); ECDSA: 256/384/521 (default 256)
@@ -225,6 +229,9 @@ The CA key passphrase can also be provided via `PUPPET_CA_KEY_PASSPHRASE` (env v
 | `expired_cert_retention_sec` | `PUPPET_CA_EXPIRED_CERT_RETENTION_SEC` |
 | `expired_cert_cleanup_interval_sec` | `PUPPET_CA_EXPIRED_CERT_CLEANUP_INTERVAL_SEC` |
 | `shutdown_timeout_sec` | `PUPPET_CA_SHUTDOWN_TIMEOUT_SEC` |
+| `memory_reserve_launcher` | `PUPPET_CA_MEMORY_RESERVE_LAUNCHER` |
+| `memory_reserve_signer` | `PUPPET_CA_MEMORY_RESERVE_SIGNER` |
+| `memory_budget_percent` | `PUPPET_CA_MEMORY_BUDGET_PERCENT` |
 | `etcd_username` | `PUPPET_CA_ETCD_USERNAME` |
 | `etcd_password` | `PUPPET_CA_ETCD_PASSWORD` |
 | `etcd_dial_timeout_sec` | `PUPPET_CA_ETCD_DIAL_TIMEOUT_SEC` |
@@ -1271,6 +1278,43 @@ them as that user rather than under `sudo`: a root-owned lock file left in
 `locks/` will fail the server's next acquisition of that name. See [running a
 second process against a live
 store](storage-backends.md#running-a-second-process-against-a-live-store).
+
+## Memory budget
+
+In the default deployment `openvox-ca` runs as **three processes** — a launcher
+supervising an isolated signer that holds the CA key, and a frontend that serves
+the API (see [CA key security](ca-key-security.md#process-isolation)).
+`GOMEMLIMIT` is a per-process knob, so left to inherit it all three would apply
+the operator's whole value independently and the aggregate soft limit would be
+three times what was asked for. The launcher therefore treats one budget as
+belonging to the **whole tree** and divides it.
+
+The budget comes from `GOMEMLIMIT` when set, and otherwise from this process's
+cgroup v2 memory ceiling (`memory.max`, resolved through `/proc/self/cgroup`, so
+a systemd unit's `MemoryMax=` is honoured as well as a container limit). An
+explicit `GOMEMLIMIT` always takes precedence over the derived figure, and is
+taken at face value; a derived ceiling has `memory_budget_percent` of it claimed
+(default 90%), because `GOMEMLIMIT` bounds Go runtime memory only and the
+binary's resident text, kernel memory charged to the cgroup and any
+memory-backed state directory count against the same ceiling from outside it.
+`GOMEMLIMIT=off` disables the whole mechanism, as it disables the runtime's own
+limit.
+
+The launcher and signer take fixed shares (`memory_reserve_launcher`,
+`memory_reserve_signer`, both byte counts in `GOMEMLIMIT`'s grammar such as
+`24MiB`) and the frontend takes the remainder, because in steady state the
+frontend is the process whose footprint grows with the fleet. The signer's share
+is the one an operator can outgrow: its startup peak is fleet-proportional at
+roughly 420 bytes per certificate, and **raising the container limit does not
+reach it**, so a fleet beyond about 60,000 certificates should raise
+`memory_reserve_signer`.
+
+Nothing is divided when no ceiling is stated anywhere, on cgroup v1, or when the
+budget is too small to leave the frontend a workable share — splitting a very
+small total would trade a visible OOMKill for a silent GC death spiral. The
+first case is logged at debug level, since an unlimited host is unremarkable;
+the other two are logged as warnings, because the operator stated a limit and
+did not get the division.
 
 ## Graceful shutdown
 

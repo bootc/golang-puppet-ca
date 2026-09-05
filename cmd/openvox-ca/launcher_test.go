@@ -340,7 +340,7 @@ var _ = Describe("spawnChild and its cleanup", func() {
 		// the pipe leaked, which is the one thing it was named for.
 		pipe := capturePSKPipe()
 
-		cmd, err := spawnChild(exe, os.Environ(), "signer", sock, hex.EncodeToString(psk), 0)
+		cmd, err := spawnChild(exe, os.Environ(), "signer", sock, hex.EncodeToString(psk), memoryBudget{})
 		Expect(err).NotTo(HaveOccurred())
 		DeferCleanup(func() { killAndReap(cmd) })
 
@@ -397,10 +397,10 @@ var _ = Describe("spawnChild and its cleanup", func() {
 		Expect(err).NotTo(HaveOccurred())
 		DeferCleanup(func() { _ = first.Close(); _ = second.Close() })
 
-		signerCmd, err := spawnChild(exe, shared, "signer", first, hex.EncodeToString(psk), 0)
+		signerCmd, err := spawnChild(exe, shared, "signer", first, hex.EncodeToString(psk), memoryBudget{})
 		Expect(err).NotTo(HaveOccurred())
 		DeferCleanup(func() { killAndReap(signerCmd) })
-		frontendCmd, err := spawnChild(exe, shared, "frontend", second, hex.EncodeToString(psk), 0)
+		frontendCmd, err := spawnChild(exe, shared, "frontend", second, hex.EncodeToString(psk), memoryBudget{})
 		Expect(err).NotTo(HaveOccurred())
 		DeferCleanup(func() { killAndReap(frontendCmd) })
 
@@ -433,7 +433,7 @@ var _ = Describe("spawnChild and its cleanup", func() {
 
 		pipe := capturePSKPipe()
 		cmd, err := spawnChild(filepath.Join(GinkgoT().TempDir(), "does-not-exist"),
-			os.Environ(), "signer", sock, hex.EncodeToString(psk), 0)
+			os.Environ(), "signer", sock, hex.EncodeToString(psk), memoryBudget{})
 		Expect(err).To(HaveOccurred(), "a missing executable must not start")
 		Expect(cmd).To(BeNil())
 		Expect(pipe().Close()).To(MatchError(os.ErrClosed),

@@ -84,6 +84,36 @@ type serverConfig struct {
 	// defaults to 30s) or the platform will SIGKILL the pod first.
 	ShutdownTimeoutSec int `yaml:"shutdown_timeout_sec"`
 
+	// The default deployment is a process tree -- a launcher supervising an
+	// isolated signer and a frontend -- and GOMEMLIMIT is a per-process knob, so
+	// the launcher divides one tree-wide budget between the three rather than
+	// letting each apply the whole of it. These three keys tune that division;
+	// none of them is needed for the defaults to be sensible.
+	//
+	// MemoryReserveLauncher and MemoryReserveSigner are the fixed shares the
+	// launcher and signer receive, as byte counts in the same grammar as
+	// GOMEMLIMIT ("24MiB", "25165824"). The frontend takes the remainder,
+	// because in steady state it is the process whose footprint grows with the
+	// fleet. The signer's share is the one an operator can outgrow: its startup
+	// peak is fleet-proportional at roughly 420 bytes per certificate, and
+	// raising the container limit does not reach it, so a fleet beyond about
+	// 60,000 certificates should raise memory_reserve_signer. Empty selects the
+	// built-in defaults.
+	MemoryReserveLauncher string `yaml:"memory_reserve_launcher"`
+	MemoryReserveSigner   string `yaml:"memory_reserve_signer"`
+
+	// MemoryBudgetPercent is how much of a cgroup memory ceiling the tree may
+	// claim when the budget is derived rather than stated. GOMEMLIMIT bounds Go
+	// runtime memory only -- the binary's resident text, kernel memory charged
+	// to the cgroup, and a memory-backed cadir all count against the same
+	// ceiling from outside it -- so claiming the whole of it would make the
+	// runtimes collect harder only once the cgroup was already at the wall.
+	// 0 selects the built-in default (defaultMemoryBudgetPercent); values
+	// outside 1-100 are ignored in favour of it. It does not apply to an
+	// explicit GOMEMLIMIT, which is taken at face value because the operator
+	// naming a number has already chosen their own headroom.
+	MemoryBudgetPercent int `yaml:"memory_budget_percent"`
+
 	// Key generation options (apply only when bootstrapping a new CA).
 	CAKeyAlgo   string `yaml:"ca_key_algo"`
 	CAKeySize   int    `yaml:"ca_key_size"`
@@ -256,6 +286,44 @@ func (c *serverConfig) shutdownDrain() time.Duration {
 		return time.Duration(c.ShutdownTimeoutSec) * time.Second
 	}
 	return defaultShutdownDrain
+}
+
+// memoryReserveLauncher and memoryReserveSigner resolve the two fixed shares of
+// the tree memory budget, falling back to the built-in defaults when unset or
+// unparseable. A malformed reservation is deliberately not fatal: it moves one
+// share, and refusing to start the CA over a tuning knob would be a worse
+// outcome than running with a sensible number. An explicit GOMEMLIMIT gets the
+// opposite treatment (reported, not silently replaced) because it sets the
+// whole tree's budget rather than one share.
+func (c *serverConfig) memoryReserveLauncher() int64 {
+	return byteCountOrDefault(c.MemoryReserveLauncher, defaultLauncherReservation)
+}
+
+func (c *serverConfig) memoryReserveSigner() int64 {
+	return byteCountOrDefault(c.MemoryReserveSigner, defaultSignerReservation)
+}
+
+// memoryBudgetPercent resolves the share of a derived cgroup ceiling the tree
+// may claim. See serverConfig.MemoryBudgetPercent.
+func (c *serverConfig) memoryBudgetPercent() int {
+	if c.MemoryBudgetPercent >= 1 && c.MemoryBudgetPercent <= 100 {
+		return c.MemoryBudgetPercent
+	}
+	return defaultMemoryBudgetPercent
+}
+
+// byteCountOrDefault parses a configured byte count, returning fallback for
+// anything empty, malformed or non-positive.
+func byteCountOrDefault(raw string, fallback int64) int64 {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return fallback
+	}
+	n, ok := parseGoByteCount(trimmed)
+	if !ok || n <= 0 {
+		return fallback
+	}
+	return n
 }
 
 // defaultCRLRefreshInterval is how often the background job checks whether the
@@ -497,6 +565,17 @@ func applyServerEnv(cfg *serverConfig) {
 	if v := os.Getenv("PUPPET_CA_SHUTDOWN_TIMEOUT_SEC"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			cfg.ShutdownTimeoutSec = n
+		}
+	}
+	if v := os.Getenv("PUPPET_CA_MEMORY_RESERVE_LAUNCHER"); v != "" {
+		cfg.MemoryReserveLauncher = v
+	}
+	if v := os.Getenv("PUPPET_CA_MEMORY_RESERVE_SIGNER"); v != "" {
+		cfg.MemoryReserveSigner = v
+	}
+	if v := os.Getenv("PUPPET_CA_MEMORY_BUDGET_PERCENT"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			cfg.MemoryBudgetPercent = n
 		}
 	}
 	if v := os.Getenv("PUPPET_CA_CA_KEY_ALGO"); v != "" {

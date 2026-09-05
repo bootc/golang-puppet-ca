@@ -18,7 +18,10 @@
 package main
 
 import (
+	"fmt"
+	"math"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 )
@@ -27,10 +30,10 @@ import (
 // tree: this launcher supervises an isolated signer and a frontend. Left to
 // inherit it, all three apply the operator's value independently -- so
 // GOMEMLIMIT set to just under the container limit, which is what the chart
-// documentation recommends, yields three times that in aggregate soft limit.
-// No runtime ever feels pressure and the cgroup wall arrives first: the advice
-// given to convert an OOMKill into GC pressure removes the GC pressure it was
-// meant to create.
+// documentation used to recommend, yields three times that in aggregate soft
+// limit. No runtime ever feels pressure and the cgroup wall arrives first: the
+// advice given to convert an OOMKill into GC pressure removes the GC pressure
+// it was meant to create.
 //
 // The launcher is the only process that can divide the budget, because it is
 // the only one that knows the tree exists.
@@ -38,56 +41,104 @@ import (
 // GOMAXPROCS is deliberately left alone. Since Go 1.25 the runtime derives it
 // from the cgroup CPU limit when it is unset (the containermaxprocs and
 // updatemaxprocs GODEBUGs), and there is no memory equivalent anywhere in the
-// runtime. The asymmetry is principled rather than an oversight: CPU is
-// time-sliced, so three runtimes sizing to the same quota costs parked threads
-// and GC workers, whereas memory is a hard ceiling and triple-counting it is
-// fatal. An operator who sets GOMAXPROCS explicitly does still have it
-// inherited by all three, which is the same shape at far lower stakes.
+// runtime. The asymmetry is principled: CPU is time-sliced, so three runtimes
+// sizing to the same quota costs parked threads and GC workers, whereas memory
+// is a hard ceiling and triple-counting it is fatal. An operator who sets
+// GOMAXPROCS explicitly does still have it inherited by all three, which is the
+// same shape at far lower stakes.
 const goMemLimitEnv = "GOMEMLIMIT"
 
-// cgroupV2MemoryMax is the unified-hierarchy file holding this process's memory
-// ceiling. It reads a decimal byte count, or the literal "max" when the cgroup
-// is unlimited.
+// cgroupMountRoot is where the unified hierarchy is conventionally mounted, and
+// cgroupSelfPath names this process's own cgroup within it.
+//
+// Both are needed. Inside a container with a cgroup namespace the container's
+// own cgroup *is* the root, so memory.max sits directly at the mount point.
+// Under systemd on a host it does not: the service lives at
+// system.slice/<unit>, the v2 root carries no memory.max at all (the root
+// cgroup is exempt from resource control), and reading only the mount point
+// finds nothing. Resolving /proc/self/cgroup first makes a unit's MemoryMax=
+// work; falling back to the mount point keeps the container case working when
+// /proc is unavailable.
 //
 // cgroup v1's memory.limit_in_bytes is deliberately not consulted. It reports a
 // near-int64-max sentinel rather than a word when unlimited, so a v1 reader that
 // forgot the sentinel would derive an absurd budget and silently divide it --
-// worse than deriving nothing. The unified hierarchy has been the default on
-// every distribution this project targets for years, and an operator on v1 can
-// still set GOMEMLIMIT explicitly, which takes precedence anyway.
-const cgroupV2MemoryMax = "/sys/fs/cgroup/memory.max"
+// worse than deriving nothing. An operator on v1 can still set GOMEMLIMIT
+// explicitly, which takes precedence anyway.
+const (
+	cgroupMountRoot = "/sys/fs/cgroup"
+	cgroupSelfPath  = "/proc/self/cgroup"
+	cgroupMemoryMax = "memory.max"
+)
 
 // The launcher's and signer's shares are absolute reservations rather than
 // percentages, and the frontend takes whatever is left. Only the frontend's
-// footprint grows with the fleet, so only it should absorb growth; a percentage
-// split scales the two processes whose cost is roughly constant and starves them
-// exactly where the total is tightest. At the chart's default 64Mi limit a 10%
-// signer share would be 6.4MiB, which is below a bare Go runtime's own
-// footprint.
+// footprint grows with the fleet in steady state, so it should absorb growth; a
+// percentage split scales the two processes whose cost is roughly constant and
+// starves them exactly where the total is tightest. At the chart's default 64Mi
+// limit a 10% signer share would be 6.4MiB, which is below a bare Go runtime's
+// own footprint.
 const (
-	// launcherMemoryReservation covers the supervisor, which holds two
+	// defaultLauncherReservation covers the supervisor, which holds two
 	// os.Process handles and blocks on channels. Its live heap is a few hundred
-	// KiB; the rest is headroom, because a GOMEMLIMIT set near a process's true
-	// need causes continuous GC rather than a failure -- a soft limit that is
-	// too low degrades silently, which is worse than one that is absent.
-	launcherMemoryReservation = 8 << 20
+	// KiB, but GOMEMLIMIT governs the runtime's whole mapped-and-unreleased
+	// footprint (MemStats.Sys - MemStats.HeapReleased), not live heap: arenas,
+	// stacks and GC metadata are inside it, and that baseline is a few MiB for
+	// any process built from this binary. The margin over live heap is
+	// therefore the point, not slack -- Go's own documentation warns that a
+	// limit below the runtime's own usage makes the collector run nearly
+	// continuously.
+	defaultLauncherReservation = 8 << 20
 
-	// signerMemoryReservation must cover the signer's *peak*, which falls during
-	// ca.Init and is fleet-proportional at roughly 420 bytes per certificate:
-	// buildSerialIndex plus the []CertRecord that rebuildCertIndex materialises.
-	// 24MiB therefore covers on the order of 60,000 certificates.
+	// defaultSignerReservation must cover the signer's *peak*, which falls
+	// during ca.Init and is fleet-proportional at roughly 420 bytes per
+	// certificate: buildSerialIndex plus the []CertRecord that rebuildCertIndex
+	// materialises. 24MiB therefore covers on the order of 60,000
+	// certificates.
 	//
-	// Note this peak is not removed by giving the signer a shorter-lived store:
-	// that shrinks the steady state, not the Init peak, so this reservation
-	// remains fleet-sensitive either way. Exceeding it is not fatal -- GOMEMLIMIT
-	// is a soft limit, so the signer collects harder during startup.
-	signerMemoryReservation = 24 << 20
+	// This share does NOT scale with the tree total, so raising the container
+	// limit does not reach the signer. Above roughly that fleet size, raise
+	// PUPPET_CA_MEMORY_RESERVE_SIGNER. Exceeding the share is not fatal --
+	// GOMEMLIMIT is a soft limit, so the signer collects harder during startup
+	// and Init takes longer.
+	defaultSignerReservation = 24 << 20
 
 	// minFrontendMemoryShare is the floor below which dividing the budget is
 	// worse than leaving it undivided: the frontend is the process actually
-	// serving traffic, and squeezing it into a share near its live heap trades an
-	// OOMKill for a GC death spiral that reports nothing.
+	// serving traffic, and squeezing it into a share near its live heap trades
+	// an OOMKill for a GC death spiral that reports nothing.
 	minFrontendMemoryShare = 24 << 20
+
+	// defaultMemoryBudgetPercent is how much of a cgroup ceiling the tree may
+	// claim when memory_budget_percent is unset.
+	// GOMEMLIMIT bounds Go runtime memory only: the binary's resident text,
+	// kernel memory charged to the cgroup, and -- for this chart specifically --
+	// the cadir tmpfs when persistence is disabled all sit outside it and count
+	// against the same cgroup. Handing the runtimes 100% of the ceiling would
+	// make them collect harder only once the cgroup was already at the wall,
+	// which is the OOMKill this whole mechanism exists to convert into GC
+	// pressure. An explicit GOMEMLIMIT is taken at face value instead, because
+	// the operator naming a number has already chosen their own headroom.
+	defaultMemoryBudgetPercent = 90
+)
+
+// budgetKind says why a budget was or was not applied, so the caller can log
+// the cases an operator must act on differently from the ones they need not.
+type budgetKind int
+
+const (
+	// budgetApplied: the tree budget was resolved and divided.
+	budgetApplied budgetKind = iota
+	// budgetNoCeiling: nothing stated a ceiling. Unremarkable -- it is every
+	// host that is not memory-limited -- so it does not warrant an operator's
+	// attention.
+	budgetNoCeiling
+	// budgetTooSmall: a ceiling was found and rejected as too small to divide.
+	// The operator asked for a limit and did not get the division, so this one
+	// has to be visible.
+	budgetTooSmall
+	// budgetInvalid: GOMEMLIMIT was set to something unparseable.
+	budgetInvalid
 )
 
 // memoryBudget is the tree's total allowance and its division between the three
@@ -97,73 +148,187 @@ type memoryBudget struct {
 	launcher int64
 	signer   int64
 	frontend int64
-	// source names where total came from, for the operator-facing log line.
+	// ceiling is the raw figure the budget was derived from before headroom was
+	// withheld, and equals total when the operator stated it outright.
+	ceiling int64
+	// source names where the ceiling came from, for the operator-facing log.
 	source string
+}
+
+// shareFor returns the limit for one role in the tree.
+//
+// The mapping lives here rather than at the call sites so that a share cannot
+// reach the wrong process: spawnChild is handed the whole budget and the role it
+// is already spawning, so there is no argument left to transpose. Passing
+// budget.signer and budget.frontend positionally is exactly the shape where a
+// swap compiles, runs, and is invisible to every spec that checks arithmetic.
+//
+// An unknown role, and every role when no budget was resolved, returns 0 --
+// which spawnChild reads as "leave the runtime default alone". Zero must never
+// be handed to debug.SetMemoryLimit as a limit.
+func (b memoryBudget) shareFor(role string) int64 {
+	switch role {
+	case "launcher":
+		return b.launcher
+	case "signer":
+		return b.signer
+	case "frontend":
+		return b.frontend
+	default:
+		return 0
+	}
 }
 
 // resolveMemoryBudget determines the tree-wide budget and divides it.
 //
 // An explicit GOMEMLIMIT wins: the operator asked for a specific number and it
 // is taken to name the budget for the whole tree, which is what the
-// documentation will say it means. Only when it is unset is the cgroup
-// consulted, so deriving can never override a deliberate setting.
+// documentation says it means. Only when it is unset is the cgroup consulted,
+// so deriving can never override a deliberate setting.
 //
-// The second return value is a human-readable reason the budget was not
-// applied, empty when ok is true. getenv and cgroupPath are parameters rather
-// than package-level references so a spec can drive every branch without
-// mutating the process environment or the filesystem.
-func resolveMemoryBudget(getenv func(string) string, cgroupPath string) (budget memoryBudget, ok bool, reason string) {
-	total, source, ok := treeMemoryTotal(getenv, cgroupPath)
-	if !ok {
-		return memoryBudget{}, false, source
+// The returned kind says how the caller should report the outcome, and reason
+// is the operator-facing explanation (empty when a budget was applied). getenv
+// and cgroupPath are parameters rather than package-level references so a spec
+// can drive every branch without mutating the process environment or writing
+// under /sys; cfg supplies the three tuning keys (memory_reserve_launcher,
+// memory_reserve_signer, memory_budget_percent).
+func resolveMemoryBudget(cfg *serverConfig, getenv func(string) string, cgroupPath string) (budget memoryBudget, kind budgetKind, reason string) {
+	ceiling, source, kind, reason := treeMemoryCeiling(getenv, cgroupPath)
+	if kind != budgetApplied {
+		return memoryBudget{}, kind, reason
 	}
 
-	frontend := total - launcherMemoryReservation - signerMemoryReservation
+	total := ceiling
+	if source != goMemLimitEnv {
+		// Withhold headroom only from a figure we derived. See
+		// serverConfig.MemoryBudgetPercent.
+		total = scalePercent(ceiling, cfg.memoryBudgetPercent())
+	}
+
+	launcher := cfg.memoryReserveLauncher()
+	signer := cfg.memoryReserveSigner()
+
+	frontend := total - launcher - signer
 	if frontend < minFrontendMemoryShare {
-		return memoryBudget{}, false, "the total is too small to divide: " +
-			strconv.FormatInt(total, 10) + " bytes leaves the frontend below its " +
-			strconv.FormatInt(minFrontendMemoryShare, 10) + "-byte floor once the " +
-			"launcher and signer are reserved for; raise the limit or unset GOMEMLIMIT"
+		return memoryBudget{}, budgetTooSmall, fmt.Sprintf(
+			"%s gives a tree budget of %d bytes, which leaves the frontend %d after reserving "+
+				"%d for the launcher and %d for the signer; it needs at least %d. Raise the limit, "+
+				"or lower memory_reserve_launcher / memory_reserve_signer",
+			source, total, frontend, launcher, signer, int64(minFrontendMemoryShare))
 	}
 
 	return memoryBudget{
 		total:    total,
-		launcher: launcherMemoryReservation,
-		signer:   signerMemoryReservation,
+		launcher: launcher,
+		signer:   signer,
 		frontend: frontend,
+		ceiling:  ceiling,
 		source:   source,
-	}, true, ""
+	}, budgetApplied, ""
 }
 
-// treeMemoryTotal returns the tree's total budget and where it came from. When
-// no budget is available the second string is the reason rather than a source.
-func treeMemoryTotal(getenv func(string) string, cgroupPath string) (int64, string, bool) {
-	if raw := strings.TrimSpace(getenv(goMemLimitEnv)); raw != "" {
+// scalePercent returns percent% of n, multiplying before dividing so the result
+// is exact for every plausible ceiling. Dividing first truncates n to a
+// multiple of 100 and loses up to 99 bytes per percentage point, which is
+// harmless operationally but makes the arithmetic awkward to state and to
+// assert. The guard covers an implausibly large ceiling -- parseGoByteCount
+// accepts values up to 1<<62 -- where the multiply would overflow; there the
+// imprecise order is used instead, because a wrong sign is worse than a lost
+// byte.
+func scalePercent(n int64, percent int) int64 {
+	if n > math.MaxInt64/100 {
+		return n / 100 * int64(percent)
+	}
+	return n * int64(percent) / 100
+}
+
+// treeMemoryCeiling returns the ceiling the tree budget is drawn from and where
+// it came from.
+func treeMemoryCeiling(getenv func(string) string, cgroupPath string) (int64, string, budgetKind, string) {
+	raw := strings.TrimSpace(getenv(goMemLimitEnv))
+	switch raw {
+	case "":
+		// Fall through to the cgroup.
+	case "off":
+		// The Go runtime special-cases "off" to mean unlimited, ahead of its own
+		// byte-count parser (runtime.readGOMEMLIMIT). An operator who wrote it
+		// disabled the limit deliberately, so this is neither an error nor a
+		// budget -- and it must not fall through to the cgroup, which would
+		// reinstate the limit they just turned off.
+		return 0, "", budgetNoCeiling, "GOMEMLIMIT is off, so no budget is divided"
+	default:
 		n, valid := parseGoByteCount(raw)
 		if !valid {
-			// Deliberately not fatal, and deliberately not silently ignored: the
-			// Go runtime itself refuses to start on a malformed GOMEMLIMIT, so a
-			// child would fail anyway. Reporting it here names the launcher as
-			// the place the value was read.
-			return 0, "GOMEMLIMIT is set to " + strconv.Quote(raw) + ", which is not a valid byte count", false
+			return 0, "", budgetInvalid, fmt.Sprintf(
+				"GOMEMLIMIT is set to %s, which is not a byte count the Go runtime accepts", strconv.Quote(raw))
 		}
-		return n, "GOMEMLIMIT", true
+		return n, goMemLimitEnv, budgetApplied, ""
 	}
 
-	n, found := readCgroupMemoryMax(cgroupPath)
+	n, path, found := readCgroupMemoryMax(cgroupPath)
 	if !found {
-		return 0, "GOMEMLIMIT is unset and no cgroup memory ceiling was found", false
+		return 0, "", budgetNoCeiling, "GOMEMLIMIT is unset and no cgroup memory ceiling was found"
 	}
-	return n, "cgroup " + cgroupPath, true
+	return n, "cgroup " + path, budgetApplied, ""
 }
 
-// readCgroupMemoryMax reads a cgroup v2 memory ceiling. A missing file, an
-// unreadable one, the literal "max", or anything that does not parse all yield
-// false -- every one of them means "no ceiling stated here", and none is worth
-// failing startup over.
-func readCgroupMemoryMax(path string) (int64, bool) {
-	// path is a compile-time constant in production; it is a parameter only so
-	// a spec can drive every branch without writing under /sys.
+// readCgroupMemoryMax reads a cgroup v2 memory ceiling, preferring this
+// process's own cgroup over the mount root, and returns the path it read.
+//
+// mountRoot is a parameter so a spec can point the whole lookup at a temporary
+// directory; passing a path that is itself a file (rather than a mount root)
+// reads that file directly, which keeps the single-file fixtures simple.
+func readCgroupMemoryMax(mountRoot string) (int64, string, bool) {
+	for _, candidate := range cgroupMemoryMaxCandidates(mountRoot) {
+		if n, ok := parseCgroupMemoryMax(candidate); ok {
+			return n, candidate, true
+		}
+	}
+	return 0, "", false
+}
+
+// cgroupMemoryMaxCandidates lists the files that may hold this process's memory
+// ceiling, most specific first.
+func cgroupMemoryMaxCandidates(mountRoot string) []string {
+	// A fixture pointing straight at a file is used as-is.
+	if info, err := os.Stat(mountRoot); err == nil && !info.IsDir() {
+		return []string{mountRoot}
+	}
+	candidates := make([]string, 0, 2)
+	if rel := selfCgroupPath(); rel != "" {
+		candidates = append(candidates, filepath.Join(mountRoot, rel, cgroupMemoryMax))
+	}
+	return append(candidates, filepath.Join(mountRoot, cgroupMemoryMax))
+}
+
+// selfCgroupPath returns this process's cgroup v2 path relative to the mount
+// root, or "" when it cannot be determined. The unified hierarchy is the line
+// with an empty controller list, written "0::<path>".
+func selfCgroupPath() string {
+	data, err := os.ReadFile(cgroupSelfPath)
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		rest, ok := strings.CutPrefix(strings.TrimSpace(line), "0::")
+		if !ok {
+			continue
+		}
+		// "/" is the root, which the mount-root candidate already covers, and
+		// joining it would produce that same path twice.
+		if rest == "" || rest == "/" {
+			return ""
+		}
+		return rest
+	}
+	return ""
+}
+
+// parseCgroupMemoryMax reads one memory.max file. A missing file, an unreadable
+// one, the literal "max", or anything that does not parse all yield false --
+// every one of them means "no ceiling stated here", and none is worth failing
+// startup over.
+func parseCgroupMemoryMax(path string) (int64, bool) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return 0, false
@@ -186,6 +351,9 @@ func readCgroupMemoryMax(path string) (int64, bool) {
 // be divided here and then refused by the child, and anything the runtime
 // accepts but this rejects would silently fall through to the cgroup and
 // override the operator.
+//
+// The runtime's "off" is handled by the caller rather than here, because it is
+// not a byte count: it names the absence of a limit.
 func parseGoByteCount(s string) (int64, bool) {
 	if s == "" {
 		return 0, false

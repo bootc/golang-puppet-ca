@@ -68,8 +68,9 @@ const (
 // passed via inherited file descriptors (fd 3). There is no filesystem path
 // for the socket; only the two child processes hold endpoints.
 //
-// drain is the frontend's resolved graceful HTTP-drain budget (see
-// serverConfig.shutdownDrain). The launcher waits drain+launcherShutdownHeadroom
+// cfg supplies the frontend's graceful HTTP-drain budget (see
+// serverConfig.shutdownDrain) and the three memory-budget keys. The launcher
+// waits drain+launcherShutdownHeadroom
 // for both children to exit after forwarding SIGTERM before hard-killing them,
 // so the frontend always gets its full drain even though the launcher's timer
 // starts first.
@@ -85,8 +86,8 @@ const (
 // before any startup work begins, so a reload arriving early is queued rather
 // than fatal — SIGHUP's default disposition would otherwise kill the launcher.
 // NIST 800-53: SC-3 (Security Function Isolation), SC-4 (Information in Shared System Resources)
-func runLauncher(drain time.Duration, notify *sdnotify.Notifier, hupCh <-chan os.Signal) error {
-	gracefulShutdownTimeout := drain + launcherShutdownHeadroom
+func runLauncher(cfg *serverConfig, notify *sdnotify.Notifier, hupCh <-chan os.Signal) error {
+	gracefulShutdownTimeout := cfg.shutdownDrain() + launcherShutdownHeadroom
 
 	// Create the socketpair for signer ↔ frontend communication.
 	signerSock, frontendSock, err := signer.Socketpair()
@@ -135,34 +136,39 @@ func runLauncher(drain time.Duration, notify *sdnotify.Notifier, hupCh <-chan os
 	// operator's whole value independently; see launcher_memlimit.go. A zero
 	// share means "leave the runtime default alone", which is what every child
 	// gets when no budget could be resolved.
-	budget, budgeted, reason := resolveMemoryBudget(os.Getenv, cgroupV2MemoryMax)
-	switch {
-	case budgeted:
+	budget, kind, reason := resolveMemoryBudget(cfg, os.Getenv, cgroupMountRoot)
+	switch kind {
+	case budgetApplied:
 		slog.Info("Dividing the memory budget across the process tree",
 			"source", budget.source,
+			"ceiling_bytes", budget.ceiling,
 			"total_bytes", budget.total,
 			"launcher_bytes", budget.launcher,
 			"signer_bytes", budget.signer,
 			"frontend_bytes", budget.frontend,
 		)
-		debug.SetMemoryLimit(budget.launcher)
-	case os.Getenv(goMemLimitEnv) != "":
-		// The operator asked for something and did not get it, so this is the
-		// one path they need to see: without it the tree silently keeps the
-		// triple-counted behaviour the setting was meant to prevent.
+		debug.SetMemoryLimit(budget.shareFor("launcher"))
+	case budgetTooSmall, budgetInvalid:
+		// A ceiling was stated and the division did not happen, so the operator
+		// asked for something and did not get it. Without this line the tree
+		// silently keeps the triple-counted behaviour the limit was meant to
+		// prevent -- and the documentation promises they are told.
 		slog.Warn("Not dividing the memory budget across the process tree", "reason", reason)
-	default:
+	case budgetNoCeiling:
+		// Nothing stated a ceiling anywhere, which is every host that is not
+		// memory-limited. Unremarkable, so it does not warrant an operator's
+		// attention.
 		slog.Debug("No memory budget to divide across the process tree", "reason", reason)
 	}
 
 	// The frontend gets baseEnv untouched: it is the process that knows when
 	// the listener is accepting, so it is the one that reports READY=1.
-	signerCmd, err := spawnChild(exe, signerEnv(baseEnv), "signer", signerSock, pskHex, budget.signer)
+	signerCmd, err := spawnChild(exe, signerEnv(baseEnv), "signer", signerSock, pskHex, budget)
 	if err != nil {
 		return err
 	}
 
-	frontendCmd, err := spawnChild(exe, baseEnv, "frontend", frontendSock, pskHex, budget.frontend)
+	frontendCmd, err := spawnChild(exe, baseEnv, "frontend", frontendSock, pskHex, budget)
 	if err != nil {
 		// The signer is already running and nothing will ever connect to it, so
 		// it has to go -- and be reaped, not merely signalled: Kill on its own
@@ -349,7 +355,12 @@ var pskPipeFn = pskPipe
 // testable: the parent's copies of both descriptors must be dropped as soon as
 // the child holds them, and a PSK pipe created for a child that never starts
 // must not be leaked. Both rules were open-coded twice.
-func spawnChild(exe string, baseEnv []string, role string, sock *os.File, pskHex string, memLimit int64) (*exec.Cmd, error) {
+//
+// It takes the whole budget rather than one share, and picks the share by the
+// role it was already given, so a share cannot reach the wrong process. Two
+// positional int64 arguments at the call sites would let a transposition
+// compile, run, and pass every spec that only checks the arithmetic.
+func spawnChild(exe string, baseEnv []string, role string, sock *os.File, pskHex string, budget memoryBudget) (*exec.Cmd, error) {
 	pskRead, err := pskPipeFn(pskHex)
 	if err != nil {
 		// Including here, the earliest exit: os.Pipe fails under descriptor
@@ -372,7 +383,7 @@ func spawnChild(exe string, baseEnv []string, role string, sock *os.File, pskHex
 		"PUPPET_CA_ROLE="+role,
 		"PUPPET_CA_DAEMON=1",
 	)
-	if memLimit > 0 {
+	if memLimit := budget.shareFor(role); memLimit > 0 {
 		// Appended *after* baseEnv, which still carries the operator's
 		// tree-wide GOMEMLIMIT when they set one: os/exec's dedupEnv keeps the
 		// last occurrence of a key, so this child's share wins over the

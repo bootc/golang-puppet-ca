@@ -472,7 +472,7 @@ func newRootCmd() *cobra.Command {
 
 			// Launcher mode (default): spawn isolated signer + frontend children.
 			if role == "" && !singleProcess {
-				return runLauncher(cfg.shutdownDrain(), notifier, hupCh)
+				return runLauncher(cfg, notifier, hupCh)
 			}
 
 			// Frontend mode (role=frontend) or single-process mode: run HTTP server.
