@@ -25,6 +25,8 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"runtime/debug"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -128,14 +130,39 @@ func runLauncher(drain time.Duration, notify *sdnotify.Notifier, hupCh <-chan os
 	// share a backing array.
 	baseEnv := filterEnv(os.Environ(), internalEnvKeys...)
 
+	// Divide the tree's memory budget before either child starts. GOMEMLIMIT is
+	// a per-process knob and all three processes would otherwise apply the
+	// operator's whole value independently; see launcher_memlimit.go. A zero
+	// share means "leave the runtime default alone", which is what every child
+	// gets when no budget could be resolved.
+	budget, budgeted, reason := resolveMemoryBudget(os.Getenv, cgroupV2MemoryMax)
+	switch {
+	case budgeted:
+		slog.Info("Dividing the memory budget across the process tree",
+			"source", budget.source,
+			"total_bytes", budget.total,
+			"launcher_bytes", budget.launcher,
+			"signer_bytes", budget.signer,
+			"frontend_bytes", budget.frontend,
+		)
+		debug.SetMemoryLimit(budget.launcher)
+	case os.Getenv(goMemLimitEnv) != "":
+		// The operator asked for something and did not get it, so this is the
+		// one path they need to see: without it the tree silently keeps the
+		// triple-counted behaviour the setting was meant to prevent.
+		slog.Warn("Not dividing the memory budget across the process tree", "reason", reason)
+	default:
+		slog.Debug("No memory budget to divide across the process tree", "reason", reason)
+	}
+
 	// The frontend gets baseEnv untouched: it is the process that knows when
 	// the listener is accepting, so it is the one that reports READY=1.
-	signerCmd, err := spawnChild(exe, signerEnv(baseEnv), "signer", signerSock, pskHex)
+	signerCmd, err := spawnChild(exe, signerEnv(baseEnv), "signer", signerSock, pskHex, budget.signer)
 	if err != nil {
 		return err
 	}
 
-	frontendCmd, err := spawnChild(exe, baseEnv, "frontend", frontendSock, pskHex)
+	frontendCmd, err := spawnChild(exe, baseEnv, "frontend", frontendSock, pskHex, budget.frontend)
 	if err != nil {
 		// The signer is already running and nothing will ever connect to it, so
 		// it has to go -- and be reaped, not merely signalled: Kill on its own
@@ -322,7 +349,7 @@ var pskPipeFn = pskPipe
 // testable: the parent's copies of both descriptors must be dropped as soon as
 // the child holds them, and a PSK pipe created for a child that never starts
 // must not be leaked. Both rules were open-coded twice.
-func spawnChild(exe string, baseEnv []string, role string, sock *os.File, pskHex string) (*exec.Cmd, error) {
+func spawnChild(exe string, baseEnv []string, role string, sock *os.File, pskHex string, memLimit int64) (*exec.Cmd, error) {
 	pskRead, err := pskPipeFn(pskHex)
 	if err != nil {
 		// Including here, the earliest exit: os.Pipe fails under descriptor
@@ -345,6 +372,15 @@ func spawnChild(exe string, baseEnv []string, role string, sock *os.File, pskHex
 		"PUPPET_CA_ROLE="+role,
 		"PUPPET_CA_DAEMON=1",
 	)
+	if memLimit > 0 {
+		// Appended *after* baseEnv, which still carries the operator's
+		// tree-wide GOMEMLIMIT when they set one: os/exec's dedupEnv keeps the
+		// last occurrence of a key, so this child's share wins over the
+		// inherited total. Stripping GOMEMLIMIT from baseEnv instead would be
+		// wrong for the --daemon re-exec, which has to pass the operator's
+		// value through so the re-executed launcher can divide it.
+		cmd.Env = append(cmd.Env, goMemLimitEnv+"="+strconv.FormatInt(memLimit, 10))
+	}
 	cmd.ExtraFiles = []*os.File{sock, pskRead} // fd 3, fd 4
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
