@@ -318,8 +318,10 @@ The launcher and signer take fixed shares (`config.memory_reserve_launcher`,
 `config.memory_reserve_signer`) and the frontend takes the remainder. The
 signer's share is the one you can outgrow: its startup peak is
 fleet-proportional at roughly 420 bytes per certificate, and **raising
-`resources.limits.memory` does not reach it**, so past about 60,000 certificates
-raise `config.memory_reserve_signer` as well:
+`resources.limits.memory` does not reach it**. The share also carries the Go
+runtime's own footprint, so the usable headroom in the 24MiB default is nearer
+16MiB: past roughly 40,000 certificates raise `config.memory_reserve_signer` as
+well:
 
 ```yaml
 config:

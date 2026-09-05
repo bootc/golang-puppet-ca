@@ -1306,8 +1306,9 @@ The launcher and signer take fixed shares (`memory_reserve_launcher`,
 frontend is the process whose footprint grows with the fleet. The signer's share
 is the one an operator can outgrow: its startup peak is fleet-proportional at
 roughly 420 bytes per certificate, and **raising the container limit does not
-reach it**, so a fleet beyond about 60,000 certificates should raise
-`memory_reserve_signer`.
+reach it**. The share also has to carry the Go runtime's own footprint, a few
+MiB before any inventory, so the usable headroom in the 24MiB default is nearer
+16MiB: raise `memory_reserve_signer` beyond roughly 40,000 certificates.
 
 `memory_reserve_launcher` and `memory_reserve_signer` take an integer with an
 optional IEC suffix, with or without the trailing `B`: `24MiB` and `24Mi` are
@@ -1316,9 +1317,12 @@ both accepted, as is a bare `25165824`. SI spellings are not — `64MB`, `64M`,
 guessing which was meant is worse than refusing. Neither may be below 8MiB: a
 share under the Go runtime's own footprint is arithmetically valid and
 operationally a process that collects continuously. A `memory_budget_percent`
-outside 1-100 is likewise rejected. In every one of these cases the built-in
-default is used and **the launcher logs a warning naming the key and the value
-it ignored**, so a mistyped reservation does not pass unnoticed.
+outside 1-100 is likewise rejected. In each of these cases the built-in default
+is used and **the launcher logs a warning naming the key and the value it
+ignored**, so a mistyped reservation does not pass unnoticed. The one exception
+is a `PUPPET_CA_MEMORY_BUDGET_PERCENT` that is not an integer at all: like every
+other numeric environment variable here it is discarded during parsing, before
+the launcher can see it, and the default is used silently.
 
 Nothing is divided at all in three cases. One is logged as a **warning**,
 because the operator stated a ceiling and did not get the division: a budget too
@@ -1326,7 +1330,12 @@ small to leave the frontend a workable share, which under the default
 reservations means a ceiling below 63Mi on the derived path (the three shares
 need 56MiB between them, and a derived ceiling is scaled to 90% first).
 Splitting a very small total would trade a visible OOMKill for a silent GC death
-spiral, so it is left undivided — and then no process gets a limit at all.
+spiral, so it is left undivided. What that leaves depends on where the ceiling
+came from. On the derived path no process gets a limit at all. Where the
+too-small ceiling was an explicit `GOMEMLIMIT`, it is still in the environment
+and all three processes inherit and apply the whole of it — the triple-counted
+aggregate this section opens by describing — so raise such a value to one that
+divides rather than lowering it further.
 
 The other two are logged at **debug** level, since there is nothing to act on:
 no ceiling stated anywhere — which includes every cgroup v1 host, because
