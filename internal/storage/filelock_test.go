@@ -53,6 +53,14 @@ var _ = Describe("Same-host locking", func() {
 	// A short deadline for the contended attempts. Long enough that a slow
 	// machine does not report contention where there is none, short enough that
 	// a regression fails the suite rather than hanging it.
+	//
+	// It bounds operations expected to FAIL, and must not reach one expected to
+	// succeed. What it is sized against is a lock acquisition that loses; a real
+	// schema migration costs whatever the schema and the machine cost, and one
+	// was observed taking 1.508s under -race on a loaded runner. Anything
+	// asserted to succeed therefore gets the production budget instead. The
+	// migration spec below is where this had already drifted onto a success
+	// path, which is the whole of #298.
 	const contendedTimeout = 750 * time.Millisecond
 
 	svc := func(b Backend) *StorageService {
@@ -683,7 +691,23 @@ var _ = Describe("Same-host locking", func() {
 				"and the error must say why, since this is a startup failure an operator sees")
 
 			// Released, it proceeds — so the refusal was the lock, not the DSN.
+			// It has to be this same backend that proceeds: a fresh one would
+			// only show the DSN is migratable, not that what stopped *this* one
+			// was the lock. But the budget it still carries was sized for the
+			// refusal above, and what follows is a genuine schema migration, so
+			// hand it the production budget for that.
+			second.migrationTimeout = sqlMigrationTimeout
+
 			Expect(held.Unlock()).To(Succeed())
+
+			// Asserted, not merely assigned. Deleting the line above would put a
+			// 750ms deadline back on a migration measured at 1.508s under -race,
+			// and the spec would go back to failing on whichever loaded runner
+			// picked it up — in any of the four backend jobs, none of which this
+			// SQLite spec has anything to do with (#298). Failing here instead
+			// costs nothing and names the reason.
+			Expect(second.migrationTimeout).To(Equal(sqlMigrationTimeout),
+				"the migration below must not run under the contended budget")
 			Expect(second.EnsureReady(ctx)).To(Succeed())
 		})
 
