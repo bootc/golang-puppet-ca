@@ -402,6 +402,196 @@ Rules that keep the decomposed structure coherent:
   stored value still being the one that was decoded (the mutable fields are not
   chain input), so index repair cannot fork the integrity head.
 
+## Inventory integrity: threat model and rationale
+
+The sections above describe what the integrity mechanism *computes*. This one
+states what it is *for*: which threats it is meant to address, which it is not,
+and why the chosen shape meets the first set. A threat model that overstates
+what a control provides is worse than none, because it stops people looking; so
+the limitations below are stated as plainly as the guarantees.
+
+**The reasoning behind the original remediation item is not recorded in this
+repository.** The whole-blob HMAC arrived with the CA-key process isolation work
+as remediation item `[012]`, which references a design document
+(`PUPPET-CA-20260318-055744`) that is not in the repo. What follows is derived
+from the code as it stands, not from the original intent. Where the two could
+differ this section says so rather than reconstructing a rationale that would
+read as authoritative — see [Open questions](#open-questions).
+
+For context, upstream Puppet Server's CA does none of this: its `inventory.txt`
+is a plain append-only text file with no integrity checking. This is an
+openvox-ca addition, which is why its purpose has to be argued rather than
+inherited.
+
+### What the control is
+
+Exactly one integrity value is persisted for the whole inventory, under the
+`inventory_hmac` logical key, keyed by `hmac_key`. Two schemes compute it:
+
+- **Whole-blob HMAC** — `HMAC-SHA256(key, blob)`, used by backends that keep the
+  inventory as a blob.
+- **Hash chain** — the fold described in
+  [Integrity: a hash chain](#integrity-a-hash-chain), used by `InventoryStore`
+  backends, which persists only the final head.
+
+Both detect modification, insertion, deletion and truncation of the entry set.
+Neither persists a per-entry value, so **a mismatch establishes that the
+inventory diverged from its recorded state, never where it diverged.** Recovery
+is therefore a rebuild, not a repair.
+
+Verification runs at startup from `CA.Init`, on every `ReadInventory` and
+`InventoryEntries`, and periodically: the OCSP serial-index resync tick reaches
+`InventoryEntries` on every backend family, so an established CA re-checks its
+inventory continuously rather than only at boot. A mismatch returns
+`ErrInventoryTampered`, which fails startup at `CA.Init` and fails the calling
+operation elsewhere.
+
+Two paths do not verify. `SubjectForSerial` skips it deliberately on
+`InventoryStore` backends, because it would cost a second full fetch of every
+row, and says so in its own comment. The append path also does not verify
+before it writes; no comment records whether that is intentional, and it
+matters more — see out-of-scope item 1.
+
+### In scope
+
+1. **Accidental corruption, truncation and partial writes.** A half-written
+   append, a truncation after a full disk or an unclean shutdown, or bit-rot in
+   the stored bytes all change the covered input and are caught with
+   overwhelming probability. This is the strongest justification for the
+   control and the one least sensitive to where the key lives: corruption does
+   not recompute a MAC.
+
+2. **Tampering that reaches the inventory but not the key.** A tampered or
+   mismatched backup, or an exposure path that reaches the inventory without
+   reaching `hmac_key`. Genuine, but narrow: it depends on the two being
+   separable in the deployment, which by default they are not.
+
+3. **Defence in depth.** The control raises the cost of a silent edit — an
+   attacker must additionally reach the key or the integrity blob, rather than
+   appending a line to a text file and stopping.
+
+### Out of scope
+
+These are properties of the design, not defects to be fixed quietly. They are
+recorded so the control is not credited with more than it does.
+
+1. **An adversary with write access to the storage backend.** This is the
+   central limitation. `hmac_key` lives in the same backend as the inventory it
+   protects, behind the same permissions, so an attacker who can write the
+   inventory can usually also read the key and recompute a valid MAC.
+
+   The bypass is in fact cheaper than that. `VerifyInventoryHMAC` treats an
+   **absent** `inventory_hmac` as a first run: it logs `No inventory HMAC found;
+   initializing integrity baseline` at `Info` level and computes a fresh value
+   over whatever the inventory currently contains. Tampering with the inventory
+   and unlinking one blob is therefore sufficient — the key need not be read at
+   all, and no restart is needed, because the next verification of any kind
+   re-establishes the baseline over the tampered contents. Absence is
+   indistinguishable from a first run, so the control's own initialisation path
+   is the bypass.
+
+   A second and quieter path reaches the same place on blob backends without
+   deleting anything: the append path does not verify before it writes.
+   `AppendInventoryRecord` reads the current blob, appends the new line and
+   stores an HMAC over the result, so if the blob had already been tampered
+   with, the next issued certificate re-blesses it. **The hash chain does not
+   launder tampering this way** — a new head is chained onto its stored
+   predecessor while verification folds over the rows themselves, so an altered
+   row keeps failing every subsequent check.
+
+   **Against an adversary with storage write access, this control should not be
+   relied upon.**
+
+2. **Concurrent appends on blob backends — structural, not operator error.**
+   Issuance serialises on a per-subject lock (`subjectLockName(subject)`). There
+   is no global inventory lock, and `StorageService.inventoryMu` is a plain
+   `sync.RWMutex`, so it orders nothing between processes. Two appends for two
+   different subjects race by construction.
+
+   Single-instance enforcement does not close this either:
+   `AcquireInstanceLock` returns a no-op when the backend supports distributed
+   locking, by design, because those are precisely the HA deployments meant to
+   run many replicas.
+
+   So on a whole-blob backend a losing writer can leave the stored head covering
+   a blob that no longer exists — a mismatch with an entirely benign cause. The
+   hash chain does not have this failure mode: the head advances atomically with
+   the row inside the backend's append transaction.
+
+3. **Rollback to an earlier consistent state.** The stored value covers contents,
+   not freshness. Replacing both the inventory and its integrity value with an
+   older, self-consistent pair verifies successfully. This is what lets a whole
+   backup be restored, and equally what makes such a rollback undetectable here.
+
+4. **The denormalised projection.** The chain input is `canonicalInventoryLine`
+   — serial, notBefore, notAfter, subject — and `InventoryEntry` carries exactly
+   those fields, so the projection columns added for the certificate index,
+   including the mutable revocation state, are not integrity-covered and cannot
+   be by construction. This is deliberate (see
+   [The certificate index](#the-certificate-index-certindex)): revocation truth
+   rests on the signed CRL, not on this control.
+
+5. **The append/HMAC ordering gap on blob backends.** The line is durably
+   appended before the integrity value is updated, so a crash between the two
+   leaves them inconsistent. `AppendInventory` reports the failure rather than
+   hiding it, and the code explains why it does not attempt to make the pair
+   atomic, but the window is real. The structured backends do not have it.
+
+### What a mismatch does and does not prove
+
+This differs by scheme, and the operator-visible message names which scheme it
+computed under.
+
+- **Whole-blob HMAC** — a mismatch means only that the stored head does not
+  match the blob. Tampering, a torn append and two replicas racing their head
+  updates all produce it. **It is not by itself evidence of tampering**, and
+  treating it as such sends an on-call after the wrong thing.
+- **Hash chain** (`InventoryStore` backends) — the head advances atomically with
+  the row, so the race cause does not apply and a mismatch is a stronger signal.
+
+### Why the mechanism meets the in-scope set
+
+- A keyed MAC over the covered input catches any change to it, truncation at any
+  offset included, which is what in-scope item 1 requires.
+- **Keying the hash is what buys item 2.** An unkeyed checksum stored beside the
+  data could be recomputed by anyone able to write the data, so it would detect
+  corruption but no tampering at all. The key is what makes the control
+  adversarial in the cases where the attacker cannot reach it.
+- The **hash chain** exists so appends stay O(1) on structured backends while
+  preserving the same detection properties, and — as a side effect that matters
+  more than the performance — it removes failure mode 2 above by advancing the
+  head inside the append transaction.
+- Storing **one head** rather than per-entry values is a deliberate trade: it is
+  cheap and makes a forked chain impossible, at the cost of localising damage.
+
+The honest summary is that the control is well matched to accidental corruption
+and to tampering that cannot reach the key, and provides little against an
+adversary who can write the store. Whether that is the intended goal is the
+first of the open questions below.
+
+### Open questions
+
+These need a decision or the original author's input; they are recorded here
+rather than resolved, and this document does not change the mechanism.
+
+1. **The reasoning behind `[012]` and `PUPPET-CA-20260318-055744`.** Not
+   recorded in this repository. @trevor-vaughan wrote the original remediation.
+2. **Compliance mapping.** The codebase cites NIST 800-53 controls at many
+   sites, but `internal/storage` cites none, so the inventory HMAC has no
+   recorded control mapping. If `[012]` was written against a specific integrity
+   control, naming it would settle whether the current shape satisfies it.
+3. **Is the co-located key an accepted limitation or a gap to close?** Moving
+   `hmac_key` outside the storage boundary — environment, a separate secret
+   store, or transit/HSM custody — is the only change that would bring
+   out-of-scope item 1 into scope. That is a larger change and is worth making
+   only if the adversarial case is agreed to be in scope.
+4. **The ordering gap** (out-of-scope item 5) is fixable on its own, independently
+   of the above.
+5. **The absent-integrity-blob path** cannot distinguish "never had one" from
+   "had one and it is now missing", and logs at `Info` either way. On an
+   established CA the latter means a partial restore or a deletion, and an
+   operator grepping for warnings after an incident would find nothing.
+
 ## Scope
 
 - **SQL backend** (sqlite/postgres/mysql) implements `InventoryStore` with a
