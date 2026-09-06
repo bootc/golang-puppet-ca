@@ -502,11 +502,15 @@ minutes), but that job starts only for the shared backends:
 server logs `OCSP serial index sync not started` and no tick runs.
 
 So on postgres, mysql, etcd and redis an established CA re-checks its inventory
-continuously. On the default filesystem backend — which is also the only
-whole-blob backend — it does not: after `CA.Init`, verification happens only
-when something drives a verifying read, in practice renewal and revocation, plus
-the opt-in expired-certificate cleanup. The backend with the weaker integrity
-scheme is the one whose integrity value is checked least often.
+continuously. The two without a tick do not, and they differ from each other.
+On the default filesystem backend — also the only whole-blob backend —
+verification after `CA.Init` happens only when something drives a verifying
+read, in practice renewal and revocation, plus the opt-in expired-certificate
+cleanup. SQLite gets a smaller set still: because the by-subject and by-serial
+lookups skip verification on `InventoryStore` backends, renewal and revocation
+do not carry it there, leaving startup, the `ReadInventory`/`InventoryEntries`
+callers and the prune. The backend with the weaker integrity scheme is among
+those whose value is checked least often.
 
 What a mismatch then does depends on the caller. At `CA.Init` it returns
 `ErrInventoryTampered` and startup fails. On the periodic path it does **not**
@@ -523,6 +527,13 @@ secondary: `puppetca_ocsp_index_sync_failures_total` counts *every* failed
 inventory read on that path, an unreachable backend included, so a rise in it
 means "this replica is not refreshing its serial index" and only the log line
 says why.
+
+No metric moves on the mismatch itself, so alerting on it is log-based. That
+matters most where it is least convenient: the shipped `PuppetCAOCSPIndexSyncFailing`
+alert fires on the counter, the counter is only ever incremented by the tick, and
+the tick does not run on filesystem or SQLite. On those two backends the shipped
+alert can never fire for this, and the signals are the log line and a failed
+start.
 
 Several read paths do not verify at all. `SerialExists` reads through
 `inventoryEntriesLocked`, which checks nothing on any backend.
@@ -601,7 +612,12 @@ recorded so the control is not credited with more than it does.
    `openvox-ca-ctl migrate` recomputes the integrity value over whatever was
    copied. That clears a mismatch on **either** scheme — it is the rebuild the
    opening of this section says recovery requires, and it cannot tell a repair
-   from a laundering.
+   from a laundering. It is a cutover rather than an in-place repair: the
+   destination must be a different store (a store cannot be migrated onto
+   itself), one that already holds a CA is refused without `--force`, and the CA
+   must then be served from the destination. Copy the `inventory` and
+   `inventory_hmac` blobs aside first if the mismatch is still to be
+   investigated — this is the command that overwrites the evidence.
 
    **Against an adversary with storage write access, this control should not be
    relied upon.**
@@ -635,9 +651,11 @@ recorded so the control is not credited with more than it does.
    the rule. A platform where it is unavailable
    (`ErrSameHostLockingUnsupported`), and the two branches where the capability
    probe fails or the backend offers no store-wide lock, each log a warning
-   naming the reason. **A cadir on a network filesystem logs nothing at all** —
-   `flock(2)` is taken and reported as held while excluding nothing across
-   hosts, and no code detects the case. So a clean log is not evidence that a
+   naming the reason. **A cadir on a network filesystem that accepts `flock(2)`
+   logs nothing at all** — the lock is taken and reported as held while
+   excluding nothing across hosts, and no code detects the case. One that
+   rejects it (`EOPNOTSUPP`, `ENOSYS`) falls into the unavailable branch above
+   and does warn. So a clean log is not evidence that a
    second writer was excluded; an operator has to know from their own deployment
    whether the cadir is local. The derivation behind all this lives in
    [locking.md](locking.md); only the conclusion belongs here.
@@ -691,8 +709,11 @@ the error an operator first meets.
   not conclusive either: a first start after upgrading a
   `ca_key_file`/`ca_cert_file` deployment over a structured backend can fail
   here with no tampering, because the stored value was written under the
-  whole-blob scheme and is now read as a chain. That is precisely why the
-  warning names the scheme it computed under.
+  whole-blob scheme and is now read as a chain. That affects pre-release builds
+  only — deployments created after the unwrap fix are unaffected — and
+  [storage-internals.md](storage-internals.md#upgrading-a-pre-fix-ca_key_file--ca_cert_file--database-deployment)
+  carries the recovery. It is precisely why the warning names the scheme it
+  computed under.
 
 ### Why the mechanism meets the in-scope set
 
@@ -714,12 +735,17 @@ and to tampering that reaches the inventory but neither `hmac_key` nor
 `inventory_hmac`. It provides little against an adversary who can write the
 store.
 
-Three properties compound, and they point the same way. The only whole-blob
-backend is the default one; it is the only family where an append can re-bless
-already-tampered contents; and it is one of the two that get no periodic
-verification at all. **The control is weakest exactly where the threat is
-strongest.** Whether that is the intended goal is the first of the open
-questions below.
+Three properties compound on one backend. The only whole-blob backend is the
+default one; it is the only family where an append can re-bless already-tampered
+contents; and it is one of the two that get no periodic verification, and the
+one where the shipped alert cannot fire. **The control is weakest on the
+backend a deployment gets if it chooses nothing.**
+
+That is a claim about the control, not about where the threat is worst — the
+section does not argue the latter, and for at least one threat it points the
+other way, since a networked store is reachable from more places than a local
+`0600` directory. Whether this distribution of strength is the intended goal is
+the first of the open questions below.
 
 ### Open questions
 
@@ -746,7 +772,7 @@ rather than resolved, and this document does not change the mechanism.
    of the above.
 5. **The absent-integrity-blob path** cannot distinguish "never had one" from
    "had one and it is now missing", which on an established CA means a partial
-   restore, a deletion, or the bypass in out-of-scope item 1. The two verifiers
+   restore, a deletion, or the absent-value bypass in out-of-scope item 1. The two verifiers
    report it differently: `verifyInventoryHMACLocked` re-baselines and logs at
    `Info`, while `compareInventoryMACLocked` logs at `Warn` and writes nothing.
    So on a shared backend, where the resync tick runs, a deleted integrity blob
@@ -755,17 +781,27 @@ rather than resolved, and this document does not change the mechanism.
    reaches the store before any verifying read, the append silently rewrites the
    value and there is no record at all, not even the `Info` line; on SQLite the
    same issuance chains onto the absent predecessor and leaves the permanent
-   mismatch described in out-of-scope item 1, which fails the next start rather
-   than logging
-   anything.
-6. **Three details here are not pinned by a spec**, though most of the section
-   is. Both arms of the absent-value behaviour are asserted — the re-baseline by
-   `storage_test.go`'s "initializes HMAC baseline when no HMAC file exists yet",
-   the non-writing compare by `sql_inventory_test.go`'s "accepts a missing stored
-   value without writing one" — as are the backend gate on the resync tick, the
-   periodic path's not failing closed, and the chain half of the blob/chain
-   asymmetry on all three structured backends. What no test asserts is the blob
-   half of that asymmetry (tamper the blob, append, and verification passes), the
-   `Info`/`Warn` levels of the quoted messages, and the `scheme` attribute the
-   mismatch warning carries. A change to any of those three would leave this
-   section quietly wrong rather than failing a build.
+   mismatch described in out-of-scope item 1. That one fails the next start and
+   logs the `inventory HMAC mismatch; integrity check failed` warning with
+   `scheme=hash-chain` before it does, so a deletion surfaces there as a
+   suspected-tampering signal rather than as the absent-value notice that
+   produced it.
+6. **Some of this is pinned by a spec and some is not**, and the split is worth
+   knowing before relying on any of it. Asserted: both arms of the absent-value
+   behaviour — the re-baseline by `storage_test.go`'s "initializes HMAC baseline
+   when no HMAC file exists yet", the non-writing compare by
+   `sql_inventory_test.go`'s "accepts a missing stored value without writing
+   one" — the backend gate on the resync tick, the periodic path's not failing
+   closed, the ordering gap on both the append and prune halves, and detection of
+   a modified, inserted or deleted row on all three structured backends.
+
+   Not asserted, and load-bearing for this section's argument: **the blob/chain
+   asymmetry on either side**. The tamper suites verify immediately after
+   tampering and never append in between, which is the step the asymmetry is
+   about — so nothing pins that a blob append re-blesses, and nothing pins that a
+   chain append does not. A refactor making `AppendEntry` recompute over all rows
+   would launder tampering exactly as the blob path does and every existing spec
+   would still pass. Also unasserted: the migration laundering above, the
+   `Info`/`Warn` levels of the quoted messages, and the `scheme` attribute on the
+   mismatch warning. A change to any of these would leave this section quietly
+   wrong rather than failing a build.

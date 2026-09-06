@@ -2,8 +2,8 @@
 
 This page covers how the CA private key is protected while the CA is running and
 at rest, the options for moving key custody off the CA host entirely, the
-detective control that watches for anomalous destructive operations, and how
-inventory integrity relates to all three.
+detective control that watches for anomalous destructive operations, and where
+inventory integrity's own key lives.
 
 ## Process isolation
 
