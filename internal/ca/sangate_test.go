@@ -27,10 +27,12 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"io/fs"
 	"log/slog"
 	"net"
 	"net/url"
+	"strings"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -211,6 +213,32 @@ var _ = Describe("Subject alternative name policy", func() {
 			Expect(buf.String()).To(ContainSubstring("DNS:puppet.example.com"))
 			Expect(buf.String()).To(ContainSubstring("allow_subject_alt_names"))
 			Expect(err.Error()).NotTo(ContainSubstring("puppet.example.com"))
+		})
+
+		It("caps the logged entries but not the count", func() {
+			// A CSR can carry a great many names. The operator needs enough to
+			// recognise what was asked for; the count is what tells them the
+			// list was trimmed, so a cap that silently lost the total would
+			// leave them reading ten of an unknown number.
+			var buf bytes.Buffer
+			orig := slog.Default()
+			slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+			defer slog.SetDefault(orig)
+
+			names := make([]string, 0, 12)
+			for i := range 12 {
+				names = append(names, fmt.Sprintf("alt%02d.example.com", i))
+			}
+			submit("web08", sanCSR("web08", func(t *x509.CertificateRequest) {
+				t.DNSNames = names
+			}))
+			_, err := myCA.Sign(ctx, "web08")
+			Expect(err).To(MatchError(ca.ErrDisallowedSubjectAltNames))
+
+			Expect(strings.Count(buf.String(), "DNS:")).To(Equal(10),
+				"the logged list should be capped at maxLoggedSANs")
+			Expect(buf.String()).To(ContainSubstring("disallowed_count=12"),
+				"the count must report the whole set, not the truncated list")
 		})
 
 		It("gates the autosign path, not just explicit signing", func() {

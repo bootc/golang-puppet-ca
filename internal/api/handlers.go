@@ -309,6 +309,17 @@ func (s *Server) handlePutStatus(w http.ResponseWriter, r *http.Request) {
 			slog.Warn("Sign failed", "subject", subject, "error", err)
 			if strings.Contains(err.Error(), "CSR not found") {
 				http.Error(w, "CSR not found", http.StatusNotFound)
+			} else if errors.Is(err, ca.ErrDisallowedSubjectAltNames) {
+				// 409 rather than the 400 the CSR-submission path uses, because
+				// here the operator's request is well-formed — it is the stored
+				// CSR that policy refuses, which is a conflict with the CA's
+				// state rather than a bad request. That matches the sibling
+				// signing-policy rejection immediately below, and the message
+				// is surfaced for the same reason: an admin-tier caller acting
+				// on a queued CSR needs to know why it will not sign, and a
+				// bare "conflict" sends them to the logs of whichever replica
+				// served them.
+				http.Error(w, ca.ErrDisallowedSubjectAltNames.Error(), http.StatusConflict)
 			} else if strings.Contains(err.Error(), "found extensions that disallow signing") {
 				// Signing-policy rejection: the message lists only disallowed
 				// OIDs (no filesystem paths), so it is safe to surface and is a
@@ -1538,6 +1549,18 @@ func (s *Server) handlePostCertificateRenewal(w http.ResponseWriter, r *http.Req
 			if errors.Is(err, ca.ErrNotInitialized) {
 				// See the auto-renewal branch.
 				http.Error(w, "CA not ready", http.StatusServiceUnavailable)
+				return
+			}
+			if errors.Is(err, ca.ErrDisallowedSubjectAltNames) {
+				// 400 as on PUT /certificate_request, and for the same reason:
+				// the client supplied this CSR, the refusal is a policy
+				// decision rather than a fault, and it can never succeed as
+				// submitted — so the agent must stop rather than retry a 500
+				// forever. Without this arm the catch-all below answers 500 and
+				// the agent reads a deliberate refusal as a server problem.
+				slog.Warn("Renewal refused: disallowed subject alternative names",
+					"subject", sanitiseForLog(cn))
+				http.Error(w, ca.ErrDisallowedSubjectAltNames.Error(), http.StatusBadRequest)
 				return
 			}
 			slog.Warn("Renewal failed", "subject", sanitiseForLog(cn), "error", err)

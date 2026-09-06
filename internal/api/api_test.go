@@ -1295,6 +1295,64 @@ var _ = Describe("API Workflow", func() {
 		})
 	})
 
+	Context("renewal CSR requesting disallowed subject alternative names", func() {
+		// The CA-layer refusal is covered in sangate_test.go; what is covered
+		// here is the mapping, which is where the property the gate was built
+		// for actually holds or fails. A refusal reaching an agent as 500 reads
+		// as a server fault it should retry, and this endpoint's whole point is
+		// that a renewal which can never succeed stops.
+		It("answers 400, not the catch-all 500", func() {
+			subject := "renew-san-node"
+
+			csrPEM, err := testutil.GenerateCSR(subject)
+			Expect(err).NotTo(HaveOccurred())
+			mux.ServeHTTP(httptest.NewRecorder(),
+				httptest.NewRequest("PUT", "/certificate_request/"+subject, bytes.NewReader(csrPEM)))
+			body, _ := json.Marshal(api.PutStatusBody{DesiredState: "signed"})
+			mux.ServeHTTP(httptest.NewRecorder(),
+				httptest.NewRequest("PUT", "/certificate_status/"+subject, bytes.NewReader(body)))
+
+			certPEM, err := myCA.Storage.GetCert(context.Background(), subject)
+			Expect(err).NotTo(HaveOccurred())
+			block, _ := pem.Decode(certPEM)
+			Expect(block).NotTo(BeNil())
+			clientCert, err := x509.ParseCertificate(block.Bytes)
+			Expect(err).NotTo(HaveOccurred())
+
+			// A name the presented certificate does not carry, so the renewal
+			// baseline cannot excuse it.
+			renewCSR := generateCSRWithSANs(subject, []string{"puppet.example.com"})
+			req := httptest.NewRequest("POST", "/certificate_renewal", bytes.NewReader(renewCSR))
+			req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{clientCert}}
+			rr := httptest.NewRecorder()
+			mux.ServeHTTP(rr, req)
+
+			Expect(rr.Code).To(Equal(http.StatusBadRequest),
+				"a policy refusal must not surface as a server fault the agent will retry")
+			Expect(rr.Body.String()).To(ContainSubstring(ca.ErrDisallowedSubjectAltNames.Error()))
+			Expect(rr.Body.String()).NotTo(ContainSubstring("puppet.example.com"))
+		})
+	})
+
+	Context("manual signing of a CSR requesting disallowed subject alternative names", func() {
+		It("answers 409 naming the refusal, not a bare conflict", func() {
+			// Autosign is off in this fixture, so the CSR queues and an
+			// operator meets the refusal at the signing step instead.
+			subject := "manual-san-node"
+			csrPEM := generateCSRWithSANs(subject, []string{"puppet.example.com"})
+			mux.ServeHTTP(httptest.NewRecorder(),
+				httptest.NewRequest("PUT", "/certificate_request/"+subject, bytes.NewReader(csrPEM)))
+
+			body, _ := json.Marshal(api.PutStatusBody{DesiredState: "signed"})
+			rr := httptest.NewRecorder()
+			mux.ServeHTTP(rr, httptest.NewRequest("PUT", "/certificate_status/"+subject, bytes.NewReader(body)))
+
+			Expect(rr.Code).To(Equal(http.StatusConflict))
+			Expect(rr.Body.String()).To(ContainSubstring(ca.ErrDisallowedSubjectAltNames.Error()),
+				"a bare \"conflict\" sends the operator to the logs of whichever replica served them")
+		})
+	})
+
 	Context("CSR requesting disallowed subject alternative names", func() {
 		// The branch only fires where SaveRequest itself signs, so this needs an
 		// autosigning CA rather than the suite's manual-signing fixture. That is
