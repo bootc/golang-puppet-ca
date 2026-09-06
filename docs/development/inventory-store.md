@@ -506,11 +506,13 @@ continuously. The two without a tick do not, and they differ from each other.
 On the default filesystem backend — also the only whole-blob backend —
 verification after `CA.Init` happens only when something drives a verifying
 read, in practice renewal and revocation, plus the opt-in expired-certificate
-cleanup. SQLite gets a smaller set still: because the by-subject and by-serial
-lookups skip verification on `InventoryStore` backends, renewal and revocation
-do not carry it there, leaving startup, the `ReadInventory`/`InventoryEntries`
-callers and the prune. The backend with the weaker integrity scheme is among
-those whose value is checked least often.
+cleanup. SQLite gets a smaller set still: the by-subject and by-serial lookups
+skip verification on `InventoryStore` backends, so renewal and revocation do not
+carry it there, and `ReadInventory` is reachable only from the blob branch
+SQLite never takes. That leaves startup and, if the opt-in cleanup is enabled,
+the prune — with cleanup off, verification happens once per process start. The
+backend with the weaker integrity scheme is among those whose value is checked
+least often.
 
 What a mismatch then does depends on the caller. At `CA.Init` it returns
 `ErrInventoryTampered` and startup fails. On the periodic path it does **not**
@@ -528,12 +530,17 @@ inventory read on that path, an unreachable backend included, so a rise in it
 means "this replica is not refreshing its serial index" and only the log line
 says why.
 
-No metric moves on the mismatch itself, so alerting on it is log-based. That
-matters most where it is least convenient: the shipped `PuppetCAOCSPIndexSyncFailing`
-alert fires on the counter, the counter is only ever incremented by the tick, and
-the tick does not run on filesystem or SQLite. On those two backends the shipped
-alert can never fire for this, and the signals are the log line and a failed
-start.
+No metric is *specific* to the mismatch, so only the log line identifies it as
+one. What a mismatch moves depends on which path met it, and that differs by
+backend. On the shared backends the tick counts into
+`puppetca_ocsp_index_sync_failures_total`, raising `PuppetCAOCSPIndexSyncFailing`.
+On filesystem the tick does not run, but a revocation that meets the mismatch
+does count: both revoke paths read through a verifying call there, so the failure
+lands in `puppetca_crl_update_failures_total` and can raise
+`PuppetCACRLUpdateFailing` — an alert that fires for a tamper signal while naming
+it a CRL problem. SQLite is the one backend where neither happens: no tick, and
+the by-subject and by-serial lookups verify nothing, so no metric moves for a
+mismatch at all and the signals are the log line and a failed start.
 
 Several read paths do not verify at all. `SerialExists` reads through
 `inventoryEntriesLocked`, which checks nothing on any backend.
@@ -615,9 +622,12 @@ recorded so the control is not credited with more than it does.
    from a laundering. It is a cutover rather than an in-place repair: the
    destination must be a different store (a store cannot be migrated onto
    itself), one that already holds a CA is refused without `--force`, and the CA
-   must then be served from the destination. Copy the `inventory` and
-   `inventory_hmac` blobs aside first if the mismatch is still to be
-   investigated — this is the command that overwrites the evidence.
+   must then be served from the destination. Because it only ever reads the
+   source, the mismatched pair survives in the store you migrated away from, so
+   a cutover does not destroy the evidence — decommissioning or re-forcing into
+   that store afterwards is what does. Note that migrating into a scratch
+   destination preserves nothing: the rebuild overwrites the copied value
+   there.
 
    **Against an adversary with storage write access, this control should not be
    relied upon.**
@@ -737,9 +747,10 @@ store.
 
 Three properties compound on one backend. The only whole-blob backend is the
 default one; it is the only family where an append can re-bless already-tampered
-contents; and it is one of the two that get no periodic verification, and the
-one where the shipped alert cannot fire. **The control is weakest on the
-backend a deployment gets if it chooses nothing.**
+contents; and it is one of the two that get no periodic verification.
+**The control is weakest on the backend a deployment gets if it chooses
+nothing.** (SQLite is the one where no metric moves for a mismatch at all, so
+it is worst served for detection even though its scheme is the stronger one.)
 
 That is a claim about the control, not about where the threat is worst — the
 section does not argue the latter, and for at least one threat it points the
@@ -792,8 +803,11 @@ rather than resolved, and this document does not change the mechanism.
    when no HMAC file exists yet", the non-writing compare by
    `sql_inventory_test.go`'s "accepts a missing stored value without writing
    one" — the backend gate on the resync tick, the periodic path's not failing
-   closed, the ordering gap on both the append and prune halves, and detection of
-   a modified, inserted or deleted row on all three structured backends.
+   closed, both halves of the ordering gap reporting their failure rather than
+   hiding it, and detection of a modified, inserted or deleted row on all three
+   structured backends. Only the prune half additionally pins the aftermath —
+   that the rewrite is durable, the head lags it, and the next read reports
+   `ErrInventoryTampered`.
 
    Not asserted, and load-bearing for this section's argument: **the blob/chain
    asymmetry on either side**. The tamper suites verify immediately after
@@ -801,7 +815,10 @@ rather than resolved, and this document does not change the mechanism.
    about — so nothing pins that a blob append re-blesses, and nothing pins that a
    chain append does not. A refactor making `AppendEntry` recompute over all rows
    would launder tampering exactly as the blob path does and every existing spec
-   would still pass. Also unasserted: the migration laundering above, the
+   would still pass. Nor is the append half's aftermath pinned: its spec asserts
+   only that an error is returned, so rolling the line back on failure, or
+   writing the value first, would leave it green and this item's first sentence
+   false. Also unasserted: the migration laundering above, the
    `Info`/`Warn` levels of the quoted messages, and the `scheme` attribute on the
    mismatch warning. A change to any of these would leave this section quietly
    wrong rather than failing a build.
