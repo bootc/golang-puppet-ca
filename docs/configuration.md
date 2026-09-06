@@ -1289,6 +1289,15 @@ the operator's whole value independently and the aggregate soft limit would be
 three times what was asked for. The launcher therefore treats one budget as
 belonging to the **whole tree** and divides it.
 
+**Upgrading.** This is not additive for a deployment that already ran under a
+memory ceiling. Before this release nothing derived a limit, so each process's
+runtime was capped only by whatever `GOMEMLIMIT` the operator set — usually
+none. After it, a host with a cgroup v2 ceiling (a container memory limit, or a
+systemd unit with `MemoryMax=`) has that ceiling divided, and the frontend is
+capped at what remains after the two fixed reservations. Exceeding a soft limit
+is continuous GC rather than an OOMKill, which is quieter than what it replaced.
+If your fleet was running near the old ceiling, raise it at upgrade time.
+
 The budget comes from `GOMEMLIMIT` when set, and otherwise from this process's
 cgroup v2 memory ceiling (`memory.max`, resolved through `/proc/self/cgroup`, so
 a systemd unit's `MemoryMax=` is honoured as well as a container limit). An
@@ -1311,18 +1320,21 @@ MiB before any inventory, so the usable headroom in the 24MiB default is nearer
 16MiB: raise `memory_reserve_signer` beyond roughly 40,000 certificates.
 
 `memory_reserve_launcher` and `memory_reserve_signer` take an integer with an
-optional IEC suffix, with or without the trailing `B`: `24MiB` and `24Mi` are
+optional IEC suffix, with or without the trailing `B`. Leaving either empty, or
+`memory_budget_percent` at `0`, selects the built-in default and is not reported
+— those are the unset sentinels, not rejected values. `24MiB` and `24Mi` are
 both accepted, as is a bare `25165824`. SI spellings are not — `64MB`, `64M`,
 `64 MiB` and `1.5GiB` are all rejected, because SI and IEC differ by 5% and
 guessing which was meant is worse than refusing. Neither may be below 8MiB: a
 share under the Go runtime's own footprint is arithmetically valid and
 operationally a process that collects continuously. A `memory_budget_percent`
-outside 1-100 is likewise rejected. In each of these cases the built-in default
-is used and **the launcher logs a warning naming the key and the value it
-ignored**, so a mistyped reservation does not pass unnoticed. The one exception
-is a `PUPPET_CA_MEMORY_BUDGET_PERCENT` that is not an integer at all: like every
-other numeric environment variable here it is discarded during parsing, before
-the launcher can see it, and the default is used silently.
+that is non-zero and outside 1-100 is likewise rejected. In each of these cases
+the built-in default is used and **the launcher logs a warning naming the key and
+the value it ignored**, so a mistyped reservation does not pass unnoticed. One
+value escapes that promise: a `PUPPET_CA_MEMORY_BUDGET_PERCENT` that is not an
+integer at all is discarded during parsing, before the launcher can see it, like
+every other numeric environment variable here, and the default is used
+silently.
 
 Nothing is divided at all in three cases. One is logged as a **warning**,
 because the operator stated a ceiling and did not get the division: a budget too
