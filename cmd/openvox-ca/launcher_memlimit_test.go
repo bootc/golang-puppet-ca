@@ -85,14 +85,20 @@ func stubMountRoot(root string) {
 	DeferCleanup(func() { cgroupMountRootPath = previous })
 }
 
-// stubSelfCgroup makes selfCgroupPathFn report rel for the current spec, so the
+// stubSelfCgroup points the real resolver at a fixture stating rel, so the
 // candidate ordering can be driven on a host whose own /proc/self/cgroup says
 // nothing useful (macOS) as well as one where it does.
+//
+// It writes a file rather than replacing the resolver: a second seam above the
+// read let every ordering spec bypass parseSelfCgroup entirely, so the two
+// could disagree with nothing noticing. One seam, at the file.
 func stubSelfCgroup(rel string) {
 	GinkgoHelper()
-	previous := selfCgroupPathFn
-	selfCgroupPathFn = func() string { return rel }
-	DeferCleanup(func() { selfCgroupPathFn = previous })
+	f := filepath.Join(GinkgoT().TempDir(), "cgroup")
+	Expect(os.WriteFile(f, []byte("0::"+rel+"\n"), 0o600)).To(Succeed())
+	previous := cgroupSelfPathFile
+	cgroupSelfPathFile = f
+	DeferCleanup(func() { cgroupSelfPathFile = previous })
 }
 
 // missingPath names a file that does not exist, standing in for a host with no
@@ -441,7 +447,7 @@ var _ = Describe("dividing the memory budget across the process tree", func() {
 
 		It("honours configured reservations, which is how a large fleet reaches the signer", func() {
 			// The signer's share does not scale with the tree total, so this key
-			// is the only way an operator past ~60,000 certificates can give it
+			// is the only way an operator past ~40,000 certificates can give it
 			// more. If this stops working the documented remedy has no effect.
 			cfg := &serverConfig{MemoryReserveSigner: "64MiB", MemoryReserveLauncher: "16MiB"}
 			budget, kind, reason := resolveMemoryBudget(cfg, memLimitEnv("512MiB"), missingPath())
@@ -480,8 +486,15 @@ var _ = Describe("dividing the memory budget across the process tree", func() {
 
 			Expect(kind).To(Equal(budgetApplied))
 			Expect(budget.notes).To(HaveLen(2), "both rejected settings must be reported")
-			Expect(strings.Join(budget.notes, "\n")).To(ContainSubstring("memory_reserve_signer"))
-			Expect(strings.Join(budget.notes, "\n")).To(ContainSubstring("memory_budget_percent"))
+			joined := strings.Join(budget.notes, "\n")
+			Expect(joined).To(ContainSubstring("memory_reserve_signer"))
+			Expect(joined).To(ContainSubstring("memory_budget_percent"))
+			// The value too, not only the key: the documentation promises the
+			// warning names "the key and the value it ignored", and dropping
+			// the value from either format string left every assertion green
+			// while removing the half that lets an operator find their typo.
+			Expect(joined).To(ContainSubstring(`"64MB"`), "the rejected byte count")
+			Expect(joined).To(ContainSubstring("250"), "the rejected percentage")
 		})
 
 		DescribeTable("reports an ignored setting whatever the ceiling lookup did",
@@ -672,6 +685,45 @@ var _ = Describe("dividing the memory budget across the process tree", func() {
 		Entry("the empty string", "", int64(0), false),
 	)
 
+	Describe("the production defaults of the cgroup seams", func() {
+		// The seams exist because a path constant could be passed wrongly with
+		// no spec noticing. Nothing asserted their defaults, so the same
+		// transposition simply moved into the var declaration: pointing
+		// cgroupMountRootPath at cgroupSelfPath disabled the derived budget on
+		// every host with the whole suite green. These are the assertions that
+		// were missing.
+		It("starts the lookup at the cgroup mount root", func() {
+			Expect(cgroupMountRootPath).To(Equal("/sys/fs/cgroup"))
+		})
+
+		It("reads this process's cgroup from /proc/self/cgroup", func() {
+			Expect(cgroupSelfPathFile).To(Equal("/proc/self/cgroup"))
+		})
+
+		It("reports a failed close on stderr by default", func() {
+			Expect(logCloseErrOut).To(BeIdenticalTo(os.Stderr))
+		})
+
+		It("resolves a unit's own cgroup through the real chain, unstubbed", func() {
+			// End to end with nothing replaced but the file itself: the
+			// candidate list, selfCgroupPath and parseSelfCgroup all run. A
+			// resolver rebound to return "" would fall back to the mount root
+			// and pass every other spec in this file.
+			root := GinkgoT().TempDir()
+			own := filepath.Join(root, "system.slice", "openvox-ca.service")
+			Expect(os.MkdirAll(own, 0o700)).To(Succeed())
+			Expect(os.WriteFile(filepath.Join(own, "memory.max"), []byte("268435456\n"), 0o600)).To(Succeed())
+			Expect(os.WriteFile(filepath.Join(root, "memory.max"), []byte("1073741824\n"), 0o600)).To(Succeed())
+			stubSelfCgroup("/system.slice/openvox-ca.service")
+
+			budget, kind, reason := resolveMemoryBudget(defaultCfg(), noEnv, root)
+
+			Expect(kind).To(Equal(budgetApplied), "reason: %s", reason)
+			Expect(budget.ceiling).To(Equal(int64(256<<20)),
+				"the unit's own ceiling must win, through the unstubbed resolver")
+		})
+	})
+
 	DescribeTable("containing the cgroup candidate path beneath the mount root",
 		func(root, path string, want bool) {
 			Expect(withinRoot(root, path)).To(Equal(want))
@@ -684,6 +736,12 @@ var _ = Describe("dividing the memory budget across the process tree", func() {
 		Entry("an escape", "/sys/fs/cgroup", "/etc/memory.max", false),
 		Entry("a sibling sharing a prefix", "/sys/fs/cgroup", "/sys/fs/cgroupX/memory.max", false),
 		Entry("an unclean root still contains", "/sys/fs/cgroup/", "/sys/fs/cgroup/memory.max", true),
+		// Asserted FALSE deliberately. Against the previous implementation this
+		// returned true -- a path that escapes reported as contained -- so an
+		// entry written to match the old behaviour would have pinned the bug as
+		// correct. The helper cleans the path now.
+		Entry("a traversing path escapes", "/sys/fs/cgroup", "/sys/fs/cgroup/../etc/memory.max", false),
+		Entry("a traversal that stays inside is contained", "/sys/fs/cgroup", "/sys/fs/cgroup/x/../memory.max", true),
 	)
 
 	It("drops a cgroup candidate whose relative path escapes the mount root", func() {
@@ -703,9 +761,8 @@ var _ = Describe("dividing the memory budget across the process tree", func() {
 
 	Describe("reading this process's cgroup path", func() {
 		// The parsing is table-driven below, but the read above it had no spec:
-		// with only selfCgroupPathFn stubbed, pointing the constant at a
-		// nonexistent file left every spec green because the mount-root
-		// candidate answers either way.
+		// pointing the constant at a nonexistent file left every spec green,
+		// because the mount-root candidate answers either way.
 		It("returns the unified path from the file it is pointed at", func() {
 			f := filepath.Join(GinkgoT().TempDir(), "cgroup")
 			Expect(os.WriteFile(f, []byte("12:pids:/system.slice/x.service\n0::/system.slice/openvox-ca.service\n"), 0o600)).To(Succeed())
@@ -814,6 +871,13 @@ var _ = Describe("dividing the memory budget across the process tree", func() {
 			Entry("a budget too small to divide warns", memLimitEnv("32MiB"), "level=WARN", ""),
 			// No ceiling anywhere is every unlimited host: unremarkable.
 			Entry("no ceiling anywhere stays at debug", noEnv, "level=DEBUG", "level=WARN"),
+			// The fourth kind. Grouped with too-small in one WARN arm, and
+			// reached by nothing until now: removing it from the case list
+			// dropped the outcome to silence with the suite green. It is
+			// unreachable in production, because the Go runtime rejects a
+			// malformed GOMEMLIMIT before any of this runs, so it is a backstop
+			// against the two grammars diverging rather than a live path.
+			Entry("a malformed GOMEMLIMIT warns", memLimitEnv("240 MiB"), "level=WARN", ""),
 		)
 
 		It("applies nothing when the budget was too small to divide", func() {

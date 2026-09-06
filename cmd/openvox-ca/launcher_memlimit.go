@@ -276,10 +276,13 @@ func resolveMemoryBudget(cfg *serverConfig, getenv func(string) string, cgroupPa
 // is exact for every plausible ceiling. Dividing first truncates n to a
 // multiple of 100 and loses up to 99 bytes per percentage point, which is
 // harmless operationally but makes the arithmetic awkward to state and to
-// assert. The guard covers an implausibly large ceiling -- parseGoByteCount
-// accepts values up to 1<<62 -- where the multiply would overflow; there the
-// imprecise order is used instead, because a wrong sign is worse than a lost
-// byte.
+// assert.
+//
+// The guard covers an implausibly large ceiling, where the multiply would
+// overflow; there the imprecise order is used instead, because a wrong sign is
+// worse than a lost byte. That ceiling comes from parseCgroupMemoryMax's
+// ParseInt, not from parseGoByteCount: scalePercent runs only on the derived
+// path, and an explicit GOMEMLIMIT is taken at face value without it.
 func scalePercent(n int64, percent int) int64 {
 	if n > math.MaxInt64/100 {
 		return n / 100 * int64(percent)
@@ -338,7 +341,7 @@ func readCgroupMemoryMax(mountRoot string) (int64, string, bool) {
 // ceiling, most specific first.
 func cgroupMemoryMaxCandidates(mountRoot string) []string {
 	candidates := make([]string, 0, 2)
-	if rel := selfCgroupPathFn(); rel != "" {
+	if rel := selfCgroupPath(); rel != "" {
 		// Containment, not because a traversal is reachable -- /proc/self/cgroup
 		// is kernel-generated and a cgroup directory cannot be named ".." -- but
 		// because this is a path built from file content and joined onto a
@@ -352,23 +355,28 @@ func cgroupMemoryMaxCandidates(mountRoot string) []string {
 	return append(candidates, filepath.Join(mountRoot, cgroupMemoryMax))
 }
 
-// withinRoot reports whether path stays beneath root after cleaning.
+// withinRoot reports whether path stays beneath root, both cleaned first.
+//
+// Cleaning path is the load-bearing half and it used to be missing: the comment
+// claimed it and the code compared the argument raw, so a path containing ".."
+// was reported as contained even though it escaped. The only caller passes a
+// filepath.Join result, which is already clean, so production was never
+// exposed -- but a containment helper that does not honour its own contract is
+// the wrong thing to leave in the tree, and the obvious spec written against
+// the old behaviour would have pinned the escape as correct.
 func withinRoot(root, path string) bool {
-	cleaned := filepath.Clean(root)
-	return strings.HasPrefix(path, cleaned+string(os.PathSeparator))
+	cleanRoot := filepath.Clean(root)
+	return strings.HasPrefix(filepath.Clean(path), cleanRoot+string(os.PathSeparator))
 }
-
-// selfCgroupPathFn is the resolver cgroupMemoryMaxCandidates uses. A variable so
-// a spec can drive the more-specific-wins ordering on a host whose own
-// /proc/self/cgroup says nothing useful, in the same style as pskPipeFn.
-var selfCgroupPathFn = selfCgroupPath
 
 // selfCgroupPath returns this process's cgroup v2 path relative to the mount
 // root, or "" when it cannot be determined.
 // cgroupSelfPathFile is the file selfCgroupPath reads. A variable for the same
-// reason mountRoot is a parameter: with only selfCgroupPathFn stubbed, the read
-// itself had no spec, so pointing it at a nonexistent path left every spec green
-// because the mount-root candidate answers either way.
+// reason mountRoot is a parameter: the read had no spec of its own, so pointing
+// it at a nonexistent path left every spec green because the mount-root
+// candidate answers either way. It is the only seam on this path -- an earlier
+// version also wrapped the resolver, which let every ordering spec bypass
+// parseSelfCgroup entirely.
 var cgroupSelfPathFile = cgroupSelfPath
 
 func selfCgroupPath() string {

@@ -70,6 +70,15 @@ func openRoleLog(cfg *serverConfig) (func(), error) {
 	if logFile == nil {
 		return func() {}, nil
 	}
+	return closeRoleLog(logFile), nil
+}
+
+// closeRoleLog returns the deferred closer for a role's log file. Shared by
+// openRoleLog and runSignerMode: the setup differs between them deliberately
+// (the signer degrades to stderr where the other two return the error), but
+// this half is the same work in all three, and leaving it duplicated meant only
+// openRoleLog's copy was covered while the signer's could drift unguarded.
+func closeRoleLog(logFile *os.File) func() {
 	return func() {
 		// Report on stderr, not slog: the default logger writes to this very
 		// file, which is being closed here.
@@ -78,7 +87,7 @@ func openRoleLog(cfg *serverConfig) (func(), error) {
 			// for a failed close, and there is nowhere left to report a failure to.
 			_, _ = fmt.Fprintf(logCloseErrOut, "failed to close log file: %v\n", cerr)
 		}
-	}, nil
+	}
 }
 
 // logCloseErrOut is where openRoleLog reports a failed close. A variable so a
@@ -1084,13 +1093,7 @@ func runSignerMode(ctx context.Context, cfg *serverConfig, absCADir string) erro
 		slog.Warn("Failed to open log file, using stderr", "error", err)
 	}
 	if logFile != nil {
-		defer func() {
-			// Report on stderr, not slog: the default logger writes to this
-			// very file, which is being closed here.
-			if cerr := logFile.Close(); cerr != nil {
-				fmt.Fprintf(os.Stderr, "failed to close log file: %v\n", cerr)
-			}
-		}()
+		defer closeRoleLog(logFile)()
 	}
 
 	ignoreReloadSignal()
