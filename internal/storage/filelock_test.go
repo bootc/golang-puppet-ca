@@ -76,11 +76,14 @@ var _ = Describe("Same-host locking", func() {
 	//
 	// It matters that it is well under ten minutes. sqlMigrationTimeout is
 	// exactly ten minutes, and so is go test's default binary timeout, which
-	// nothing here overrides -- magefile.go passes no -timeout to any of the
-	// four backend targets that build this untagged file. Left unbounded, a
-	// regression in lock *release* would therefore race those two deadlines and
-	// most likely surface as "panic: test timed out after 10m0s" for the whole
-	// package, in four jobs, naming nothing. Twenty times the worst migration
+	// nothing here overrides -- magefile.go passes no -timeout anywhere. This
+	// file is untagged, and unitTestExcludes holds only internal/testutil, so
+	// every job that builds the package runs it: test:unit as well as the four
+	// backend targets, five in all, plus the pre-push hook's `go test -race
+	// ./...`. Left unbounded, a regression in lock *release* would therefore
+	// race those two deadlines and most likely surface as "panic: test timed
+	// out after 10m0s" for the whole package, naming nothing, in all of them --
+	// including the one job every change runs. Twenty times the worst migration
 	// yet observed, and a twentieth of the binary's budget.
 	const specPatience = 30 * time.Second
 
@@ -664,6 +667,13 @@ var _ = Describe("Same-host locking", func() {
 				DeferCleanup(func() { _ = b.Close() })
 			}
 
+			// Bounded for the same reason as the migration below: these four
+			// carry the production budget, and a regression in lock release
+			// would wedge three of them until it expired. Being the concurrent
+			// one, this spec is the likelier of the two to meet that first.
+			ready, cancelReady := context.WithTimeout(ctx, specPatience)
+			defer cancelReady()
+
 			errs := make([]error, runners)
 			var wg sync.WaitGroup
 			wg.Add(runners)
@@ -671,7 +681,7 @@ var _ = Describe("Same-host locking", func() {
 				go func() {
 					defer GinkgoRecover()
 					defer wg.Done()
-					errs[i] = backends[i].EnsureReady(ctx)
+					errs[i] = backends[i].EnsureReady(ready)
 				}()
 			}
 			wg.Wait()
@@ -708,8 +718,10 @@ var _ = Describe("Same-host locking", func() {
 
 			// The refusal's own premise, pinned for the same reason as the reset
 			// below. Without this the guard is one-directional: moving the reset
-			// above this line would leave the spec passing, just ten minutes
-			// later, and nothing here would say why it had become slow.
+			// above this line would put the production budget on the refusal,
+			// which waits its budget out -- and ten minutes is also the binary
+			// timeout, so the likely surface is the package-wide panic rather
+			// than a slow pass. This fails in microseconds instead, and says so.
 			Expect(second.migrationTimeout).To(Equal(contendedTimeout),
 				"the refusal below must run under the contended budget")
 
@@ -731,9 +743,16 @@ var _ = Describe("Same-host locking", func() {
 			// Asserted, not merely assigned. Deleting the line above would put a
 			// 750ms deadline back on a migration measured at 1.508s under -race,
 			// and the spec would go back to failing on whichever loaded runner
-			// picked it up — in any of the four backend jobs, none of which this
-			// SQLite spec has anything to do with (#298). Failing here instead
-			// costs nothing and names the reason.
+			// picked it up — in test:unit, or in any of the four backend jobs,
+			// four of which this SQLite spec has nothing otherwise to do with
+			// (#298). Failing here instead costs nothing and names the reason.
+			//
+			// This is a deletion tripwire, not an invariant of the code under
+			// test: nothing in production can move the field between the line
+			// above and this one. That is what it is for, and the assertion
+			// below it is the one that exercises real plumbing. Timing the
+			// migration instead would put a clock back on the success path,
+			// which is the defect this whole change removes.
 			Expect(second.migrationTimeout).To(Equal(sqlMigrationTimeout),
 				"the migration below must not run under the contended budget")
 
