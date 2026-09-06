@@ -353,10 +353,14 @@ func (c *CA) sign(ctx context.Context, subject string) ([]byte, error) {
 // its unnormalised String() for that reason: two spellings of one resource read
 // as two names, and the gate refuses rather than guesses.
 //
-// IP addresses are the deliberate exception, because net.IP.String() is
-// canonical: a baseline holding 192.0.2.1 matches a request for
-// ::ffff:192.0.2.1. Those are one address, and equating them only ever carries
-// forward a name the presented certificate already had.
+// IP addresses go through net.IP.String() so the comparison is on a canonical
+// form rather than on raw bytes. That is defensive rather than load-bearing:
+// every address reaching this function has been through DER, and encoding
+// normalises an IPv4 address to four octets, so an IPv4-in-IPv6 spelling has
+// already collapsed to the same value by the time it arrives. Nothing on this
+// path can observe the difference -- which is why no spec pins it. It stays
+// because a future caller that builds a SAN set in Go rather than parsing one
+// would not have that guarantee.
 func sanStrings(dns []string, ips []net.IP, emails []string, uris []*url.URL) []string {
 	out := make([]string, 0, len(dns)+len(ips)+len(emails)+len(uris))
 	for _, d := range dns {

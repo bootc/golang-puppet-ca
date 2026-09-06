@@ -275,6 +275,29 @@ var _ = Describe("Subject alternative name policy", func() {
 				"the count must report the whole set, not the truncated list")
 		})
 
+		It("truncates an over-long entry rather than logging it whole", func() {
+			// The count cap alone leaves the record's size in the requester's
+			// hands: this endpoint takes a mebibyte of body without a client
+			// certificate, and one refused CSR wrote all of it.
+			var buf bytes.Buffer
+			orig := slog.Default()
+			slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+			defer slog.SetDefault(orig)
+
+			long := strings.Repeat("a", 4096) + ".example.com"
+			submit("web09", sanCSR("web09", func(t *x509.CertificateRequest) {
+				t.DNSNames = []string{long}
+			}))
+			_, err := myCA.Sign(ctx, "web09")
+			Expect(err).To(MatchError(ca.ErrDisallowedSubjectAltNames))
+
+			Expect(buf.Len()).To(BeNumerically("<", 1024),
+				"a 4KiB name must not reach the log record whole")
+			Expect(buf.String()).To(ContainSubstring("...(truncated)"))
+			Expect(buf.String()).To(ContainSubstring("disallowed_count=1"),
+				"truncating the value must not lose the count")
+		})
+
 		It("gates the autosign path, not just explicit signing", func() {
 			autoCA := ca.New(store, ca.AutosignConfig{Mode: "true"}, "puppet.test")
 			autoCA.CAKeyConfig = ca.KeyConfig{Algo: ca.KeyAlgoECDSA, Size: 256}
@@ -351,9 +374,12 @@ var _ = Describe("Subject alternative name policy", func() {
 			Expect(err).NotTo(HaveOccurred())
 		})
 
-		It("treats an equivalent IP spelling as the same address", func() {
-			// net.IP.String() canonicalises IPv4-in-IPv6, and equating them only
-			// ever carries forward a name the certificate already had.
+		It("accepts an IPv4-in-IPv6 spelling of an address it already holds", func() {
+			// Documents the outcome, and deliberately does not claim to pin the
+			// canonicalisation in sanStrings: DER encoding normalises an IPv4
+			// address to four octets, so both spellings are the same value
+			// before the gate compares anything. Mutating String() away does not
+			// fail this spec, and no spec on this path could -- see sanStrings.
 			_, err := myCA.Renew(ctx, "legacy01", sanCSR("legacy01", func(t *x509.CertificateRequest) {
 				t.DNSNames = []string{"legacy01"}
 				t.IPAddresses = []net.IP{net.ParseIP("::ffff:10.0.0.1")}
