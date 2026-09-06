@@ -749,8 +749,9 @@ var _ = Describe("Same-host locking", func() {
 			//
 			// This is a deletion tripwire, not an invariant of the code under
 			// test: nothing in production can move the field between the line
-			// above and this one. That is what it is for, and the assertion
-			// below it is the one that exercises real plumbing. Timing the
+			// above and this one. That is what it is for; the refusal-side
+			// assertion above is the one that exercises real plumbing, running
+			// SQLConfig through applyDefaults into the field. Timing the
 			// migration instead would put a clock back on the success path,
 			// which is the defect this whole change removes.
 			Expect(second.migrationTimeout).To(Equal(sqlMigrationTimeout),
