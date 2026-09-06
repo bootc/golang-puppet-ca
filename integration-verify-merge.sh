@@ -4,27 +4,15 @@
 #
 # This exists because rerere replays a resolution whenever the CONFLICT TEXT
 # matches, not whenever the resolution is still right. rr-cache lives in the
-# shared .git and is written by every worktree on this repo, so a build inherits
+# shared .git and is written by every worktree here, so a build inherits
 # resolutions recorded against trees that have since moved. When one replays,
-# git prints "Resolved 'F' using previous resolution", leaves no markers, and
-# the merge looks clean — which is why "rerere resolved it" is evidence that a
-# previous resolution existed for the same text, and nothing more.
+# git prints "Resolved 'F' using previous resolution", leaves no markers, and the
+# merge looks clean — so "rerere resolved it" is evidence that a previous
+# resolution existed for the same text, and nothing more.
 #
-# Two real losses from the 2026-08-16 build, both silent, both in prose that no
-# suite covers:
-#
-#   - #213 added `RevokeSerial` to the Tier 1 `crl` row of
-#     docs/development/locking.md. Its head carried the line; the merge of it
-#     did not. The resolution took ours wholesale.
-#   - #154 corrected "blob backends (filesystem/etcd/redis)" to
-#     "(filesystem/redis)" — etcd gained a structured inventory. Merging #154
-#     brought the fix in; merging #186 four steps later put the false statement
-#     back, because #186 was cut before the correction and the replayed
-#     resolution took theirs.
-#
-# Neither is a defect on any branch, and both survive a green build: the race
-# suite, the mage suite and golangci-lint all passed over a tree documenting an
-# etcd behaviour that had not been true for days.
+# Advisory, not blocking: dropping a line is often the right resolution, and
+# re-wrapped prose false-positives here because the content survives while the
+# line breaks move.
 #
 # Usage: ./integration-verify-merge.sh [file...]     (default: every staged file
 #                                                     with all three stages)

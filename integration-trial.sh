@@ -1,19 +1,12 @@
 #!/usr/bin/env bash
 # Replay integration.sh's merge order through the object store and report which
 # branches conflict, without creating a worktree, checking anything out, or
-# touching the index. Safe to run at any time, including while a build is in
-# progress in ../openvox-ca-integration.
+# touching the index. Safe to run at any time, including during a build.
 #
-# This exists because the conflict table in integration.sh decays as fast as the
-# branches do. Two of its entries were stale when this was first run: #157 was
-# listed as carrying the #184 collision that main had since absorbed, and #168
-# was listed as clean when it collides on README.md. Re-run this rather than
-# trusting a table anyone wrote by hand.
-#
-# READ THE OUTPUT AS AN UPPER BOUND AFTER THE FIRST CONFLICT. `merge-tree`
-# writes its tree with conflict markers left in, so each later step merges
-# against a file the real build would have resolved first. Clean rows are
-# trustworthy; conflicted rows may over-report both files and branches.
+# READ THE OUTPUT AS AN UPPER BOUND AFTER THE FIRST CONFLICT. `merge-tree` writes
+# its tree with conflict markers left in, so each later step merges against a
+# file the real build would have resolved first. Clean rows are trustworthy;
+# conflicted rows may over-report both files and branches.
 #
 # Usage: ./integration-trial.sh [base]        (base defaults to origin/main)
 set -eu -o pipefail
@@ -21,14 +14,11 @@ set -eu -o pipefail
 cd "$(dirname "$0")"
 BASE=${1:-origin/main}
 
-# Reuse integration.sh's own list so the two can never disagree about the order.
+# Reuse integration.sh's own list so the two can never disagree.
 #
-# eval, not `source <(sed ...)`. The env shebang above should find bash 5, but
-# this stays portable to the bash 3.2 at /bin/bash, where sourcing a process
-# substitution of this size silently sets nothing and leaves BRANCHES unbound —
-# a failure that appears only when someone runs `/bin/bash integration-trial.sh`
-# rather than executing it. Command substitution reads the whole block before
-# the shell parses it and behaves the same under both.
+# eval, not `source <(sed ...)`: under the bash 3.2 at /bin/bash, sourcing a
+# process substitution this size silently sets nothing and leaves BRANCHES
+# unbound. Command substitution behaves the same under both shells.
 eval "$(sed -n '/^BRANCHES=(/,/^)/p' integration.sh)"
 
 printf 'Replaying %d branches onto %s\n\n' "${#BRANCHES[@]}" "$BASE"
