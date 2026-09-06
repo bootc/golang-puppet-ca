@@ -562,8 +562,10 @@ allow_subject_alt_names: true
 
 Certificates you have already imported are unaffected: renewal carries forward
 whatever SANs a certificate already holds, whatever the setting says. Only a
-request for a *new* name is refused. Offline `generate --dns` is not filtered
-either, since those names come from you rather than from a request.
+request for a *new* name is refused. The generate paths are not filtered either
+— `openvox-ca generate --dns` on the CA host and the admin-only
+`POST /generate/{subject}?dns=` — because their names come from an administrator
+rather than from an agent's CSR.
 
 The refusal names no entries back to the requester; look in the CA's log at
 `WARN` for which ones were refused.

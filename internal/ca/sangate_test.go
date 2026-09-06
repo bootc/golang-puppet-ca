@@ -30,9 +30,11 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
+	"math/big"
 	"net"
 	"net/url"
 	"strings"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -82,6 +84,33 @@ var _ = Describe("Subject alternative name policy", func() {
 		der, err := x509.CreateCertificateRequest(rand.Reader, tmpl, key)
 		Expect(err).NotTo(HaveOccurred())
 		return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: der})
+	}
+
+	// mintLeaf signs a leaf directly with this fixture's CA key, which is the
+	// only way to obtain a baseline certificate carrying IP, email or URI SANs:
+	// the signing path drops those before they reach a certificate (#241), so a
+	// certificate holding them can only have come from elsewhere -- an import
+	// from a legacy CA, which is exactly the case these specs stand in for. It
+	// must be signed by this CA, or Renew refuses it as foreign before the SAN
+	// policy is ever consulted.
+	mintLeaf := func(cn string, shape func(*x509.Certificate)) *x509.Certificate {
+		GinkgoHelper()
+		key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		Expect(err).NotTo(HaveOccurred())
+		serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+		Expect(err).NotTo(HaveOccurred())
+		tmpl := &x509.Certificate{
+			SerialNumber: serial,
+			Subject:      pkix.Name{CommonName: cn},
+			NotBefore:    time.Now().Add(-time.Hour),
+			NotAfter:     time.Now().Add(24 * time.Hour),
+		}
+		shape(tmpl)
+		der, err := x509.CreateCertificate(rand.Reader, tmpl, myCA.CACert, &key.PublicKey, myCA.CAKey)
+		Expect(err).NotTo(HaveOccurred())
+		cert, err := x509.ParseCertificate(der)
+		Expect(err).NotTo(HaveOccurred())
+		return cert
 	}
 
 	submit := func(subject string, csrPEM []byte) {
@@ -176,8 +205,13 @@ var _ = Describe("Subject alternative name policy", func() {
 				t.DNSNames = []string{"WEB04"}
 			}))
 
-			_, err := myCA.Sign(ctx, "web04")
+			certPEM, err := myCA.Sign(ctx, "web04")
 			Expect(err).NotTo(HaveOccurred())
+			// The gate folds case to decide; issuance does not rewrite, so the
+			// requested spelling is what reaches the certificate. Asserting the
+			// issued set as the sibling spec does, rather than only that Sign
+			// returned, is what would catch a dropped or rewritten name.
+			Expect(parse(certPEM).DNSNames).To(ConsistOf("WEB04"))
 		})
 
 		It("refuses the subject's own name alongside one that is not its own", func() {
@@ -258,11 +292,11 @@ var _ = Describe("Subject alternative name policy", func() {
 		})
 
 		It("does not gate the offline minting path", func() {
-			// Deliberate: those names come from an operator's --dns flags, not
-			// from a request. Generate reaches issueLeafLocked without passing
-			// through signWithDuration at all, which is where GenerateWithOptions'
-			// doc comment says the filtering belongs — on the path that parses
-			// network input.
+			// Deliberate: Generate reaches issueLeafLocked without passing
+			// through signWithDuration at all. The exemption is about where the
+			// names come from — an administrator, not an agent's CSR — rather
+			// than about being offline: POST /generate/{subject}?dns= shares
+			// this path and is a request, admitted as tierAdminOnly.
 			res, err := myCA.Generate(ctx, "offline01", []string{"offline01.example.com"})
 			Expect(err).NotTo(HaveOccurred())
 			Expect(parse(res.CertificatePEM).DNSNames).To(ContainElement("offline01.example.com"))
@@ -280,6 +314,70 @@ var _ = Describe("Subject alternative name policy", func() {
 			certPEM, err := myCA.Sign(ctx, "web06")
 			Expect(err).NotTo(HaveOccurred())
 			Expect(parse(certPEM).DNSNames).To(ConsistOf("web06.example.com", "alt.example.com"))
+		})
+	})
+
+	Describe("renewal of a certificate carrying non-DNS SANs", func() {
+		// sanStrings normalises the four kinds differently on purpose: DNS is
+		// case-folded because DNS is case-insensitive, IP goes through
+		// net.IP.String() so equivalent spellings of one address compare equal,
+		// and email and URI are compared verbatim so that two entries a TLS peer
+		// treats as different never compare equal. Only DNS exercised those
+		// rules before; a certificate imported from a legacy CA is exactly the
+		// case that carries the others, and getting the comparison wrong there
+		// refuses a renewal the node needs.
+		var legacy *x509.Certificate
+
+		BeforeEach(func() {
+			uri, err := url.Parse("spiffe://puppet.test/node/legacy01")
+			Expect(err).NotTo(HaveOccurred())
+			legacy = mintLeaf("legacy01", func(tmpl *x509.Certificate) {
+				tmpl.DNSNames = []string{"legacy01"}
+				tmpl.IPAddresses = []net.IP{net.ParseIP("10.0.0.1")}
+				tmpl.EmailAddresses = []string{"Ops@example.com"}
+				tmpl.URIs = []*url.URL{uri}
+			})
+		})
+
+		It("carries an IP, email and URI the certificate already holds", func() {
+			uri, err := url.Parse("spiffe://puppet.test/node/legacy01")
+			Expect(err).NotTo(HaveOccurred())
+			_, err = myCA.Renew(ctx, "legacy01", sanCSR("legacy01", func(t *x509.CertificateRequest) {
+				t.DNSNames = []string{"legacy01"}
+				t.IPAddresses = []net.IP{net.ParseIP("10.0.0.1")}
+				t.EmailAddresses = []string{"Ops@example.com"}
+				t.URIs = []*url.URL{uri}
+			}), legacy)
+			Expect(err).NotTo(HaveOccurred())
+		})
+
+		It("treats an equivalent IP spelling as the same address", func() {
+			// net.IP.String() canonicalises IPv4-in-IPv6, and equating them only
+			// ever carries forward a name the certificate already had.
+			_, err := myCA.Renew(ctx, "legacy01", sanCSR("legacy01", func(t *x509.CertificateRequest) {
+				t.DNSNames = []string{"legacy01"}
+				t.IPAddresses = []net.IP{net.ParseIP("::ffff:10.0.0.1")}
+			}), legacy)
+			Expect(err).NotTo(HaveOccurred())
+		})
+
+		It("refuses a case-varied email, which is not folded", func() {
+			// The direction that would wrongly permit a name: email local-parts
+			// are case-sensitive, so a differing spelling is a different name
+			// and the gate must refuse rather than guess.
+			_, err := myCA.Renew(ctx, "legacy01", sanCSR("legacy01", func(t *x509.CertificateRequest) {
+				t.DNSNames = []string{"legacy01"}
+				t.EmailAddresses = []string{"ops@example.com"}
+			}), legacy)
+			Expect(err).To(MatchError(ca.ErrDisallowedSubjectAltNames))
+		})
+
+		It("refuses a new IP the certificate does not carry", func() {
+			_, err := myCA.Renew(ctx, "legacy01", sanCSR("legacy01", func(t *x509.CertificateRequest) {
+				t.DNSNames = []string{"legacy01"}
+				t.IPAddresses = []net.IP{net.ParseIP("10.0.0.2")}
+			}), legacy)
+			Expect(err).To(MatchError(ca.ErrDisallowedSubjectAltNames))
 		})
 	})
 
@@ -317,6 +415,23 @@ var _ = Describe("Subject alternative name policy", func() {
 			}), original)
 			Expect(err).To(MatchError(ca.ErrDisallowedSubjectAltNames),
 				"renewal must not introduce DNS:puppet.example.com, which the presented certificate lacks")
+		})
+
+		It("leaves the issued certificate in place when it refuses a renewal", func() {
+			// Renew saves the CSR before the gate runs, so a refused renewal
+			// leaves the rejected request stored. What must not change is the
+			// certificate the node is still using.
+			before, err := store.GetCert(ctx, "renew01")
+			Expect(err).NotTo(HaveOccurred())
+
+			_, err = myCA.Renew(ctx, "renew01", sanCSR("renew01", func(t *x509.CertificateRequest) {
+				t.DNSNames = []string{"renew01.example.com", "puppet.example.com"}
+			}), original)
+			Expect(err).To(MatchError(ca.ErrDisallowedSubjectAltNames))
+
+			after, err := store.GetCert(ctx, "renew01")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(after).To(Equal(before), "a refused renewal must not disturb the certificate in use")
 		})
 
 		It("carries SANs through auto-renewal, which carries no CSR to judge", func() {

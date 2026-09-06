@@ -105,7 +105,7 @@ ca_path_length: -1    # -1 = unconstrained, 0 = leaf certs only, N = N levels of
 ca_validity_days: 0   # 0 = built-in default (~5 years); positive integer overrides
 leaf_validity_days: 0 # 0 = built-in default (~5 years); positive integer overrides
 promote_cn_to_san: true # add the CN as a DNS SAN when a CSR carries none (RFC 2818)
-allow_subject_alt_names: false # let a CSR request SANs of its own; see Autosigning
+allow_subject_alt_names: false # let a CSR request SANs of its own; see "Subject alternative names requested by a CSR"
 crl_validity_days: 0  # 0 = built-in default (30 days); positive integer overrides
 csr_rate_limit: 60    # max CSR submissions per IP per minute; 0 = disable rate limiting
 # Caps concurrent CA-key signatures across issuance, CRL re-signing and the OCSP
@@ -1313,6 +1313,17 @@ csr_pem=$(cat)
 Alternative Names of its own. It is **off by default**, matching OpenVox
 Server's `allow-subject-alt-names`.
 
+> **Upgrading.** This changes behaviour without any config change. Earlier
+> openvox-ca releases signed whatever SANs a CSR asked for; this release refuses
+> them by default. Any node whose CSR requests a name beyond its own certname —
+> a `dns_alt_names` setting in its `puppet.conf`, or a service enrolling under
+> several hostnames — stops being able to enrol or re-key, with a `WARN` naming
+> `allow_subject_alt_names` in the CA's log and a `400` (autosigned) or `409`
+> (manual) to the client. Certificates already issued keep renewing: renewal
+> carries their existing names forward, so what is exposed is new registrations
+> and re-keys. Set `allow_subject_alt_names: true` to restore the previous
+> behaviour.
+
 It matters most with autosigning. TLS peers match the name they dialled against
 a certificate's SAN set, not its Common Name, so a CSR that may name anything is
 a CSR that may ask to *be* anything: a node autosigned as `web01` could request
@@ -1333,6 +1344,15 @@ alongside it:
 allow_subject_alt_names: true
 ```
 
+Note what turning it on does *not* yet buy. Only DNS names are carried onto an
+issued certificate today, so a CSR requesting an IP, email or URI SAN is signed
+with the setting on and that entry is silently dropped — the certificate comes
+back without it, and the mismatch surfaces later as a failed TLS verification
+rather than as a refusal at signing time. With the setting off the same request
+is refused outright, which is the louder of the two failures.
+[#241](https://github.com/voxpupuli/openvox-ca/issues/241) adds the
+carry-through; this caveat goes when it lands.
+
 The refusal is deliberately terse to the requester: it names no entries, so a
 client cannot use it to discover which names the CA would issue. The specifics
 are in the CA's log, at `WARN`:
@@ -1343,14 +1363,22 @@ level=WARN msg="Refusing CSR: requested subject alternative names are not allowe
   renewal=false setting=allow_subject_alt_names
 ```
 
-Two paths are unaffected by the setting, both deliberately:
+The gate covers names carried on a *submitted CSR*. Three paths are treated
+differently, all deliberately:
 
-- **Renewal.** A certificate that already carries SANs stays renewable after the
+- **Renewal** is judged against the certificate being renewed rather than against
+  policy, so a certificate that already carries SANs stays renewable after the
   setting is turned off — otherwise enabling the gate would strand exactly the
-  nodes it was enabled for. A renewal may keep the names its own certificate
-  already has; it may not introduce new ones.
-- **Offline minting.** `openvox-ca generate --dns` takes its names from an
-  operator on the CA host, not from a request, and is not filtered.
+  nodes it was enabled for. The gate does still run: a renewal may keep the names
+  its own certificate already has, and may not introduce new ones.
+- **`openvox-ca generate --dns`** mints offline from names an operator typed on
+  the CA host, and is not filtered.
+- **`POST /generate/{subject}?dns=`** is the same minting path reached over HTTP,
+  and is likewise not filtered. It *is* a request, but an admin-only one —
+  `lookupTier` classifies it `tierAdminOnly` — so its names come from an
+  administrator who could already mint anything, not from an enrolling agent.
+  That is the distinction the exemption rests on: who supplies the names, not
+  whether the path is offline.
 
 ## Directory layout (filesystem backend)
 

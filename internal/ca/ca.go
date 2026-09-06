@@ -159,11 +159,16 @@ type CA struct {
 	// set to true a request for an IP, email or URI SAN is signed and the SAN
 	// dropped — see #241, which adds the carry-through this gate assumes.
 	//
-	// This governs SANs a *client* asks for. It has no bearing on the offline
-	// minting path, where the names come from an operator's --dns flags rather
-	// than from a request: GenerateWithOptions calls issueLeafLocked directly
-	// and so keeps the filtering "exactly where it belongs -- on the path that
-	// parses network input", as its own doc comment puts it.
+	// The boundary is the CSR, not the caller: this governs names carried on a
+	// submitted certificate request, wherever it arrives from. Generate and
+	// GenerateWithOptions reach issueLeafLocked directly, never through
+	// signWithDuration, so neither is gated -- and that covers two callers, not
+	// one. The offline `openvox-ca generate --dns` takes its names from an
+	// operator on the CA host; POST /generate/{subject}?dns= takes them from a
+	// query string, and *is* a request, admitted by lookupTier's tierAdminOnly
+	// default. Both mint from names an administrator supplied directly rather
+	// than from an agent's CSR, which is the distinction that makes the
+	// exemption safe -- not the fact that one of them is offline.
 	AllowSubjectAltNames bool
 
 	// NoBootstrap makes Init refuse to create a new CA when none is found,

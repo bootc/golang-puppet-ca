@@ -160,8 +160,9 @@ type serverConfig struct {
 	// Names of its own (default: false, matching OpenVox Server's
 	// allow-subject-alt-names). When false, a CSR carrying any SAN other than a
 	// lone DNS entry equal to its own certname is refused at signing time. Does
-	// not affect the offline `generate` command, whose names come from an
-	// operator rather than from a request.
+	// not affect either generate path (`openvox-ca generate --dns` or the
+	// admin-only `POST /generate/{subject}?dns=`), whose names come from an
+	// administrator rather than from an agent's CSR.
 	AllowSubjectAltNames bool `yaml:"allow_subject_alt_names"`
 	// PuppetDateTimeFormat formats JSON date/time fields using the original Puppet CA
 	// style ("2006-01-02T15:04:05MST") instead of RFC 3339 (default: false).

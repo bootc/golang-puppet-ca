@@ -34,8 +34,10 @@ import (
 	"net"
 	"net/url"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/voxpupuli/openvox-ca/internal/storage"
 )
@@ -372,10 +374,34 @@ func sanStrings(dns []string, ips []net.IP, emails []string, uris []*url.URL) []
 	return out
 }
 
-// maxLoggedSANs bounds how many refused entries reach a log record. The set is
-// requester-supplied and a CSR can carry a great many of them; the operator
-// needs enough to recognise what was asked for, not all of it.
-const maxLoggedSANs = 10
+// maxLoggedSANs bounds how many refused entries reach a log record, and
+// maxLoggedSANValue how long each one may be. The set is requester-supplied and
+// a CSR can carry a great many of them, at whatever length it likes: the body
+// cap on the submission endpoint is a mebibyte, so bounding the count alone
+// still lets one refused CSR write about that much into a single record, on a
+// path reachable without a client certificate. The operator needs enough to
+// recognise what was asked for, not all of it.
+//
+// These mirror maxLoggedValues/maxLoggedValue in internal/api, which bound the
+// same class for the same reason. That helper cannot be reused here — internal/api
+// imports this package, so the dependency would cycle.
+const (
+	maxLoggedSANs     = 10
+	maxLoggedSANValue = 256
+)
+
+// truncateSAN bounds one rendered entry for logging, cutting back to a rune
+// boundary so a multi-byte name is not sliced mid-character.
+func truncateSAN(s string) string {
+	if len(s) <= maxLoggedSANValue {
+		return s
+	}
+	cut := maxLoggedSANValue
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + "...(truncated)"
+}
 
 // checkSubjectAltNames enforces the AllowSubjectAltNames policy against a
 // submitted CSR. It is the single gate for every path that signs one, which is
@@ -442,6 +468,12 @@ func (c *CA) checkSubjectAltNames(subject string, csr *x509.CertificateRequest, 
 	logged := disallowed
 	if len(logged) > maxLoggedSANs {
 		logged = logged[:maxLoggedSANs]
+	}
+	// Bound each surviving entry as well as the list: the count cap alone
+	// leaves the record's size in the requester's hands.
+	logged = slices.Clone(logged)
+	for i := range logged {
+		logged[i] = truncateSAN(logged[i])
 	}
 	slog.Warn("Refusing CSR: requested subject alternative names are not allowed",
 		"subject", subject,
