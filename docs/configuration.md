@@ -1313,16 +1313,15 @@ csr_pem=$(cat)
 Alternative Names of its own. It is **off by default**, matching OpenVox
 Server's `allow-subject-alt-names`.
 
-> **Upgrading.** This changes behaviour without any config change. Earlier
-> openvox-ca releases signed whatever SANs a CSR asked for; this release refuses
-> them by default. Any node whose CSR requests a name beyond its own certname —
-> a `dns_alt_names` setting in its `puppet.conf`, or a service enrolling under
-> several hostnames — stops being able to enrol or re-key, with a `WARN` naming
-> `allow_subject_alt_names` in the CA's log and a `400` (autosigned) or `409`
-> (manual) to the client. Certificates already issued keep renewing: renewal
-> carries their existing names forward, so what is exposed is new registrations
-> and re-keys. Set `allow_subject_alt_names: true` to restore the previous
-> behaviour.
+> **What you will see if your agents request alt names.** Any node whose CSR
+> asks for a name beyond its own certname — a `dns_alt_names` setting in its
+> `puppet.conf`, or a service enrolling under several hostnames — cannot enrol
+> or re-key while this is off. The CA logs a `WARN` naming
+> `allow_subject_alt_names`, and the client gets a `400` (autosigned) or a `409`
+> (manual signing). Set `allow_subject_alt_names: true` if that is what your
+> fleet needs. Certificates that already hold SANs keep renewing either way:
+> renewal carries their existing names forward, so only new registrations and
+> re-keys are affected.
 
 It matters most with autosigning. TLS peers match the name they dialled against
 a certificate's SAN set, not its Common Name, so a CSR that may name anything is
