@@ -312,5 +312,6 @@ control is aimed at accidental corruption and at tampering that cannot reach the
 key — not at an adversary with write access to the store. Unlike the CA private
 key, there is at present no option to move `hmac_key` outside that boundary.
 
-Whether that should change is an open question; the trade-offs are set out in
-the threat model linked above.
+Whether that should change is an open question, and moving the key would close
+only part of the gap: the cheaper bypass needs no key at all. The trade-offs are
+set out in the threat model linked above.

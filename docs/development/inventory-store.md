@@ -492,8 +492,9 @@ Neither persists a per-entry value, so **a mismatch establishes that the
 inventory diverged from its recorded state, never where it diverged.** Recovery
 is therefore a rebuild, not a repair.
 
-Verification runs at startup from `CA.Init`, and on the read paths that go
-through `ReadInventory` or `InventoryEntries`. **How often it runs after startup
+Verification runs at startup from `CA.Init`, on `ReadInventory` and
+`InventoryEntries`, on `SubjectForSerial` on the blob path, and in
+`PruneInventory` on every backend. **How often it runs after startup
 depends on the backend, and the difference cuts against the weaker scheme.** The
 OCSP serial-index resync tick re-checks the inventory through
 `InventoryEntries` once per `ocsp_index_sync_interval_sec` (default five
@@ -505,14 +506,24 @@ So on postgres, mysql, etcd and redis an established CA re-checks its inventory
 continuously. The two without a tick do not, and they differ from each other.
 On the default filesystem backend — also the only whole-blob backend —
 verification after `CA.Init` happens only when something drives a verifying
-read, in practice renewal and revocation, plus the opt-in expired-certificate
-cleanup. SQLite gets a smaller set still: the by-subject and by-serial lookups
-skip verification on `InventoryStore` backends, so renewal and revocation do not
-carry it there, and `ReadInventory` is reachable only from the blob branch
-SQLite never takes. That leaves startup and, if the opt-in cleanup is enabled,
-the prune — with cleanup off, verification happens once per process start. The
-backend with the weaker integrity scheme is among those whose value is checked
-least often.
+read: both revocation entry points, the CSR-based renewal path, and the opt-in
+expired-certificate cleanup. **Auto-renewal is not one of them.** `AutoRenew` —
+the empty-body flow real agents use by default — takes the predecessor serial
+from the presented certificate rather than the inventory, so a fleet doing
+nothing but routine renewal never drives a verifying read at all.
+
+SQLite gets a smaller set still: the by-subject and by-serial lookups skip
+verification on `InventoryStore` backends, so no revocation carries it there,
+and `ReadInventory` is reachable only from the blob branch SQLite never takes.
+That leaves startup and, if the opt-in cleanup is enabled, the prune. Startup
+itself verifies twice — `InitHMAC`, which fails the start, and the serial-index
+build, whose failure is only logged — so with cleanup off, those two passes are
+the whole of it.
+
+So the gap between the two is narrower than it looks: on a filesystem CA whose
+agents only auto-renew, verification is also just the startup pair. The backend
+with the weaker integrity scheme is among those whose value is checked least
+often.
 
 What a mismatch then does depends on the caller. At `CA.Init` it returns
 `ErrInventoryTampered` and startup fails. On the periodic path it does **not**
@@ -540,7 +551,11 @@ lands in `puppetca_crl_update_failures_total` and can raise
 `PuppetCACRLUpdateFailing` — an alert that fires for a tamper signal while naming
 it a CRL problem. SQLite is the one backend where neither happens: no tick, and
 the by-subject and by-serial lookups verify nothing, so no metric moves for a
-mismatch at all and the signals are the log line and a failed start.
+mismatch at all and the signals are the log line and a failed start. A refused
+start aborts before the metrics listener binds, so it shows up as
+`PuppetCAExporterDown` (or a bare `absent(up)`) rather than `PuppetCANotReady` —
+mislabelled in the same way, and on SQLite it is the only alert a mismatch
+produces.
 
 Several read paths do not verify at all. `SerialExists` reads through
 `inventoryEntriesLocked`, which checks nothing on any backend.
@@ -560,8 +575,9 @@ out-of-scope item 1.
    overwhelming probability. This is the strongest justification for the
    control and the one least sensitive to where the key lives: corruption does
    not recompute a MAC. Detection is bounded by how often verification runs,
-   though, which on the default filesystem backend is at startup and on the
-   renew and revoke paths rather than continuously.
+   though, which on the default filesystem backend is at startup, on revocation
+   and CSR-based renewal, and on the opt-in cleanup — not on auto-renewal, and
+   not continuously.
 
 2. **Tampering that reaches the inventory but not the key.** A tampered or
    mismatched backup, or an exposure path that reaches the inventory without
@@ -627,7 +643,11 @@ recorded so the control is not credited with more than it does.
    a cutover does not destroy the evidence — decommissioning or re-forcing into
    that store afterwards is what does. Note that migrating into a scratch
    destination preserves nothing: the rebuild overwrites the copied value
-   there.
+   there. An operator with no second store has only one in-field move — delete
+   the stored value and let the next verifier re-baseline — and that is the same
+   path described above as the attacker's cheap bypass. It is silent and
+   irreversible, so copy the inventory and its integrity value aside first: the
+   mismatch is the only evidence that there was one.
 
    **Against an adversary with storage write access, this control should not be
    relied upon.**
@@ -755,7 +775,7 @@ it is worst served for detection even though its scheme is the stronger one.)
 That is a claim about the control, not about where the threat is worst — the
 section does not argue the latter, and for at least one threat it points the
 other way, since a networked store is reachable from more places than a local
-`0600` directory. Whether this distribution of strength is the intended goal is
+cadir of `0600` files under `0750` directories. Whether this distribution of strength is the intended goal is
 the first of the open questions below.
 
 ### Open questions
@@ -805,7 +825,10 @@ rather than resolved, and this document does not change the mechanism.
    one" — the backend gate on the resync tick, the periodic path's not failing
    closed, both halves of the ordering gap reporting their failure rather than
    hiding it, and detection of a modified, inserted or deleted row on all three
-   structured backends. Only the prune half additionally pins the aftermath —
+   `InventoryStore` implementations (SQL, etcd, redis — PostgreSQL and MySQL
+   carry no tamper spec of their own and inherit the SQLite one through the
+   shared SQL path). The by-serial half of the CRL-counter claim above is
+   asserted too. Only the prune half additionally pins the aftermath —
    that the rewrite is durable, the head lags it, and the next read reports
    `ErrInventoryTampered`.
 
@@ -818,7 +841,10 @@ rather than resolved, and this document does not change the mechanism.
    would still pass. Nor is the append half's aftermath pinned: its spec asserts
    only that an error is returned, so rolling the line back on failure, or
    writing the value first, would leave it green and this item's first sentence
-   false. Also unasserted: the migration laundering above, the
+   false. Nor is the by-subject half of the CRL-counter claim: nothing pins
+   that `LatestSerialForSubject` verifies on a blob backend, so a refactor
+   giving it an unverified fast path would leave that paragraph half wrong.
+   Also unasserted: the migration laundering above, the
    `Info`/`Warn` levels of the quoted messages, and the `scheme` attribute on the
    mismatch warning. A change to any of these would leave this section quietly
    wrong rather than failing a build.
