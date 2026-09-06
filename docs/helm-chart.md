@@ -792,6 +792,14 @@ Pass `-f values.yaml` instead if you keep your values in a file.
 
 Worth knowing before you upgrade:
 
+- **The server now divides one memory budget across its three processes**, where
+  each previously applied the whole of `GOMEMLIMIT` independently. With the
+  chart's default `resources.limits.memory: 64Mi` and no `GOMEMLIMIT` set, the
+  frontend's runtime was uncapped before and is now limited to 25.6Mi; exceeding
+  that is continuous GC rather than an OOMKill restart, so it is quieter than
+  what it replaced. An install left at the default takes this without any values
+  change. If your fleet was running near the old limit, raise
+  `resources.limits.memory` at upgrade time — see [Sizing](#sizing).
 - While `persistence.enabled` is true the derived strategy is Recreate, so
   there is a brief outage as the old pod releases the volume. External-backend
   deployments (`persistence.enabled: false`) derive RollingUpdate and roll
