@@ -752,8 +752,11 @@ var _ = Describe("Same-host locking", func() {
 			// above and this one. That is what it is for; the refusal-side
 			// assertion above is the one that exercises real plumbing, running
 			// SQLConfig through applyDefaults into the field. Timing the
-			// migration instead would put a clock back on the success path,
-			// which is the defect this whole change removes.
+			// migration instead would buy nothing: the ready context below
+			// already bounds that same window, so an elapsed-time assertion
+			// could only fire where the deadline has already cancelled -- no
+			// detection gained, and a clock on the success path is what #298
+			// was about.
 			Expect(second.migrationTimeout).To(Equal(sqlMigrationTimeout),
 				"the migration below must not run under the contended budget")
 
