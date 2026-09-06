@@ -110,10 +110,12 @@ BRANCHES=(
   origin/fix/293-allow-subject-alt-names  # PR #294 — issue #293
   origin/fix/304-partition-memory-budget  # PR #307 — issue #304
 
-  # Collide on magefile.go, so they sit together. #266 is approved and held
-  # behind #282, and is far the furthest behind main.
-  origin/feature/release-packaging        # PR #266
+  # Collide on magefile.go, so they sit together. #282 FIRST: #266 wires
+  # release.yml to call `mage build:packages`, which #282 provides, and #266's
+  # PR body says it must not merge before #282. The build rehearses the merge,
+  # so it rehearses that order. #266 is also far the furthest behind main.
   origin/feature/package-payload          # PR #282
+  origin/feature/release-packaging        # PR #266
 )
 
 
