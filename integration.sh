@@ -109,11 +109,18 @@ BRANCHES=(
 
   origin/fix/293-allow-subject-alt-names  # PR #294 — issue #293
   origin/fix/304-partition-memory-budget  # PR #307 — issue #304
+  origin/fix/298-migration-timeout        # PR #309 — issue #298
 
-  # Collide on magefile.go, so they sit together. #282 FIRST: #266 wires
-  # release.yml to call `mage build:packages`, which #282 provides, and #266's
-  # PR body says it must not merge before #282. The build rehearses the merge,
-  # so it rehearses that order. #266 is also far the furthest behind main.
+  # Collide on docs/operator-cli.md. #311 rewrote that section's table and the
+  # prose under it as one argument, so resolve the whole "Running alongside a
+  # live server" section as a unit, not just the conflicted hunk — otherwise
+  # the table can end up saying one thing and the prose beneath it another.
+  origin/docs/136-inventory-integrity-threat-model  # PR #311 — issue #136
+  origin/feature/188-rebuild-inventory-hmac  # PR #312 — issue #188
+
+  # Collide on magefile.go. #282 FIRST: #266 wires release.yml to call
+  # `mage build:packages`, which #282 provides, and #266's body says it must
+  # not merge before #282.
   origin/feature/package-payload          # PR #282
   origin/feature/release-packaging        # PR #266
 )
