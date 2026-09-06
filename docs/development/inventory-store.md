@@ -439,18 +439,39 @@ Neither persists a per-entry value, so **a mismatch establishes that the
 inventory diverged from its recorded state, never where it diverged.** Recovery
 is therefore a rebuild, not a repair.
 
-Verification runs at startup from `CA.Init`, on every `ReadInventory` and
-`InventoryEntries`, and periodically: the OCSP serial-index resync tick reaches
-`InventoryEntries` on every backend family, so an established CA re-checks its
-inventory continuously rather than only at boot. A mismatch returns
-`ErrInventoryTampered`, which fails startup at `CA.Init` and fails the calling
-operation elsewhere.
+Verification runs at startup from `CA.Init`, and on the read paths that go
+through `ReadInventory` or `InventoryEntries`. **How often it runs after startup
+depends on the backend, and the difference cuts against the weaker scheme.** The
+OCSP serial-index resync tick re-checks the inventory on a timer through
+`InventoryEntries`, but that job starts only for the shared backends:
+`sharedStorageBackend` excludes `filesystem` and `sqlite`, and on those the
+server logs `OCSP serial index sync not started` and no tick runs.
 
-Two paths do not verify. `SubjectForSerial` skips it deliberately on
-`InventoryStore` backends, because it would cost a second full fetch of every
-row, and says so in its own comment. The append path also does not verify
-before it writes; no comment records whether that is intentional, and it
-matters more — see out-of-scope item 1.
+So on postgres, mysql, etcd and redis an established CA re-checks its inventory
+continuously. On the default filesystem backend — which is also the only
+whole-blob backend — it does not: after `CA.Init`, verification happens only
+when something drives a verifying read, in practice renewal and revocation, plus
+the opt-in expired-certificate cleanup. The backend with the weaker integrity
+scheme is the one whose integrity value is checked least often.
+
+What a mismatch then does depends on the caller. At `CA.Init` it returns
+`ErrInventoryTampered` and startup fails. On the periodic path it does **not**
+fail closed: `SyncSerialIndex` counts the failure into
+`puppetca_ocsp_index_sync_failures_total`, `syncOCSPIndexOnce` logs `OCSP serial
+index sync failed; continuing with the index already in memory` at `Warn`, and
+the CA keeps answering from the index it already holds. Alerting on that counter,
+or on the mismatch warning itself, is what turns the periodic check into a
+detection rather than a log line.
+
+Several read paths do not verify at all. `SerialExists` reads through
+`inventoryEntriesLocked`, which checks nothing on any backend.
+`SubjectForSerial` and `LatestSerialForSubject` verify on the blob path but not
+on `InventoryStore` backends — deliberately, because re-verifying would cost a
+second full fetch of every row, as `SubjectForSerial`'s comment sets out at
+length. `CertStatuses`, which answers the certificate-status listing, reads the
+index without checking it. And the append path does not verify before it writes;
+no comment records whether that is intentional, and it matters more — see
+out-of-scope item 1.
 
 ### In scope
 
@@ -459,7 +480,9 @@ matters more — see out-of-scope item 1.
    the stored bytes all change the covered input and are caught with
    overwhelming probability. This is the strongest justification for the
    control and the one least sensitive to where the key lives: corruption does
-   not recompute a MAC.
+   not recompute a MAC. Detection is bounded by how often verification runs,
+   though, which on the default filesystem backend is at startup and on the
+   renew and revoke paths rather than continuously.
 
 2. **Tampering that reaches the inventory but not the key.** A tampered or
    mismatched backup, or an exposure path that reaches the inventory without
@@ -485,10 +508,20 @@ recorded so the control is not credited with more than it does.
    initializing integrity baseline` at `Info` level and computes a fresh value
    over whatever the inventory currently contains. Tampering with the inventory
    and unlinking one blob is therefore sufficient — the key need not be read at
-   all, and no restart is needed, because the next verification of any kind
-   re-establishes the baseline over the tampered contents. Absence is
-   indistinguishable from a first run, so the control's own initialisation path
-   is the bypass.
+   all, and no restart is strictly needed. Absence is indistinguishable from a
+   first run, so the control's own initialisation path is the bypass.
+
+   Which verifier gets there first matters. `verifyInventoryHMACLocked` — reached
+   from `CA.Init`, `ReadInventory`, `SubjectForSerial` and the prune path — is
+   the one that re-baselines. `compareInventoryMACLocked`, which
+   `InventoryEntries` and therefore the resync tick use, instead logs `No
+   inventory HMAC stored; skipping the integrity check for this read` at `Warn`
+   and writes nothing; its comment says the divergence is deliberate, because a
+   read path that writes, from every replica at once on a timer, is not worth
+   leaving available. On a hash-chain backend an append that lands before any
+   re-baseline makes things worse for the attacker rather than better: the new
+   head chains onto the absent predecessor while verification folds over every
+   row, leaving a mismatch that no later check clears.
 
    A second and quieter path reaches the same place on blob backends without
    deleting anything: the append path does not verify before it writes.
@@ -502,21 +535,38 @@ recorded so the control is not credited with more than it does.
    **Against an adversary with storage write access, this control should not be
    relied upon.**
 
-2. **Concurrent appends on blob backends — structural, not operator error.**
-   Issuance serialises on a per-subject lock (`subjectLockName(subject)`). There
-   is no global inventory lock, and `StorageService.inventoryMu` is a plain
-   `sync.RWMutex`, so it orders nothing between processes. Two appends for two
-   different subjects race by construction.
+2. **Interleaved appends from a second writer, where one can reach the store.**
+   Locks do not prevent this on a blob backend, but the single-instance rule
+   mostly does, and the distinction decides how an operator should read a
+   mismatch.
 
-   Single-instance enforcement does not close this either:
-   `AcquireInstanceLock` returns a no-op when the backend supports distributed
-   locking, by design, because those are precisely the HA deployments meant to
-   run many replicas.
+   Neither lock helps. Issuance serialises on a per-subject lock
+   (`subjectLockName(subject)`), a different name per subject, and there is no
+   global inventory lock. `AppendInventoryRecord` does hold
+   `StorageService.inventoryMu` across the whole read-append-rewrite sequence, so
+   two appends inside one process cannot interleave — but `inventoryMu` is a
+   plain `sync.RWMutex` and orders nothing between processes.
 
-   So on a whole-blob backend a losing writer can leave the stored head covering
-   a blob that no longer exists — a mismatch with an entirely benign cause. The
-   hash chain does not have this failure mode: the head advances atomically with
-   the row inside the backend's append transaction.
+   What excludes a second writer is the single-instance rule. On the filesystem
+   backend `AcquireInstanceLock` takes a store-wide `flock(2)` and refuses a
+   second instance, so on a supported single-node deployment this case is closed.
+   The no-op branch — where `AcquireInstanceLock` returns without locking because
+   the backend has distributed locking — is reached only by etcd, Redis and SQL,
+   which are exactly the hash-chain backends that advance the head atomically and
+   never had this failure mode. It cannot fire on a whole-blob backend at all.
+
+   The enforcement is best-effort by design, and the code says so: an advisory
+   lock says nothing useful over NFS, and a second process on another host cannot
+   be excluded at all. It is also taken once per instance, by the launcher, and
+   not by the signer and frontend children that share it. The residual paths are
+   therefore a cadir on a network filesystem, a platform where the store-wide
+   lock is unavailable (`ErrSameHostLockingUnsupported`), and the two
+   warn-and-permit branches where the capability probe fails or the backend
+   offers no such lock. Each logs a warning naming the reason, which is what an
+   operator checks before deciding a mismatch was benign.
+
+   Where it does happen, two concurrent appenders leave an integrity value
+   covering a blob that **never existed** — not one that has since changed.
 
 3. **Rollback to an earlier consistent state.** The stored value covers contents,
    not freshness. Replacing both the inventory and its integrity value with an
@@ -542,24 +592,31 @@ recorded so the control is not credited with more than it does.
 This differs by scheme, and the operator-visible message names which scheme it
 computed under.
 
-- **Whole-blob HMAC** — a mismatch means only that the stored head does not
-  match the blob. Tampering, a torn append and two replicas racing their head
-  updates all produce it. **It is not by itself evidence of tampering**, and
-  treating it as such sends an on-call after the wrong thing.
+- **Whole-blob HMAC** (the filesystem backend) — a mismatch means only that the
+  stored value does not match the blob. Tampering is one cause. A torn append is
+  another, and it needs no second writer: the line is durably appended before the
+  integrity value is updated, so a crash between the two produces exactly this
+  (out-of-scope item 5). An interleaved append from a second writer is a third,
+  but only in the configurations named in item 2, where the instance lock did not
+  hold. **A mismatch is not by itself evidence of tampering** — though on a
+  single-node deployment whose instance lock was in force, the benign
+  explanations narrow to the torn append, and the signal is correspondingly
+  stronger than the general case.
 - **Hash chain** (`InventoryStore` backends) — the head advances atomically with
-  the row, so the race cause does not apply and a mismatch is a stronger signal.
+  the row inside the append transaction, so neither the torn-append nor the
+  interleaved-append cause applies, and a mismatch is a stronger signal again.
 
 ### Why the mechanism meets the in-scope set
 
 - A keyed MAC over the covered input catches any change to it, truncation at any
   offset included, which is what in-scope item 1 requires.
-- **Keying the hash is what buys item 2.** An unkeyed checksum stored beside the
+- **Keying the hash is what buys in-scope item 2.** An unkeyed checksum stored beside the
   data could be recomputed by anyone able to write the data, so it would detect
   corruption but no tampering at all. The key is what makes the control
   adversarial in the cases where the attacker cannot reach it.
 - The **hash chain** exists so appends stay O(1) on structured backends while
   preserving the same detection properties, and — as a side effect that matters
-  more than the performance — it removes failure mode 2 above by advancing the
+  more than the performance — it removes out-of-scope item 2 by advancing the
   head inside the append transaction.
 - Storing **one head** rather than per-entry values is a deliberate trade: it is
   cheap and makes a forked chain impossible, at the cost of localising damage.
@@ -575,7 +632,9 @@ These need a decision or the original author's input; they are recorded here
 rather than resolved, and this document does not change the mechanism.
 
 1. **The reasoning behind `[012]` and `PUPPET-CA-20260318-055744`.** Not
-   recorded in this repository. @trevor-vaughan wrote the original remediation.
+   recorded in this repository; asked in
+   [#136](https://github.com/voxpupuli/openvox-ca/issues/136). The remediation
+   arrived with commit `18ff78be08ec`, which is where the author is recorded.
 2. **Compliance mapping.** The codebase cites NIST 800-53 controls at many
    sites, but `internal/storage` cites none, so the inventory HMAC has no
    recorded control mapping. If `[012]` was written against a specific integrity
@@ -588,9 +647,19 @@ rather than resolved, and this document does not change the mechanism.
 4. **The ordering gap** (out-of-scope item 5) is fixable on its own, independently
    of the above.
 5. **The absent-integrity-blob path** cannot distinguish "never had one" from
-   "had one and it is now missing", and logs at `Info` either way. On an
-   established CA the latter means a partial restore or a deletion, and an
-   operator grepping for warnings after an incident would find nothing.
+   "had one and it is now missing", which on an established CA means a partial
+   restore, a deletion, or the bypass in out-of-scope item 1. The two verifiers
+   also report it differently: `verifyInventoryHMACLocked` re-baselines and logs
+   at `Info`, while `compareInventoryMACLocked` logs at `Warn` and writes
+   nothing. So on a shared backend, where the resync tick runs, a deleted
+   integrity blob does produce a repeating warning worth alerting on; on
+   filesystem and SQLite, where no tick runs, the only record is that `Info` line
+   at the next start.
+6. **None of this is pinned by a spec.** The bypass in out-of-scope item 1, the
+   blob/chain asymmetry, the log levels and the scheme label in the mismatch
+   message are all statements about current behaviour that no test asserts, so a
+   change to any of them would leave this section quietly wrong rather than
+   failing a build.
 
 ## Scope
 
