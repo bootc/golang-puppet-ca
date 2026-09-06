@@ -836,6 +836,23 @@ var _ = Describe("dividing the memory budget across the process tree", func() {
 			Expect(out).To(ContainSubstring("memory_reserve_signer"))
 		})
 
+		It("emits one warning per ignored setting, not just the first", func() {
+			// Driven with two rejected keys because one proves only that the
+			// loop runs, not that it accumulates: emitting the first element,
+			// or overwriting instead of appending, passes a single-note spec
+			// unchanged. resolveMemoryBudget's own notes-length assertion
+			// covers the slice; this covers the loop that reaches the operator.
+			cfg := &serverConfig{MemoryReserveSigner: "64MB", MemoryBudgetPercent: 250}
+			out := captureLogs(slog.LevelDebug, func() {
+				applyMemoryBudget(cfg, noEnv, func(int64) int64 { return 0 })
+			})
+
+			Expect(strings.Count(out, "Ignoring a memory-budget setting")).To(Equal(2),
+				"one warning line per rejected key")
+			Expect(out).To(ContainSubstring("memory_reserve_signer"))
+			Expect(out).To(ContainSubstring("memory_budget_percent"))
+		})
+
 		It("returns the budget it resolved, for the children to draw shares from", func() {
 			budget := applyMemoryBudget(defaultCfg(), memLimitEnv("256MiB"),
 				func(int64) int64 { return 0 })
